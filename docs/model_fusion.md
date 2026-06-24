@@ -9,7 +9,7 @@ cross-frame correspondence embeddings.
 
 ## Current Implementation
 
-- `externals/` is a place for local symlinks or clones of SAM3 and VGGT.
+- `externals/` contains SAM3 and StreamVGGT as git submodules.
 - `scripts/inspect_backbone_outputs.py` runs a small subset of processed
   ScanNet++ frames and dumps the real SAM3/VGGT output structures.
 - `src/vggtsam/models/fusion.py` implements the model core using a clean token
@@ -31,6 +31,8 @@ names. Run the inspect script on the server and share the JSON/text summary.
 ## Server Commands
 
 ```bash
+git submodule update --init --recursive
+
 PYTHONPATH=src python scripts/inspect_backbone_outputs.py \
   --config configs/fusion_debug.yaml
 ```
@@ -45,8 +47,9 @@ PYTHONPATH=src python scripts/inspect_backbone_outputs.py \
   --sam3-checkpoint /home/bod/86Nas/95_data_bak/FoundationModels/sam3/sam3.pt \
   --sam3-repo externals/sam3 \
   --sam3-prompt chair \
-  --vggt-repo /home/wlh50060092/FoundationCode/vggt \
-  --vggt-checkpoint /home/wlh50060092/FoundationCode/vggt/checkpoints.pth \
+  --geometry-backbone streamvggt \
+  --vggt-repo externals/streamvggt \
+  --vggt-checkpoint /home/bod/86Nas/95_data_bak/FoundationModels/StreamVGGT/checkpoints.pth \
   --device cuda \
   --output-json outputs/debug/backbone_outputs.json
 ```

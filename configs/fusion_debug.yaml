@@ -11,8 +11,9 @@ sam3:
   gpus_to_use: [0]
 
 vggt:
-  repo: externals/vggt
-  checkpoint: /home/wlh50060092/FoundationCode/vggt/checkpoints.pth
+  backbone: streamvggt
+  repo: externals/streamvggt
+  checkpoint: /home/bod/86Nas/95_data_bak/FoundationModels/StreamVGGT/checkpoints.pth
   patch_multiple: 14
 
 runtime:

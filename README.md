@@ -32,6 +32,8 @@ VGGT/StreamVGGT geometry tokens. Before fixing the exact backbone layer, inspect
 the real server-side outputs:
 
 ```bash
+git submodule update --init --recursive
+
 PYTHONPATH=src python scripts/inspect_backbone_outputs.py \
   --config configs/fusion_debug.yaml
 ```

@@ -1,0 +1,6 @@
+[submodule "externals/sam3"]
+	path = externals/sam3
+	url = https://github.com/facebookresearch/sam3.git
+[submodule "externals/streamvggt"]
+	path = externals/streamvggt
+	url = https://github.com/wzzheng/StreamVGGT.git

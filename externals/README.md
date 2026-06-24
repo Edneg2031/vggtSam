@@ -6,9 +6,7 @@ foundation-model codebases. Do not commit those repositories or checkpoints.
 Suggested server layout:
 
 ```bash
-mkdir -p externals
-ln -s /home/wlh50060092/FoundationCode/vggt externals/vggt
-ln -s /path/to/sam3 externals/sam3
+git submodule update --init --recursive
 ```
 
 The scripts also accept explicit `--vggt-repo` and `--sam3-repo` paths, so the
@@ -17,6 +15,6 @@ external repos can stay outside this project if that is cleaner on the server.
 Expected checkpoints in the current server setup:
 
 ```text
-SAM3: /home/bod/86Nas/95_data_bak/FoundationModels/sam3/sam3.pt
-VGGT: /home/wlh50060092/FoundationCode/vggt/checkpoints.pth
+SAM3:       /home/bod/86Nas/95_data_bak/FoundationModels/sam3/sam3.pt
+StreamVGGT: /home/bod/86Nas/95_data_bak/FoundationModels/StreamVGGT/checkpoints.pth
 ```

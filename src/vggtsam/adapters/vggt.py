@@ -57,6 +57,26 @@ def load_vggt_model(
     return model.to(device).eval()
 
 
+def load_streamvggt_model(
+    *,
+    repo_path: Optional[str | Path],
+    checkpoint_path: str | Path,
+    device: str,
+    strict: bool = True,
+) -> Any:
+    import torch
+
+    maybe_add_repo_to_path(repo_path)
+    from streamvggt.models.streamvggt import StreamVGGT
+
+    model = StreamVGGT()
+    state = torch.load(checkpoint_path, map_location="cpu")
+    if isinstance(state, dict) and "model" in state:
+        state = state["model"]
+    model.load_state_dict(state, strict=strict)
+    return model.to(device).eval()
+
+
 def run_vggt_forward(
     model,
     images,
@@ -71,3 +91,29 @@ def run_vggt_forward(
     )
     with torch.no_grad():
         return model(images)
+
+
+def run_streamvggt_inference(
+    model,
+    frame_paths,
+    *,
+    device: str,
+) -> Any:
+    import torch
+
+    from streamvggt.utils.load_fn import load_and_preprocess_images
+
+    image_paths = [str(path) for path in frame_paths]
+    images = load_and_preprocess_images(image_paths).to(device)
+    frames = [{"img": images[idx].unsqueeze(0)} for idx in range(images.shape[0])]
+
+    with torch.no_grad():
+        if str(device).startswith("cuda"):
+            dtype = (
+                torch.bfloat16
+                if torch.cuda.get_device_capability()[0] >= 8
+                else torch.float16
+            )
+            with torch.cuda.amp.autocast(dtype=dtype):
+                return model.inference(frames)
+        return model.inference(frames)

@@ -22,5 +22,6 @@ PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
 
 
 检查SAM3/VGGT真实输出结构
+git submodule update --init --recursive
 PYTHONPATH=src python scripts/inspect_backbone_outputs.py \
   --config configs/fusion_debug.yaml

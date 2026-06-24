@@ -1,3 +1,6 @@
 *
 !.gitignore
 !README.md
+!sam3/
+!streamvggt/
+!vggt/

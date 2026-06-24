@@ -19,7 +19,12 @@ def maybe_add_repo_to_path(repo_path: Optional[str | Path]) -> Optional[Path]:
     if not path.exists():
         return None
     path = path.resolve()
-    path_str = str(path)
-    if path_str not in sys.path:
-        sys.path.insert(0, path_str)
+    candidates = [path]
+    src_path = path / "src"
+    if src_path.is_dir():
+        candidates.insert(0, src_path)
+    for candidate in candidates:
+        path_str = str(candidate)
+        if path_str not in sys.path:
+            sys.path.insert(0, path_str)
     return path

@@ -19,7 +19,12 @@ from vggtsam.adapters.sam3 import (
     prepare_video_frame_dir,
     run_sam3_text_prompt,
 )
-from vggtsam.adapters.vggt import load_vggt_model, run_vggt_forward
+from vggtsam.adapters.vggt import (
+    load_streamvggt_model,
+    load_vggt_model,
+    run_streamvggt_inference,
+    run_vggt_forward,
+)
 
 
 def main() -> None:
@@ -48,7 +53,7 @@ def main() -> None:
         report["sam3"] = inspect_sam3(args, frame_paths)
 
     if not args.skip_vggt and args.vggt_checkpoint:
-        report["vggt"] = inspect_vggt(args, frame_paths)
+        report["vggt"] = inspect_geometry_backbone(args, frame_paths)
 
     if args.output_json:
         write_json(args.output_json, report)
@@ -75,8 +80,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sam3-tmp-dir", type=Path, default=Path("outputs/tmp/sam3_frames"))
     parser.add_argument("--skip-sam3", action="store_true")
 
-    parser.add_argument("--vggt-repo", type=Path, default=Path("externals/vggt"))
+    parser.add_argument("--vggt-repo", type=Path, default=Path("externals/streamvggt"))
     parser.add_argument("--vggt-checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--geometry-backbone",
+        choices=["streamvggt", "vggt"],
+        default="streamvggt",
+    )
     parser.add_argument("--vggt-patch-multiple", type=int, default=14)
     parser.add_argument(
         "--vggt-value-scale",
@@ -120,6 +130,7 @@ def apply_config(args: argparse.Namespace) -> argparse.Namespace:
 
     maybe_set(args, defaults, "vggt_repo", vggt.get("repo"), Path)
     maybe_set(args, defaults, "vggt_checkpoint", vggt.get("checkpoint"), Path)
+    maybe_set(args, defaults, "geometry_backbone", vggt.get("backbone"))
     maybe_set(args, defaults, "vggt_patch_multiple", vggt.get("patch_multiple"), int)
     maybe_set(args, defaults, "vggt_value_scale", vggt.get("value_scale"), float)
     return args
@@ -196,31 +207,48 @@ def inspect_sam3(args: argparse.Namespace, frame_paths: List[Path]) -> Dict[str,
     }
 
 
-def inspect_vggt(args: argparse.Namespace, frame_paths: List[Path]) -> Dict[str, Any]:
-    print("loading VGGT...")
+def inspect_geometry_backbone(
+    args: argparse.Namespace, frame_paths: List[Path]
+) -> Dict[str, Any]:
     import torch
 
-    model = load_vggt_model(
-        repo_path=args.vggt_repo,
-        checkpoint_path=args.vggt_checkpoint,
-        device=args.device,
-        strict=False,
-    )
-    images = load_images_as_tensor(frame_paths).to(args.device)
-    print(f"running VGGT images={tuple(images.shape)}")
-    output = run_vggt_forward(
-        model,
-        images,
-        patch_multiple=args.vggt_patch_multiple,
-        value_scale=args.vggt_value_scale,
-    )
+    print(f"loading geometry backbone={args.geometry_backbone}...")
+    if args.geometry_backbone == "streamvggt":
+        model = load_streamvggt_model(
+            repo_path=args.vggt_repo,
+            checkpoint_path=args.vggt_checkpoint,
+            device=args.device,
+            strict=True,
+        )
+        print(f"running StreamVGGT frames={len(frame_paths)}")
+        output = run_streamvggt_inference(model, frame_paths, device=args.device)
+    else:
+        model = load_vggt_model(
+            repo_path=args.vggt_repo,
+            checkpoint_path=args.vggt_checkpoint,
+            device=args.device,
+            strict=False,
+        )
+        images = load_images_as_tensor(frame_paths).to(args.device)
+        print(f"running VGGT images={tuple(images.shape)}")
+        output = run_vggt_forward(
+            model,
+            images,
+            patch_multiple=args.vggt_patch_multiple,
+            value_scale=args.vggt_value_scale,
+        )
+
     if str(args.device).startswith("cuda"):
         torch.cuda.empty_cache()
     summary = summarize_object(output)
     candidates = tensor_candidates(output)
-    print_section("VGGT output summary", summary)
-    print_candidates("VGGT tensor candidates", candidates)
-    return {"summary": summary, "tensor_candidates": candidates}
+    print_section("Geometry output summary", summary)
+    print_candidates("Geometry tensor candidates", candidates)
+    return {
+        "backbone": args.geometry_backbone,
+        "summary": summary,
+        "tensor_candidates": candidates,
+    }
 
 
 def load_images_as_tensor(frame_paths: List[Path]):
