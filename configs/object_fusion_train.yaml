@@ -1,0 +1,47 @@
+# Object-level geometry/semantic fusion training on processed ScanNet++.
+dataset:
+  manifest: data/processed/scannetpp_2d/manifest.json
+  scene_id: 0a5c013435
+  sequence_length: 4
+  frame_stride: 1
+  image_size: [350, 518]
+
+objects:
+  min_pixels: 128
+  max_area_ratio: 0.25
+  min_visible_frames: 2
+  max_objects_per_frame: 32
+  ignore_instance_id: 0
+  semantic_ignore_label: 65535
+
+geometry:
+  backbone: streamvggt
+  repo: externals/streamvggt
+  checkpoint: /home/bod/86Nas/95_data_bak/FoundationModels/StreamVGGT/checkpoints.pth
+  freeze: true
+  token_grid: [25, 37]
+  feature_channels:
+    - xyz
+    - depth
+    - conf
+    - depth_conf
+
+model:
+  d_fuse: 256
+  num_heads: 8
+  num_classes: 1024
+
+loss:
+  semantic_weight: 1.0
+  centroid_weight: 1.0
+  contrastive_weight: 0.5
+  temperature: 0.07
+
+training:
+  device: cuda
+  iterations: 200
+  lr: 0.0003
+  seed: 0
+  log_every: 10
+  save_every: 100
+  output_dir: outputs/object_fusion_debug

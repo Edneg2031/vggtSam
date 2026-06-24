@@ -25,3 +25,10 @@ PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
 git submodule update --init --recursive
 PYTHONPATH=src python scripts/inspect_backbone_outputs.py \
   --config configs/fusion_debug.yaml
+
+
+训练object-level fusion v0
+PYTHONPATH=src python scripts/train_object_fusion.py \
+  --config configs/object_fusion_train.yaml \
+  --iterations 20 \
+  --device cuda

@@ -14,6 +14,9 @@ cross-frame correspondence embeddings.
   ScanNet++ frames and dumps the real SAM3/VGGT output structures.
 - `src/vggtsam/models/fusion.py` implements the model core using a clean token
   interface. It does not assume a specific internal SAM3 or VGGT layer yet.
+- `scripts/train_object_fusion.py` trains the first object-level version using
+  ScanNet++ projected instance masks as oracle cross-frame supervision and
+  frozen StreamVGGT geometry outputs as geometric context.
 
 ## Why Inspect First
 
@@ -55,3 +58,32 @@ PYTHONPATH=src python scripts/inspect_backbone_outputs.py \
 ```
 
 You can omit either SAM3 or VGGT arguments to inspect only one side.
+
+## Training V0
+
+The first training version follows the intended supervision path:
+
+```text
+ScanNet++ 3D instance ids
+  -> rasterized cross-frame-consistent instance_masks
+  -> object queries and object correspondence labels
+
+StreamVGGT frozen output
+  -> point/depth/conf/camera geometry context
+
+Object fusion model
+  -> semantic logits, 3D object centroid, cross-frame match embeddings
+```
+
+Run a tiny debug job:
+
+```bash
+PYTHONPATH=src python scripts/train_object_fusion.py \
+  --config configs/object_fusion_train.yaml \
+  --iterations 20 \
+  --device cuda
+```
+
+This version intentionally does not depend on SAM3 returning masks during
+training. SAM3 is the later open-vocabulary query source; ScanNet++ masks are
+the stable training target.

@@ -39,3 +39,14 @@ PYTHONPATH=src python scripts/inspect_backbone_outputs.py \
 ```
 
 More details are in [docs/model_fusion.md](docs/model_fusion.md).
+
+## Object Fusion Training
+
+Debug object-level training with ScanNet++ instance masks and frozen StreamVGGT:
+
+```bash
+PYTHONPATH=src python scripts/train_object_fusion.py \
+  --config configs/object_fusion_train.yaml \
+  --iterations 20 \
+  --device cuda
+```
