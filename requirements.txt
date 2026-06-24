@@ -1,0 +1,9 @@
+numpy>=1.23
+opencv-python>=4.8
+pillow>=9.0
+plyfile>=1.0
+pyyaml>=6.0
+tqdm>=4.64
+
+# Optional but strongly recommended for CPU rasterization speed:
+# numba>=0.58

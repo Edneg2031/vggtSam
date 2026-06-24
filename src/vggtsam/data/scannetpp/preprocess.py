@@ -1,0 +1,509 @@
+"""ScanNet++ 3D-to-2D semantic/instance preprocessing."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+from dataclasses import asdict, dataclass, fields
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
+
+import numpy as np
+from tqdm import tqdm
+
+from .colmap import image_lookup, ordered_images, read_colmap_text_model
+from .io import (
+    discover_scene_ids,
+    face_property_from_vertices,
+    filter_by_split,
+    load_ply_mesh,
+    load_train_test_lists,
+    load_vertex_instances,
+    read_text_list,
+    write_json,
+)
+from .rasterize import has_numba, rasterize_labels
+from .visualize import colorize_ids, overlay_labels, save_rgb
+
+
+@dataclass
+class ScanNetPP2DConfig:
+    data_root: Path
+    output_root: Path
+    scene_ids: List[str]
+    scene_list: Optional[Path] = None
+    limit_scenes: Optional[int] = None
+    image_subdir: str = "dslr/resized_images"
+    mask_subdir: str = "dslr/resized_anon_masks"
+    colmap_subdir: str = "dslr/colmap"
+    scan_subdir: str = "scans"
+    split: str = "all"
+    frame_step: int = 1
+    max_frames: Optional[int] = None
+    frame_list: Optional[Path] = None
+    near: float = 0.001
+    semantic_ignore_label: int = 65535
+    save_visualizations: bool = False
+    save_raster: bool = True
+    apply_anon_mask: bool = True
+    skip_existing: bool = True
+    dry_run: bool = False
+
+
+def prepare_scannetpp_2d(config: ScanNetPP2DConfig) -> Dict[str, Any]:
+    config.data_root = Path(config.data_root)
+    config.output_root = Path(config.output_root)
+    config.output_root.mkdir(parents=True, exist_ok=True)
+
+    scene_ids = _resolve_scene_ids(config)
+    print(f"scannetpp_preprocess scenes={len(scene_ids)} root={config.data_root}")
+    if not has_numba():
+        print(
+            "Warning: numba is not installed; CPU rasterization will work but can be slow. "
+            "Install it with `pip install numba` on the server."
+        )
+
+    manifest: Dict[str, Any] = {
+        "dataset": "scannetpp",
+        "created_at": _dt.datetime.now().isoformat(timespec="seconds"),
+        "data_root": str(config.data_root),
+        "output_root": str(config.output_root),
+        "config": _jsonable_config(config),
+        "scenes": [],
+    }
+
+    for scene_id in tqdm(scene_ids, desc="scene"):
+        if config.dry_run:
+            scene_manifest = _inspect_scene(scene_id, config)
+        else:
+            scene_manifest = _process_scene(scene_id, config)
+        manifest["scenes"].append(scene_manifest)
+
+    write_json(config.output_root / "manifest.json", manifest)
+    print(f"Wrote manifest: {config.output_root / 'manifest.json'}")
+    return manifest
+
+
+def _inspect_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
+    scene_root = config.data_root / scene_id
+    scans_dir = scene_root / config.scan_subdir
+    image_dir = scene_root / config.image_subdir
+    colmap_dir = scene_root / config.colmap_subdir
+
+    required = {
+        "semantic_mesh": scans_dir / "mesh_aligned_0.05_semantic.ply",
+        "segments": scans_dir / "segments.json",
+        "segments_anno": scans_dir / "segments_anno.json",
+        "images": image_dir,
+        "colmap": colmap_dir,
+    }
+    missing = [name for name, path in required.items() if not path.exists()]
+
+    if "colmap" in missing or "images" in missing:
+        cameras = {}
+        colmap_images = {}
+        frame_names = []
+    else:
+        cameras, colmap_images = read_colmap_text_model(colmap_dir)
+        image_by_name = image_lookup(ordered_images(colmap_images))
+        frame_names = _select_frame_names(scene_root, image_dir, image_by_name, config)
+    print(
+        f"[dry-run:{scene_id}] missing={missing} cameras={len(cameras)} "
+        f"colmap_images={len(colmap_images)} selected_frames={len(frame_names)}"
+    )
+    return {
+        "scene_id": scene_id,
+        "scene_root": str(scene_root),
+        "dry_run": True,
+        "missing": missing,
+        "num_cameras": int(len(cameras)),
+        "num_colmap_images": int(len(colmap_images)),
+        "num_selected_frames": int(len(frame_names)),
+        "selected_frame_preview": frame_names[:10],
+    }
+
+
+def _process_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
+    scene_root = config.data_root / scene_id
+    scans_dir = scene_root / config.scan_subdir
+    image_dir = scene_root / config.image_subdir
+    anon_mask_dir = scene_root / config.mask_subdir
+    colmap_dir = scene_root / config.colmap_subdir
+
+    semantic_mesh_path = scans_dir / "mesh_aligned_0.05_semantic.ply"
+    segments_path = scans_dir / "segments.json"
+    annotations_path = scans_dir / "segments_anno.json"
+
+    out_scene_dir = config.output_root / scene_id
+    semantic_dir = out_scene_dir / "semantic_masks"
+    instance_dir = out_scene_dir / "instance_masks"
+    raster_dir = out_scene_dir / "raster"
+    viz_dir = out_scene_dir / "visualizations"
+    for path in [semantic_dir, instance_dir, raster_dir, viz_dir]:
+        path.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n[{scene_id}] loading mesh and annotations")
+    mesh = load_ply_mesh(semantic_mesh_path)
+    vertices = mesh["vertices"]
+    faces = mesh["faces"]
+    vertex_semantic_ids = mesh["labels"]
+    if vertex_semantic_ids is None:
+        raise ValueError(
+            f"{semantic_mesh_path} does not contain a vertex 'label' property."
+        )
+
+    instance_data = load_vertex_instances(segments_path, annotations_path, len(vertices))
+    vertex_instance_ids = instance_data["vertex_instance_ids"]
+    objects = instance_data["objects"]
+
+    face_semantic_ids = face_property_from_vertices(
+        vertex_semantic_ids,
+        faces,
+        ignore_values=(-100, -1, config.semantic_ignore_label),
+        default_value=config.semantic_ignore_label,
+    )
+    face_instance_ids = face_property_from_vertices(
+        vertex_instance_ids,
+        faces,
+        ignore_values=(-1, 0),
+        default_value=0,
+    )
+
+    cameras, colmap_images = read_colmap_text_model(colmap_dir)
+    image_by_name = image_lookup(ordered_images(colmap_images))
+    frame_names = _select_frame_names(scene_root, image_dir, image_by_name, config)
+    print(f"[{scene_id}] frames={len(frame_names)}")
+
+    scene_manifest: Dict[str, Any] = {
+        "scene_id": scene_id,
+        "scene_root": str(scene_root),
+        "output_dir": str(out_scene_dir),
+        "num_vertices": int(len(vertices)),
+        "num_faces": int(len(faces)),
+        "objects": {
+            str(object_id): value
+            for object_id, value in sorted(objects.items(), key=lambda item: item[0])
+        },
+        "frames": [],
+    }
+
+    for frame_name in tqdm(frame_names, desc=f"{scene_id} frame", leave=False):
+        frame_record = _process_frame(
+            frame_name=frame_name,
+            image_dir=image_dir,
+            anon_mask_dir=anon_mask_dir,
+            image_by_name=image_by_name,
+            cameras=cameras,
+            vertices=vertices,
+            faces=faces,
+            face_semantic_ids=face_semantic_ids,
+            face_instance_ids=face_instance_ids,
+            semantic_dir=semantic_dir,
+            instance_dir=instance_dir,
+            raster_dir=raster_dir,
+            viz_dir=viz_dir,
+            config=config,
+        )
+        if frame_record is not None:
+            scene_manifest["frames"].append(frame_record)
+
+    write_json(out_scene_dir / "scene_manifest.json", scene_manifest)
+    return scene_manifest
+
+
+def _process_frame(
+    *,
+    frame_name: str,
+    image_dir: Path,
+    anon_mask_dir: Path,
+    image_by_name: Dict[str, Any],
+    cameras: Dict[int, Any],
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    face_semantic_ids: np.ndarray,
+    face_instance_ids: np.ndarray,
+    semantic_dir: Path,
+    instance_dir: Path,
+    raster_dir: Path,
+    viz_dir: Path,
+    config: ScanNetPP2DConfig,
+) -> Optional[Dict[str, Any]]:
+    import cv2
+
+    image_path = image_dir / Path(frame_name).name
+    if not image_path.is_file():
+        image_path = image_dir / frame_name
+    if not image_path.is_file():
+        print(f"Skipping missing image: {frame_name}")
+        return None
+
+    stem = Path(frame_name).stem
+    semantic_path = semantic_dir / f"{stem}.png"
+    instance_path = instance_dir / f"{stem}.png"
+    raster_path = raster_dir / f"{stem}.npz"
+    if config.skip_existing and semantic_path.exists() and instance_path.exists():
+        return {
+            "image_name": frame_name,
+            "image_path": str(image_path),
+            "semantic_mask": str(semantic_path),
+            "instance_mask": str(instance_path),
+            "raster": str(raster_path) if raster_path.exists() else None,
+            "skipped_existing": True,
+        }
+
+    image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        print(f"Skipping unreadable image: {image_path}")
+        return None
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    height, width = image_rgb.shape[:2]
+
+    colmap_image = image_by_name.get(frame_name) or image_by_name.get(
+        Path(frame_name).name
+    )
+    if colmap_image is None:
+        print(f"Skipping image not present in COLMAP images.txt: {frame_name}")
+        return None
+    camera = cameras[colmap_image.camera_id].scaled_to(width, height)
+
+    semantic, instance, pix_to_face, zbuf = rasterize_labels(
+        vertices,
+        faces,
+        face_semantic_ids,
+        face_instance_ids,
+        colmap_image.world_to_camera,
+        camera,
+        height=height,
+        width=width,
+        near=config.near,
+        semantic_ignore_label=config.semantic_ignore_label,
+    )
+
+    if config.apply_anon_mask:
+        anon_mask_path = anon_mask_dir / Path(frame_name).name
+        if anon_mask_path.is_file():
+            anon = cv2.imread(str(anon_mask_path), cv2.IMREAD_GRAYSCALE)
+            if anon is not None and anon.shape[:2] == semantic.shape:
+                invalid = anon == 0
+                semantic[invalid] = config.semantic_ignore_label
+                instance[invalid] = 0
+
+    _write_uint16_png(semantic_path, semantic, config.semantic_ignore_label)
+    _write_uint16_png(instance_path, instance, 0)
+
+    if config.save_raster:
+        raster_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            raster_path,
+            pix_to_face=pix_to_face.astype(np.int32),
+            zbuf=zbuf.astype(np.float32),
+        )
+
+    if config.save_visualizations:
+        sem_color = colorize_ids(semantic, ignore_values=(config.semantic_ignore_label,))
+        inst_color = colorize_ids(instance, ignore_values=(0,))
+        save_rgb(
+            viz_dir / "semantic" / f"{stem}.jpg",
+            overlay_labels(image_rgb, semantic, sem_color, alpha=0.55),
+        )
+        save_rgb(
+            viz_dir / "instance" / f"{stem}.jpg",
+            overlay_labels(image_rgb, instance, inst_color, alpha=0.55),
+        )
+
+    valid_semantic = semantic != config.semantic_ignore_label
+    valid_instance = instance > 0
+    visible_instances = sorted(int(v) for v in np.unique(instance[valid_instance]))
+    return {
+        "image_name": frame_name,
+        "image_path": str(image_path),
+        "semantic_mask": str(semantic_path),
+        "instance_mask": str(instance_path),
+        "raster": str(raster_path) if config.save_raster else None,
+        "width": int(width),
+        "height": int(height),
+        "camera_id": int(colmap_image.camera_id),
+        "semantic_pixels": int(valid_semantic.sum()),
+        "instance_pixels": int(valid_instance.sum()),
+        "visible_instance_ids": visible_instances,
+    }
+
+
+def _resolve_scene_ids(config: ScanNetPP2DConfig) -> List[str]:
+    scene_ids: List[str] = []
+    if config.scene_ids:
+        scene_ids.extend(config.scene_ids)
+    if config.scene_list:
+        scene_ids.extend(read_text_list(Path(config.scene_list)))
+    if not scene_ids:
+        scene_ids = discover_scene_ids(config.data_root)
+
+    seen = set()
+    unique = []
+    for scene_id in scene_ids:
+        if scene_id in seen:
+            continue
+        seen.add(scene_id)
+        unique.append(scene_id)
+    if config.limit_scenes is not None:
+        unique = unique[: config.limit_scenes]
+    if not unique:
+        raise ValueError("No scenes selected for preprocessing.")
+    return unique
+
+
+def _select_frame_names(
+    scene_root: Path,
+    image_dir: Path,
+    image_by_name: Dict[str, Any],
+    config: ScanNetPP2DConfig,
+) -> List[str]:
+    if config.frame_list:
+        names = read_text_list(Path(config.frame_list))
+    else:
+        names = [Path(image.name).name for image in image_by_name.values()]
+        names = sorted(set(names))
+
+    existing = []
+    for name in names:
+        if (image_dir / Path(name).name).is_file() or (image_dir / name).is_file():
+            existing.append(name)
+
+    train_test_lists = load_train_test_lists(scene_root / "dslr" / "train_test_lists.json")
+    existing = filter_by_split(existing, train_test_lists, config.split)
+
+    if config.frame_step <= 0:
+        raise ValueError(f"frame_step must be positive, got {config.frame_step}")
+    existing = existing[:: config.frame_step]
+    if config.max_frames is not None:
+        existing = existing[: config.max_frames]
+    return existing
+
+
+def _write_uint16_png(path: Path, values: np.ndarray, invalid_value: int) -> None:
+    import cv2
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    values = np.asarray(values)
+    if values.min(initial=0) < 0:
+        values = np.where(values < 0, invalid_value, values)
+    max_value = int(values.max(initial=0))
+    if max_value > np.iinfo(np.uint16).max:
+        raise ValueError(
+            f"Cannot write {path} as uint16 PNG; max label {max_value} is too large."
+        )
+    ok = cv2.imwrite(str(path), values.astype(np.uint16))
+    if not ok:
+        raise IOError(f"Failed to write PNG: {path}")
+
+
+def _jsonable_config(config: ScanNetPP2DConfig) -> Dict[str, Any]:
+    result = asdict(config)
+    for key, value in list(result.items()):
+        if isinstance(value, Path):
+            result[key] = str(value)
+        elif isinstance(value, list):
+            result[key] = [
+                str(item) if isinstance(item, Path) else item for item in value
+            ]
+    return result
+
+
+def _load_yaml_config(path: Optional[Path]) -> Dict[str, Any]:
+    if path is None:
+        return {}
+    import yaml
+
+    with Path(path).open("r", encoding="utf8") as handle:
+        payload = yaml.safe_load(handle) or {}
+    if not isinstance(payload, dict):
+        raise ValueError(f"Config file must contain a mapping: {path}")
+    return payload
+
+
+def _build_config(args: argparse.Namespace) -> ScanNetPP2DConfig:
+    payload = _load_yaml_config(args.config)
+    valid_fields = {field.name for field in fields(ScanNetPP2DConfig)}
+    payload = {key: value for key, value in payload.items() if key in valid_fields}
+
+    for key in valid_fields:
+        if not hasattr(args, key):
+            continue
+        value = getattr(args, key)
+        if value is not None:
+            payload[key] = value
+
+    if "data_root" not in payload or payload["data_root"] is None:
+        raise ValueError("--data-root is required unless provided by --config")
+    if "output_root" not in payload or payload["output_root"] is None:
+        raise ValueError("--output-root is required unless provided by --config")
+
+    payload["data_root"] = Path(payload["data_root"])
+    payload["output_root"] = Path(payload["output_root"])
+    if payload.get("scene_list"):
+        payload["scene_list"] = Path(payload["scene_list"])
+    if payload.get("frame_list"):
+        payload["frame_list"] = Path(payload["frame_list"])
+    payload["scene_ids"] = list(payload.get("scene_ids") or [])
+
+    return ScanNetPP2DConfig(**payload)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Rasterize ScanNet++ 3D semantic/instance labels to selected DSLR frames."
+    )
+    parser.add_argument("--config", type=Path, default=None)
+    parser.add_argument("--data-root", type=Path, default=None)
+    parser.add_argument("--output-root", type=Path, default=None)
+    parser.add_argument("--scene-ids", nargs="*", default=None)
+    parser.add_argument("--scene-list", type=Path, default=None)
+    parser.add_argument("--limit-scenes", type=int, default=None)
+    parser.add_argument("--image-subdir", default=None)
+    parser.add_argument("--mask-subdir", default=None)
+    parser.add_argument("--colmap-subdir", default=None)
+    parser.add_argument("--scan-subdir", default=None)
+    parser.add_argument(
+        "--split",
+        choices=["all", "train", "test", "val", "validation"],
+        default=None,
+    )
+    parser.add_argument("--frame-step", type=int, default=None)
+    parser.add_argument("--max-frames", type=int, default=None)
+    parser.add_argument("--frame-list", type=Path, default=None)
+    parser.add_argument("--near", type=float, default=None)
+    parser.add_argument("--semantic-ignore-label", type=int, default=None)
+
+    viz = parser.add_mutually_exclusive_group()
+    viz.add_argument(
+        "--save-visualizations", dest="save_visualizations", action="store_true"
+    )
+    viz.add_argument(
+        "--no-visualizations", dest="save_visualizations", action="store_false"
+    )
+    parser.set_defaults(save_visualizations=None)
+
+    raster = parser.add_mutually_exclusive_group()
+    raster.add_argument("--save-raster", dest="save_raster", action="store_true")
+    raster.add_argument("--no-raster", dest="save_raster", action="store_false")
+    parser.set_defaults(save_raster=None)
+
+    anon = parser.add_mutually_exclusive_group()
+    anon.add_argument("--apply-anon-mask", dest="apply_anon_mask", action="store_true")
+    anon.add_argument("--ignore-anon-mask", dest="apply_anon_mask", action="store_false")
+    parser.set_defaults(apply_anon_mask=None)
+
+    skip = parser.add_mutually_exclusive_group()
+    skip.add_argument("--skip-existing", dest="skip_existing", action="store_true")
+    skip.add_argument("--overwrite", dest="skip_existing", action="store_false")
+    parser.set_defaults(skip_existing=None)
+    parser.add_argument("--dry-run", action="store_true", default=None)
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    args = build_arg_parser().parse_args(argv)
+    config = _build_config(args)
+    print(json.dumps(_jsonable_config(config), indent=2, sort_keys=True))
+    prepare_scannetpp_2d(config)

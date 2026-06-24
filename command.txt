@@ -1,0 +1,21 @@
+cd /path/to/vggtSam
+pip install -r requirements.txt
+pip install numba
+
+
+测试
+PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
+  --config configs/scannetpp_2d.yaml \
+  --scene-ids 0a5c013435 \
+  --max-frames 5 \
+  --frame-step 10 \
+  --dry-run
+
+
+正式处理数据
+PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
+  --config configs/scannetpp_2d.yaml \
+  --scene-ids 0a5c013435 \
+  --max-frames 20 \
+  --frame-step 5 \
+  --save-visualizations
