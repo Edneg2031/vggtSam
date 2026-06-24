@@ -45,7 +45,7 @@ The equivalent explicit command is:
 ```bash
 PYTHONPATH=src python scripts/inspect_backbone_outputs.py \
   --manifest data/processed/scannetpp_2d/manifest.json \
-  --scene-id 0a5c013435 \
+  --scene-id 0b031f3119 \
   --num-frames 4 \
   --sam3-checkpoint /home/bod/86Nas/95_data_bak/FoundationModels/sam3/sam3.pt \
   --sam3-repo externals/sam3 \
