@@ -28,10 +28,20 @@ def plot_training_curves(
         return
 
     steps = [int(row["step"]) for row in rows]
-    loss_names = ["loss", "semantic_loss", "centroid_loss", "contrastive_loss"]
+    fieldnames = rows[0].keys()
+    loss_names = ["loss"] + [
+        name for name in fieldnames if name.endswith("_loss") and name != "loss"
+    ]
+    count_names = [
+        name
+        for name in fieldnames
+        if name.startswith("num_") and all(row.get(name, "").strip() for row in rows)
+    ]
 
     fig, axes = plt.subplots(2, 1, figsize=(9, 7), sharex=True)
     for name in loss_names:
+        if name not in fieldnames:
+            continue
         values = [float(row[name]) for row in rows]
         axes[0].plot(steps, values, label=name)
     axes[0].set_title(title)
@@ -39,10 +49,11 @@ def plot_training_curves(
     axes[0].grid(True, alpha=0.3)
     axes[0].legend(loc="best")
 
-    object_counts = [int(row["num_objects"]) for row in rows]
-    axes[1].plot(steps, object_counts, label="num_objects", color="tab:gray")
+    for name in count_names:
+        values = [int(float(row[name])) for row in rows]
+        axes[1].plot(steps, values, label=name)
     axes[1].set_xlabel("step")
-    axes[1].set_ylabel("objects")
+    axes[1].set_ylabel("counts")
     axes[1].grid(True, alpha=0.3)
     axes[1].legend(loc="best")
 

@@ -1,0 +1,67 @@
+# Latent SAM3/StreamVGGT fusion training on processed ScanNet++.
+# This is the first implementation aligned with idea/ours_model.py:
+# SAM3 intermediate tokens are query, StreamVGGT latent geometry/camera tokens are context.
+
+dataset:
+  manifest: data/processed/scannetpp_2d/manifest.json
+  scene_id: 0a5c013435
+  sequence_length: 4
+  frame_stride: 1
+
+objects:
+  min_pixels: 128
+  max_area_ratio: 0.25
+  min_visible_frames: 2
+  max_objects_per_frame: 32
+  ignore_instance_id: 0
+  semantic_ignore_label: 65535
+  # Fill this once the ScanNet++ semantic id mapping is confirmed.
+  # The area filter already suppresses most wall/floor/ceiling tokens.
+  excluded_semantic_labels: []
+  # Token-grid supervision is used only when a pooled cell has a clean majority.
+  min_token_majority: 0.55
+  min_tokens_per_instance: 2
+  max_match_tokens: 2048
+
+sam3:
+  repo: externals/sam3
+  checkpoint: /home/bod/86Nas/95_data_bak/FoundationModels/sam3/sam3.pt
+  prompt: object
+  resolution: 1008
+  # Choices implemented: detector_fpn2, detector_fpn1, detector_fpn0,
+  # vision_features, tracker_fpn2.
+  feature_source: detector_fpn2
+  # concat appends pooled text features to every spatial SAM3 token.
+  text_conditioning: concat
+  enable_inst_interactivity: false
+
+geometry:
+  repo: externals/streamvggt
+  checkpoint: /home/bod/86Nas/95_data_bak/FoundationModels/StreamVGGT/checkpoints.pth
+  # Supervision/query grid. SAM3 1008 input with patch size 14 naturally gives 72x72.
+  token_grid: [72, 72]
+  # Key/value grid for geometry context. Keep small for first tests.
+  context_grid: [12, 12]
+  layer_index: -1
+  image_mode: crop
+
+model:
+  d_fuse: 256
+  num_heads: 8
+  num_classes: 1024
+  dropout: 0.0
+
+loss:
+  semantic_weight: 1.0
+  point_weight: 1.0
+  match_weight: 0.5
+  temperature: 0.07
+
+training:
+  device: cuda
+  iterations: 200
+  lr: 0.0003
+  seed: 0
+  log_every: 10
+  save_every: 100
+  output_dir: outputs/latent_fusion_debug
