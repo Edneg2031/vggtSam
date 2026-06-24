@@ -24,3 +24,16 @@ The output contains one folder per scene with `semantic_masks`,
 top-level `manifest.json`.
 
 More details are in [docs/scannetpp_preprocessing.md](docs/scannetpp_preprocessing.md).
+
+## Fusion Model Debug
+
+The fusion model is scaffolded around generic SAM3 semantic tokens and
+VGGT/StreamVGGT geometry tokens. Before fixing the exact backbone layer, inspect
+the real server-side outputs:
+
+```bash
+PYTHONPATH=src python scripts/inspect_backbone_outputs.py \
+  --config configs/fusion_debug.yaml
+```
+
+More details are in [docs/model_fusion.md](docs/model_fusion.md).

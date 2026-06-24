@@ -19,3 +19,8 @@ PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
   --max-frames 20 \
   --frame-step 5 \
   --save-visualizations
+
+
+检查SAM3/VGGT真实输出结构
+PYTHONPATH=src python scripts/inspect_backbone_outputs.py \
+  --config configs/fusion_debug.yaml
