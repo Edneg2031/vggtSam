@@ -15,8 +15,28 @@ def load_sam3_video_predictor(
     checkpoint_path: str | Path,
     gpus_to_use: Optional[List[int]] = None,
 ):
-    maybe_add_repo_to_path(repo_path)
-    from sam3.model_builder import build_sam3_video_predictor
+    repo = maybe_add_repo_to_path(repo_path)
+    if repo_path is not None:
+        expected = Path(repo_path).expanduser()
+        if repo is None:
+            raise RuntimeError(
+                f"SAM3 repo path does not exist: {expected}\n"
+                "Run `git submodule update --init --recursive`, or pass the correct repo path."
+            )
+        if not ((repo / "sam3").is_dir() or (repo / "src" / "sam3").is_dir()):
+            raise RuntimeError(
+                f"SAM3 repo at {repo} does not look initialized; missing package `sam3`.\n"
+                "Run `git submodule update --init --recursive`, or pass the correct repo path."
+            )
+    try:
+        from sam3.model_builder import build_sam3_video_predictor
+    except ModuleNotFoundError as exc:
+        if exc.name == "sam3":
+            raise RuntimeError(
+                "Could not import `sam3`. Run `git submodule update --init --recursive` "
+                "or pass `--sam3-repo` to a SAM3 repo."
+            ) from exc
+        raise
 
     kwargs = {"checkpoint_path": str(checkpoint_path)}
     if gpus_to_use is not None:

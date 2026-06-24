@@ -8,6 +8,30 @@ from typing import Any, Optional
 from vggtsam.utils.imports import maybe_add_repo_to_path
 
 
+def _require_package_dir(
+    repo_path: Optional[str | Path],
+    package_name: str,
+    *,
+    label: str,
+) -> Optional[Path]:
+    repo = maybe_add_repo_to_path(repo_path)
+    if repo_path is None:
+        return repo
+    expected = Path(repo_path).expanduser()
+    if repo is None:
+        raise RuntimeError(
+            f"{label} repo path does not exist: {expected}\n"
+            "Run `git submodule update --init --recursive`, or pass the correct repo path."
+        )
+    if not ((repo / "src" / package_name).is_dir() or (repo / package_name).is_dir()):
+        raise RuntimeError(
+            f"{label} repo at {repo} does not look initialized; missing package "
+            f"`{package_name}` under repo root or repo/src.\n"
+            "Run `git submodule update --init --recursive`, or pass the correct repo path."
+        )
+    return repo
+
+
 def preprocess_vggt_images(
     images,
     *,
@@ -46,8 +70,16 @@ def load_vggt_model(
 ) -> Any:
     import torch
 
-    maybe_add_repo_to_path(repo_path)
-    from vggt.models.vggt import VGGT
+    _require_package_dir(repo_path, "vggt", label="VGGT")
+    try:
+        from vggt.models.vggt import VGGT
+    except ModuleNotFoundError as exc:
+        if exc.name == "vggt":
+            raise RuntimeError(
+                "Could not import `vggt`. Run `git submodule update --init --recursive` "
+                "or pass `--vggt-repo` to a VGGT/StreamVGGT repo."
+            ) from exc
+        raise
 
     model = VGGT()
     state = torch.load(checkpoint_path, map_location="cpu")
@@ -66,8 +98,16 @@ def load_streamvggt_model(
 ) -> Any:
     import torch
 
-    maybe_add_repo_to_path(repo_path)
-    from streamvggt.models.streamvggt import StreamVGGT
+    _require_package_dir(repo_path, "streamvggt", label="StreamVGGT")
+    try:
+        from streamvggt.models.streamvggt import StreamVGGT
+    except ModuleNotFoundError as exc:
+        if exc.name == "streamvggt":
+            raise RuntimeError(
+                "Could not import `streamvggt`. Run `git submodule update --init --recursive` "
+                "or pass `--vggt-repo` to a StreamVGGT repo."
+            ) from exc
+        raise
 
     model = StreamVGGT()
     state = torch.load(checkpoint_path, map_location="cpu")
