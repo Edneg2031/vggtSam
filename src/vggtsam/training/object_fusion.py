@@ -6,7 +6,7 @@ import csv
 import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, Sequence
 
 import numpy as np
 import torch
@@ -19,6 +19,7 @@ from vggtsam.data.scannetpp.object_sequence import (
     keep_instances_visible_in_multiple_frames,
 )
 from vggtsam.models.object_fusion import ObjectFusionModel
+from vggtsam.training.plotting import plot_training_curves
 
 
 @dataclass
@@ -180,9 +181,20 @@ def train_object_fusion(config: ObjectFusionTrainConfig) -> None:
             )
         if step % config.save_every == 0:
             save_checkpoint(config.output_dir / f"ckpt_step{step:06d}.pt", model, optimizer, step, config)
+            plot_training_curves(
+                metrics_path,
+                config.output_dir / "training_curves.png",
+                title="Object Fusion Training",
+            )
 
     save_checkpoint(config.output_dir / "ckpt_last.pt", model, optimizer, config.iterations, config)
+    plot_training_curves(
+        metrics_path,
+        config.output_dir / "training_curves.png",
+        title="Object Fusion Training",
+    )
     print(f"training history: {metrics_path}")
+    print(f"training curves: {config.output_dir / 'training_curves.png'}")
 
 
 def build_object_batch(
@@ -330,3 +342,4 @@ def save_checkpoint(
         },
     }
     torch.save(payload, path)
+

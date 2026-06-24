@@ -32,3 +32,8 @@ PYTHONPATH=src python scripts/train_object_fusion.py \
   --config configs/object_fusion_train.yaml \
   --iterations 20 \
   --device cuda
+
+重画object-level fusion训练曲线
+PYTHONPATH=src python scripts/plot_training_curves.py \
+  --metrics outputs/object_fusion_debug/training_history.csv \
+  --output outputs/object_fusion_debug/training_curves.png
