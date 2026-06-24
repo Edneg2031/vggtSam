@@ -54,6 +54,92 @@ cross-attention fusion
 
 ScanNet++ 的 `instance_masks` 和 `semantic_masks` 是训练监督，而不是最终架构里唯一的输入。SAM3 最终 mask 可以作为推理时的辅助输出或下游 decoder，但不应该是整个融合模型成立的前提。
 
+## SAM3 输出层级理解
+
+已有一次 SAM3 inspection 的结果大致是：
+
+```text
+输入 RGB:
+  [B, 3, 1008, 1008]
+
+Patch Embedding:
+  patch size = 14
+  1008 / 14 = 72
+
+32 层 ViT 主干:
+  hidden dim = 1024
+  final map ~= [B, 72, 72, 1024]
+
+SAM3 Detector Neck:
+  开放词汇检测 / 文本分割分支
+  FPN-0 [B, 256, 288, 288]
+  FPN-1 [B, 256, 144, 144]
+  FPN-2 [B, 256,  72,  72]
+  Detector Transformer + Language Features
+
+SAM2 Tracker Neck:
+  视频传播 / 交互分割分支
+  FPN-0 [B, 256, 288, 288]
+  FPN-1 [B, 256, 144, 144]
+  FPN-2 [B, 256,  72,  72]
+  Memory Attention + Mask Decoder
+```
+
+这个结果很关键，因为 `72 x 72` 是最自然的第一版融合网格：
+
+```text
+SAM3 ViT / FPN-2 tokens:
+  semantic + open-vocabulary + tracking prior
+
+StreamVGGT patch / aggregator tokens:
+  geometry + camera + 3D prior
+
+ScanNet++ projected masks:
+  downsample 到 72 x 72 做 semantic / instance / matching 监督
+```
+
+因此第一版真正模型不建议先从高分辨率 mask decoder 做起，而是先在 `72 x 72` latent grid 上做：
+
+```text
+sam_tokens_72 = project(SAM3 detector/tracker FPN-2 or ViT tokens)
+geo_tokens_72 = project(StreamVGGT latent geometry tokens)
+cam_tokens    = project(StreamVGGT camera tokens)
+
+fused_tokens = CrossAttention(
+  query = sam_tokens_72,
+  key/value = concat(geo_tokens_72, cam_tokens)
+)
+```
+
+不同 SAM3 层的用途可以这样分工：
+
+```text
+ViT final map [B, 72, 72, 1024]:
+  更底层、更通用，适合作为稳健 spatial semantic tokens。
+
+Detector FPN-2 [B, 256, 72, 72]:
+  最适合第一版 text/open-vocabulary fusion，分辨率和 VGGT patch grid 对齐。
+
+Tracker FPN-2 [B, 256, 72, 72]:
+  更适合加入时序传播和 memory consistency。
+
+Detector Transformer + Language Features:
+  如果能 hook 出来，最适合作为 text-conditioned query 或 prompt-conditioned token。
+
+FPN-1 / FPN-0:
+  暂时不作为主融合层，后续用于 mask decoder / 高分辨率 refinement。
+```
+
+训练标签也应该先对齐到这个 token grid：
+
+```text
+semantic_mask -> nearest/majority downsample -> [B, 72, 72]
+instance_mask -> nearest/majority downsample -> [B, 72, 72]
+pointmap/depth/conf -> average/valid pooling -> [B, 72, 72, ...]
+```
+
+对每个 72x72 token，只在 majority ratio 足够高时计算监督；混合像素太多、instance id 为 0、墙地板天花板、面积过大的结构 token 都应该 ignore。这样可以避免 final mask 没检测到时训练断掉，也避免噪声小块和大结构面主导 loss。
+
 ## Model 理解
 
 模型不应该只做“SAM3 final mask -> object query -> 分类/追踪”。更接近 `idea/ours_model.py` 的设计是 latent token fusion：SAM3 提供语义/追踪 token，StreamVGGT 提供几何/相机 token，二者先在隐空间里融合，再接不同任务 head。
