@@ -117,9 +117,220 @@ match_loss:
   different instance id -> separated embeddings
 ```
 
-## 4. `ours_model.py` 的当前落地
+## 4. 关键设计澄清
 
-### 4.1 Backbone 加载
+### 4.1 当前数据集是否缺少 `gt_pointmaps`
+
+是的，当前 `prepare_scannetpp_2d.py` 生成的 processed ScanNet++ 数据集没有显式 `gt_pointmaps`。
+
+当前 processed 数据包含：
+
+```text
+RGB image_path
+semantic_mask
+instance_mask
+raster metadata / visualization
+```
+
+它不包含：
+
+```text
+gt_pointmaps: [T, 72, 72, 3] 或 [T, H, W, 3]
+```
+
+因此当前代码中的 `point_loss` 使用的是：
+
+```text
+frozen StreamVGGT point_head output
+  -> pointmap_grid [T, 72, 72, 3]
+  -> pseudo point target
+```
+
+这和 `ours_training.py` 里的 `gt_pointmaps` 不是完全等价的真值监督。当前版本先用 StreamVGGT 自己的 3D 输出作为 pseudo target，目的是验证：
+
+```text
+SAM3 token 是否能通过 cross-attention 吸收 StreamVGGT geometry context
+fusion head 是否能回归 3D-like point representation
+semantic / instance supervision 是否能和 geometry token 对齐
+```
+
+如果要严格实现伪代码中的 `gt_pointmaps`，后续需要在数据预处理阶段额外生成 per-pixel 或 per-token 3D 真值，例如：
+
+```text
+ScanNet++ mesh / depth / camera pose / intrinsics
+  -> rasterize visible 3D coordinate per pixel
+  -> downsample / pool to 72 x 72 token grid
+  -> gt_pointmaps
+```
+
+这一部分当前没有实现。
+
+### 4.2 为什么把 instance masks 下采样到 token grid
+
+ScanNet++ 的 `instance_masks` 和 `semantic_masks` 仍然是当前训练的真值来源。它们被下采样，不是因为它们不是真值，而是因为当前模型的输出还不是高分辨率 mask。
+
+当前模型输出是 token-level：
+
+```text
+logits:     [1, T * 72 * 72, num_classes]
+pointmap:   [1, T * 72 * 72, 3]
+embeddings: [1, T * 72 * 72, d_fuse]
+```
+
+也就是说，当前版本没有输出：
+
+```text
+final mask: [T, H, W] 或 [T, num_objects, H, W]
+```
+
+因此监督必须先对齐到当前输出空间：
+
+```text
+semantic_mask [H, W]
+  -> majority pooling
+  -> semantic_grid [72, 72]
+
+instance_mask [H, W]
+  -> majority pooling
+  -> instance_grid [72, 72]
+```
+
+这一步的意义是把原始 2D GT mask 转换成 token-level GT：
+
+```text
+每个 SAM3 FPN-2 token 对应一个 2D patch 区域
+该 patch 内的 majority semantic label 作为 token semantic target
+该 patch 内的 majority instance id 作为 token identity target
+```
+
+只有 majority ratio 足够高的 token 才参与训练，边界混合 token 会被忽略。
+
+后续如果加入 mask decoder 或 high-resolution refinement，那么原始 `instance_masks` 应该直接用于最终 mask 输出的监督：
+
+```text
+mask_logits [T, num_objects, H, W]
+  vs.
+instance_masks [T, H, W]
+
+loss:
+  BCE / Dice / focal
+```
+
+当前版本还没有这个 final mask head，所以现在只监督 token-level 输出。
+
+### 4.3 point/semantic/match heads 是如何构建的
+
+这些 head 在当前代码里由 MLP 构成，位置是：
+
+```text
+src/vggtsam/models/fusion.py
+LatentGeometrySemanticFusion
+```
+
+当前结构：
+
+```text
+point_head:
+  Linear(d_fuse, d_fuse)
+  GELU
+  Linear(d_fuse, 3)
+
+semantic_head:
+  Linear(d_fuse, d_fuse)
+  GELU
+  Linear(d_fuse, num_classes)
+
+match_head:
+  Linear(d_fuse, d_fuse)
+  GELU
+  Linear(d_fuse, d_fuse)
+  normalize
+```
+
+它们对应 `ours_model.py` 中的抽象 heads：
+
+```text
+pointmap_head:
+  当前拆成 point_head + semantic_head
+
+classifier_head:
+  当前对应 semantic_head
+
+match_query_proj / match_key_proj:
+  当前简化为共享 match_head，然后用 embedding similarity 做 matching
+```
+
+这些 loss 的方向来自 `ours_training.py`：
+
+```text
+3D loss
+semantic classification loss
+cross-frame matching loss
+```
+
+但当前实现不是逐字照搬伪代码：
+
+```text
+ours_training.py:
+  loss_3d = L1(pred_pointmap, gt_pointmaps)
+  loss_cls = CE(pred_logits, gt_semantics)
+  loss_match = BCE(pred_match_matrix, gt_match_matrix)
+
+current implementation:
+  point_loss = SmoothL1(pred_pointmap, StreamVGGT pseudo pointmap)
+  semantic_loss = CE(pred_logits, downsampled semantic_grid)
+  match_loss = supervised contrastive loss over sampled token embeddings
+```
+
+这里把 matching BCE 换成 supervised contrastive，是为了避免构造完整的 `[N, N]` token correspondence matrix。`T=4, 72x72` 时 token 数已经超过 2 万，完整矩阵显存开销过大。
+
+### 4.4 `sam3.prompt: object` 是否表示随机选一个 object 训练
+
+不是。
+
+当前训练不是随机选一个 instance，也不是只训练 SAM3 检测到的某个 object。
+
+当前 `prompt: object` 的作用是：
+
+```text
+让 SAM3 text encoder 产生一个通用 object 文本特征
+把这个 pooled text feature concat 到每个 SAM3 spatial token
+```
+
+也就是说，它是全局 text conditioning，不是 instance sampler。
+
+当前每个训练 step 的监督对象来自 ScanNet++ mask：
+
+```text
+一个连续 clip 内所有通过过滤的 valid tokens / valid instances
+```
+
+训练使用的是多 object / 多 frame token supervision：
+
+```text
+same instance id across frames
+  -> positive matching pairs
+
+different instance ids
+  -> negative matching pairs
+```
+
+因此当前 `prompt: object` 代表的是“泛物体”训练。它不会导致模型随机只关注一个 object。
+
+后续可以升级为 category-conditioned training：
+
+```text
+从 semantic_grid 中随机选一个 category
+prompt = category name
+只把该 category 的 instances 当作强正样本
+其他 category 作为负样本或 ignore
+```
+
+这会更接近开放词汇推理，但当前第一版还没有做这个 category prompt sampling。
+
+## 5. `ours_model.py` 的当前落地
+
+### 5.1 Backbone 加载
 
 伪代码：
 
@@ -149,7 +360,7 @@ streamvggt_model.requires_grad_(False)
 
 当前不做 LoRA，也不 fine-tune SAM3 / StreamVGGT 本体。训练只更新 fusion model。
 
-### 4.2 SAM3 中间层选择
+### 5.2 SAM3 中间层选择
 
 伪代码：
 
@@ -215,7 +426,7 @@ geometry:
 [1, T * 72 * 72, C_sam]
 ```
 
-### 4.3 为什么选择 detector_fpn2
+### 5.3 为什么选择 detector_fpn2
 
 当前选择 `detector_fpn2`，而不是 final mask、FPN-0/FPN-1 或 tracker memory，原因如下：
 
@@ -252,7 +463,7 @@ SAM2 tracker memory tokens:
   当前第一版先用 ScanNet++ instance id 监督跨帧一致性。
 ```
 
-### 4.4 SAM3 文本特征使用方式
+### 5.4 SAM3 文本特征使用方式
 
 伪代码中 `sam3_backbone(image, text_prompts)` 表示 SAM3 应该是 text-conditioned。
 
@@ -282,7 +493,7 @@ SAM3 detector FPN-2 spatial feature
 
 这是一个工程上更稳定的第一版实现。后续如果能稳定 hook detector transformer output，可以把 `feature_source` 扩展到 transformer query token。
 
-### 4.5 StreamVGGT 层选择
+### 5.5 StreamVGGT 层选择
 
 伪代码：
 
@@ -333,7 +544,7 @@ geometry_tokens: [1, T * 12 * 12, D_geo]
 camera_tokens:   [1, T, 9]
 ```
 
-### 4.6 为什么 geometry context 用 12x12
+### 5.6 为什么 geometry context 用 12x12
 
 SAM3 query 是 `T * 72 * 72`，如果 geometry key/value 也用 `T * 72 * 72`，cross-attention 显存和计算量会很大。
 
@@ -357,7 +568,7 @@ context_grid:
   用于控制 cross-attention 开销
 ```
 
-### 4.7 Fusion 模块
+### 5.7 Fusion 模块
 
 伪代码：
 
@@ -408,7 +619,7 @@ fused = MultiheadAttention(
 fused = LayerNorm(fused + query)
 ```
 
-### 4.8 多任务 Heads
+### 5.8 多任务 Heads
 
 伪代码：
 
@@ -439,9 +650,9 @@ logits = embeddings @ embeddings.T / temperature
 
 这样比完整 `[N, N]` correspondence matrix 更省显存。
 
-## 5. `ours_training.py` 的当前落地
+## 6. `ours_training.py` 的当前落地
 
-### 5.1 Dataset 与 sequence
+### 6.1 Dataset 与 sequence
 
 伪代码：
 
@@ -487,7 +698,7 @@ gt_pointmaps:
   当前暂用 frozen StreamVGGT pointmap_grid
 ```
 
-### 5.2 Clip 采样
+### 6.2 Clip 采样
 
 当前每 step 随机采样一个连续窗口：
 
@@ -506,7 +717,7 @@ instance_masks:  List[np.ndarray]
 semantic_masks:  List[np.ndarray]
 ```
 
-### 5.3 Mask 到 token grid 的监督构造
+### 6.3 Mask 到 token grid 的监督构造
 
 伪代码假设已经有：
 
@@ -548,7 +759,7 @@ point target 是 finite
 2. 大面积墙面 / 地板 / 天花板可以通过面积阈值与 semantic blacklist 过滤
 ```
 
-### 5.4 当前 training loop 与伪代码差异
+### 6.4 当前 training loop 与伪代码差异
 
 伪代码是逐帧 streaming：
 
@@ -589,7 +800,7 @@ semantic supervision
 cross-frame instance matching supervision
 ```
 
-### 5.5 Loss 实现
+### 6.5 Loss 实现
 
 伪代码：
 
@@ -639,7 +850,7 @@ different instance_id
 logits = normalize(embeddings) @ normalize(embeddings).T / temperature
 ```
 
-### 5.6 参数更新
+### 6.6 参数更新
 
 当前训练参数：
 
@@ -685,7 +896,7 @@ loss:
   match_weight: 0.5
 ```
 
-## 6. 当前实现明确没有做的事情
+## 7. 当前实现明确没有做的事情
 
 当前第一版没有实现以下内容：
 
@@ -701,7 +912,7 @@ loss:
 
 这些不是被忘掉，而是当前版本为了先验证核心 latent fusion 闭环而做的边界收缩。
 
-## 7. 当前配置的关键决策
+## 8. 当前配置的关键决策
 
 ```yaml
 sam3:
@@ -743,7 +954,7 @@ max_match_tokens 2048:
   防止 cross-frame matching 矩阵过大。
 ```
 
-## 8. 调试命令
+## 9. 调试命令
 
 先检查两侧 adapter 输出：
 
@@ -781,7 +992,7 @@ initialized LatentSAMVGGTModel sam_dim=... geometry_dim=... camera_dim=...
 step=1 loss=...
 ```
 
-## 9. 输出文件
+## 10. 输出文件
 
 默认输出目录：
 
@@ -811,7 +1022,7 @@ num_match_tokens
 num_instances
 ```
 
-## 10. 后续升级方向
+## 11. 后续升级方向
 
 建议后续按以下顺序升级：
 

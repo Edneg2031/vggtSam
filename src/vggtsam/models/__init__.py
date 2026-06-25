@@ -2,7 +2,6 @@
 
 from .fusion import FusionOutput, LatentGeometrySemanticFusion
 from .latent_fusion import LatentFusionOutput, LatentSAMVGGTModel
-from .object_fusion import ObjectFusionModel, ObjectFusionOutput
 from .tokens import GeometryTokens, SemanticTokens
 
 __all__ = [
@@ -11,7 +10,5 @@ __all__ = [
     "LatentFusionOutput",
     "LatentGeometrySemanticFusion",
     "LatentSAMVGGTModel",
-    "ObjectFusionModel",
-    "ObjectFusionOutput",
     "SemanticTokens",
 ]

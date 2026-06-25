@@ -1,13 +1,17 @@
 # vggtSam
 
-This repo is a scratch space for geometry-aware open-vocabulary object tracking.
-The first concrete piece is ScanNet++ preprocessing: render 3D mesh semantics and
-instances onto selected DSLR frames so later experiments can train on RGB,
-2D masks, 3D geometry, and cross-view object identities.
+Geometry-aware open-vocabulary object tracking experiments built around
+ScanNet++, SAM3 intermediate features, and StreamVGGT latent geometry features.
+
+The current mainline is the latent fusion implementation described in:
+
+```text
+docs/latent_fusion_training_flow.md
+```
 
 ## ScanNet++ 2D Labels
 
-Example:
+Generate projected semantic and instance masks from ScanNet++ 3D annotations:
 
 ```bash
 PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
@@ -19,34 +23,76 @@ PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
   --save-visualizations
 ```
 
-The output contains one folder per scene with `semantic_masks`,
-`instance_masks`, `raster`, `visualizations`, `scene_manifest.json`, plus a
-top-level `manifest.json`.
+Output structure:
 
-More details are in [docs/scannetpp_preprocessing.md](docs/scannetpp_preprocessing.md).
-
-## Fusion Model Debug
-
-The fusion model is scaffolded around generic SAM3 semantic tokens and
-VGGT/StreamVGGT geometry tokens. Before fixing the exact backbone layer, inspect
-the real server-side outputs:
-
-```bash
-git submodule update --init --recursive
-
-PYTHONPATH=src python scripts/inspect_backbone_outputs.py \
-  --config configs/fusion_debug.yaml
+```text
+data/processed/scannetpp_2d/
+  manifest.json
+  <scene_id>/
+    scene_manifest.json
+    semantic_masks/
+    instance_masks/
+    raster/
+    visualizations/
 ```
 
-More details are in [docs/model_fusion.md](docs/model_fusion.md).
+More details:
 
-## Object Fusion Training
+```text
+docs/scannetpp_preprocessing.md
+```
 
-Debug object-level training with ScanNet++ instance masks and frozen StreamVGGT:
+## Latent Fusion
+
+Current model direction:
+
+```text
+SAM3 detector FPN-2 + pooled text feature
+  -> semantic query tokens
+
+StreamVGGT aggregator patch tokens + camera tokens
+  -> geometry key/value context
+
+cross-attention fusion
+  -> semantic logits
+  -> pointmap prediction
+  -> cross-frame matching embeddings
+```
+
+Inspect feature shapes first:
 
 ```bash
-PYTHONPATH=src python scripts/train_object_fusion.py \
-  --config configs/object_fusion_train.yaml \
+PYTHONPATH=src python scripts/inspect_latent_fusion_features.py \
+  --config configs/latent_fusion_train.yaml \
+  --device cuda
+```
+
+Run a small training job:
+
+```bash
+PYTHONPATH=src python scripts/train_latent_fusion.py \
+  --config configs/latent_fusion_train.yaml \
   --iterations 20 \
   --device cuda
+```
+
+Plot training curves:
+
+```bash
+PYTHONPATH=src python scripts/plot_training_curves.py \
+  --metrics outputs/latent_fusion_debug/training_history.csv \
+  --output outputs/latent_fusion_debug/training_curves.png
+```
+
+## Main Files
+
+```text
+configs/latent_fusion_train.yaml
+scripts/train_latent_fusion.py
+scripts/inspect_latent_fusion_features.py
+src/vggtsam/adapters/sam3_intermediate.py
+src/vggtsam/adapters/streamvggt_latent.py
+src/vggtsam/models/latent_fusion.py
+src/vggtsam/models/fusion.py
+src/vggtsam/training/latent_fusion.py
 ```
