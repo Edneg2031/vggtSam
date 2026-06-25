@@ -84,6 +84,9 @@ class LatentFusionTrainConfig:
     seed: int
     log_every: int
     save_every: int
+    visualize_every: int
+    visualize_max_objects: int
+    visualize_threshold: float
     output_dir: Path
 
 
@@ -338,6 +341,19 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
                 "tokens={num_tokens} match_tokens={num_match_tokens} "
                 "instances={num_instances} objects={num_objects} "
                 "prompt='{prompt}'".format(**row)
+            )
+        if config.visualize_every > 0 and (
+            step % config.visualize_every == 0 or completed_steps == 1
+        ):
+            save_mask_visualization(
+                config.output_dir / "visualizations" / f"step_{step:06d}.png",
+                image_paths=sequence.image_paths,
+                mask_logits=output.mask_logits[0].detach(),
+                batch=batch,
+                prompt=prompt_selection.prompt,
+                step=step,
+                max_objects=config.visualize_max_objects,
+                threshold=config.visualize_threshold,
             )
         if step % config.save_every == 0:
             save_checkpoint(
@@ -774,6 +790,125 @@ def dice_loss_with_logits(
     intersection = (probs * targets).sum(dim=1)
     union = probs.sum(dim=1) + targets.sum(dim=1)
     return (1.0 - (2.0 * intersection + eps) / (union + eps)).mean()
+
+
+def save_mask_visualization(
+    path: Path,
+    *,
+    image_paths: Sequence[Path],
+    mask_logits: torch.Tensor,
+    batch: Dict[str, torch.Tensor],
+    prompt: str,
+    step: int,
+    max_objects: int,
+    threshold: float,
+) -> None:
+    from PIL import Image, ImageDraw
+
+    pred_probs = mask_logits.sigmoid().detach().cpu()
+    gt_masks = batch["object_masks"].detach().cpu()
+    present = batch["object_present"].detach().cpu()
+    object_ids = batch["object_ids"].detach().cpu()
+
+    query_indices = present.any(dim=0).nonzero(as_tuple=False).flatten()
+    if query_indices.numel() == 0:
+        return
+    query_indices = query_indices[: max(1, int(max_objects))]
+
+    frames, _, mask_h, mask_w = gt_masks.shape
+    panel_w, panel_h = int(mask_w), int(mask_h)
+    title_h = 24
+    footer_h = 18
+    margin = 6
+    columns = 3
+    canvas_w = columns * panel_w + (columns + 1) * margin
+    canvas_h = title_h + frames * (panel_h + footer_h + margin) + margin
+    canvas = Image.new("RGB", (canvas_w, canvas_h), color=(20, 20, 20))
+    draw = ImageDraw.Draw(canvas)
+    draw.text(
+        (margin, 4),
+        f"step={step} prompt='{prompt}' threshold={threshold:.2f}",
+        fill=(240, 240, 240),
+    )
+
+    headings = ["RGB", "GT mask", "Pred mask"]
+    for col, heading in enumerate(headings):
+        draw.text(
+            (margin + col * (panel_w + margin), title_h - 15),
+            heading,
+            fill=(220, 220, 220),
+        )
+
+    colors = visualization_palette()
+    legend_items = []
+    for color_idx, query_idx in enumerate(query_indices.tolist()):
+        instance_id = int(object_ids[query_idx].item())
+        legend_items.append(f"q{query_idx}:id{instance_id}")
+
+    for frame_idx in range(frames):
+        base = Image.open(image_paths[frame_idx]).convert("RGB").resize(
+            (panel_w, panel_h),
+            Image.BILINEAR,
+        )
+        gt_overlay = overlay_query_masks(
+            base,
+            gt_masks[frame_idx],
+            query_indices=query_indices.tolist(),
+            colors=colors,
+            threshold=0.5,
+        )
+        pred_overlay = overlay_query_masks(
+            base,
+            pred_probs[frame_idx],
+            query_indices=query_indices.tolist(),
+            colors=colors,
+            threshold=threshold,
+        )
+        row_y = title_h + margin + frame_idx * (panel_h + footer_h + margin)
+        for col, panel in enumerate([base, gt_overlay, pred_overlay]):
+            x = margin + col * (panel_w + margin)
+            canvas.paste(panel, (x, row_y))
+        footer = f"frame {frame_idx}: " + ", ".join(legend_items)
+        draw.text((margin, row_y + panel_h + 2), footer[:160], fill=(220, 220, 220))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path)
+
+
+def overlay_query_masks(
+    image,
+    masks: torch.Tensor,
+    *,
+    query_indices: Sequence[int],
+    colors: Sequence[tuple[int, int, int]],
+    threshold: float,
+    alpha: float = 0.55,
+):
+    from PIL import Image
+
+    arr = np.asarray(image).astype(np.float32)
+    for color_idx, query_idx in enumerate(query_indices):
+        mask = masks[query_idx].numpy() > threshold
+        if not mask.any():
+            continue
+        color = np.asarray(colors[color_idx % len(colors)], dtype=np.float32)
+        arr[mask] = arr[mask] * (1.0 - alpha) + color * alpha
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+
+def visualization_palette() -> List[tuple[int, int, int]]:
+    return [
+        (230, 57, 70),
+        (69, 123, 157),
+        (42, 157, 143),
+        (244, 162, 97),
+        (131, 56, 236),
+        (255, 190, 11),
+        (58, 134, 255),
+        (6, 214, 160),
+        (255, 0, 110),
+        (138, 201, 38),
+    ]
 
 
 def resolve_point_targets(

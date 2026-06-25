@@ -85,4 +85,7 @@ training:
   seed: 0
   log_every: 10
   save_every: 100
+  visualize_every: 20
+  visualize_max_objects: 8
+  visualize_threshold: 0.5
   output_dir: outputs/latent_fusion_debug

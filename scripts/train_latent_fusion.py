@@ -25,6 +25,7 @@ def main() -> None:
     parser.add_argument("--device", default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--prompt", default=None)
+    parser.add_argument("--visualize-every", type=int, default=None)
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -34,6 +35,8 @@ def main() -> None:
         config["training"]["device"] = args.device
     if args.output_dir is not None:
         config["training"]["output_dir"] = str(args.output_dir)
+    if args.visualize_every is not None:
+        config["training"]["visualize_every"] = args.visualize_every
     if args.prompt is not None:
         config["sam3"]["prompt"] = args.prompt
         config["sam3"]["prompt_mode"] = "fixed"
@@ -117,6 +120,9 @@ def build_train_config(raw: dict) -> LatentFusionTrainConfig:
         seed=int(training["seed"]),
         log_every=int(training["log_every"]),
         save_every=int(training["save_every"]),
+        visualize_every=int(training.get("visualize_every", 0)),
+        visualize_max_objects=int(training.get("visualize_max_objects", 8)),
+        visualize_threshold=float(training.get("visualize_threshold", 0.5)),
         output_dir=Path(training["output_dir"]),
     )
 

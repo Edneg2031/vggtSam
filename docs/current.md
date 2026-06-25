@@ -137,6 +137,12 @@ step=20 loss=17.0002 obj_mask=0.0037 obj_point=0.9013 prompt='computer tower'
 
 这说明当前动态 prompt、多类 object supervision、GT pointmap、object-query mask 分支已经接入并可训练。
 
+训练过程会保存 mask 可视化到：
+
+```text
+outputs/latent_fusion_debug/visualizations/step_XXXXXX.png
+```
+
 ## 当前边界
 
 ```text
