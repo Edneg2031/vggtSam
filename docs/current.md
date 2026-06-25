@@ -26,7 +26,7 @@ RGB 连续帧 + 语义文本 prompt
 wall / floor / ceiling
 ```
 
-默认 `prompt_mode=random_instance`：每个 clip 随机选择一个大小合理、跨帧可见、未被 blacklist 过滤的 instance，并使用它的类别名作为 SAM3 text prompt。如果传入具体 prompt，例如 `--prompt chair`，则切换为固定 prompt 并只训练对应类别过滤后的 token。
+默认 `prompt_mode=random_instance`：每个 clip 随机选择一个大小合理、跨帧可见、未被 blacklist 过滤的 instance，并使用它的类别名作为 SAM3 text prompt。若当前 clip 中存在同类别的多个可见 instance，会优先从这些类别中采样，让 correspondence loss 有更强的同类负例。如果传入具体 prompt，例如 `--prompt chair`，则切换为固定 prompt 并只训练对应类别过滤后的 token。
 
 ## 模型结构
 

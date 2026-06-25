@@ -496,9 +496,7 @@ def streaming_correspondence_loss(
     current_ids = current_instance_ids[current_indices]
     history_ids = history_instance_ids[history_indices]
     shared_current = torch.isin(current_ids, history_ids.unique())
-    shared_history = torch.isin(history_ids, current_ids.unique())
     current_indices = current_indices[shared_current]
-    history_indices = history_indices[shared_history]
     if current_indices.numel() == 0 or history_indices.numel() == 0:
         return zero, 0
 
@@ -519,13 +517,14 @@ def streaming_correspondence_loss(
     )
     targets = (current_ids[:, None] == history_ids[None, :]).to(logits.dtype)
     positive = targets > 0.5
-    if not positive.any():
-        return zero, int(current_indices.numel() + history_indices.numel())
+    negative = ~positive
+    if not positive.any() or not negative.any():
+        return zero, 0
 
     flat_logits = logits.reshape(-1)
     flat_targets = targets.reshape(-1)
     positive_indices = positive.reshape(-1).nonzero(as_tuple=False).flatten()
-    negative_indices = (~positive).reshape(-1).nonzero(as_tuple=False).flatten()
+    negative_indices = negative.reshape(-1).nonzero(as_tuple=False).flatten()
     if negative_indices.numel() > positive_indices.numel() * negative_ratio:
         perm = torch.randperm(negative_indices.numel(), device=negative_indices.device)
         negative_indices = negative_indices[
@@ -698,6 +697,21 @@ def select_object_prompt(
     )
     if not candidate_ids:
         return None
+
+    ids_by_label: Dict[str, List[int]] = {}
+    for instance_id in candidate_ids:
+        label = object_labels.get(instance_id)
+        if not label:
+            continue
+        ids_by_label.setdefault(label.strip().lower(), []).append(instance_id)
+    repeated_label_ids = [
+        instance_id
+        for ids in ids_by_label.values()
+        if len(ids) >= 2
+        for instance_id in ids
+    ]
+    if repeated_label_ids:
+        candidate_ids = sorted(repeated_label_ids)
 
     sampled_instance_id = int(rng.choice(candidate_ids))
     sampled_label = object_labels.get(sampled_instance_id)

@@ -22,7 +22,20 @@ objects:
   # to reproduce the chair-only baseline.
   target_object_labels: []
   # Metadata-label blacklist for large room structures.
-  excluded_object_labels: [wall, floor, ceiling]
+  excluded_object_labels:
+    - wall
+    - floor
+    - ceiling
+    - window
+    - door
+    - door frame
+    - pillar
+    - table
+    - cabinet
+    - storage cabinet
+    - whiteboard
+    - electrical duct
+    - electric duct
   # Token-grid supervision is used only when a pooled cell has a clean majority.
   min_token_majority: 0.55
   min_tokens_per_instance: 2
