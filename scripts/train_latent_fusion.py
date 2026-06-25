@@ -99,6 +99,7 @@ def build_train_config(raw: dict) -> LatentFusionTrainConfig:
         streamvggt_layer_index=int(geometry["layer_index"]),
         streamvggt_image_mode=str(geometry["image_mode"]),
         point_target_source=str(geometry.get("point_target_source", "gt")),
+        use_camera_tokens=bool(geometry.get("use_camera_tokens", False)),
         d_fuse=int(model["d_fuse"]),
         num_heads=int(model["num_heads"]),
         num_classes=int(model["num_classes"]),

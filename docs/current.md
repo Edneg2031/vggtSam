@@ -46,7 +46,9 @@ RGB sequence
 
 RGB sequence
   -> frozen StreamVGGT aggregator
-     -> geometry tokens + camera tokens
+     -> geometry tokens
+
+当前默认先不使用 StreamVGGT camera tokens，用于隔离验证普通 geometry patch tokens 是否足够训练 mask。
 
 SAM3 tokens as query
 StreamVGGT tokens as key/value

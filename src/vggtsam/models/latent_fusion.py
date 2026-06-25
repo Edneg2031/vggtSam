@@ -34,7 +34,7 @@ class LatentSAMVGGTModel(nn.Module):
         *,
         sam_dim: int,
         geometry_dim: int,
-        camera_dim: int = 9,
+        camera_dim: int | None = 9,
         d_fuse: int = 256,
         num_heads: int = 8,
         num_classes: int = 1024,

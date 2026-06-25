@@ -63,6 +63,7 @@ class LatentFusionTrainConfig:
     streamvggt_layer_index: int
     streamvggt_image_mode: str
     point_target_source: str
+    use_camera_tokens: bool
     d_fuse: int
     num_heads: int
     num_classes: int
@@ -221,8 +222,9 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
             geometry_dim = int(geo_out.geometry.tokens.shape[-1])
             camera_dim = (
                 int(geo_out.geometry.camera_tokens.shape[-1])
-                if geo_out.geometry.camera_tokens is not None
-                else 9
+                if config.use_camera_tokens
+                and geo_out.geometry.camera_tokens is not None
+                else None
             )
             model = LatentSAMVGGTModel(
                 sam_dim=sam_dim,
@@ -239,7 +241,8 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
             optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
             print(
                 "initialized LatentSAMVGGTModel "
-                f"sam_dim={sam_dim} geometry_dim={geometry_dim} camera_dim={camera_dim}"
+                f"sam_dim={sam_dim} geometry_dim={geometry_dim} "
+                f"camera_dim={camera_dim} use_camera_tokens={config.use_camera_tokens}"
             )
 
         assert optimizer is not None
@@ -248,7 +251,8 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
             geometry_tokens=geo_out.geometry.tokens.float(),
             camera_tokens=(
                 geo_out.geometry.camera_tokens.float()
-                if geo_out.geometry.camera_tokens is not None
+                if config.use_camera_tokens
+                and geo_out.geometry.camera_tokens is not None
                 else None
             ),
             num_frames=config.sequence_length,

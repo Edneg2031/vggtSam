@@ -136,6 +136,7 @@ def main() -> None:
     print(f"  aux={sam_out.semantic.aux}")
     print("StreamVGGT:")
     print(f"  geometry_tokens={tuple(geo_out.geometry.tokens.shape)}")
+    print(f"  use_camera_tokens_in_training={config.use_camera_tokens}")
     print(
         "  camera_tokens="
         f"{None if geo_out.geometry.camera_tokens is None else tuple(geo_out.geometry.camera_tokens.shape)}"
