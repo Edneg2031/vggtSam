@@ -4,7 +4,7 @@
 
 dataset:
   manifest: data/processed/scannetpp_2d/manifest.json
-  scene_id: 0a5c013435
+  scene_id: 0a5c0134
   sequence_length: 4
   frame_stride: 1
 
