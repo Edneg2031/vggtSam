@@ -7,7 +7,7 @@ import math
 import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -44,12 +44,14 @@ class LatentFusionTrainConfig:
     semantic_ignore_label: int
     excluded_semantic_labels: List[int]
     target_object_labels: List[str]
+    excluded_object_labels: List[str]
     min_token_majority: float
     min_tokens_per_instance: int
     max_match_tokens: int
     sam3_repo: Path
     sam3_checkpoint: Path
     sam3_prompt: str
+    sam3_prompt_mode: str
     sam3_resolution: int
     sam3_feature_source: str
     sam3_text_conditioning: str
@@ -83,6 +85,14 @@ class LatentFusionTrainConfig:
     log_every: int
     save_every: int
     output_dir: Path
+
+
+@dataclass(frozen=True)
+class ObjectPromptSelection:
+    prompt: str
+    target_object_labels: List[str]
+    sampled_instance_id: int
+    sampled_label: str
 
 
 def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
@@ -147,6 +157,18 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
 
     for step in range(1, config.iterations + 1):
         sequence = dataset.sample(rng)
+        prompt_selection = select_object_prompt(
+            sequence.visible_instance_ids,
+            sequence.object_labels,
+            rng=rng,
+            min_visible_frames=config.min_visible_frames,
+            mode=config.sam3_prompt_mode,
+            fallback_prompt=config.sam3_prompt,
+            target_object_labels=config.target_object_labels,
+            excluded_object_labels=config.excluded_object_labels,
+        )
+        if prompt_selection is None:
+            continue
         need_streamvggt_pointmap = should_request_streamvggt_pointmap(
             config.point_target_source,
             has_gt_pointmaps=sequence.pointmaps is not None,
@@ -154,7 +176,7 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
         with torch.no_grad():
             sam_out = sam3.extract_from_paths(
                 sequence.image_paths,
-                prompt=config.sam3_prompt,
+                prompt=prompt_selection.prompt,
             )
             geo_out = geometry.extract_from_paths(
                 sequence.image_paths,
@@ -180,7 +202,8 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
             ignore_instance_id=config.ignore_instance_id,
             semantic_ignore_label=config.semantic_ignore_label,
             excluded_semantic_labels=config.excluded_semantic_labels,
-            target_object_labels=config.target_object_labels,
+            target_object_labels=prompt_selection.target_object_labels,
+            excluded_object_labels=config.excluded_object_labels,
             min_token_majority=config.min_token_majority,
             min_tokens_per_instance=config.min_tokens_per_instance,
             max_area_ratio=config.max_area_ratio,
@@ -301,6 +324,9 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
             "num_match_tokens": int(match_indices.numel()),
             "num_instances": int(batch["instance_ids"][valid].unique().numel()),
             "num_objects": int(batch["object_present"].any(dim=0).sum().item()),
+            "prompt": prompt_selection.prompt,
+            "sampled_instance_id": int(prompt_selection.sampled_instance_id),
+            "sampled_label": prompt_selection.sampled_label,
         }
         append_metric(metrics_path, row)
 
@@ -310,7 +336,8 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
                 "point={point_loss:.4f} match={match_loss:.4f} "
                 "obj_mask={object_mask_loss:.4f} obj_point={object_point_loss:.4f} "
                 "tokens={num_tokens} match_tokens={num_match_tokens} "
-                "instances={num_instances} objects={num_objects}".format(**row)
+                "instances={num_instances} objects={num_objects} "
+                "prompt='{prompt}'".format(**row)
             )
         if step % config.save_every == 0:
             save_checkpoint(
@@ -360,6 +387,7 @@ def build_latent_batch(
     semantic_ignore_label: int,
     excluded_semantic_labels: Sequence[int],
     target_object_labels: Sequence[str],
+    excluded_object_labels: Sequence[str],
     min_token_majority: float,
     min_tokens_per_instance: int,
     max_area_ratio: float,
@@ -377,6 +405,12 @@ def build_latent_batch(
         min_visible_frames=min_visible_frames,
     )
     excluded = set(int(label) for label in excluded_semantic_labels)
+    excluded_label_filters = normalize_label_filters(excluded_object_labels)
+    excluded_instance_ids = [
+        instance_id
+        for instance_id, label in object_labels.items()
+        if label_is_excluded(label, excluded_label_filters)
+    ]
 
     semantic_labels = []
     instance_ids = []
@@ -398,6 +432,8 @@ def build_latent_batch(
         valid &= (sem_grid >= 0) & (sem_grid < num_classes)
         if excluded:
             valid &= ~np.isin(sem_grid, list(excluded))
+        if excluded_instance_ids:
+            valid &= ~np.isin(inst_grid, excluded_instance_ids)
 
         visible = keep_per_frame[frame_idx]
         if visible:
@@ -439,6 +475,7 @@ def build_latent_batch(
         num_queries=num_queries,
         semantic_ignore_label=semantic_ignore_label,
         target_object_labels=target_object_labels,
+        excluded_object_labels=excluded_object_labels,
         num_classes=num_classes,
         device=device,
     )
@@ -468,16 +505,22 @@ def build_object_targets(
     num_queries: int,
     semantic_ignore_label: int,
     target_object_labels: Sequence[str],
+    excluded_object_labels: Sequence[str],
     num_classes: int,
     device: str,
 ) -> Dict[str, torch.Tensor] | None:
     label_filters = normalize_label_filters(target_object_labels)
+    excluded_filters = normalize_label_filters(excluded_object_labels)
     clip_instance_ids = sorted(
         {
             int(instance_id)
             for frame_ids in keep_per_frame
             for instance_id in frame_ids
             if label_matches(object_labels.get(int(instance_id)), label_filters)
+            and not label_is_excluded(
+                object_labels.get(int(instance_id)),
+                excluded_filters,
+            )
         }
     )[:num_queries]
     if not clip_instance_ids:
@@ -555,6 +598,66 @@ def build_object_targets(
     }
 
 
+def select_object_prompt(
+    visible_instance_ids: Sequence[Sequence[int]],
+    object_labels: Dict[int, str],
+    *,
+    rng: random.Random,
+    min_visible_frames: int,
+    mode: str,
+    fallback_prompt: str,
+    target_object_labels: Sequence[str],
+    excluded_object_labels: Sequence[str],
+) -> Optional[ObjectPromptSelection]:
+    mode = mode.lower()
+    target_filters = normalize_label_filters(target_object_labels)
+    excluded_filters = normalize_label_filters(excluded_object_labels)
+
+    if mode in {"fixed", "constant", "static"}:
+        target_labels = list(target_object_labels)
+        return ObjectPromptSelection(
+            prompt=fallback_prompt,
+            target_object_labels=target_labels,
+            sampled_instance_id=-1,
+            sampled_label=fallback_prompt,
+        )
+    if mode not in {"random_instance", "sample_instance", "dynamic"}:
+        raise ValueError(
+            "sam3.prompt_mode must be 'random_instance' or 'fixed', "
+            f"got {mode!r}"
+        )
+
+    keep_per_frame = keep_instances_visible_in_multiple_frames(
+        [list(ids) for ids in visible_instance_ids],
+        min_visible_frames=min_visible_frames,
+    )
+    candidate_ids = sorted(
+        {
+            int(instance_id)
+            for frame_ids in keep_per_frame
+            for instance_id in frame_ids
+            if label_matches(object_labels.get(int(instance_id)), target_filters)
+            and not label_is_excluded(
+                object_labels.get(int(instance_id)),
+                excluded_filters,
+            )
+        }
+    )
+    if not candidate_ids:
+        return None
+
+    sampled_instance_id = int(rng.choice(candidate_ids))
+    sampled_label = object_labels.get(sampled_instance_id)
+    if not sampled_label:
+        return None
+    return ObjectPromptSelection(
+        prompt=sampled_label,
+        target_object_labels=[sampled_label],
+        sampled_instance_id=sampled_instance_id,
+        sampled_label=sampled_label,
+    )
+
+
 def normalize_label_filters(labels: Sequence[str]) -> List[str]:
     return [str(label).strip().lower() for label in labels if str(label).strip()]
 
@@ -563,6 +666,13 @@ def label_matches(label: str | None, filters: Sequence[str]) -> bool:
     if not filters:
         return True
     if label is None:
+        return False
+    normalized = label.strip().lower()
+    return any(item in normalized for item in filters)
+
+
+def label_is_excluded(label: str | None, filters: Sequence[str]) -> bool:
+    if label is None or not filters:
         return False
     normalized = label.strip().lower()
     return any(item in normalized for item in filters)
@@ -860,6 +970,9 @@ def write_metrics_header(path: Path) -> None:
                 "num_match_tokens",
                 "num_instances",
                 "num_objects",
+                "prompt",
+                "sampled_instance_id",
+                "sampled_label",
             ],
         )
         writer.writeheader()

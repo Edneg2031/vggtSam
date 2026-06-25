@@ -18,9 +18,11 @@ objects:
   # Fill this once the ScanNet++ semantic id mapping is confirmed.
   # The area filter already suppresses most wall/floor/ceiling tokens.
   excluded_semantic_labels: []
-  # Object-level mask/point/association targets are filtered by ScanNet++ object
-  # metadata label. Set [] to train all valid small objects.
-  target_object_labels: [chair]
+  # Empty target list means sample from all valid instance labels. Set [chair]
+  # to reproduce the chair-only baseline.
+  target_object_labels: []
+  # Metadata-label blacklist for large room structures.
+  excluded_object_labels: [wall, floor, ceiling]
   # Token-grid supervision is used only when a pooled cell has a clean majority.
   min_token_majority: 0.55
   min_tokens_per_instance: 2
@@ -29,7 +31,11 @@ objects:
 sam3:
   repo: externals/sam3
   checkpoint: /home/bod/86Nas/95_data_bak/FoundationModels/sam3/sam3.pt
-  prompt: chair
+  # Used as fallback for fixed prompt mode.
+  prompt: object
+  # random_instance: sample a valid instance in each clip and use its class name
+  # as the SAM3 text prompt. fixed: always use sam3.prompt.
+  prompt_mode: random_instance
   resolution: 1008
   # Choices implemented: detector_fpn2, detector_fpn1, detector_fpn0,
   # vision_features, tracker_fpn2.

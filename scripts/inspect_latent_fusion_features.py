@@ -27,6 +27,7 @@ from vggtsam.data.scannetpp.object_sequence import (
     ObjectSamplingConfig,
     ScanNetPPObjectSequenceDataset,
 )
+from vggtsam.training.latent_fusion import select_object_prompt
 
 
 def main() -> None:
@@ -45,6 +46,9 @@ def main() -> None:
         raw["training"]["device"] = args.device
     if args.prompt is not None:
         raw["sam3"]["prompt"] = args.prompt
+        raw["sam3"]["prompt_mode"] = "fixed"
+        if args.prompt.strip().lower() != "object":
+            raw["objects"]["target_object_labels"] = [args.prompt]
     config = build_train_config(raw)
 
     object_config = ObjectSamplingConfig(
@@ -69,6 +73,25 @@ def main() -> None:
     print(f"pointmaps_available={sequence.pointmaps is not None}")
     label_preview = sorted(sequence.object_labels.items())[:20]
     print(f"object_label_preview={label_preview}")
+    prompt_selection = select_object_prompt(
+        sequence.visible_instance_ids,
+        sequence.object_labels,
+        rng=random.Random(config.seed),
+        min_visible_frames=config.min_visible_frames,
+        mode=config.sam3_prompt_mode,
+        fallback_prompt=config.sam3_prompt,
+        target_object_labels=config.target_object_labels,
+        excluded_object_labels=config.excluded_object_labels,
+    )
+    if prompt_selection is None:
+        raise RuntimeError(
+            "No valid prompt candidate found in the sampled clip. "
+            "Try lowering object filters or clearing excluded_object_labels."
+        )
+    print(
+        "sampled_prompt="
+        f"{prompt_selection.prompt!r} sampled_instance_id={prompt_selection.sampled_instance_id}"
+    )
 
     sam3_model = load_sam3_image_model(
         repo_path=config.sam3_repo,
@@ -101,7 +124,10 @@ def main() -> None:
     )
 
     with torch.no_grad():
-        sam_out = sam3.extract_from_paths(sequence.image_paths, prompt=config.sam3_prompt)
+        sam_out = sam3.extract_from_paths(
+            sequence.image_paths,
+            prompt=prompt_selection.prompt,
+        )
         geo_out = geometry.extract_from_paths(sequence.image_paths)
 
     print("SAM3:")

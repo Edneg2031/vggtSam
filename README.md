@@ -81,16 +81,19 @@ PYTHONPATH=src python scripts/train_latent_fusion.py \
   --device cuda
 ```
 
-The default config is a chair-focused single-GPU experiment:
+The default config is a single-GPU dynamic-prompt experiment:
 
 ```text
-sam3.prompt: chair
-objects.target_object_labels: [chair]
+sam3.prompt_mode: random_instance
+objects.target_object_labels: []
+objects.excluded_object_labels: [wall, floor, ceiling]
 model.mask_grid: [144, 144]
 ```
 
-Set `objects.target_object_labels: []` to train all valid small objects if the
-ScanNet++ object metadata labels do not match `chair` on your processed scene.
+Each training step samples a valid instance in the clip, uses its metadata class
+name as the SAM3 text prompt, and trains masks/centroids/association for visible
+instances of that class. Set `objects.target_object_labels: [chair]` to reproduce
+the chair-only baseline.
 
 Plot training curves:
 

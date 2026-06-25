@@ -264,25 +264,26 @@ PYTHONPATH=src python scripts/train_latent_fusion.py \
    - 原始 RGB 图片路径；
    - instance_masks；
    - semantic_masks。
-4. 运行 frozen SAM3 image backbone，取 detector_fpn2 中间特征并拼接 pooled text feature。
-5. 运行 frozen StreamVGGT aggregator，取最后层 patch tokens 和 camera tokens；point supervision 默认来自预处理生成的 COLMAP/mesh GT pointmap。
-6. 将 semantic_masks / instance_masks majority-pool 到 72x72 token grid。
-7. 将 SAM3 tokens 作为 query，StreamVGGT geometry/camera tokens 作为 key/value，送入 LatentSAMVGGTModel。
-8. LatentSAMVGGTModel 额外解码 per-frame object queries：
+4. 从当前 clip 中随机采样一个大小合理、跨帧可见、未被 blacklist 过滤的 instance，用它的类别名作为 SAM3 text prompt。
+5. 运行 frozen SAM3 image backbone，取 detector_fpn2 中间特征并拼接 pooled text feature。
+6. 运行 frozen StreamVGGT aggregator，取最后层 patch tokens 和 camera tokens；point supervision 默认来自预处理生成的 COLMAP/mesh GT pointmap。
+7. 将 semantic_masks / instance_masks majority-pool 到 72x72 token grid。
+8. 将 SAM3 tokens 作为 query，StreamVGGT geometry/camera tokens 作为 key/value，送入 LatentSAMVGGTModel。
+9. LatentSAMVGGTModel 额外解码 per-frame object queries：
    - mask_logits：默认 144x144；
    - object semantic logits；
    - object centroid；
    - object association embedding。
-9. 计算 token 级辅助损失：
+10. 计算 token 级辅助损失：
    - semantic_loss：token 预测 ScanNet++ semantic label；
    - point_loss：token 预测 COLMAP/mesh GT pointmap；旧 baseline 可通过配置回退到 StreamVGGT pseudo target；
    - match_loss：同 ScanNet++ instance id 的跨帧 token embeddings 拉近，不同 id 拉远。
-10. 计算 object 级主损失：
+11. 计算 object 级主损失：
    - object_mask_loss / object_dice_loss：query mask 对齐 ScanNet++ instance mask；
    - object_point_loss：query centroid 对齐 GT pointmap 聚合中心；
    - object_semantic_loss：query 分类到该 instance 的 semantic label；
    - object_match_loss：同一 instance 跨帧 query embedding 拉近。
-11. 写出训练日志、曲线和 checkpoint。
+12. 写出训练日志、曲线和 checkpoint。
 ```
 
 当前输出：

@@ -36,6 +36,9 @@ def main() -> None:
         config["training"]["output_dir"] = str(args.output_dir)
     if args.prompt is not None:
         config["sam3"]["prompt"] = args.prompt
+        config["sam3"]["prompt_mode"] = "fixed"
+        if args.prompt.strip().lower() != "object":
+            config["objects"]["target_object_labels"] = [args.prompt]
 
     train_latent_fusion(build_train_config(config))
 
@@ -70,12 +73,16 @@ def build_train_config(raw: dict) -> LatentFusionTrainConfig:
         target_object_labels=[
             str(label) for label in objects.get("target_object_labels", [])
         ],
+        excluded_object_labels=[
+            str(label) for label in objects.get("excluded_object_labels", [])
+        ],
         min_token_majority=float(objects["min_token_majority"]),
         min_tokens_per_instance=int(objects["min_tokens_per_instance"]),
         max_match_tokens=int(objects["max_match_tokens"]),
         sam3_repo=Path(sam3["repo"]),
         sam3_checkpoint=Path(sam3["checkpoint"]),
         sam3_prompt=str(sam3["prompt"]),
+        sam3_prompt_mode=str(sam3.get("prompt_mode", "random_instance")),
         sam3_resolution=int(sam3["resolution"]),
         sam3_feature_source=str(sam3["feature_source"]),
         sam3_text_conditioning=str(sam3["text_conditioning"]),
