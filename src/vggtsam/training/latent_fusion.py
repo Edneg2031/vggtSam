@@ -67,17 +67,10 @@ class LatentFusionTrainConfig:
     d_fuse: int
     num_heads: int
     num_classes: int
-    num_queries: int
-    mask_grid: tuple[int, int]
     dropout: float
     semantic_weight: float
     point_weight: float
     match_weight: float
-    object_semantic_weight: float
-    object_mask_weight: float
-    object_dice_weight: float
-    object_point_weight: float
-    object_match_weight: float
     temperature: float
     device: str
     iterations: int
@@ -86,7 +79,6 @@ class LatentFusionTrainConfig:
     log_every: int
     save_every: int
     visualize_every: int
-    visualize_max_objects: int
     visualize_threshold: float
     output_dir: Path
 
@@ -200,8 +192,6 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
             sequence.object_labels,
             pointmap_grid=pointmap_grid,
             token_grid=config.token_grid,
-            mask_grid=config.mask_grid,
-            num_queries=config.num_queries,
             min_visible_frames=config.min_visible_frames,
             ignore_instance_id=config.ignore_instance_id,
             semantic_ignore_label=config.semantic_ignore_label,
@@ -235,8 +225,6 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
                 num_classes=config.num_classes,
                 dropout=config.dropout,
                 token_grid=config.token_grid,
-                mask_grid=config.mask_grid,
-                num_queries=config.num_queries,
             ).to(config.device)
             optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
             print(
@@ -255,7 +243,6 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
                 and geo_out.geometry.camera_tokens is not None
                 else None
             ),
-            num_frames=config.sequence_length,
         )
 
         valid = batch["valid_tokens"]
@@ -272,36 +259,16 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
             batch["frame_ids"],
             max_tokens=config.max_match_tokens,
         )
-        match_loss = cross_frame_contrastive_loss(
+        match_loss = cross_frame_correspondence_loss(
             output.embeddings[0, match_indices],
             batch["instance_ids"][match_indices],
             batch["frame_ids"][match_indices],
-            temperature=config.temperature,
-        )
-        if (
-            output.object_logits is None
-            or output.object_points is None
-            or output.object_embeddings is None
-            or output.mask_logits is None
-        ):
-            raise RuntimeError("LatentSAMVGGTModel did not return object outputs.")
-        object_losses = compute_object_losses(
-            output.object_logits[0],
-            output.object_points[0],
-            output.object_embeddings[0],
-            output.mask_logits[0],
-            batch,
             temperature=config.temperature,
         )
         loss = (
             config.semantic_weight * semantic_loss
             + config.point_weight * point_loss
             + config.match_weight * match_loss
-            + config.object_semantic_weight * object_losses["object_semantic_loss"]
-            + config.object_mask_weight * object_losses["object_mask_loss"]
-            + config.object_dice_weight * object_losses["object_dice_loss"]
-            + config.object_point_weight * object_losses["object_point_loss"]
-            + config.object_match_weight * object_losses["object_match_loss"]
         )
 
         optimizer.zero_grad(set_to_none=True)
@@ -316,21 +283,9 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
             "semantic_loss": float(semantic_loss.detach().cpu()),
             "point_loss": float(point_loss.detach().cpu()),
             "match_loss": float(match_loss.detach().cpu()),
-            "object_semantic_loss": float(
-                object_losses["object_semantic_loss"].detach().cpu()
-            ),
-            "object_mask_loss": float(object_losses["object_mask_loss"].detach().cpu()),
-            "object_dice_loss": float(object_losses["object_dice_loss"].detach().cpu()),
-            "object_point_loss": float(
-                object_losses["object_point_loss"].detach().cpu()
-            ),
-            "object_match_loss": float(
-                object_losses["object_match_loss"].detach().cpu()
-            ),
             "num_tokens": int(valid.sum().item()),
             "num_match_tokens": int(match_indices.numel()),
             "num_instances": int(batch["instance_ids"][valid].unique().numel()),
-            "num_objects": int(batch["object_present"].any(dim=0).sum().item()),
             "prompt": prompt_selection.prompt,
             "sampled_instance_id": int(prompt_selection.sampled_instance_id),
             "sampled_label": prompt_selection.sampled_label,
@@ -341,34 +296,38 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
             print(
                 "step={step} loss={loss:.4f} semantic={semantic_loss:.4f} "
                 "point={point_loss:.4f} match={match_loss:.4f} "
-                "obj_mask={object_mask_loss:.4f} obj_point={object_point_loss:.4f} "
                 "tokens={num_tokens} match_tokens={num_match_tokens} "
-                "instances={num_instances} objects={num_objects} "
-                "prompt='{prompt}'".format(**row)
+                "instances={num_instances} prompt='{prompt}'".format(**row)
             )
         if config.visualize_every > 0 and (
             step % config.visualize_every == 0 or completed_steps == 1
         ):
             viz_path = config.output_dir / "visualizations" / f"step_{step:06d}.png"
-            save_mask_visualization(
+            save_correspondence_visualization(
                 viz_path,
                 image_paths=sequence.image_paths,
-                mask_logits=output.mask_logits[0].detach(),
+                instance_masks=sequence.instance_masks,
+                object_labels=sequence.object_labels,
+                embeddings=output.embeddings[0].detach(),
                 batch=batch,
                 prompt=prompt_selection.prompt,
+                preferred_instance_id=prompt_selection.sampled_instance_id,
                 step=step,
-                max_objects=config.visualize_max_objects,
                 threshold=config.visualize_threshold,
+                temperature=config.temperature,
             )
-            save_mask_crop_visualization(
+            save_correspondence_crop_visualization(
                 viz_path.with_name(f"step_{step:06d}_crops.png"),
                 image_paths=sequence.image_paths,
-                mask_logits=output.mask_logits[0].detach(),
+                instance_masks=sequence.instance_masks,
+                object_labels=sequence.object_labels,
+                embeddings=output.embeddings[0].detach(),
                 batch=batch,
                 prompt=prompt_selection.prompt,
+                preferred_instance_id=prompt_selection.sampled_instance_id,
                 step=step,
-                max_objects=config.visualize_max_objects,
                 threshold=config.visualize_threshold,
+                temperature=config.temperature,
             )
         if step % config.save_every == 0:
             save_checkpoint(
@@ -411,8 +370,6 @@ def build_latent_batch(
     *,
     pointmap_grid: torch.Tensor,
     token_grid: tuple[int, int],
-    mask_grid: tuple[int, int],
-    num_queries: int,
     min_visible_frames: int,
     ignore_instance_id: int,
     semantic_ignore_label: int,
@@ -435,8 +392,14 @@ def build_latent_batch(
         [list(ids) for ids in visible_instance_ids],
         min_visible_frames=min_visible_frames,
     )
+    target_label_filters = normalize_label_filters(target_object_labels)
     excluded = set(int(label) for label in excluded_semantic_labels)
     excluded_label_filters = normalize_label_filters(excluded_object_labels)
+    target_instance_ids = [
+        instance_id
+        for instance_id, label in object_labels.items()
+        if label_matches(label, target_label_filters)
+    ]
     excluded_instance_ids = [
         instance_id
         for instance_id, label in object_labels.items()
@@ -463,6 +426,11 @@ def build_latent_batch(
         valid &= (sem_grid >= 0) & (sem_grid < num_classes)
         if excluded:
             valid &= ~np.isin(sem_grid, list(excluded))
+        if target_label_filters:
+            if target_instance_ids:
+                valid &= np.isin(inst_grid, target_instance_ids)
+            else:
+                valid &= False
         if excluded_instance_ids:
             valid &= ~np.isin(inst_grid, excluded_instance_ids)
 
@@ -494,138 +462,13 @@ def build_latent_batch(
     if not valid.any():
         return None
 
-    object_targets = build_object_targets(
-        instance_masks,
-        semantic_masks,
-        instance_grids,
-        semantic_grids,
-        pointmap_grid,
-        keep_per_frame,
-        object_labels,
-        mask_grid=mask_grid,
-        num_queries=num_queries,
-        semantic_ignore_label=semantic_ignore_label,
-        target_object_labels=target_object_labels,
-        excluded_object_labels=excluded_object_labels,
-        num_classes=num_classes,
-        device=device,
-    )
-    if object_targets is None:
-        return None
-
     return {
         "semantic_labels": labels,
         "instance_ids": instances,
         "frame_ids": frames,
         "valid_tokens": valid,
         "point_targets": points,
-        **object_targets,
-    }
-
-
-def build_object_targets(
-    instance_masks: Sequence[np.ndarray],
-    semantic_masks: Sequence[np.ndarray],
-    instance_grids: Sequence[np.ndarray],
-    semantic_grids: Sequence[np.ndarray],
-    pointmap_grid: torch.Tensor,
-    keep_per_frame: Sequence[set[int]],
-    object_labels: Dict[int, str],
-    *,
-    mask_grid: tuple[int, int],
-    num_queries: int,
-    semantic_ignore_label: int,
-    target_object_labels: Sequence[str],
-    excluded_object_labels: Sequence[str],
-    num_classes: int,
-    device: str,
-) -> Dict[str, torch.Tensor] | None:
-    label_filters = normalize_label_filters(target_object_labels)
-    excluded_filters = normalize_label_filters(excluded_object_labels)
-    clip_instance_ids = sorted(
-        {
-            int(instance_id)
-            for frame_ids in keep_per_frame
-            for instance_id in frame_ids
-            if label_matches(object_labels.get(int(instance_id)), label_filters)
-            and not label_is_excluded(
-                object_labels.get(int(instance_id)),
-                excluded_filters,
-            )
-        }
-    )[:num_queries]
-    if not clip_instance_ids:
-        return None
-
-    frames = len(instance_masks)
-    mask_h, mask_w = mask_grid
-    object_present = torch.zeros((frames, num_queries), dtype=torch.bool, device=device)
-    object_masks = torch.zeros(
-        (frames, num_queries, mask_h, mask_w),
-        dtype=torch.float32,
-        device=device,
-    )
-    object_semantic_labels = torch.full(
-        (frames, num_queries),
-        -1,
-        dtype=torch.long,
-        device=device,
-    )
-    object_centroids = torch.full(
-        (frames, num_queries, 3),
-        float("nan"),
-        dtype=torch.float32,
-        device=device,
-    )
-    object_ids = torch.zeros((num_queries,), dtype=torch.long, device=device)
-    object_ids[: len(clip_instance_ids)] = torch.tensor(
-        clip_instance_ids,
-        dtype=torch.long,
-        device=device,
-    )
-
-    pointmap_np = pointmap_grid.detach().cpu().numpy()
-    for frame_idx, (inst_np, sem_np, inst_grid, sem_grid) in enumerate(
-        zip(instance_masks, semantic_masks, instance_grids, semantic_grids)
-    ):
-        visible = keep_per_frame[frame_idx]
-        for query_idx, instance_id in enumerate(clip_instance_ids):
-            if instance_id not in visible:
-                continue
-            full_mask = inst_np == instance_id
-            if not full_mask.any():
-                continue
-            semantic_label = majority_label_for_instance(
-                sem_np,
-                full_mask,
-                ignore_label=semantic_ignore_label,
-                num_classes=num_classes,
-            )
-            if semantic_label is None:
-                continue
-
-            object_present[frame_idx, query_idx] = True
-            object_masks[frame_idx, query_idx] = resize_binary_mask(
-                full_mask, mask_grid
-            ).to(device)
-            object_semantic_labels[frame_idx, query_idx] = int(semantic_label)
-
-            token_mask = (inst_grid == instance_id) & (sem_grid != semantic_ignore_label)
-            points = pointmap_np[frame_idx][token_mask]
-            finite = np.isfinite(points).all(axis=-1)
-            if finite.any():
-                object_centroids[frame_idx, query_idx] = torch.from_numpy(
-                    points[finite].mean(axis=0).astype(np.float32)
-                ).to(device)
-
-    if not object_present.any():
-        return None
-    return {
-        "object_present": object_present,
-        "object_masks": object_masks,
-        "object_semantic_labels": object_semantic_labels,
-        "object_centroids": object_centroids,
-        "object_ids": object_ids,
+        "token_grid": token_grid,
     }
 
 
@@ -709,128 +552,37 @@ def label_is_excluded(label: str | None, filters: Sequence[str]) -> bool:
     return any(item in normalized for item in filters)
 
 
-def majority_label_for_instance(
-    semantic_mask: np.ndarray,
-    instance_mask: np.ndarray,
-    *,
-    ignore_label: int,
-    num_classes: int,
-) -> int | None:
-    values = semantic_mask[instance_mask]
-    values = values[(values != ignore_label) & (values >= 0) & (values < num_classes)]
-    if values.size == 0:
-        return None
-    labels, counts = np.unique(values, return_counts=True)
-    return int(labels[int(counts.argmax())])
-
-
-def resize_binary_mask(mask: np.ndarray, out_hw: tuple[int, int]) -> torch.Tensor:
-    tensor = torch.from_numpy(mask.astype(np.float32))[None, None]
-    resized = F.interpolate(tensor, size=out_hw, mode="nearest")
-    return resized[0, 0]
-
-
-def compute_object_losses(
-    object_logits: torch.Tensor,
-    object_points: torch.Tensor,
-    object_embeddings: torch.Tensor,
-    mask_logits: torch.Tensor,
-    batch: Dict[str, torch.Tensor],
-    *,
-    temperature: float,
-) -> Dict[str, torch.Tensor]:
-    present = batch["object_present"]
-    zero = object_logits.sum() * 0.0
-    if not present.any():
-        return {
-            "object_semantic_loss": zero,
-            "object_mask_loss": zero,
-            "object_dice_loss": zero,
-            "object_point_loss": zero,
-            "object_match_loss": zero,
-        }
-
-    labels = batch["object_semantic_labels"]
-    object_semantic_loss = F.cross_entropy(object_logits[present], labels[present])
-    object_mask_loss = F.binary_cross_entropy_with_logits(
-        mask_logits[present],
-        batch["object_masks"][present],
-    )
-    object_dice_loss = dice_loss_with_logits(
-        mask_logits[present],
-        batch["object_masks"][present],
-    )
-
-    centroids = batch["object_centroids"]
-    finite_centroids = present & torch.isfinite(centroids).all(dim=-1)
-    if finite_centroids.any():
-        object_point_loss = F.smooth_l1_loss(
-            object_points[finite_centroids],
-            centroids[finite_centroids],
-        )
-    else:
-        object_point_loss = object_points.sum() * 0.0
-
-    frames, queries = present.shape
-    frame_ids = (
-        torch.arange(frames, device=present.device)[:, None]
-        .expand(frames, queries)
-        .reshape(-1)
-    )
-    object_ids = batch["object_ids"][None].expand(frames, queries).reshape(-1)
-    present_flat = present.reshape(-1)
-    object_match_loss = cross_frame_contrastive_loss(
-        object_embeddings.reshape(frames * queries, -1)[present_flat],
-        object_ids[present_flat],
-        frame_ids[present_flat],
-        temperature=temperature,
-    )
-    return {
-        "object_semantic_loss": object_semantic_loss,
-        "object_mask_loss": object_mask_loss,
-        "object_dice_loss": object_dice_loss,
-        "object_point_loss": object_point_loss,
-        "object_match_loss": object_match_loss,
-    }
-
-
-def dice_loss_with_logits(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    *,
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    probs = logits.sigmoid().flatten(1)
-    targets = targets.flatten(1)
-    intersection = (probs * targets).sum(dim=1)
-    union = probs.sum(dim=1) + targets.sum(dim=1)
-    return (1.0 - (2.0 * intersection + eps) / (union + eps)).mean()
-
-
-def save_mask_visualization(
+def save_correspondence_visualization(
     path: Path,
     *,
     image_paths: Sequence[Path],
-    mask_logits: torch.Tensor,
+    instance_masks: Sequence[np.ndarray],
+    object_labels: Dict[int, str],
+    embeddings: torch.Tensor,
     batch: Dict[str, torch.Tensor],
     prompt: str,
+    preferred_instance_id: int,
     step: int,
-    max_objects: int,
     threshold: float,
+    temperature: float,
 ) -> None:
     from PIL import Image, ImageDraw
 
-    pred_probs = mask_logits.sigmoid().detach().cpu()
-    gt_masks = batch["object_masks"].detach().cpu()
-    present = batch["object_present"].detach().cpu()
-    object_ids = batch["object_ids"].detach().cpu()
-
-    query_indices = present.any(dim=0).nonzero(as_tuple=False).flatten()
-    if query_indices.numel() == 0:
+    reference = select_propagation_reference(batch, preferred_instance_id)
+    if reference is None:
         return
-    query_indices = query_indices[: max(1, int(max_objects))]
+    target_instance_id, ref_frame = reference
+    pred_probs = propagate_instance_from_reference(
+        embeddings,
+        batch,
+        target_instance_id=target_instance_id,
+        ref_frame=ref_frame,
+        temperature=temperature,
+    )
+    if pred_probs is None:
+        return
 
-    frames = gt_masks.shape[0]
+    frames = len(image_paths)
     first_image = Image.open(image_paths[0]).convert("RGB")
     image_w, image_h = first_image.size
     panel_w = min(640, image_w)
@@ -843,13 +595,15 @@ def save_mask_visualization(
     canvas_h = title_h + frames * (panel_h + footer_h + margin) + margin
     canvas = Image.new("RGB", (canvas_w, canvas_h), color=(20, 20, 20))
     draw = ImageDraw.Draw(canvas)
+    label = object_labels.get(int(target_instance_id), "unknown")
     draw.text(
         (margin, 4),
-        f"step={step} prompt='{prompt}' threshold={threshold:.2f}",
+        f"step={step} prompt='{prompt}' id={target_instance_id} label='{label}' "
+        f"ref_frame={ref_frame} threshold={threshold:.2f}",
         fill=(240, 240, 240),
     )
 
-    headings = ["RGB", "GT mask", "Pred mask"]
+    headings = ["RGB", "GT instance", "Propagated mask"]
     for col, heading in enumerate(headings):
         draw.text(
             (margin + col * (panel_w + margin), title_h - 15),
@@ -857,26 +611,21 @@ def save_mask_visualization(
             fill=(220, 220, 220),
         )
 
-    colors = visualization_palette()
-    legend_items = []
-    for color_idx, query_idx in enumerate(query_indices.tolist()):
-        instance_id = int(object_ids[query_idx].item())
-        legend_items.append(f"q{query_idx}:id{instance_id}")
+    gt_color, pred_color = visualization_palette()[:2]
 
     for frame_idx in range(frames):
         base = Image.open(image_paths[frame_idx]).convert("RGB")
-        gt_overlay = overlay_query_masks(
+        gt_mask = np.asarray(instance_masks[frame_idx]) == target_instance_id
+        gt_overlay = overlay_single_mask(
             base,
-            gt_masks[frame_idx],
-            query_indices=query_indices.tolist(),
-            colors=colors,
+            gt_mask,
+            color=gt_color,
             threshold=0.5,
         )
-        pred_overlay = overlay_query_masks(
+        pred_overlay = overlay_single_mask(
             base,
-            pred_probs[frame_idx],
-            query_indices=query_indices.tolist(),
-            colors=colors,
+            pred_probs[frame_idx].numpy(),
+            color=pred_color,
             threshold=threshold,
         )
         base = base.resize((panel_w, panel_h), Image.BILINEAR)
@@ -886,49 +635,63 @@ def save_mask_visualization(
         for col, panel in enumerate([base, gt_overlay, pred_overlay]):
             x = margin + col * (panel_w + margin)
             canvas.paste(panel, (x, row_y))
-        footer = f"frame {frame_idx}: " + ", ".join(legend_items)
+        footer = f"frame {frame_idx}"
+        if frame_idx == ref_frame:
+            footer += " (reference)"
         draw.text((margin, row_y + panel_h + 2), footer[:160], fill=(220, 220, 220))
 
     path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(path)
 
 
-def save_mask_crop_visualization(
+def save_correspondence_crop_visualization(
     path: Path,
     *,
     image_paths: Sequence[Path],
-    mask_logits: torch.Tensor,
+    instance_masks: Sequence[np.ndarray],
+    object_labels: Dict[int, str],
+    embeddings: torch.Tensor,
     batch: Dict[str, torch.Tensor],
     prompt: str,
+    preferred_instance_id: int,
     step: int,
-    max_objects: int,
     threshold: float,
+    temperature: float,
     crop_size: int = 192,
 ) -> None:
     from PIL import Image, ImageDraw
 
-    pred_probs = mask_logits.sigmoid().detach().cpu()
-    gt_masks = batch["object_masks"].detach().cpu()
-    present = batch["object_present"].detach().cpu()
-    object_ids = batch["object_ids"].detach().cpu()
-    query_indices = present.any(dim=0).nonzero(as_tuple=False).flatten()
-    if query_indices.numel() == 0:
+    reference = select_propagation_reference(batch, preferred_instance_id)
+    if reference is None:
         return
-    query_indices = query_indices[: max(1, int(max_objects))]
+    target_instance_id, ref_frame = reference
+    pred_probs = propagate_instance_from_reference(
+        embeddings,
+        batch,
+        target_instance_id=target_instance_id,
+        ref_frame=ref_frame,
+        temperature=temperature,
+    )
+    if pred_probs is None:
+        return
 
-    colors = visualization_palette()
+    gt_color, pred_color = visualization_palette()[:2]
     crop_specs = []
-    frames = gt_masks.shape[0]
-    for query_idx in query_indices.tolist():
-        for frame_idx in range(frames):
-            if not bool(present[frame_idx, query_idx]):
-                continue
-            gt = gt_masks[frame_idx, query_idx].numpy() > 0.5
-            pred = pred_probs[frame_idx, query_idx].numpy() > threshold
-            bbox = mask_union_bbox(gt, pred, pad=8)
-            if bbox is None:
-                continue
-            crop_specs.append((frame_idx, query_idx, bbox))
+    frames = len(image_paths)
+    for frame_idx in range(frames):
+        image = Image.open(image_paths[frame_idx]).convert("RGB")
+        image_w, image_h = image.size
+        gt = np.asarray(instance_masks[frame_idx]) == target_instance_id
+        if gt.shape != (image_h, image_w):
+            gt = resize_bool_mask(gt, (image_h, image_w))
+        pred = (
+            resize_probability_mask(pred_probs[frame_idx].numpy(), (image_h, image_w))
+            > threshold
+        )
+        bbox = mask_union_bbox(gt, pred, pad=16)
+        if bbox is None:
+            continue
+        crop_specs.append((frame_idx, bbox))
     if not crop_specs:
         return
 
@@ -941,12 +704,14 @@ def save_mask_crop_visualization(
     canvas_h = title_h + rows * (crop_size + label_h + margin) + margin
     canvas = Image.new("RGB", (canvas_w, canvas_h), color=(20, 20, 20))
     draw = ImageDraw.Draw(canvas)
+    label = object_labels.get(int(target_instance_id), "unknown")
     draw.text(
         (margin, 5),
-        f"step={step} prompt='{prompt}' object crops",
+        f"step={step} prompt='{prompt}' id={target_instance_id} label='{label}' "
+        f"ref_frame={ref_frame}",
         fill=(240, 240, 240),
     )
-    headings = ["RGB crop", "GT crop", "Pred crop"]
+    headings = ["RGB crop", "GT crop", "Prop crop"]
     for col, heading in enumerate(headings):
         draw.text(
             (margin + col * (crop_size + margin), title_h - 14),
@@ -954,40 +719,35 @@ def save_mask_crop_visualization(
             fill=(220, 220, 220),
         )
 
-    for row_idx, (frame_idx, query_idx, bbox) in enumerate(crop_specs):
+    for row_idx, (frame_idx, bbox) in enumerate(crop_specs):
         image = Image.open(image_paths[frame_idx]).convert("RGB")
-        gt_overlay = overlay_query_masks(
+        gt_mask = np.asarray(instance_masks[frame_idx]) == target_instance_id
+        pred_mask = pred_probs[frame_idx].numpy()
+        gt_overlay = overlay_single_mask(
             image,
-            gt_masks[frame_idx],
-            query_indices=[query_idx],
-            colors=colors,
+            gt_mask,
+            color=gt_color,
             threshold=0.5,
         )
-        pred_overlay = overlay_query_masks(
+        pred_overlay = overlay_single_mask(
             image,
-            pred_probs[frame_idx],
-            query_indices=[query_idx],
-            colors=colors,
+            pred_mask,
+            color=pred_color,
             threshold=threshold,
         )
-        image_bbox = scale_bbox(
-            bbox,
-            from_size=(gt_masks.shape[-1], gt_masks.shape[-2]),
-            to_size=image.size,
-        )
         panels = [
-            image.crop(image_bbox).resize((crop_size, crop_size), Image.BILINEAR),
-            gt_overlay.crop(image_bbox).resize((crop_size, crop_size), Image.NEAREST),
-            pred_overlay.crop(image_bbox).resize((crop_size, crop_size), Image.NEAREST),
+            image.crop(bbox).resize((crop_size, crop_size), Image.BILINEAR),
+            gt_overlay.crop(bbox).resize((crop_size, crop_size), Image.NEAREST),
+            pred_overlay.crop(bbox).resize((crop_size, crop_size), Image.NEAREST),
         ]
         y = title_h + margin + row_idx * (crop_size + label_h + margin)
         for col, panel in enumerate(panels):
             x = margin + col * (crop_size + margin)
             canvas.paste(panel, (x, y))
-        instance_id = int(object_ids[query_idx].item())
+        suffix = " reference" if frame_idx == ref_frame else ""
         draw.text(
             (margin, y + crop_size + 2),
-            f"frame={frame_idx} query={query_idx} instance_id={instance_id}",
+            f"frame={frame_idx}{suffix}",
             fill=(220, 220, 220),
         )
 
@@ -995,12 +755,86 @@ def save_mask_crop_visualization(
     canvas.save(path)
 
 
-def overlay_query_masks(
-    image,
-    masks: torch.Tensor,
+def select_propagation_reference(
+    batch: Dict[str, torch.Tensor],
+    preferred_instance_id: int,
+) -> tuple[int, int] | None:
+    valid = batch["valid_tokens"].detach().cpu()
+    instance_ids = batch["instance_ids"].detach().cpu()
+    frame_ids = batch["frame_ids"].detach().cpu()
+    if not bool(valid.any()):
+        return None
+
+    def reference_for(instance_id: int) -> tuple[int, int] | None:
+        mask = valid & (instance_ids == int(instance_id))
+        if not bool(mask.any()):
+            return None
+        frames, counts = torch.unique(frame_ids[mask], return_counts=True)
+        best = int(torch.argmax(counts).item())
+        return int(instance_id), int(frames[best].item())
+
+    if preferred_instance_id > 0:
+        preferred = reference_for(preferred_instance_id)
+        if preferred is not None:
+            return preferred
+
+    best_score: tuple[int, int] | None = None
+    best_reference: tuple[int, int] | None = None
+    for instance_id in torch.unique(instance_ids[valid]).tolist():
+        mask = valid & (instance_ids == int(instance_id))
+        frames, counts = torch.unique(frame_ids[mask], return_counts=True)
+        score = (int(frames.numel()), int(counts.sum().item()))
+        if best_score is None or score > best_score:
+            best_score = score
+            best = int(torch.argmax(counts).item())
+            best_reference = (int(instance_id), int(frames[best].item()))
+    return best_reference
+
+
+def propagate_instance_from_reference(
+    embeddings: torch.Tensor,
+    batch: Dict[str, torch.Tensor],
     *,
-    query_indices: Sequence[int],
-    colors: Sequence[tuple[int, int, int]],
+    target_instance_id: int,
+    ref_frame: int,
+    temperature: float,
+) -> torch.Tensor | None:
+    valid = batch["valid_tokens"]
+    instance_ids = batch["instance_ids"]
+    frame_ids = batch["frame_ids"]
+    ref_mask = (
+        valid
+        & (instance_ids == int(target_instance_id))
+        & (frame_ids == int(ref_frame))
+    )
+    if not bool(ref_mask.any()):
+        return None
+
+    embeddings = F.normalize(embeddings.float(), dim=-1)
+    prototype = F.normalize(embeddings[ref_mask].mean(dim=0), dim=0)
+    logits = embeddings @ prototype / max(float(temperature), 1e-6)
+    probs = torch.sigmoid(logits)
+    probs = probs * valid.to(probs.dtype)
+
+    frames = int(frame_ids.max().item()) + 1
+    if "token_grid" in batch:
+        token_h, token_w = tuple(int(v) for v in batch["token_grid"])
+    else:
+        tokens_per_frame = int(probs.numel() // max(frames, 1))
+        token_h = int(round(math.sqrt(tokens_per_frame)))
+        if token_h * token_h != tokens_per_frame:
+            raise ValueError(
+                "Cannot infer token grid from a non-square token count; pass token_grid in batch."
+            )
+        token_w = token_h
+    return probs.detach().cpu().reshape(frames, token_h, token_w)
+
+
+def overlay_single_mask(
+    image,
+    mask: np.ndarray,
+    *,
+    color: tuple[int, int, int],
     threshold: float,
     alpha: float = 0.55,
 ):
@@ -1008,15 +842,27 @@ def overlay_query_masks(
 
     arr = np.asarray(image).astype(np.float32)
     image_h, image_w = arr.shape[:2]
-    for color_idx, query_idx in enumerate(query_indices):
-        mask = masks[query_idx].numpy() > threshold
-        if not mask.any():
-            continue
-        if mask.shape != (image_h, image_w):
+    mask = np.asarray(mask)
+    if mask.shape != (image_h, image_w):
+        if mask.dtype == np.bool_:
             mask = resize_bool_mask(mask, (image_h, image_w))
-        color = np.asarray(colors[color_idx % len(colors)], dtype=np.float32)
-        arr[mask] = arr[mask] * (1.0 - alpha) + color * alpha
+        else:
+            mask = resize_probability_mask(mask, (image_h, image_w))
+    mask = mask > threshold
+    if not mask.any():
+        return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+    color_arr = np.asarray(color, dtype=np.float32)
+    arr[mask] = arr[mask] * (1.0 - alpha) + color_arr * alpha
     return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+
+def resize_probability_mask(mask: np.ndarray, out_hw: tuple[int, int]) -> np.ndarray:
+    from PIL import Image
+
+    mask = np.asarray(mask, dtype=np.float32)
+    image = Image.fromarray(np.clip(mask * 255.0, 0, 255).astype(np.uint8))
+    image = image.resize((out_hw[1], out_hw[0]), Image.BILINEAR)
+    return np.asarray(image).astype(np.float32) / 255.0
 
 
 def resize_bool_mask(mask: np.ndarray, out_hw: tuple[int, int]) -> np.ndarray:
@@ -1054,25 +900,6 @@ def mask_union_bbox(
     x0 = max(x1 - side, 0)
     y0 = max(y1 - side, 0)
     return x0, y0, x1, y1
-
-
-def scale_bbox(
-    bbox: tuple[int, int, int, int],
-    *,
-    from_size: tuple[int, int],
-    to_size: tuple[int, int],
-) -> tuple[int, int, int, int]:
-    from_w, from_h = from_size
-    to_w, to_h = to_size
-    x0, y0, x1, y1 = bbox
-    sx = to_w / max(float(from_w), 1.0)
-    sy = to_h / max(float(from_h), 1.0)
-    return (
-        max(int(round(x0 * sx)), 0),
-        max(int(round(y0 * sy)), 0),
-        min(int(round(x1 * sx)), to_w),
-        min(int(round(y1 * sy)), to_h),
-    )
 
 
 def visualization_palette() -> List[tuple[int, int, int]]:
@@ -1237,18 +1064,19 @@ def select_match_indices(
     return indices
 
 
-def cross_frame_contrastive_loss(
+def cross_frame_correspondence_loss(
     embeddings: torch.Tensor,
     instance_ids: torch.Tensor,
     frame_ids: torch.Tensor,
     *,
     temperature: float,
+    negative_ratio: int = 8,
 ) -> torch.Tensor:
     n = embeddings.shape[0]
     if n <= 1:
         return embeddings.sum() * 0.0
     embeddings = F.normalize(embeddings, dim=-1)
-    logits = embeddings @ embeddings.T / temperature
+    logits = embeddings @ embeddings.T / max(float(temperature), 1e-6)
     eye = torch.eye(n, dtype=torch.bool, device=embeddings.device)
     positive = (instance_ids[:, None] == instance_ids[None, :]) & (
         frame_ids[:, None] != frame_ids[None, :]
@@ -1256,13 +1084,28 @@ def cross_frame_contrastive_loss(
     positive &= ~eye
     if not positive.any():
         return embeddings.sum() * 0.0
-    logits = logits.masked_fill(eye, -1e9)
-    log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
-    per_anchor = -(log_prob * positive.float()).sum(dim=1) / positive.float().sum(
-        dim=1
-    ).clamp_min(1.0)
-    valid_anchor = positive.any(dim=1)
-    return per_anchor[valid_anchor].mean()
+    cross_frame = frame_ids[:, None] != frame_ids[None, :]
+    negative = cross_frame & ~positive
+
+    flat_logits = logits.reshape(-1)
+    positive_indices = positive.reshape(-1).nonzero(as_tuple=False).flatten()
+    negative_indices = negative.reshape(-1).nonzero(as_tuple=False).flatten()
+    if negative_indices.numel() > positive_indices.numel() * negative_ratio:
+        choice = torch.randperm(
+            negative_indices.numel(),
+            device=negative_indices.device,
+        )[: positive_indices.numel() * negative_ratio]
+        negative_indices = negative_indices[choice]
+
+    selected_indices = torch.cat([positive_indices, negative_indices], dim=0)
+    targets = torch.cat(
+        [
+            torch.ones_like(positive_indices, dtype=flat_logits.dtype),
+            torch.zeros_like(negative_indices, dtype=flat_logits.dtype),
+        ],
+        dim=0,
+    )
+    return F.binary_cross_entropy_with_logits(flat_logits[selected_indices], targets)
 
 
 def write_metrics_header(path: Path) -> None:
@@ -1275,15 +1118,9 @@ def write_metrics_header(path: Path) -> None:
                 "semantic_loss",
                 "point_loss",
                 "match_loss",
-                "object_semantic_loss",
-                "object_mask_loss",
-                "object_dice_loss",
-                "object_point_loss",
-                "object_match_loss",
                 "num_tokens",
                 "num_match_tokens",
                 "num_instances",
-                "num_objects",
                 "prompt",
                 "sampled_instance_id",
                 "sampled_label",

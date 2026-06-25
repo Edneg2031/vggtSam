@@ -64,20 +64,12 @@ model:
   d_fuse: 256
   num_heads: 8
   num_classes: 1024
-  num_queries: 32
-  # Object masks are decoded above the 72x72 fusion grid.
-  mask_grid: [288, 288]
   dropout: 0.0
 
 loss:
   semantic_weight: 1.0
   point_weight: 1.0
   match_weight: 0.5
-  object_semantic_weight: 1.0
-  object_mask_weight: 1.0
-  object_dice_weight: 1.0
-  object_point_weight: 1.0
-  object_match_weight: 0.5
   temperature: 0.07
 
 training:
@@ -88,6 +80,5 @@ training:
   log_every: 10
   save_every: 100
   visualize_every: 20
-  visualize_max_objects: 8
   visualize_threshold: 0.5
   output_dir: outputs/latent_fusion_debug
