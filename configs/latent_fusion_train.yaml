@@ -4,7 +4,7 @@
 
 dataset:
   manifest: data/processed/scannetpp_2d/manifest.json
-  scene_id: 0a5c0134
+  scene_id: 0b031f3119
   sequence_length: 4
   frame_stride: 1
 
@@ -35,7 +35,7 @@ sam3:
   prompt: object
   # random_instance: sample a valid instance in each clip and use its class name
   # as the SAM3 text prompt. fixed: always use sam3.prompt.
-  prompt_mode: random_instance
+  prompt_mode: fixed
   resolution: 1008
   # Choices implemented: detector_fpn2, detector_fpn1, detector_fpn0,
   # vision_features, tracker_fpn2.
@@ -65,9 +65,8 @@ model:
   num_heads: 8
   num_classes: 1024
   num_queries: 32
-  # Object masks are decoded above the 72x72 fusion grid. 144x144 is the first
-  # single-3090 friendly setting; try [288, 288] after the 144 baseline runs.
-  mask_grid: [144, 144]
+  # Object masks are decoded above the 72x72 fusion grid.
+  mask_grid: [288, 288]
   dropout: 0.0
 
 loss:

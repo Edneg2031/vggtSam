@@ -48,7 +48,7 @@ RGB sequence
   -> frozen StreamVGGT aggregator
      -> geometry tokens
 
-当前默认先不使用 StreamVGGT camera tokens，用于隔离验证普通 geometry patch tokens 是否足够训练 mask。
+当前默认先用固定 "object" prompt 训练所有非 blacklist 小物体，并暂时不使用 StreamVGGT camera tokens，用于隔离验证普通 geometry patch tokens 是否足够训练 mask。
 
 SAM3 tokens as query
 StreamVGGT tokens as key/value
@@ -68,7 +68,7 @@ token matching embedding:
   token 级跨帧 instance 对齐特征
 
 object mask logits:
-  [T, num_queries, 144, 144]
+  [T, num_queries, 288, 288]
   每一帧、每个 object query 的 mask
 
 object semantic logits:
@@ -143,6 +143,7 @@ step=20 loss=17.0002 obj_mask=0.0037 obj_point=0.9013 prompt='computer tower'
 
 ```text
 outputs/latent_fusion_debug/visualizations/step_XXXXXX.png
+outputs/latent_fusion_debug/visualizations/step_XXXXXX_crops.png
 ```
 
 ## 当前边界

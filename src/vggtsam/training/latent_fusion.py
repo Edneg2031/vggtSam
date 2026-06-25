@@ -349,8 +349,19 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
         if config.visualize_every > 0 and (
             step % config.visualize_every == 0 or completed_steps == 1
         ):
+            viz_path = config.output_dir / "visualizations" / f"step_{step:06d}.png"
             save_mask_visualization(
-                config.output_dir / "visualizations" / f"step_{step:06d}.png",
+                viz_path,
+                image_paths=sequence.image_paths,
+                mask_logits=output.mask_logits[0].detach(),
+                batch=batch,
+                prompt=prompt_selection.prompt,
+                step=step,
+                max_objects=config.visualize_max_objects,
+                threshold=config.visualize_threshold,
+            )
+            save_mask_crop_visualization(
+                viz_path.with_name(f"step_{step:06d}_crops.png"),
                 image_paths=sequence.image_paths,
                 mask_logits=output.mask_logits[0].detach(),
                 batch=batch,
@@ -819,8 +830,11 @@ def save_mask_visualization(
         return
     query_indices = query_indices[: max(1, int(max_objects))]
 
-    frames, _, mask_h, mask_w = gt_masks.shape
-    panel_w, panel_h = int(mask_w), int(mask_h)
+    frames = gt_masks.shape[0]
+    first_image = Image.open(image_paths[0]).convert("RGB")
+    image_w, image_h = first_image.size
+    panel_w = min(640, image_w)
+    panel_h = max(1, int(round(image_h * panel_w / max(image_w, 1))))
     title_h = 24
     footer_h = 18
     margin = 6
@@ -850,10 +864,7 @@ def save_mask_visualization(
         legend_items.append(f"q{query_idx}:id{instance_id}")
 
     for frame_idx in range(frames):
-        base = Image.open(image_paths[frame_idx]).convert("RGB").resize(
-            (panel_w, panel_h),
-            Image.BILINEAR,
-        )
+        base = Image.open(image_paths[frame_idx]).convert("RGB")
         gt_overlay = overlay_query_masks(
             base,
             gt_masks[frame_idx],
@@ -868,12 +879,117 @@ def save_mask_visualization(
             colors=colors,
             threshold=threshold,
         )
+        base = base.resize((panel_w, panel_h), Image.BILINEAR)
+        gt_overlay = gt_overlay.resize((panel_w, panel_h), Image.NEAREST)
+        pred_overlay = pred_overlay.resize((panel_w, panel_h), Image.NEAREST)
         row_y = title_h + margin + frame_idx * (panel_h + footer_h + margin)
         for col, panel in enumerate([base, gt_overlay, pred_overlay]):
             x = margin + col * (panel_w + margin)
             canvas.paste(panel, (x, row_y))
         footer = f"frame {frame_idx}: " + ", ".join(legend_items)
         draw.text((margin, row_y + panel_h + 2), footer[:160], fill=(220, 220, 220))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path)
+
+
+def save_mask_crop_visualization(
+    path: Path,
+    *,
+    image_paths: Sequence[Path],
+    mask_logits: torch.Tensor,
+    batch: Dict[str, torch.Tensor],
+    prompt: str,
+    step: int,
+    max_objects: int,
+    threshold: float,
+    crop_size: int = 192,
+) -> None:
+    from PIL import Image, ImageDraw
+
+    pred_probs = mask_logits.sigmoid().detach().cpu()
+    gt_masks = batch["object_masks"].detach().cpu()
+    present = batch["object_present"].detach().cpu()
+    object_ids = batch["object_ids"].detach().cpu()
+    query_indices = present.any(dim=0).nonzero(as_tuple=False).flatten()
+    if query_indices.numel() == 0:
+        return
+    query_indices = query_indices[: max(1, int(max_objects))]
+
+    colors = visualization_palette()
+    crop_specs = []
+    frames = gt_masks.shape[0]
+    for query_idx in query_indices.tolist():
+        for frame_idx in range(frames):
+            if not bool(present[frame_idx, query_idx]):
+                continue
+            gt = gt_masks[frame_idx, query_idx].numpy() > 0.5
+            pred = pred_probs[frame_idx, query_idx].numpy() > threshold
+            bbox = mask_union_bbox(gt, pred, pad=8)
+            if bbox is None:
+                continue
+            crop_specs.append((frame_idx, query_idx, bbox))
+    if not crop_specs:
+        return
+
+    columns = 3
+    title_h = 26
+    label_h = 18
+    margin = 8
+    rows = len(crop_specs)
+    canvas_w = columns * crop_size + (columns + 1) * margin
+    canvas_h = title_h + rows * (crop_size + label_h + margin) + margin
+    canvas = Image.new("RGB", (canvas_w, canvas_h), color=(20, 20, 20))
+    draw = ImageDraw.Draw(canvas)
+    draw.text(
+        (margin, 5),
+        f"step={step} prompt='{prompt}' object crops",
+        fill=(240, 240, 240),
+    )
+    headings = ["RGB crop", "GT crop", "Pred crop"]
+    for col, heading in enumerate(headings):
+        draw.text(
+            (margin + col * (crop_size + margin), title_h - 14),
+            heading,
+            fill=(220, 220, 220),
+        )
+
+    for row_idx, (frame_idx, query_idx, bbox) in enumerate(crop_specs):
+        image = Image.open(image_paths[frame_idx]).convert("RGB")
+        gt_overlay = overlay_query_masks(
+            image,
+            gt_masks[frame_idx],
+            query_indices=[query_idx],
+            colors=colors,
+            threshold=0.5,
+        )
+        pred_overlay = overlay_query_masks(
+            image,
+            pred_probs[frame_idx],
+            query_indices=[query_idx],
+            colors=colors,
+            threshold=threshold,
+        )
+        image_bbox = scale_bbox(
+            bbox,
+            from_size=(gt_masks.shape[-1], gt_masks.shape[-2]),
+            to_size=image.size,
+        )
+        panels = [
+            image.crop(image_bbox).resize((crop_size, crop_size), Image.BILINEAR),
+            gt_overlay.crop(image_bbox).resize((crop_size, crop_size), Image.NEAREST),
+            pred_overlay.crop(image_bbox).resize((crop_size, crop_size), Image.NEAREST),
+        ]
+        y = title_h + margin + row_idx * (crop_size + label_h + margin)
+        for col, panel in enumerate(panels):
+            x = margin + col * (crop_size + margin)
+            canvas.paste(panel, (x, y))
+        instance_id = int(object_ids[query_idx].item())
+        draw.text(
+            (margin, y + crop_size + 2),
+            f"frame={frame_idx} query={query_idx} instance_id={instance_id}",
+            fill=(220, 220, 220),
+        )
 
     path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(path)
@@ -891,13 +1007,72 @@ def overlay_query_masks(
     from PIL import Image
 
     arr = np.asarray(image).astype(np.float32)
+    image_h, image_w = arr.shape[:2]
     for color_idx, query_idx in enumerate(query_indices):
         mask = masks[query_idx].numpy() > threshold
         if not mask.any():
             continue
+        if mask.shape != (image_h, image_w):
+            mask = resize_bool_mask(mask, (image_h, image_w))
         color = np.asarray(colors[color_idx % len(colors)], dtype=np.float32)
         arr[mask] = arr[mask] * (1.0 - alpha) + color * alpha
     return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+
+def resize_bool_mask(mask: np.ndarray, out_hw: tuple[int, int]) -> np.ndarray:
+    from PIL import Image
+
+    image = Image.fromarray(mask.astype(np.uint8) * 255)
+    image = image.resize((out_hw[1], out_hw[0]), Image.NEAREST)
+    return np.asarray(image) > 0
+
+
+def mask_union_bbox(
+    gt: np.ndarray,
+    pred: np.ndarray,
+    *,
+    pad: int,
+) -> tuple[int, int, int, int] | None:
+    union = gt | pred
+    if not union.any():
+        union = gt
+    if not union.any():
+        return None
+    ys, xs = np.where(union)
+    h, w = union.shape
+    x0 = max(int(xs.min()) - pad, 0)
+    y0 = max(int(ys.min()) - pad, 0)
+    x1 = min(int(xs.max()) + pad + 1, w)
+    y1 = min(int(ys.max()) + pad + 1, h)
+    side = max(x1 - x0, y1 - y0, 1)
+    cx = (x0 + x1) // 2
+    cy = (y0 + y1) // 2
+    x0 = max(cx - side // 2, 0)
+    y0 = max(cy - side // 2, 0)
+    x1 = min(x0 + side, w)
+    y1 = min(y0 + side, h)
+    x0 = max(x1 - side, 0)
+    y0 = max(y1 - side, 0)
+    return x0, y0, x1, y1
+
+
+def scale_bbox(
+    bbox: tuple[int, int, int, int],
+    *,
+    from_size: tuple[int, int],
+    to_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    from_w, from_h = from_size
+    to_w, to_h = to_size
+    x0, y0, x1, y1 = bbox
+    sx = to_w / max(float(from_w), 1.0)
+    sy = to_h / max(float(from_h), 1.0)
+    return (
+        max(int(round(x0 * sx)), 0),
+        max(int(round(y0 * sy)), 0),
+        min(int(round(x1 * sx)), to_w),
+        min(int(round(y1 * sy)), to_h),
+    )
 
 
 def visualization_palette() -> List[tuple[int, int, int]]:
