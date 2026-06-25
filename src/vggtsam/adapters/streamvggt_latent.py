@@ -16,7 +16,7 @@ from vggtsam.models.tokens import GeometryTokens
 @dataclass
 class StreamVGGTLatentOutput:
     geometry: GeometryTokens
-    pointmap_grid: torch.Tensor
+    pointmap_grid: Optional[torch.Tensor]
     confidence_grid: Optional[torch.Tensor] = None
     raw_output: Any = None
     aux: Dict[str, Any] = field(default_factory=dict)
@@ -61,6 +61,8 @@ class StreamVGGTLatentAdapter:
     def extract_from_paths(
         self,
         image_paths: Sequence[str | Path],
+        *,
+        return_pointmap: bool = True,
     ) -> StreamVGGTLatentOutput:
         from streamvggt.utils.load_fn import load_and_preprocess_images
 
@@ -68,10 +70,15 @@ class StreamVGGTLatentAdapter:
             [str(path) for path in image_paths],
             mode=self.image_mode,
         ).to(self.device)
-        return self.extract(images)
+        return self.extract(images, return_pointmap=return_pointmap)
 
     @torch.no_grad()
-    def extract(self, images: torch.Tensor) -> StreamVGGTLatentOutput:
+    def extract(
+        self,
+        images: torch.Tensor,
+        *,
+        return_pointmap: bool = True,
+    ) -> StreamVGGTLatentOutput:
         if images.ndim != 4:
             raise ValueError(f"Expected images [T, 3, H, W], got {tuple(images.shape)}")
         images = images.to(self.device)
@@ -95,7 +102,7 @@ class StreamVGGTLatentAdapter:
         pointmap_grid = None
         confidence_grid = None
         raw_output = None
-        if getattr(self.model, "point_head", None) is not None:
+        if return_pointmap and getattr(self.model, "point_head", None) is not None:
             with torch.cuda.amp.autocast(enabled=False):
                 pts3d, pts3d_conf = self.model.point_head(
                     aggregated_tokens_list,

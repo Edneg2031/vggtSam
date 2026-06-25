@@ -31,6 +31,7 @@ class ObjectSequence:
     instance_masks: List[np.ndarray]
     semantic_masks: List[np.ndarray]
     visible_instance_ids: List[List[int]]
+    pointmaps: Optional[List[np.ndarray]] = None
 
 
 class ScanNetPPObjectSequenceDataset:
@@ -55,7 +56,9 @@ class ScanNetPPObjectSequenceDataset:
         if scene_id is not None:
             scenes = [scene for scene in scenes if scene.get("scene_id") == scene_id]
         if not scenes:
-            raise ValueError(f"No scenes found in {self.manifest_path} for scene_id={scene_id!r}")
+            raise ValueError(
+                f"No scenes found in {self.manifest_path} for scene_id={scene_id!r}"
+            )
 
         self.scenes = scenes
         self.windows: List[Dict[str, Any]] = []
@@ -65,7 +68,9 @@ class ScanNetPPObjectSequenceDataset:
             if len(frames) < window_size:
                 continue
             for start in range(0, len(frames) - window_size + 1):
-                indices = [start + i * self.frame_stride for i in range(self.sequence_length)]
+                indices = [
+                    start + i * self.frame_stride for i in range(self.sequence_length)
+                ]
                 self.windows.append({"scene": scene, "indices": indices})
 
         if not self.windows:
@@ -87,6 +92,12 @@ class ScanNetPPObjectSequenceDataset:
         image_paths = [Path(frame["image_path"]) for frame in selected]
         instance_masks = [read_mask(frame["instance_mask"]) for frame in selected]
         semantic_masks = [read_mask(frame["semantic_mask"]) for frame in selected]
+        pointmap_paths = [frame.get("pointmap") for frame in selected]
+        pointmaps = (
+            [read_pointmap(path) for path in pointmap_paths]
+            if all(pointmap_paths)
+            else None
+        )
         visible_instance_ids = [
             filter_visible_instances(
                 inst,
@@ -101,6 +112,7 @@ class ScanNetPPObjectSequenceDataset:
             instance_masks=instance_masks,
             semantic_masks=semantic_masks,
             visible_instance_ids=visible_instance_ids,
+            pointmaps=pointmaps,
         )
 
     def sample(self, rng: random.Random) -> ObjectSequence:
@@ -110,6 +122,26 @@ class ScanNetPPObjectSequenceDataset:
 def read_mask(path: str | Path) -> np.ndarray:
     image = Image.open(path)
     return np.asarray(image)
+
+
+def read_pointmap(path: str | Path) -> np.ndarray:
+    payload = np.load(path)
+    if isinstance(payload, np.lib.npyio.NpzFile):
+        try:
+            if "pointmap" in payload.files:
+                pointmap = payload["pointmap"]
+            else:
+                pointmap = payload[payload.files[0]]
+        finally:
+            payload.close()
+    else:
+        pointmap = payload
+    pointmap = np.asarray(pointmap, dtype=np.float32)
+    if pointmap.ndim != 3 or pointmap.shape[-1] != 3:
+        raise ValueError(
+            f"Pointmap must have shape [H, W, 3], got {pointmap.shape}: {path}"
+        )
+    return pointmap
 
 
 def filter_visible_instances(

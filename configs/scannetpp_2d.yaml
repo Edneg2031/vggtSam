@@ -21,6 +21,7 @@ near: 0.001
 semantic_ignore_label: 65535
 save_visualizations: true
 save_raster: true
+save_pointmaps: true
 apply_anon_mask: true
 skip_existing: true
 dry_run: false

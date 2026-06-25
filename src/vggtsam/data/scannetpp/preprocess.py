@@ -23,7 +23,7 @@ from .io import (
     read_text_list,
     write_json,
 )
-from .rasterize import has_numba, rasterize_labels
+from .rasterize import has_numba, rasterize_labels_and_points
 from .visualize import colorize_ids, overlay_labels, save_rgb
 
 
@@ -46,6 +46,7 @@ class ScanNetPP2DConfig:
     semantic_ignore_label: int = 65535
     save_visualizations: bool = False
     save_raster: bool = True
+    save_pointmaps: bool = True
     apply_anon_mask: bool = True
     skip_existing: bool = True
     dry_run: bool = False
@@ -138,9 +139,10 @@ def _process_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
     out_scene_dir = config.output_root / scene_id
     semantic_dir = out_scene_dir / "semantic_masks"
     instance_dir = out_scene_dir / "instance_masks"
+    pointmap_dir = out_scene_dir / "pointmaps"
     raster_dir = out_scene_dir / "raster"
     viz_dir = out_scene_dir / "visualizations"
-    for path in [semantic_dir, instance_dir, raster_dir, viz_dir]:
+    for path in [semantic_dir, instance_dir, pointmap_dir, raster_dir, viz_dir]:
         path.mkdir(parents=True, exist_ok=True)
 
     print(f"\n[{scene_id}] loading mesh and annotations")
@@ -201,6 +203,7 @@ def _process_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
             face_instance_ids=face_instance_ids,
             semantic_dir=semantic_dir,
             instance_dir=instance_dir,
+            pointmap_dir=pointmap_dir,
             raster_dir=raster_dir,
             viz_dir=viz_dir,
             config=config,
@@ -225,6 +228,7 @@ def _process_frame(
     face_instance_ids: np.ndarray,
     semantic_dir: Path,
     instance_dir: Path,
+    pointmap_dir: Path,
     raster_dir: Path,
     viz_dir: Path,
     config: ScanNetPP2DConfig,
@@ -241,13 +245,21 @@ def _process_frame(
     stem = Path(frame_name).stem
     semantic_path = semantic_dir / f"{stem}.png"
     instance_path = instance_dir / f"{stem}.png"
+    pointmap_path = pointmap_dir / f"{stem}.npz"
     raster_path = raster_dir / f"{stem}.npz"
-    if config.skip_existing and semantic_path.exists() and instance_path.exists():
+    pointmap_exists = (not config.save_pointmaps) or pointmap_path.exists()
+    if (
+        config.skip_existing
+        and semantic_path.exists()
+        and instance_path.exists()
+        and pointmap_exists
+    ):
         return {
             "image_name": frame_name,
             "image_path": str(image_path),
             "semantic_mask": str(semantic_path),
             "instance_mask": str(instance_path),
+            "pointmap": str(pointmap_path) if pointmap_path.exists() else None,
             "raster": str(raster_path) if raster_path.exists() else None,
             "skipped_existing": True,
         }
@@ -267,7 +279,7 @@ def _process_frame(
         return None
     camera = cameras[colmap_image.camera_id].scaled_to(width, height)
 
-    semantic, instance, pix_to_face, zbuf = rasterize_labels(
+    semantic, instance, pix_to_face, zbuf, pointmap = rasterize_labels_and_points(
         vertices,
         faces,
         face_semantic_ids,
@@ -288,9 +300,18 @@ def _process_frame(
                 invalid = anon == 0
                 semantic[invalid] = config.semantic_ignore_label
                 instance[invalid] = 0
+                pointmap[invalid] = np.nan
 
     _write_uint16_png(semantic_path, semantic, config.semantic_ignore_label)
     _write_uint16_png(instance_path, instance, 0)
+
+    if config.save_pointmaps:
+        pointmap_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            pointmap_path,
+            pointmap=pointmap.astype(np.float32),
+            valid=np.isfinite(pointmap).all(axis=-1),
+        )
 
     if config.save_raster:
         raster_path.parent.mkdir(parents=True, exist_ok=True)
@@ -314,18 +335,21 @@ def _process_frame(
 
     valid_semantic = semantic != config.semantic_ignore_label
     valid_instance = instance > 0
+    valid_pointmap = np.isfinite(pointmap).all(axis=-1)
     visible_instances = sorted(int(v) for v in np.unique(instance[valid_instance]))
     return {
         "image_name": frame_name,
         "image_path": str(image_path),
         "semantic_mask": str(semantic_path),
         "instance_mask": str(instance_path),
+        "pointmap": str(pointmap_path) if config.save_pointmaps else None,
         "raster": str(raster_path) if config.save_raster else None,
         "width": int(width),
         "height": int(height),
         "camera_id": int(colmap_image.camera_id),
         "semantic_pixels": int(valid_semantic.sum()),
         "instance_pixels": int(valid_instance.sum()),
+        "pointmap_pixels": int(valid_pointmap.sum()),
         "visible_instance_ids": visible_instances,
     }
 
@@ -488,6 +512,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     raster.add_argument("--save-raster", dest="save_raster", action="store_true")
     raster.add_argument("--no-raster", dest="save_raster", action="store_false")
     parser.set_defaults(save_raster=None)
+
+    pointmaps = parser.add_mutually_exclusive_group()
+    pointmaps.add_argument(
+        "--save-pointmaps", dest="save_pointmaps", action="store_true"
+    )
+    pointmaps.add_argument(
+        "--no-pointmaps", dest="save_pointmaps", action="store_false"
+    )
+    parser.set_defaults(save_pointmaps=None)
 
     anon = parser.add_mutually_exclusive_group()
     anon.add_argument("--apply-anon-mask", dest="apply_anon_mask", action="store_true")

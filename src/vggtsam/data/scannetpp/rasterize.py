@@ -28,6 +28,35 @@ def rasterize_labels(
     semantic_ignore_label: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Rasterize face semantic and instance IDs to an image grid."""
+    semantic, instance, pix_to_face, zbuf, _ = rasterize_labels_and_points(
+        vertices,
+        faces,
+        face_semantic_ids,
+        face_instance_ids,
+        world_to_camera,
+        camera,
+        height=height,
+        width=width,
+        near=near,
+        semantic_ignore_label=semantic_ignore_label,
+    )
+    return semantic, instance, pix_to_face, zbuf
+
+
+def rasterize_labels_and_points(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    face_semantic_ids: np.ndarray,
+    face_instance_ids: np.ndarray,
+    world_to_camera: np.ndarray,
+    camera: Camera,
+    *,
+    height: int,
+    width: int,
+    near: float,
+    semantic_ignore_label: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Rasterize labels plus visible world-space surface coordinates."""
     uv, z = project_points(vertices, world_to_camera, camera)
     tri_uv = uv[faces]
     tri_z = z[faces]
@@ -51,17 +80,20 @@ def rasterize_labels(
             np.zeros((height, width), dtype=np.int32),
             np.full((height, width), -1, dtype=np.int32),
             np.full((height, width), np.inf, dtype=np.float32),
+            np.full((height, width, 3), np.nan, dtype=np.float32),
         )
 
     face_ids = np.nonzero(keep)[0].astype(np.int32)
     tri_data = np.concatenate([tri_uv[keep], tri_z[keep, :, None]], axis=2).astype(
         np.float32
     )
+    point_data = vertices[faces][keep].astype(np.float32)
     sem = face_semantic_ids[keep].astype(np.int32)
     inst = face_instance_ids[keep].astype(np.int32)
 
     return _rasterize_dispatch(
         tri_data,
+        point_data,
         sem,
         inst,
         face_ids,
@@ -73,21 +105,24 @@ def rasterize_labels(
 
 def _rasterize_dispatch(
     triangles: np.ndarray,
+    point_triangles: np.ndarray,
     semantic_ids: np.ndarray,
     instance_ids: np.ndarray,
     face_ids: np.ndarray,
     height: int,
     width: int,
     semantic_ignore_label: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     zbuf = np.full((height, width), np.inf, dtype=np.float32)
     semantic = np.full((height, width), semantic_ignore_label, dtype=np.int32)
     instance = np.zeros((height, width), dtype=np.int32)
     pix_to_face = np.full((height, width), -1, dtype=np.int32)
+    pointmap = np.full((height, width, 3), np.nan, dtype=np.float32)
 
     if _rasterize_triangles_numba is not None:
         _rasterize_triangles_numba(
             triangles,
+            point_triangles,
             semantic_ids,
             instance_ids,
             face_ids,
@@ -95,10 +130,12 @@ def _rasterize_dispatch(
             semantic,
             instance,
             pix_to_face,
+            pointmap,
         )
     else:
         _rasterize_triangles_python(
             triangles,
+            point_triangles,
             semantic_ids,
             instance_ids,
             face_ids,
@@ -106,12 +143,14 @@ def _rasterize_dispatch(
             semantic,
             instance,
             pix_to_face,
+            pointmap,
         )
-    return semantic, instance, pix_to_face, zbuf
+    return semantic, instance, pix_to_face, zbuf, pointmap
 
 
 def _rasterize_triangles_python(
     triangles: np.ndarray,
+    point_triangles: np.ndarray,
     semantic_ids: np.ndarray,
     instance_ids: np.ndarray,
     face_ids: np.ndarray,
@@ -119,11 +158,13 @@ def _rasterize_triangles_python(
     semantic: np.ndarray,
     instance: np.ndarray,
     pix_to_face: np.ndarray,
+    pointmap: np.ndarray,
 ) -> None:
     height, width = zbuf.shape
     for tri_idx in range(triangles.shape[0]):
         _rasterize_one(
             triangles[tri_idx],
+            point_triangles[tri_idx],
             int(semantic_ids[tri_idx]),
             int(instance_ids[tri_idx]),
             int(face_ids[tri_idx]),
@@ -131,6 +172,7 @@ def _rasterize_triangles_python(
             semantic,
             instance,
             pix_to_face,
+            pointmap,
             height,
             width,
         )
@@ -138,6 +180,7 @@ def _rasterize_triangles_python(
 
 def _rasterize_one(
     tri: np.ndarray,
+    point_tri: np.ndarray,
     semantic_id: int,
     instance_id: int,
     face_id: int,
@@ -145,6 +188,7 @@ def _rasterize_one(
     semantic: np.ndarray,
     instance: np.ndarray,
     pix_to_face: np.ndarray,
+    pointmap: np.ndarray,
     height: int,
     width: int,
 ) -> None:
@@ -179,6 +223,15 @@ def _rasterize_one(
             semantic[py, px] = semantic_id
             instance[py, px] = instance_id
             pix_to_face[py, px] = face_id
+            pointmap[py, px, 0] = (
+                w0 * point_tri[0, 0] + w1 * point_tri[1, 0] + w2 * point_tri[2, 0]
+            )
+            pointmap[py, px, 1] = (
+                w0 * point_tri[0, 1] + w1 * point_tri[1, 1] + w2 * point_tri[2, 1]
+            )
+            pointmap[py, px, 2] = (
+                w0 * point_tri[0, 2] + w1 * point_tri[1, 2] + w2 * point_tri[2, 2]
+            )
 
 
 if njit is not None:
@@ -186,6 +239,7 @@ if njit is not None:
     @njit(cache=True)
     def _rasterize_triangles_numba(
         triangles,
+        point_triangles,
         semantic_ids,
         instance_ids,
         face_ids,
@@ -193,11 +247,13 @@ if njit is not None:
         semantic,
         instance,
         pix_to_face,
+        pointmap,
     ):
         height = zbuf.shape[0]
         width = zbuf.shape[1]
         for tri_idx in range(triangles.shape[0]):
             tri = triangles[tri_idx]
+            point_tri = point_triangles[tri_idx]
             x0 = float(tri[0, 0])
             y0 = float(tri[0, 1])
             z0 = float(tri[0, 2])
@@ -239,6 +295,21 @@ if njit is not None:
                     semantic[py, px] = semantic_ids[tri_idx]
                     instance[py, px] = instance_ids[tri_idx]
                     pix_to_face[py, px] = face_ids[tri_idx]
+                    pointmap[py, px, 0] = (
+                        w0 * point_tri[0, 0]
+                        + w1 * point_tri[1, 0]
+                        + w2 * point_tri[2, 0]
+                    )
+                    pointmap[py, px, 1] = (
+                        w0 * point_tri[0, 1]
+                        + w1 * point_tri[1, 1]
+                        + w2 * point_tri[2, 1]
+                    )
+                    pointmap[py, px, 2] = (
+                        w0 * point_tri[0, 2]
+                        + w1 * point_tri[1, 2]
+                        + w2 * point_tri[2, 2]
+                    )
 
 else:
     _rasterize_triangles_numba = None

@@ -59,6 +59,7 @@ class LatentFusionTrainConfig:
     context_grid: tuple[int, int]
     streamvggt_layer_index: int
     streamvggt_image_mode: str
+    point_target_source: str
     d_fuse: int
     num_heads: int
     num_classes: int
@@ -138,23 +139,31 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
 
     for step in range(1, config.iterations + 1):
         sequence = dataset.sample(rng)
+        need_streamvggt_pointmap = should_request_streamvggt_pointmap(
+            config.point_target_source,
+            has_gt_pointmaps=sequence.pointmaps is not None,
+        )
         with torch.no_grad():
             sam_out = sam3.extract_from_paths(
                 sequence.image_paths,
                 prompt=config.sam3_prompt,
             )
-            geo_out = geometry.extract_from_paths(sequence.image_paths)
-            if geo_out.pointmap_grid is None:
-                raise RuntimeError(
-                    "Current latent fusion training requires StreamVGGT point_head "
-                    "outputs as pointmap pseudo targets."
-                )
+            geo_out = geometry.extract_from_paths(
+                sequence.image_paths,
+                return_pointmap=need_streamvggt_pointmap,
+            )
+            pointmap_grid = resolve_point_targets(
+                sequence.pointmaps,
+                geo_out.pointmap_grid,
+                token_grid=config.token_grid,
+                source=config.point_target_source,
+            )
 
         batch = build_latent_batch(
             sequence.instance_masks,
             sequence.semantic_masks,
             sequence.visible_instance_ids,
-            pointmap_grid=geo_out.pointmap_grid,
+            pointmap_grid=pointmap_grid,
             token_grid=config.token_grid,
             min_visible_frames=config.min_visible_frames,
             ignore_instance_id=config.ignore_instance_id,
@@ -305,6 +314,11 @@ def build_latent_batch(
     device: str,
 ) -> Dict[str, torch.Tensor] | None:
     token_h, token_w = token_grid
+    expected_shape = (len(instance_masks), token_h, token_w, 3)
+    if tuple(pointmap_grid.shape) != expected_shape:
+        raise ValueError(
+            f"pointmap_grid must have shape {expected_shape}, got {tuple(pointmap_grid.shape)}"
+        )
     keep_per_frame = keep_instances_visible_in_multiple_frames(
         [list(ids) for ids in visible_instance_ids],
         min_visible_frames=min_visible_frames,
@@ -363,6 +377,83 @@ def build_latent_batch(
         "valid_tokens": valid,
         "point_targets": points,
     }
+
+
+def resolve_point_targets(
+    gt_pointmaps: Sequence[np.ndarray] | None,
+    streamvggt_pointmap_grid: torch.Tensor | None,
+    *,
+    token_grid: tuple[int, int],
+    source: str,
+) -> torch.Tensor:
+    source = source.lower()
+    if source in {"gt", "colmap", "mesh"}:
+        if gt_pointmaps is None:
+            raise RuntimeError(
+                "point_target_source is set to 'gt', but the selected frames do not "
+                "have pointmap entries. Re-run scripts/prepare_scannetpp_2d.py with "
+                "--save-pointmaps or set geometry.point_target_source to 'streamvggt' "
+                "for the old pseudo-target baseline."
+            )
+        return torch.from_numpy(pool_pointmaps_to_grid(gt_pointmaps, token_grid))
+    if source in {"streamvggt", "pseudo"}:
+        if streamvggt_pointmap_grid is None:
+            raise RuntimeError("StreamVGGT did not return a pointmap_grid.")
+        return streamvggt_pointmap_grid.detach().cpu()
+    if source == "auto":
+        if gt_pointmaps is not None:
+            return torch.from_numpy(pool_pointmaps_to_grid(gt_pointmaps, token_grid))
+        if streamvggt_pointmap_grid is not None:
+            return streamvggt_pointmap_grid.detach().cpu()
+        raise RuntimeError(
+            "No point targets are available: missing dataset pointmaps and "
+            "StreamVGGT pointmap_grid."
+        )
+    raise ValueError(
+        "geometry.point_target_source must be one of 'gt', 'streamvggt', or 'auto', "
+        f"got {source!r}"
+    )
+
+
+def should_request_streamvggt_pointmap(
+    source: str,
+    *,
+    has_gt_pointmaps: bool,
+) -> bool:
+    source = source.lower()
+    if source in {"streamvggt", "pseudo"}:
+        return True
+    if source == "auto":
+        return not has_gt_pointmaps
+    return False
+
+
+def pool_pointmaps_to_grid(
+    pointmaps: Sequence[np.ndarray],
+    out_hw: tuple[int, int],
+) -> np.ndarray:
+    out_h, out_w = out_hw
+    pooled = np.full((len(pointmaps), out_h, out_w, 3), np.nan, dtype=np.float32)
+    for frame_idx, pointmap in enumerate(pointmaps):
+        pointmap = np.asarray(pointmap, dtype=np.float32)
+        if pointmap.ndim != 3 or pointmap.shape[-1] != 3:
+            raise ValueError(
+                f"Pointmap must have shape [H, W, 3], got {pointmap.shape}"
+            )
+        src_h, src_w = pointmap.shape[:2]
+        for y in range(out_h):
+            y0 = int(math.floor(y * src_h / out_h))
+            y1 = int(math.floor((y + 1) * src_h / out_h))
+            y1 = max(y1, y0 + 1)
+            for x in range(out_w):
+                x0 = int(math.floor(x * src_w / out_w))
+                x1 = int(math.floor((x + 1) * src_w / out_w))
+                x1 = max(x1, x0 + 1)
+                patch = pointmap[y0:y1, x0:x1]
+                valid = np.isfinite(patch).all(axis=-1)
+                if valid.any():
+                    pooled[frame_idx, y, x] = patch[valid].mean(axis=0)
+    return pooled
 
 
 def majority_pool_mask(

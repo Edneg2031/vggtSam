@@ -32,9 +32,13 @@ data/processed/scannetpp_2d/
     scene_manifest.json
     semantic_masks/
     instance_masks/
+    pointmaps/
     raster/
     visualizations/
 ```
+
+`pointmaps/*.npz` stores COLMAP/mesh-rasterized visible world-space XYZ
+targets. The latent fusion trainer uses these as the default point supervision.
 
 More details:
 
