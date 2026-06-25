@@ -43,6 +43,7 @@ class LatentFusionTrainConfig:
     ignore_instance_id: int
     semantic_ignore_label: int
     excluded_semantic_labels: List[int]
+    target_object_labels: List[str]
     min_token_majority: float
     min_tokens_per_instance: int
     max_match_tokens: int
@@ -63,10 +64,17 @@ class LatentFusionTrainConfig:
     d_fuse: int
     num_heads: int
     num_classes: int
+    num_queries: int
+    mask_grid: tuple[int, int]
     dropout: float
     semantic_weight: float
     point_weight: float
     match_weight: float
+    object_semantic_weight: float
+    object_mask_weight: float
+    object_dice_weight: float
+    object_point_weight: float
+    object_match_weight: float
     temperature: float
     device: str
     iterations: int
@@ -163,12 +171,16 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
             sequence.instance_masks,
             sequence.semantic_masks,
             sequence.visible_instance_ids,
+            sequence.object_labels,
             pointmap_grid=pointmap_grid,
             token_grid=config.token_grid,
+            mask_grid=config.mask_grid,
+            num_queries=config.num_queries,
             min_visible_frames=config.min_visible_frames,
             ignore_instance_id=config.ignore_instance_id,
             semantic_ignore_label=config.semantic_ignore_label,
             excluded_semantic_labels=config.excluded_semantic_labels,
+            target_object_labels=config.target_object_labels,
             min_token_majority=config.min_token_majority,
             min_tokens_per_instance=config.min_tokens_per_instance,
             max_area_ratio=config.max_area_ratio,
@@ -194,6 +206,9 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
                 num_heads=config.num_heads,
                 num_classes=config.num_classes,
                 dropout=config.dropout,
+                token_grid=config.token_grid,
+                mask_grid=config.mask_grid,
+                num_queries=config.num_queries,
             ).to(config.device)
             optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
             print(
@@ -210,6 +225,7 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
                 if geo_out.geometry.camera_tokens is not None
                 else None
             ),
+            num_frames=config.sequence_length,
         )
 
         valid = batch["valid_tokens"]
@@ -232,10 +248,30 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
             batch["frame_ids"][match_indices],
             temperature=config.temperature,
         )
+        if (
+            output.object_logits is None
+            or output.object_points is None
+            or output.object_embeddings is None
+            or output.mask_logits is None
+        ):
+            raise RuntimeError("LatentSAMVGGTModel did not return object outputs.")
+        object_losses = compute_object_losses(
+            output.object_logits[0],
+            output.object_points[0],
+            output.object_embeddings[0],
+            output.mask_logits[0],
+            batch,
+            temperature=config.temperature,
+        )
         loss = (
             config.semantic_weight * semantic_loss
             + config.point_weight * point_loss
             + config.match_weight * match_loss
+            + config.object_semantic_weight * object_losses["object_semantic_loss"]
+            + config.object_mask_weight * object_losses["object_mask_loss"]
+            + config.object_dice_weight * object_losses["object_dice_loss"]
+            + config.object_point_weight * object_losses["object_point_loss"]
+            + config.object_match_weight * object_losses["object_match_loss"]
         )
 
         optimizer.zero_grad(set_to_none=True)
@@ -250,9 +286,21 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
             "semantic_loss": float(semantic_loss.detach().cpu()),
             "point_loss": float(point_loss.detach().cpu()),
             "match_loss": float(match_loss.detach().cpu()),
+            "object_semantic_loss": float(
+                object_losses["object_semantic_loss"].detach().cpu()
+            ),
+            "object_mask_loss": float(object_losses["object_mask_loss"].detach().cpu()),
+            "object_dice_loss": float(object_losses["object_dice_loss"].detach().cpu()),
+            "object_point_loss": float(
+                object_losses["object_point_loss"].detach().cpu()
+            ),
+            "object_match_loss": float(
+                object_losses["object_match_loss"].detach().cpu()
+            ),
             "num_tokens": int(valid.sum().item()),
             "num_match_tokens": int(match_indices.numel()),
             "num_instances": int(batch["instance_ids"][valid].unique().numel()),
+            "num_objects": int(batch["object_present"].any(dim=0).sum().item()),
         }
         append_metric(metrics_path, row)
 
@@ -260,8 +308,9 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
             print(
                 "step={step} loss={loss:.4f} semantic={semantic_loss:.4f} "
                 "point={point_loss:.4f} match={match_loss:.4f} "
+                "obj_mask={object_mask_loss:.4f} obj_point={object_point_loss:.4f} "
                 "tokens={num_tokens} match_tokens={num_match_tokens} "
-                "instances={num_instances}".format(**row)
+                "instances={num_instances} objects={num_objects}".format(**row)
             )
         if step % config.save_every == 0:
             save_checkpoint(
@@ -300,13 +349,17 @@ def build_latent_batch(
     instance_masks: Sequence[np.ndarray],
     semantic_masks: Sequence[np.ndarray],
     visible_instance_ids: Sequence[Sequence[int]],
+    object_labels: Dict[int, str],
     *,
     pointmap_grid: torch.Tensor,
     token_grid: tuple[int, int],
+    mask_grid: tuple[int, int],
+    num_queries: int,
     min_visible_frames: int,
     ignore_instance_id: int,
     semantic_ignore_label: int,
     excluded_semantic_labels: Sequence[int],
+    target_object_labels: Sequence[str],
     min_token_majority: float,
     min_tokens_per_instance: int,
     max_area_ratio: float,
@@ -329,10 +382,14 @@ def build_latent_batch(
     instance_ids = []
     frame_ids = []
     valid_masks = []
+    instance_grids = []
+    semantic_grids = []
 
     for frame_idx, (inst_np, sem_np) in enumerate(zip(instance_masks, semantic_masks)):
         inst_grid, inst_ratio = majority_pool_mask(inst_np, token_grid)
         sem_grid, sem_ratio = majority_pool_mask(sem_np, token_grid)
+        instance_grids.append(inst_grid)
+        semantic_grids.append(sem_grid)
 
         valid = inst_grid != ignore_instance_id
         valid &= inst_ratio >= min_token_majority
@@ -370,13 +427,243 @@ def build_latent_batch(
     if not valid.any():
         return None
 
+    object_targets = build_object_targets(
+        instance_masks,
+        semantic_masks,
+        instance_grids,
+        semantic_grids,
+        pointmap_grid,
+        keep_per_frame,
+        object_labels,
+        mask_grid=mask_grid,
+        num_queries=num_queries,
+        semantic_ignore_label=semantic_ignore_label,
+        target_object_labels=target_object_labels,
+        num_classes=num_classes,
+        device=device,
+    )
+    if object_targets is None:
+        return None
+
     return {
         "semantic_labels": labels,
         "instance_ids": instances,
         "frame_ids": frames,
         "valid_tokens": valid,
         "point_targets": points,
+        **object_targets,
     }
+
+
+def build_object_targets(
+    instance_masks: Sequence[np.ndarray],
+    semantic_masks: Sequence[np.ndarray],
+    instance_grids: Sequence[np.ndarray],
+    semantic_grids: Sequence[np.ndarray],
+    pointmap_grid: torch.Tensor,
+    keep_per_frame: Sequence[set[int]],
+    object_labels: Dict[int, str],
+    *,
+    mask_grid: tuple[int, int],
+    num_queries: int,
+    semantic_ignore_label: int,
+    target_object_labels: Sequence[str],
+    num_classes: int,
+    device: str,
+) -> Dict[str, torch.Tensor] | None:
+    label_filters = normalize_label_filters(target_object_labels)
+    clip_instance_ids = sorted(
+        {
+            int(instance_id)
+            for frame_ids in keep_per_frame
+            for instance_id in frame_ids
+            if label_matches(object_labels.get(int(instance_id)), label_filters)
+        }
+    )[:num_queries]
+    if not clip_instance_ids:
+        return None
+
+    frames = len(instance_masks)
+    mask_h, mask_w = mask_grid
+    object_present = torch.zeros((frames, num_queries), dtype=torch.bool, device=device)
+    object_masks = torch.zeros(
+        (frames, num_queries, mask_h, mask_w),
+        dtype=torch.float32,
+        device=device,
+    )
+    object_semantic_labels = torch.full(
+        (frames, num_queries),
+        -1,
+        dtype=torch.long,
+        device=device,
+    )
+    object_centroids = torch.full(
+        (frames, num_queries, 3),
+        float("nan"),
+        dtype=torch.float32,
+        device=device,
+    )
+    object_ids = torch.zeros((num_queries,), dtype=torch.long, device=device)
+    object_ids[: len(clip_instance_ids)] = torch.tensor(
+        clip_instance_ids,
+        dtype=torch.long,
+        device=device,
+    )
+
+    pointmap_np = pointmap_grid.detach().cpu().numpy()
+    for frame_idx, (inst_np, sem_np, inst_grid, sem_grid) in enumerate(
+        zip(instance_masks, semantic_masks, instance_grids, semantic_grids)
+    ):
+        visible = keep_per_frame[frame_idx]
+        for query_idx, instance_id in enumerate(clip_instance_ids):
+            if instance_id not in visible:
+                continue
+            full_mask = inst_np == instance_id
+            if not full_mask.any():
+                continue
+            semantic_label = majority_label_for_instance(
+                sem_np,
+                full_mask,
+                ignore_label=semantic_ignore_label,
+                num_classes=num_classes,
+            )
+            if semantic_label is None:
+                continue
+
+            object_present[frame_idx, query_idx] = True
+            object_masks[frame_idx, query_idx] = resize_binary_mask(
+                full_mask, mask_grid
+            ).to(device)
+            object_semantic_labels[frame_idx, query_idx] = int(semantic_label)
+
+            token_mask = (inst_grid == instance_id) & (sem_grid != semantic_ignore_label)
+            points = pointmap_np[frame_idx][token_mask]
+            finite = np.isfinite(points).all(axis=-1)
+            if finite.any():
+                object_centroids[frame_idx, query_idx] = torch.from_numpy(
+                    points[finite].mean(axis=0).astype(np.float32)
+                ).to(device)
+
+    if not object_present.any():
+        return None
+    return {
+        "object_present": object_present,
+        "object_masks": object_masks,
+        "object_semantic_labels": object_semantic_labels,
+        "object_centroids": object_centroids,
+        "object_ids": object_ids,
+    }
+
+
+def normalize_label_filters(labels: Sequence[str]) -> List[str]:
+    return [str(label).strip().lower() for label in labels if str(label).strip()]
+
+
+def label_matches(label: str | None, filters: Sequence[str]) -> bool:
+    if not filters:
+        return True
+    if label is None:
+        return False
+    normalized = label.strip().lower()
+    return any(item in normalized for item in filters)
+
+
+def majority_label_for_instance(
+    semantic_mask: np.ndarray,
+    instance_mask: np.ndarray,
+    *,
+    ignore_label: int,
+    num_classes: int,
+) -> int | None:
+    values = semantic_mask[instance_mask]
+    values = values[(values != ignore_label) & (values >= 0) & (values < num_classes)]
+    if values.size == 0:
+        return None
+    labels, counts = np.unique(values, return_counts=True)
+    return int(labels[int(counts.argmax())])
+
+
+def resize_binary_mask(mask: np.ndarray, out_hw: tuple[int, int]) -> torch.Tensor:
+    tensor = torch.from_numpy(mask.astype(np.float32))[None, None]
+    resized = F.interpolate(tensor, size=out_hw, mode="nearest")
+    return resized[0, 0]
+
+
+def compute_object_losses(
+    object_logits: torch.Tensor,
+    object_points: torch.Tensor,
+    object_embeddings: torch.Tensor,
+    mask_logits: torch.Tensor,
+    batch: Dict[str, torch.Tensor],
+    *,
+    temperature: float,
+) -> Dict[str, torch.Tensor]:
+    present = batch["object_present"]
+    zero = object_logits.sum() * 0.0
+    if not present.any():
+        return {
+            "object_semantic_loss": zero,
+            "object_mask_loss": zero,
+            "object_dice_loss": zero,
+            "object_point_loss": zero,
+            "object_match_loss": zero,
+        }
+
+    labels = batch["object_semantic_labels"]
+    object_semantic_loss = F.cross_entropy(object_logits[present], labels[present])
+    object_mask_loss = F.binary_cross_entropy_with_logits(
+        mask_logits[present],
+        batch["object_masks"][present],
+    )
+    object_dice_loss = dice_loss_with_logits(
+        mask_logits[present],
+        batch["object_masks"][present],
+    )
+
+    centroids = batch["object_centroids"]
+    finite_centroids = present & torch.isfinite(centroids).all(dim=-1)
+    if finite_centroids.any():
+        object_point_loss = F.smooth_l1_loss(
+            object_points[finite_centroids],
+            centroids[finite_centroids],
+        )
+    else:
+        object_point_loss = object_points.sum() * 0.0
+
+    frames, queries = present.shape
+    frame_ids = (
+        torch.arange(frames, device=present.device)[:, None]
+        .expand(frames, queries)
+        .reshape(-1)
+    )
+    object_ids = batch["object_ids"][None].expand(frames, queries).reshape(-1)
+    present_flat = present.reshape(-1)
+    object_match_loss = cross_frame_contrastive_loss(
+        object_embeddings.reshape(frames * queries, -1)[present_flat],
+        object_ids[present_flat],
+        frame_ids[present_flat],
+        temperature=temperature,
+    )
+    return {
+        "object_semantic_loss": object_semantic_loss,
+        "object_mask_loss": object_mask_loss,
+        "object_dice_loss": object_dice_loss,
+        "object_point_loss": object_point_loss,
+        "object_match_loss": object_match_loss,
+    }
+
+
+def dice_loss_with_logits(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    probs = logits.sigmoid().flatten(1)
+    targets = targets.flatten(1)
+    intersection = (probs * targets).sum(dim=1)
+    union = probs.sum(dim=1) + targets.sum(dim=1)
+    return (1.0 - (2.0 * intersection + eps) / (union + eps)).mean()
 
 
 def resolve_point_targets(
@@ -564,9 +851,15 @@ def write_metrics_header(path: Path) -> None:
                 "semantic_loss",
                 "point_loss",
                 "match_loss",
+                "object_semantic_loss",
+                "object_mask_loss",
+                "object_dice_loss",
+                "object_point_loss",
+                "object_match_loss",
                 "num_tokens",
                 "num_match_tokens",
                 "num_instances",
+                "num_objects",
             ],
         )
         writer.writeheader()

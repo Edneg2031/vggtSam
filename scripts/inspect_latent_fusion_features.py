@@ -66,6 +66,9 @@ def main() -> None:
     print(f"scene={sequence.scene_id} frames={sequence.frame_indices}")
     for path in sequence.image_paths:
         print(f"  {path}")
+    print(f"pointmaps_available={sequence.pointmaps is not None}")
+    label_preview = sorted(sequence.object_labels.items())[:20]
+    print(f"object_label_preview={label_preview}")
 
     sam3_model = load_sam3_image_model(
         repo_path=config.sam3_repo,

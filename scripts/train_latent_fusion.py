@@ -67,6 +67,9 @@ def build_train_config(raw: dict) -> LatentFusionTrainConfig:
         excluded_semantic_labels=[
             int(label) for label in objects.get("excluded_semantic_labels", [])
         ],
+        target_object_labels=[
+            str(label) for label in objects.get("target_object_labels", [])
+        ],
         min_token_majority=float(objects["min_token_majority"]),
         min_tokens_per_instance=int(objects["min_tokens_per_instance"]),
         max_match_tokens=int(objects["max_match_tokens"]),
@@ -89,10 +92,17 @@ def build_train_config(raw: dict) -> LatentFusionTrainConfig:
         d_fuse=int(model["d_fuse"]),
         num_heads=int(model["num_heads"]),
         num_classes=int(model["num_classes"]),
+        num_queries=int(model.get("num_queries", 32)),
+        mask_grid=tuple(int(v) for v in model.get("mask_grid", [144, 144])),
         dropout=float(model.get("dropout", 0.0)),
         semantic_weight=float(loss["semantic_weight"]),
         point_weight=float(loss["point_weight"]),
         match_weight=float(loss["match_weight"]),
+        object_semantic_weight=float(loss.get("object_semantic_weight", 1.0)),
+        object_mask_weight=float(loss.get("object_mask_weight", 1.0)),
+        object_dice_weight=float(loss.get("object_dice_weight", 1.0)),
+        object_point_weight=float(loss.get("object_point_weight", 1.0)),
+        object_match_weight=float(loss.get("object_match_weight", 0.5)),
         temperature=float(loss["temperature"]),
         device=training["device"],
         iterations=int(training["iterations"]),

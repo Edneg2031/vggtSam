@@ -61,6 +61,7 @@ cross-attention fusion
   -> semantic logits
   -> pointmap prediction
   -> cross-frame matching embeddings
+  -> object query masks / centroids / association embeddings
 ```
 
 Inspect feature shapes first:
@@ -79,6 +80,17 @@ PYTHONPATH=src python scripts/train_latent_fusion.py \
   --iterations 20 \
   --device cuda
 ```
+
+The default config is a chair-focused single-GPU experiment:
+
+```text
+sam3.prompt: chair
+objects.target_object_labels: [chair]
+model.mask_grid: [144, 144]
+```
+
+Set `objects.target_object_labels: []` to train all valid small objects if the
+ScanNet++ object metadata labels do not match `chair` on your processed scene.
 
 Plot training curves:
 

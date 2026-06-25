@@ -18,6 +18,9 @@ objects:
   # Fill this once the ScanNet++ semantic id mapping is confirmed.
   # The area filter already suppresses most wall/floor/ceiling tokens.
   excluded_semantic_labels: []
+  # Object-level mask/point/association targets are filtered by ScanNet++ object
+  # metadata label. Set [] to train all valid small objects.
+  target_object_labels: [chair]
   # Token-grid supervision is used only when a pooled cell has a clean majority.
   min_token_majority: 0.55
   min_tokens_per_instance: 2
@@ -26,7 +29,7 @@ objects:
 sam3:
   repo: externals/sam3
   checkpoint: /home/bod/86Nas/95_data_bak/FoundationModels/sam3/sam3.pt
-  prompt: object
+  prompt: chair
   resolution: 1008
   # Choices implemented: detector_fpn2, detector_fpn1, detector_fpn0,
   # vision_features, tracker_fpn2.
@@ -52,12 +55,21 @@ model:
   d_fuse: 256
   num_heads: 8
   num_classes: 1024
+  num_queries: 32
+  # Object masks are decoded above the 72x72 fusion grid. 144x144 is the first
+  # single-3090 friendly setting; try [288, 288] after the 144 baseline runs.
+  mask_grid: [144, 144]
   dropout: 0.0
 
 loss:
   semantic_weight: 1.0
   point_weight: 1.0
   match_weight: 0.5
+  object_semantic_weight: 1.0
+  object_mask_weight: 1.0
+  object_dice_weight: 1.0
+  object_point_weight: 1.0
+  object_match_weight: 0.5
   temperature: 0.07
 
 training:

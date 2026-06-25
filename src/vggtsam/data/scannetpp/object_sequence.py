@@ -31,6 +31,7 @@ class ObjectSequence:
     instance_masks: List[np.ndarray]
     semantic_masks: List[np.ndarray]
     visible_instance_ids: List[List[int]]
+    object_labels: Dict[int, str]
     pointmaps: Optional[List[np.ndarray]] = None
 
 
@@ -105,6 +106,7 @@ class ScanNetPPObjectSequenceDataset:
             )
             for inst in instance_masks
         ]
+        object_labels = extract_object_labels(scene.get("objects", {}))
         return ObjectSequence(
             scene_id=scene["scene_id"],
             frame_indices=frame_indices,
@@ -112,6 +114,7 @@ class ScanNetPPObjectSequenceDataset:
             instance_masks=instance_masks,
             semantic_masks=semantic_masks,
             visible_instance_ids=visible_instance_ids,
+            object_labels=object_labels,
             pointmaps=pointmaps,
         )
 
@@ -142,6 +145,51 @@ def read_pointmap(path: str | Path) -> np.ndarray:
             f"Pointmap must have shape [H, W, 3], got {pointmap.shape}: {path}"
         )
     return pointmap
+
+
+def extract_object_labels(objects: Dict[str, Any]) -> Dict[int, str]:
+    labels: Dict[int, str] = {}
+    for object_id, metadata in objects.items():
+        try:
+            instance_id = int(object_id)
+        except (TypeError, ValueError):
+            continue
+        label = find_label_string(metadata)
+        if label:
+            labels[instance_id] = label
+    return labels
+
+
+def find_label_string(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        preferred = [
+            "label",
+            "label_name",
+            "labelName",
+            "class",
+            "class_name",
+            "className",
+            "category",
+            "category_name",
+            "nyuClass",
+            "rawLabel",
+        ]
+        for key in preferred:
+            item = value.get(key)
+            if isinstance(item, str) and item:
+                return item
+        for item in value.values():
+            found = find_label_string(item)
+            if found:
+                return found
+    if isinstance(value, list):
+        for item in value:
+            found = find_label_string(item)
+            if found:
+                return found
+    return None
 
 
 def filter_visible_instances(
