@@ -1,391 +1,405 @@
-# Latent Fusion 训练流
+# Latent Fusion 技术设计与训练流程
 
-这份文档记录当前 `train_latent_fusion.py` 的数据流和训练过程。它对应的是当前主线 idea：
+## 1. 文档目的
+
+本文档说明当前代码如何把 `idea/ours_model.py` 与 `idea/ours_training.py` 中的伪代码落实为可运行训练流程。
+
+两份伪代码已经定义了核心方向：
 
 ```text
-SAM3 中间语义 / tracking tokens
+SAM3 semantic/tracking tokens
   as query
 
-StreamVGGT latent geometry tokens + camera tokens
+StreamVGGT geometry/camera tokens
   as key/value context
 
 cross-attention fusion
-  -> semantic logits
   -> pointmap prediction
-  -> cross-frame match embeddings
+  -> semantic logits
+  -> cross-frame matching embeddings
 ```
 
-注意：这条训练流不依赖 SAM3 final mask。SAM3 最终是否检测到物体，不决定训练是否有输入。
+但伪代码没有明确以下工程选择：
 
-## 入口
-
-训练入口：
-
-```bash
-PYTHONPATH=src python scripts/train_latent_fusion.py \
-  --config configs/latent_fusion_train.yaml \
-  --iterations 200 \
-  --device cuda
+```text
+1. SAM3 具体取哪一层作为 sam_feat
+2. StreamVGGT 具体取哪一层作为 vggt_feat / cam_token
+3. ScanNet++ mask 如何对齐到 token grid
+4. 跨帧 matching 的真值矩阵如何构造
+5. 当前哪些模块 frozen，哪些模块训练
+6. 当前实现与伪代码相比有哪些简化
 ```
 
-特征检查入口：
+本文档逐项明确这些选择。
 
-```bash
-PYTHONPATH=src python scripts/inspect_latent_fusion_features.py \
-  --config configs/latent_fusion_train.yaml \
-  --device cuda
+## 2. 对应代码
+
+入口脚本：
+
+```text
+scripts/train_latent_fusion.py
+scripts/inspect_latent_fusion_features.py
 ```
 
-主要配置文件：
+配置文件：
 
 ```text
 configs/latent_fusion_train.yaml
 ```
 
-主要代码文件：
+核心实现：
 
 ```text
-scripts/train_latent_fusion.py
-src/vggtsam/training/latent_fusion.py
 src/vggtsam/adapters/sam3_intermediate.py
 src/vggtsam/adapters/streamvggt_latent.py
 src/vggtsam/models/latent_fusion.py
 src/vggtsam/models/fusion.py
+src/vggtsam/training/latent_fusion.py
 ```
 
-## 数据来源
+## 3. 总体数据流
 
-训练从已处理好的 ScanNet++ manifest 读取数据：
+当前训练每一步随机采样一个连续 ScanNet++ clip：
 
 ```text
-data/processed/scannetpp_2d/manifest.json
+processed ScanNet++ manifest
+  -> image_paths
+  -> instance_masks
+  -> semantic_masks
 ```
 
-每个 scene 下的 frame 需要包含：
+同一个 clip 同时送入两个 frozen foundation model adapter：
 
 ```text
-image_path       RGB 图片
-instance_mask    由 3D instance annotation 投影得到的 2D instance id
-semantic_mask    由 3D semantic annotation 投影得到的 2D semantic id
+image_paths
+  -> SAM3IntermediateAdapter
+     -> sam_tokens
+
+image_paths
+  -> StreamVGGTLatentAdapter
+     -> geometry_tokens
+     -> camera_tokens
+     -> pointmap_grid
 ```
 
-当前默认 scene：
+ScanNet++ 标注被下采样到和 SAM3 token 对齐的监督网格：
+
+```text
+instance_masks -> instance_grid [T, 72, 72]
+semantic_masks -> semantic_grid [T, 72, 72]
+```
+
+模型 forward：
+
+```text
+sam_tokens      [1, T * 72 * 72, D_sam]
+geometry_tokens [1, T * 12 * 12, D_geo]
+camera_tokens   [1, T, 9]
+
+  -> LatentSAMVGGTModel
+
+logits      [1, T * 72 * 72, num_classes]
+pointmap    [1, T * 72 * 72, 3]
+embeddings  [1, T * 72 * 72, d_fuse]
+```
+
+训练损失：
+
+```text
+semantic_loss:
+  fused token -> semantic label
+
+point_loss:
+  fused token -> StreamVGGT pointmap pseudo target
+
+match_loss:
+  same ScanNet++ instance id across frames -> close embeddings
+  different instance id -> separated embeddings
+```
+
+## 4. `ours_model.py` 的当前落地
+
+### 4.1 Backbone 加载
+
+伪代码：
+
+```python
+self.stream_vggt_backbone = self._load_vggt_backbone()
+self.sam3_backbone = self._load_sam3_backbone()
+```
+
+当前实现：
+
+```text
+SAM3:
+  load_sam3_image_model()
+  SAM3IntermediateAdapter
+
+StreamVGGT:
+  load_streamvggt_latent_model()
+  StreamVGGTLatentAdapter
+```
+
+当前二者均 frozen：
+
+```text
+sam3_model.requires_grad_(False)
+streamvggt_model.requires_grad_(False)
+```
+
+当前不做 LoRA，也不 fine-tune SAM3 / StreamVGGT 本体。训练只更新 fusion model。
+
+### 4.2 SAM3 中间层选择
+
+伪代码：
+
+```python
+sam_feat = self.sam3_backbone(image, text_prompts)
+```
+
+当前明确选择：
+
+```text
+SAM3 detector neck FPN-2
+```
+
+代码位置：
+
+```text
+src/vggtsam/adapters/sam3_intermediate.py
+select_sam3_spatial_feature()
+```
+
+具体取法：
+
+```python
+backbone_out = model.backbone.forward_image(images)
+spatial = backbone_out["backbone_fpn"][-1]
+```
+
+配置项：
 
 ```yaml
-dataset:
-  scene_id: 0a5c013435
-  sequence_length: 4
-  frame_stride: 1
+sam3:
+  feature_source: detector_fpn2
 ```
 
-也就是说，每次训练随机采样一个连续 4 帧窗口。
-
-## Clip 采样与实例过滤
-
-采样逻辑在：
+在 SAM3 image model 中，输入被 resize 到 `1008 x 1008`，ViT patch size 为 `14`：
 
 ```text
-ScanNetPPObjectSequenceDataset
+1008 / 14 = 72
 ```
 
-每次得到：
+SAM3 detector neck 产生多尺度 FPN。当前取 detector 分支里与 patch grid 对齐的低分辨率层：
 
 ```text
-ObjectSequence:
-  scene_id
-  frame_indices
-  image_paths
-  instance_masks
-  semantic_masks
-  visible_instance_ids
+detector_fpn2 ~= [T, 256, 72, 72]
 ```
 
-在读取每帧 `instance_mask` 时先做粗过滤：
+adapter 会保证输出 resize 到配置中的 token grid：
 
 ```yaml
-objects:
-  min_pixels: 128
-  max_area_ratio: 0.25
-  min_visible_frames: 2
-  max_objects_per_frame: 32
-  ignore_instance_id: 0
+geometry:
+  token_grid: [72, 72]
+```
+
+因此当前 `sam_tokens` 的空间结构是：
+
+```text
+[T, 72, 72, C_sam]
+```
+
+再展平成：
+
+```text
+[1, T * 72 * 72, C_sam]
+```
+
+### 4.3 为什么选择 detector_fpn2
+
+当前选择 `detector_fpn2`，而不是 final mask、FPN-0/FPN-1 或 tracker memory，原因如下：
+
+```text
+1. 不依赖 SAM3 final detection
+   SAM3 final mask 可能因为 prompt 或阈值没有检测到目标。
+   当前 idea 的核心是中间特征融合，不应该被 final mask 是否存在阻断。
+
+2. 与 ViT patch grid 对齐
+   1008 输入、14 patch size 自然得到 72 x 72。
+   ScanNet++ semantic/instance mask 可以稳定下采样到这个 grid。
+
+3. 保留开放词汇语义分支信息
+   detector neck 是 SAM3 开放词汇检测 / 文本分割分支的一部分，
+   比纯视觉底层特征更接近当前任务。
+
+4. 计算量可控
+   FPN-0/FPN-1 分辨率更高，适合后续 mask refinement，
+   不适合第一版直接做全 token fusion。
+```
+
+当前没有选择：
+
+```text
+SAM3 final masks:
+  不稳定；检测不到时没有训练输入；不符合当前 latent fusion idea。
+
+Detector Transformer output:
+  理论上很适合 text-conditioned object query，
+  但当前代码先选择更稳定、shape 更明确的 FPN-2。
+
+SAM2 tracker memory tokens:
+  更适合后续时序 memory 版本。
+  当前第一版先用 ScanNet++ instance id 监督跨帧一致性。
+```
+
+### 4.4 SAM3 文本特征使用方式
+
+伪代码中 `sam3_backbone(image, text_prompts)` 表示 SAM3 应该是 text-conditioned。
+
+当前实现：
+
+```python
+text_out = model.backbone.forward_text([prompt])
+language = pool_language_features(text_out)
+sam_token = concat(spatial_token, language)
+```
+
+配置项：
+
+```yaml
+sam3:
+  prompt: object
+  text_conditioning: concat
+```
+
+也就是说，当前不是直接取 SAM3 detector transformer 的 text-conditioned query，而是：
+
+```text
+SAM3 detector FPN-2 spatial feature
+  + pooled SAM3 language feature
+  -> sam_tokens
+```
+
+这是一个工程上更稳定的第一版实现。后续如果能稳定 hook detector transformer output，可以把 `feature_source` 扩展到 transformer query token。
+
+### 4.5 StreamVGGT 层选择
+
+伪代码：
+
+```python
+vggt_feat, cam_token, updated_kv_cache = self.stream_vggt_backbone(image, kv_cache)
+```
+
+当前明确选择：
+
+```text
+StreamVGGT aggregator 最后一层 patch tokens
+StreamVGGT camera_head 输出 pose encoding
+```
+
+代码位置：
+
+```text
+src/vggtsam/adapters/streamvggt_latent.py
+```
+
+具体取法：
+
+```python
+aggregated_tokens_list, patch_start_idx = model.aggregator(images)
+tokens = aggregated_tokens_list[layer_index]
+patch_tokens = tokens[:, :, patch_start_idx:, :]
+```
+
+配置项：
+
+```yaml
+geometry:
+  layer_index: -1
+  context_grid: [12, 12]
+```
+
+`patch_start_idx` 之前是 camera/register tokens，之后是 patch tokens。当前只取 patch tokens 作为几何上下文 token，并单独调用 camera head：
+
+```python
+pose_enc_list = model.camera_head(aggregated_tokens_list)
+camera_tokens = pose_enc_list[-1]
+```
+
+当前输出：
+
+```text
+geometry_tokens: [1, T * 12 * 12, D_geo]
+camera_tokens:   [1, T, 9]
+```
+
+### 4.6 为什么 geometry context 用 12x12
+
+SAM3 query 是 `T * 72 * 72`，如果 geometry key/value 也用 `T * 72 * 72`，cross-attention 显存和计算量会很大。
+
+因此当前实现区分两个 grid：
+
+```yaml
+token_grid: [72, 72]
+context_grid: [12, 12]
 ```
 
 含义：
 
 ```text
-instance id = 0:
-  忽略背景 / 无效区域
+token_grid:
+  SAM3 query grid
+  ScanNet++ supervision grid
+  pointmap target grid
 
-min_pixels:
-  去掉极小噪声 instance
-
-max_area_ratio:
-  去掉占画面比例过大的结构面或大物体
-
-min_visible_frames:
-  只保留至少跨多帧可见的 instance，用于跨帧 matching 监督
-
-max_objects_per_frame:
-  限制每帧最多保留的 instance 数量，控制训练开销
+context_grid:
+  StreamVGGT geometry key/value grid
+  用于控制 cross-attention 开销
 ```
 
-后续如果确认了 ScanNet++ semantic id 映射，可以在配置里加入墙、地板、天花板等大结构黑名单：
+### 4.7 Fusion 模块
 
-```yaml
-excluded_semantic_labels: []
+伪代码：
+
+```python
+f_vggt = self.proj_vggt(vggt_feat)
+f_cam = self.proj_cam(cam_token)
+f_sam = self.proj_sam(sam_feat)
+
+geometry_context = torch.cat([f_vggt, f_cam], dim=1)
+f_fused, _ = self.cross_attention_fusion(
+    query=f_sam,
+    key=geometry_context,
+    value=geometry_context,
+)
 ```
 
-## SAM3 分支
-
-SAM3 分支在：
+当前实现：
 
 ```text
-src/vggtsam/adapters/sam3_intermediate.py
-```
-
-当前使用 `build_sam3_image_model` 加载 image model，并冻结参数：
-
-```text
-sam3_model.requires_grad_(False)
-```
-
-每个 clip 的 RGB 会被 SAM3 adapter 处理成：
-
-```text
-[T, 3, 1008, 1008]
-```
-
-归一化方式与 SAM3 image processor 一致：
-
-```text
-Resize(1008, 1008)
-Normalize(mean=0.5, std=0.5)
-```
-
-然后调用：
-
-```text
-model.backbone.forward_image(images)
-model.backbone.forward_text([prompt])
-```
-
-当前默认取：
-
-```yaml
-sam3:
-  feature_source: detector_fpn2
-  prompt: object
-  text_conditioning: concat
-```
-
-`detector_fpn2` 对应 SAM3 detector neck 的低分辨率语义特征：
-
-```text
-detector_fpn2: [T, 256, 72, 72]
-```
-
-adapter 会把它整理成 token：
-
-```text
-[1, T * 72 * 72, 256]
-```
-
-如果 `text_conditioning: concat`，会额外把 pooled text feature 拼到每个 spatial token 上：
-
-```text
-language_features -> pooled text vector
-sam_token = concat(spatial_token, text_vector)
-```
-
-所以最终 `sam_tokens` 的最后一维会大于 256。具体维度由服务器实际 SAM3 输出决定，训练时会自动初始化模型。
-
-可选的 SAM3 feature source：
-
-```text
-detector_fpn2
-detector_fpn1
-detector_fpn0
-vision_features
-tracker_fpn2
-```
-
-第一版优先使用 `detector_fpn2`，因为它天然是 `72 x 72`，适合作为融合 query grid。
-
-## StreamVGGT 分支
-
-StreamVGGT 分支在：
-
-```text
-src/vggtsam/adapters/streamvggt_latent.py
-```
-
-当前使用 frozen StreamVGGT：
-
-```text
-streamvggt_model.requires_grad_(False)
-```
-
-RGB 图片先走 StreamVGGT 自己的 preprocessing：
-
-```yaml
-geometry:
-  image_mode: crop
-```
-
-之后调用：
-
-```text
-model.aggregator(images)
-```
-
-得到：
-
-```text
-aggregated_tokens_list
-patch_start_idx
-```
-
-adapter 会取指定层：
-
-```yaml
-geometry:
-  layer_index: -1
-```
-
-然后切出 patch tokens：
-
-```text
-patch_tokens = aggregated_tokens[:, :, patch_start_idx:, :]
-```
-
-这些 token 先 reshape 回 StreamVGGT 自己的 patch grid，再 resize 成两个网格：
-
-```yaml
-geometry:
-  token_grid: [72, 72]
-  context_grid: [12, 12]
-```
-
-两者用途不同：
-
-```text
-token_grid = 72 x 72:
-  和 SAM3 token / ScanNet++ mask supervision 对齐
-  用于 point target、semantic target、instance target
-
-context_grid = 12 x 12:
-  作为 cross-attention 的 geometry key/value
-  控制显存和注意力计算量
-```
-
-StreamVGGT adapter 同时会调用：
-
-```text
-camera_head -> camera_tokens
-point_head  -> pointmap_grid
-```
-
-输出主要包括：
-
-```text
-geometry_tokens: [1, T * 12 * 12, D_geo]
-camera_tokens:   [1, T, 9]
-pointmap_grid:   [T, 72, 72, 3]
-```
-
-其中 `pointmap_grid` 当前作为 3D pseudo target 使用。
-
-## Token-Grid 监督构造
-
-监督构造在：
-
-```text
-build_latent_batch()
-```
-
-输入：
-
-```text
-instance_masks
-semantic_masks
-visible_instance_ids
-pointmap_grid
-```
-
-首先把 ScanNet++ 的原始 mask 下采样到 `72 x 72`：
-
-```text
-instance_mask -> majority_pool -> instance_grid [T, 72, 72]
-semantic_mask -> majority_pool -> semantic_grid [T, 72, 72]
-```
-
-这里不是简单 nearest resize，而是对每个 token cell 取 majority label，并记录 majority ratio。
-
-一个 token 会被用于训练，需要同时满足：
-
-```text
-instance_id != 0
-instance majority ratio >= min_token_majority
-semantic majority ratio >= min_token_majority
-semantic label != semantic_ignore_label
-semantic label 在 [0, num_classes)
-semantic label 不在 excluded_semantic_labels
-instance 至少跨 min_visible_frames 可见
-instance token 数 >= min_tokens_per_instance
-instance token 面积比例 <= max_area_ratio
-point target 是 finite 数值
-```
-
-这些过滤是为了解决两个问题：
-
-```text
-1. mask 边界混合或噪声 token 不参与监督
-2. 墙、地板、天花板、大结构或超大区域不主导训练
-```
-
-当前 batch target：
-
-```text
-semantic_labels: [T * 72 * 72]
-instance_ids:    [T * 72 * 72]
-frame_ids:       [T * 72 * 72]
-valid_tokens:    [T * 72 * 72]
-point_targets:   [T * 72 * 72, 3]
-```
-
-## 模型 Forward
-
-模型在：
-
-```text
-src/vggtsam/models/latent_fusion.py
 src/vggtsam/models/fusion.py
+LatentGeometrySemanticFusion
 ```
 
-输入：
+核心等价关系：
 
 ```text
-sam_tokens:
-  [1, T * 72 * 72, D_sam]
-
-geometry_tokens:
-  [1, T * 12 * 12, D_geo]
-
-camera_tokens:
-  [1, T, 9]
+proj_semantic = proj_sam
+proj_geometry = proj_vggt
+proj_camera   = proj_cam
+cross_attention = cross_attention_fusion
 ```
 
-核心 fusion：
+当前 forward：
 
 ```text
-query = proj_sam(sam_tokens)
+query = proj_semantic(sam_tokens)
 context = concat(
   proj_geometry(geometry_tokens),
   proj_camera(camera_tokens)
 )
 
-fused = MultiHeadCrossAttention(
+fused = MultiheadAttention(
   query=query,
   key=context,
   value=context
@@ -394,109 +408,262 @@ fused = MultiHeadCrossAttention(
 fused = LayerNorm(fused + query)
 ```
 
+### 4.8 多任务 Heads
+
+伪代码：
+
+```python
+pred_pointmap = geo_outputs[..., :3]
+pred_logits = classifier_head(semantic_embeddings)
+match_matrix = q @ k.T
+```
+
+当前实现：
+
+```text
+point_head:
+  fused token -> [x, y, z]
+
+semantic_head:
+  fused token -> semantic logits
+
+match_head:
+  fused token -> normalized match embedding
+```
+
+当前没有直接输出 dense `match_matrix`，而是输出 embedding，并在 loss 里对采样 token 计算相似度矩阵：
+
+```python
+logits = embeddings @ embeddings.T / temperature
+```
+
+这样比完整 `[N, N]` correspondence matrix 更省显存。
+
+## 5. `ours_training.py` 的当前落地
+
+### 5.1 Dataset 与 sequence
+
+伪代码：
+
+```python
+video_sequence 包含:
+  frames
+  text_prompts
+  gt_pointmaps
+  gt_semantic_masks
+  gt_instance_ids
+```
+
+当前实现的数据来自 processed ScanNet++：
+
+```text
+image_paths
+semantic_masks
+instance_masks
+```
+
+当前没有直接读取真实 `gt_pointmaps`。第一版使用 StreamVGGT frozen point head 生成 pseudo pointmap target：
+
+```text
+pointmap_grid = StreamVGGT point_head output
+```
+
+因此当前对应关系是：
+
+```text
+frames:
+  image_paths 加载得到
+
+text_prompts:
+  config.sam3.prompt，默认 "object"
+
+gt_semantic_masks:
+  ScanNet++ semantic_masks 下采样到 72x72
+
+gt_instance_ids:
+  ScanNet++ instance_masks 下采样到 72x72
+
+gt_pointmaps:
+  当前暂用 frozen StreamVGGT pointmap_grid
+```
+
+### 5.2 Clip 采样
+
+当前每 step 随机采样一个连续窗口：
+
+```yaml
+dataset:
+  sequence_length: 4
+  frame_stride: 1
+```
+
 输出：
 
 ```text
-logits:
-  [1, T * 72 * 72, num_classes]
-
-pointmap:
-  [1, T * 72 * 72, 3]
-
-embeddings:
-  [1, T * 72 * 72, d_fuse]
+T = 4
+image_paths:     List[Path]
+instance_masks:  List[np.ndarray]
+semantic_masks:  List[np.ndarray]
 ```
 
-这里的 `embeddings` 是跨帧 matching 使用的 token embedding。
+### 5.3 Mask 到 token grid 的监督构造
 
-## Loss
+伪代码假设已经有：
 
-当前有三个 loss：
+```python
+gt_semantic_masks: [B, T, N]
+gt_instance_ids: [B, T, N]
+```
+
+当前代码通过 majority pooling 构造：
 
 ```text
-semantic_loss
-point_loss
-match_loss
+semantic_mask [H, W]
+  -> semantic_grid [72, 72]
+
+instance_mask [H, W]
+  -> instance_grid [72, 72]
 ```
 
-### Semantic Loss
+每个 `72x72` token cell 取对应像素区域的 majority label，同时记录 majority ratio。
 
-只在 `valid_tokens` 上计算：
+token 参与训练需要满足：
 
 ```text
-cross_entropy(logits[valid_tokens], semantic_labels[valid_tokens])
+instance_id != 0
+semantic_id != semantic_ignore_label
+semantic_id 在 [0, num_classes)
+majority ratio >= min_token_majority
+instance 至少跨 min_visible_frames 可见
+instance token 数 >= min_tokens_per_instance
+instance 面积比例 <= max_area_ratio
+semantic_id 不在 excluded_semantic_labels
+point target 是 finite
 ```
 
-目标是让 fused token 学到 ScanNet++ semantic label。
-
-### Point Loss
-
-只在 `valid_tokens` 上计算：
+这一步解决了当前数据里的两个噪声问题：
 
 ```text
-smooth_l1_loss(pointmap[valid_tokens], point_targets[valid_tokens])
+1. 极小噪声 mask 不参与训练
+2. 大面积墙面 / 地板 / 天花板可以通过面积阈值与 semantic blacklist 过滤
 ```
 
-当前 `point_targets` 来自 frozen StreamVGGT point_head 的输出，所以这是第一版 pseudo 3D supervision。后续如果引入 ScanNet++ 真 3D 投影点，也可以替换这里。
+### 5.4 当前 training loop 与伪代码差异
 
-### Match Loss
+伪代码是逐帧 streaming：
 
-matching 不对所有 `T * 72 * 72` token 做全量两两计算，而是先采样：
-
-```yaml
-max_match_tokens: 2048
+```python
+for t in range(T):
+    outputs = model(current_frame, text_prompts, kv_cache=kv_cache)
+    historical_token_buffer.append(fused_tokens.detach())
 ```
 
-采样条件：
+当前实现是 clip-level batched token fusion：
 
 ```text
-token 有效
-token 所属 instance 至少出现在两个不同 frame
+先对整个 T 帧 clip 提取 SAM3 tokens
+先对整个 T 帧 clip 提取 StreamVGGT tokens
+一次 forward 得到所有 T 帧 token 输出
 ```
 
-正样本定义：
+当前没有显式维护 `kv_cache`。原因：
 
 ```text
-instance_id 相同
-frame_id 不同
+1. 第一版目标是先验证 latent fusion 数据流和监督闭环
+2. StreamVGGT inference / aggregator 已经在 clip 内处理多帧
+3. SAM3 tracker memory 接入会放到后续版本
 ```
 
-负样本自然来自同 batch 中其他 instance 的 token。
-
-当前实现是 supervised contrastive loss：
+因此当前是：
 
 ```text
-normalize(embeddings)
-logits = embeddings @ embeddings.T / temperature
-同 instance 跨帧 token 拉近
-不同 instance token 拉远
+sequence-level training
+not frame-by-frame streaming training
 ```
 
-## 参数更新
+但监督目标保持与伪代码一致：
+
+```text
+semantic supervision
+3D point supervision
+cross-frame instance matching supervision
+```
+
+### 5.5 Loss 实现
+
+伪代码：
+
+```python
+loss_3d = F.l1_loss(pred_pointmap, gt_pointmaps[:, t, ...])
+loss_cls = F.cross_entropy(pred_logits.transpose(1, 2), gt_semantics[:, t, ...])
+loss_match = F.binary_cross_entropy(pred_match_matrix, gt_match_matrix)
+```
+
+当前实现：
+
+```text
+semantic_loss:
+  cross_entropy(logits[valid_tokens], semantic_labels[valid_tokens])
+
+point_loss:
+  smooth_l1_loss(pointmap[valid_tokens], point_targets[valid_tokens])
+
+match_loss:
+  supervised contrastive loss over cross-frame same-instance tokens
+```
+
+当前 `match_loss` 没有使用 BCE，是为了避免完整 `[N, N]` match matrix 显存过大。实现上先筛选：
+
+```text
+valid tokens
+instance 至少出现在两个 frame
+最多 max_match_tokens 个 token
+```
+
+正样本：
+
+```text
+same instance_id
+different frame_id
+```
+
+负样本：
+
+```text
+different instance_id
+```
+
+最终：
+
+```python
+logits = normalize(embeddings) @ normalize(embeddings).T / temperature
+```
+
+### 5.6 参数更新
+
+当前训练参数：
+
+```text
+LatentSAMVGGTModel:
+  projection layers
+  cross-attention
+  point head
+  semantic head
+  match head
+```
 
 当前 frozen：
 
 ```text
-SAM3 image backbone
-StreamVGGT backbone / heads
-```
-
-当前训练：
-
-```text
-LatentSAMVGGTModel
-  projection layers
-  cross-attention fusion
-  point head
-  semantic head
-  match head
+SAM3
+StreamVGGT
 ```
 
 优化器：
 
 ```text
 AdamW
-lr = 0.0003
+lr = 3e-4
 grad clip = 1.0
 ```
 
@@ -509,7 +676,7 @@ loss =
   + match_weight * match_loss
 ```
 
-默认权重：
+默认：
 
 ```yaml
 loss:
@@ -518,7 +685,103 @@ loss:
   match_weight: 0.5
 ```
 
-## 输出
+## 6. 当前实现明确没有做的事情
+
+当前第一版没有实现以下内容：
+
+```text
+1. 不使用 SAM3 final masks 作为训练输入
+2. 不训练 SAM3 或 StreamVGGT
+3. 不接 LoRA
+4. 不使用 SAM3 tracker memory / KV cache
+5. 不从 detector transformer 中 hook object query
+6. 不使用真实 ScanNet++ 3D pointmap 作为 point loss target
+7. 不训练 mask decoder
+```
+
+这些不是被忘掉，而是当前版本为了先验证核心 latent fusion 闭环而做的边界收缩。
+
+## 7. 当前配置的关键决策
+
+```yaml
+sam3:
+  feature_source: detector_fpn2
+  prompt: object
+  text_conditioning: concat
+
+geometry:
+  token_grid: [72, 72]
+  context_grid: [12, 12]
+  layer_index: -1
+
+objects:
+  min_token_majority: 0.55
+  min_tokens_per_instance: 2
+  max_match_tokens: 2048
+```
+
+解释：
+
+```text
+detector_fpn2:
+  当前 SAM3 中间特征层选择，负责提供 semantic query。
+
+prompt: object:
+  第一版使用通用 object prompt。
+  后续可以换成随机 semantic category prompt。
+
+text_conditioning: concat:
+  把 pooled language feature 拼到每个 SAM3 spatial token 上。
+
+token_grid [72,72]:
+  对齐 SAM3 1008 输入 / 14 patch grid。
+
+context_grid [12,12]:
+  压缩 StreamVGGT geometry context，控制 attention 开销。
+
+max_match_tokens 2048:
+  防止 cross-frame matching 矩阵过大。
+```
+
+## 8. 调试命令
+
+先检查两侧 adapter 输出：
+
+```bash
+PYTHONPATH=src python scripts/inspect_latent_fusion_features.py \
+  --config configs/latent_fusion_train.yaml \
+  --device cuda
+```
+
+预期重点输出：
+
+```text
+SAM3:
+  tokens=(1, T * 72 * 72, D_sam)
+
+StreamVGGT:
+  geometry_tokens=(1, T * 12 * 12, D_geo)
+  camera_tokens=(1, T, 9)
+  pointmap_grid=(T, 72, 72, 3)
+```
+
+小步训练：
+
+```bash
+PYTHONPATH=src python scripts/train_latent_fusion.py \
+  --config configs/latent_fusion_train.yaml \
+  --iterations 20 \
+  --device cuda
+```
+
+正常启动时应出现：
+
+```text
+initialized LatentSAMVGGTModel sam_dim=... geometry_dim=... camera_dim=...
+step=1 loss=...
+```
+
+## 9. 输出文件
 
 默认输出目录：
 
@@ -526,7 +789,7 @@ loss:
 outputs/latent_fusion_debug
 ```
 
-训练会写：
+训练输出：
 
 ```text
 training_history.csv
@@ -548,58 +811,16 @@ num_match_tokens
 num_instances
 ```
 
-`training_curves.png` 会画 loss 曲线和 token/instance 数量曲线。
+## 10. 后续升级方向
 
-## 当前限制
-
-1. SAM3 只使用中间 backbone/FPN/text feature，没有使用 final mask，也没有训练 mask decoder。
-2. `point_loss` 当前对齐的是 StreamVGGT pseudo pointmap，不是 ScanNet++ 真值 3D pointmap。
-3. `excluded_semantic_labels` 还没有填 ScanNet++ 的墙、地板、天花板语义 id。
-4. `context_grid` 默认压到 `12 x 12` 是为了先控制显存，后续可以逐步增大。
-5. 当前是 single batch / single clip 训练，还没有 DataLoader 多 worker 或特征缓存。
-
-## 建议调试顺序
-
-第一步先检查 adapter 输出：
-
-```bash
-PYTHONPATH=src python scripts/inspect_latent_fusion_features.py \
-  --config configs/latent_fusion_train.yaml \
-  --device cuda
-```
-
-需要重点看：
+建议后续按以下顺序升级：
 
 ```text
-SAM3 tokens shape
-StreamVGGT geometry_tokens shape
-camera_tokens shape
-pointmap_grid shape
-```
-
-第二步小步训练：
-
-```bash
-PYTHONPATH=src python scripts/train_latent_fusion.py \
-  --config configs/latent_fusion_train.yaml \
-  --iterations 20 \
-  --device cuda
-```
-
-如果能输出类似：
-
-```text
-initialized LatentSAMVGGTModel sam_dim=... geometry_dim=... camera_dim=...
-step=1 loss=...
-```
-
-说明主数据流已经跑通。
-
-第三步再扩大：
-
-```bash
-PYTHONPATH=src python scripts/train_latent_fusion.py \
-  --config configs/latent_fusion_train.yaml \
-  --iterations 200 \
-  --device cuda
+1. 跑通 detector_fpn2 + StreamVGGT latent fusion baseline
+2. 填入 ScanNet++ semantic blacklist，明确过滤墙 / 地板 / 天花板
+3. 尝试 category-specific prompt，而不是固定 "object"
+4. hook SAM3 Detector Transformer + Language Features，替换或补充 detector_fpn2
+5. 接入 SAM3 tracker memory tokens，实现真正 streaming KV / memory training
+6. 用 ScanNet++ 几何或重建结果替代 StreamVGGT pseudo point target
+7. 加 mask decoder / high-resolution refinement
 ```
