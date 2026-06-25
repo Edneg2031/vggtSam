@@ -11,3 +11,10 @@ PYTHONPATH=src python scripts/inspect_latent_fusion_features.py \
   --config configs/latent_fusion_train.yaml \
   --iterations 20 \
   --device cuda
+
+
+  PYTHONPATH=src python scripts/train_latent_fusion.py \
+  --config configs/latent_fusion_train.yaml \
+  --iterations 200 \
+  --device cuda \
+  --output-dir outputs/latent_fusion_correspondence
