@@ -2,3 +2,8 @@ PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
   --config configs/scannetpp_2d.yaml \
   --scene-ids 0a5c013435 \
   --save-pointmaps
+
+  PYTHONPATH=src python scripts/train_latent_fusion.py \
+  --config configs/latent_fusion_train.yaml \
+  --iterations 20 \
+  --device cuda
