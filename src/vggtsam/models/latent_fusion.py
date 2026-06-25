@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from .fusion import LatentGeometrySemanticFusion
 from .tokens import GeometryTokens, SemanticTokens
@@ -64,3 +65,18 @@ class LatentSAMVGGTModel(nn.Module):
             pointmap=output.pred_pointmap,
             embeddings=output.match_embeddings,
         )
+
+    def compute_mask_correspondence(
+        self,
+        current_embeddings: torch.Tensor,
+        history_embeddings: torch.Tensor,
+        *,
+        temperature: float = 0.07,
+    ) -> torch.Tensor:
+        """Return current-to-history token correspondence logits."""
+        current_embeddings = F.normalize(current_embeddings, dim=-1)
+        history_embeddings = F.normalize(history_embeddings, dim=-1)
+        return torch.matmul(
+            current_embeddings,
+            history_embeddings.transpose(-1, -2),
+        ) / max(float(temperature), 1e-6)

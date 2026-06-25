@@ -234,42 +234,106 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
             )
 
         assert optimizer is not None
-        output = model(
-            sam_tokens=sam_out.semantic.tokens.float(),
-            geometry_tokens=geo_out.geometry.tokens.float(),
-            camera_tokens=(
-                geo_out.geometry.camera_tokens.float()
-                if config.use_camera_tokens
-                and geo_out.geometry.camera_tokens is not None
-                else None
-            ),
+        num_frames = len(sequence.image_paths)
+        tokens_per_frame = config.token_grid[0] * config.token_grid[1]
+        context_tokens_per_frame = config.context_grid[0] * config.context_grid[1]
+        sam_frame_tokens = split_sequence_tokens(
+            sam_out.semantic.tokens.float(),
+            num_frames=num_frames,
+            tokens_per_frame=tokens_per_frame,
+            name="sam_tokens",
+        )
+        geometry_frame_tokens = split_sequence_tokens(
+            geo_out.geometry.tokens.float(),
+            num_frames=num_frames,
+            tokens_per_frame=context_tokens_per_frame,
+            name="geometry_tokens",
+        )
+        camera_tokens = (
+            geo_out.geometry.camera_tokens.float()
+            if config.use_camera_tokens and geo_out.geometry.camera_tokens is not None
+            else None
         )
 
-        valid = batch["valid_tokens"]
-        labels = batch["semantic_labels"]
-        semantic_loss = F.cross_entropy(output.logits[0, valid], labels[valid])
-        point_loss = F.smooth_l1_loss(
-            output.pointmap[0, valid],
-            batch["point_targets"][valid],
-        )
+        history_buffer = []
+        frame_embeddings = []
+        frame_losses = []
+        semantic_losses = []
+        point_losses = []
+        match_losses = []
+        selected_match_tokens = 0
 
-        match_indices = select_match_indices(
-            valid,
-            batch["instance_ids"],
-            batch["frame_ids"],
-            max_tokens=config.max_match_tokens,
-        )
-        match_loss = cross_frame_correspondence_loss(
-            output.embeddings[0, match_indices],
-            batch["instance_ids"][match_indices],
-            batch["frame_ids"][match_indices],
-            temperature=config.temperature,
-        )
-        loss = (
-            config.semantic_weight * semantic_loss
-            + config.point_weight * point_loss
-            + config.match_weight * match_loss
-        )
+        for frame_idx in range(num_frames):
+            output = model(
+                sam_tokens=sam_frame_tokens[frame_idx],
+                geometry_tokens=geometry_frame_tokens[frame_idx],
+                camera_tokens=slice_camera_tokens(
+                    camera_tokens,
+                    frame_idx=frame_idx,
+                    num_frames=num_frames,
+                ),
+            )
+
+            start = frame_idx * tokens_per_frame
+            end = start + tokens_per_frame
+            valid = batch["valid_tokens"][start:end]
+            labels = batch["semantic_labels"][start:end]
+            instance_ids = batch["instance_ids"][start:end]
+            point_targets = batch["point_targets"][start:end]
+
+            zero = output.logits.sum() * 0.0
+            if valid.any():
+                semantic_loss_t = F.cross_entropy(output.logits[0, valid], labels[valid])
+                point_loss_t = F.smooth_l1_loss(
+                    output.pointmap[0, valid],
+                    point_targets[valid],
+                )
+            else:
+                semantic_loss_t = zero
+                point_loss_t = zero
+
+            match_loss_t = zero
+            match_token_count_t = 0
+            if history_buffer:
+                history = history_buffer[rng.randrange(len(history_buffer))]
+                match_loss_t, match_token_count_t = streaming_correspondence_loss(
+                    model,
+                    current_embeddings=output.embeddings[0],
+                    history_embeddings=history["embeddings"],
+                    current_instance_ids=instance_ids,
+                    history_instance_ids=history["instance_ids"],
+                    current_valid=valid,
+                    history_valid=history["valid"],
+                    max_tokens=config.max_match_tokens,
+                    temperature=config.temperature,
+                )
+
+            frame_loss = (
+                config.semantic_weight * semantic_loss_t
+                + config.point_weight * point_loss_t
+                + config.match_weight * match_loss_t
+            )
+            frame_losses.append(frame_loss)
+            semantic_losses.append(semantic_loss_t)
+            point_losses.append(point_loss_t)
+            match_losses.append(match_loss_t)
+            selected_match_tokens += match_token_count_t
+            frame_embeddings.append(output.embeddings[0])
+
+            history_buffer.append(
+                {
+                    "embeddings": output.embeddings[0].detach(),
+                    "instance_ids": instance_ids.detach(),
+                    "valid": valid.detach(),
+                    "frame_idx": frame_idx,
+                }
+            )
+
+        loss = torch.stack(frame_losses).mean()
+        semantic_loss = torch.stack(semantic_losses).mean()
+        point_loss = torch.stack(point_losses).mean()
+        match_loss = torch.stack(match_losses).mean()
+        all_embeddings = torch.cat([item.detach() for item in frame_embeddings], dim=0)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -283,9 +347,11 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
             "semantic_loss": float(semantic_loss.detach().cpu()),
             "point_loss": float(point_loss.detach().cpu()),
             "match_loss": float(match_loss.detach().cpu()),
-            "num_tokens": int(valid.sum().item()),
-            "num_match_tokens": int(match_indices.numel()),
-            "num_instances": int(batch["instance_ids"][valid].unique().numel()),
+            "num_tokens": int(batch["valid_tokens"].sum().item()),
+            "num_match_tokens": int(selected_match_tokens),
+            "num_instances": int(
+                batch["instance_ids"][batch["valid_tokens"]].unique().numel()
+            ),
             "prompt": prompt_selection.prompt,
             "sampled_instance_id": int(prompt_selection.sampled_instance_id),
             "sampled_label": prompt_selection.sampled_label,
@@ -308,7 +374,7 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
                 image_paths=sequence.image_paths,
                 instance_masks=sequence.instance_masks,
                 object_labels=sequence.object_labels,
-                embeddings=output.embeddings[0].detach(),
+                embeddings=all_embeddings,
                 batch=batch,
                 prompt=prompt_selection.prompt,
                 preferred_instance_id=prompt_selection.sampled_instance_id,
@@ -321,7 +387,7 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
                 image_paths=sequence.image_paths,
                 instance_masks=sequence.instance_masks,
                 object_labels=sequence.object_labels,
-                embeddings=output.embeddings[0].detach(),
+                embeddings=all_embeddings,
                 batch=batch,
                 prompt=prompt_selection.prompt,
                 preferred_instance_id=prompt_selection.sampled_instance_id,
@@ -360,6 +426,119 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
     )
     print(f"training history: {metrics_path}")
     print(f"training curves: {config.output_dir / 'training_curves.png'}")
+
+
+def split_sequence_tokens(
+    tokens: torch.Tensor,
+    *,
+    num_frames: int,
+    tokens_per_frame: int,
+    name: str,
+) -> torch.Tensor:
+    if tokens.ndim != 3:
+        raise ValueError(f"{name} must have shape [B, T*N, C], got {tuple(tokens.shape)}")
+    expected = int(num_frames) * int(tokens_per_frame)
+    if tokens.shape[1] != expected:
+        raise ValueError(
+            f"{name} expected {expected} tokens for num_frames={num_frames} "
+            f"and tokens_per_frame={tokens_per_frame}, got {tokens.shape[1]}"
+        )
+    return tokens.reshape(
+        tokens.shape[0],
+        int(num_frames),
+        int(tokens_per_frame),
+        tokens.shape[-1],
+    ).permute(1, 0, 2, 3)
+
+
+def slice_camera_tokens(
+    camera_tokens: torch.Tensor | None,
+    *,
+    frame_idx: int,
+    num_frames: int,
+) -> torch.Tensor | None:
+    if camera_tokens is None:
+        return None
+    if camera_tokens.ndim == 3:
+        if camera_tokens.shape[1] == num_frames:
+            return camera_tokens[:, frame_idx : frame_idx + 1]
+        if camera_tokens.shape[0] == num_frames:
+            return camera_tokens[frame_idx : frame_idx + 1]
+        return camera_tokens
+    if camera_tokens.ndim == 4 and camera_tokens.shape[1] == num_frames:
+        return camera_tokens[:, frame_idx].reshape(
+            camera_tokens.shape[0],
+            -1,
+            camera_tokens.shape[-1],
+        )
+    return camera_tokens
+
+
+def streaming_correspondence_loss(
+    model: LatentSAMVGGTModel,
+    *,
+    current_embeddings: torch.Tensor,
+    history_embeddings: torch.Tensor,
+    current_instance_ids: torch.Tensor,
+    history_instance_ids: torch.Tensor,
+    current_valid: torch.Tensor,
+    history_valid: torch.Tensor,
+    max_tokens: int,
+    temperature: float,
+    negative_ratio: int = 8,
+) -> tuple[torch.Tensor, int]:
+    zero = current_embeddings.sum() * 0.0
+    current_indices = current_valid.nonzero(as_tuple=False).flatten()
+    history_indices = history_valid.nonzero(as_tuple=False).flatten()
+    if current_indices.numel() == 0 or history_indices.numel() == 0:
+        return zero, 0
+
+    current_ids = current_instance_ids[current_indices]
+    history_ids = history_instance_ids[history_indices]
+    shared_current = torch.isin(current_ids, history_ids.unique())
+    shared_history = torch.isin(history_ids, current_ids.unique())
+    current_indices = current_indices[shared_current]
+    history_indices = history_indices[shared_history]
+    if current_indices.numel() == 0 or history_indices.numel() == 0:
+        return zero, 0
+
+    max_tokens = max(1, int(max_tokens))
+    if current_indices.numel() > max_tokens:
+        perm = torch.randperm(current_indices.numel(), device=current_indices.device)
+        current_indices = current_indices[perm[:max_tokens]]
+    if history_indices.numel() > max_tokens:
+        perm = torch.randperm(history_indices.numel(), device=history_indices.device)
+        history_indices = history_indices[perm[:max_tokens]]
+
+    current_ids = current_instance_ids[current_indices]
+    history_ids = history_instance_ids[history_indices]
+    logits = model.compute_mask_correspondence(
+        current_embeddings[current_indices],
+        history_embeddings[history_indices],
+        temperature=temperature,
+    )
+    targets = (current_ids[:, None] == history_ids[None, :]).to(logits.dtype)
+    positive = targets > 0.5
+    if not positive.any():
+        return zero, int(current_indices.numel() + history_indices.numel())
+
+    flat_logits = logits.reshape(-1)
+    flat_targets = targets.reshape(-1)
+    positive_indices = positive.reshape(-1).nonzero(as_tuple=False).flatten()
+    negative_indices = (~positive).reshape(-1).nonzero(as_tuple=False).flatten()
+    if negative_indices.numel() > positive_indices.numel() * negative_ratio:
+        perm = torch.randperm(negative_indices.numel(), device=negative_indices.device)
+        negative_indices = negative_indices[
+            perm[: positive_indices.numel() * negative_ratio]
+        ]
+    selected = torch.cat([positive_indices, negative_indices], dim=0)
+    return (
+        F.binary_cross_entropy_with_logits(
+            flat_logits[selected],
+            flat_targets[selected],
+        ),
+        int(current_indices.numel() + history_indices.numel()),
+    )
 
 
 def build_latent_batch(
@@ -1046,75 +1225,6 @@ def filter_token_instances(
         if count / total > max_area_ratio:
             out[instance_grid == instance_id] = False
     return out
-
-
-def select_match_indices(
-    valid: torch.Tensor,
-    instance_ids: torch.Tensor,
-    frame_ids: torch.Tensor,
-    *,
-    max_tokens: int,
-) -> torch.Tensor:
-    indices = valid.nonzero(as_tuple=False).flatten()
-    if indices.numel() <= 1:
-        return indices
-
-    usable = []
-    for instance_id in instance_ids[indices].unique():
-        inst_indices = indices[instance_ids[indices] == instance_id]
-        if frame_ids[inst_indices].unique().numel() >= 2:
-            usable.append(inst_indices)
-    if not usable:
-        return indices[:0]
-    indices = torch.cat(usable, dim=0)
-    if indices.numel() > max_tokens:
-        perm = torch.randperm(indices.numel(), device=indices.device)[:max_tokens]
-        indices = indices[perm]
-    return indices
-
-
-def cross_frame_correspondence_loss(
-    embeddings: torch.Tensor,
-    instance_ids: torch.Tensor,
-    frame_ids: torch.Tensor,
-    *,
-    temperature: float,
-    negative_ratio: int = 8,
-) -> torch.Tensor:
-    n = embeddings.shape[0]
-    if n <= 1:
-        return embeddings.sum() * 0.0
-    embeddings = F.normalize(embeddings, dim=-1)
-    logits = embeddings @ embeddings.T / max(float(temperature), 1e-6)
-    eye = torch.eye(n, dtype=torch.bool, device=embeddings.device)
-    positive = (instance_ids[:, None] == instance_ids[None, :]) & (
-        frame_ids[:, None] != frame_ids[None, :]
-    )
-    positive &= ~eye
-    if not positive.any():
-        return embeddings.sum() * 0.0
-    cross_frame = frame_ids[:, None] != frame_ids[None, :]
-    negative = cross_frame & ~positive
-
-    flat_logits = logits.reshape(-1)
-    positive_indices = positive.reshape(-1).nonzero(as_tuple=False).flatten()
-    negative_indices = negative.reshape(-1).nonzero(as_tuple=False).flatten()
-    if negative_indices.numel() > positive_indices.numel() * negative_ratio:
-        choice = torch.randperm(
-            negative_indices.numel(),
-            device=negative_indices.device,
-        )[: positive_indices.numel() * negative_ratio]
-        negative_indices = negative_indices[choice]
-
-    selected_indices = torch.cat([positive_indices, negative_indices], dim=0)
-    targets = torch.cat(
-        [
-            torch.ones_like(positive_indices, dtype=flat_logits.dtype),
-            torch.zeros_like(negative_indices, dtype=flat_logits.dtype),
-        ],
-        dim=0,
-    )
-    return F.binary_cross_entropy_with_logits(flat_logits[selected_indices], targets)
 
 
 def write_metrics_header(path: Path) -> None:
