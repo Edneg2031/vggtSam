@@ -7,9 +7,10 @@ whether an object is present.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -110,8 +111,9 @@ class SAM3IntermediateAdapter:
         if images.ndim != 4:
             raise ValueError(f"Expected images [T, 3, H, W], got {tuple(images.shape)}")
 
-        backbone_out = self.model.backbone.forward_image(images.to(self.device))
-        text_out = self.model.backbone.forward_text([prompt], device=self.device)
+        with sam3_autocast(self.device):
+            backbone_out = self.model.backbone.forward_image(images.to(self.device))
+            text_out = self.model.backbone.forward_text([prompt], device=self.device)
 
         spatial = select_sam3_spatial_feature(backbone_out, source=self.source)
         spatial = ensure_bchw_tensor(spatial).float()
@@ -229,3 +231,9 @@ def pool_language_features(text_out: Dict[str, Any]) -> Optional[torch.Tensor]:
     if features.ndim == 2:
         return features.mean(dim=0, keepdim=True)
     raise ValueError(f"Unsupported language feature shape: {tuple(features.shape)}")
+
+
+def sam3_autocast(device: str):
+    if str(device).startswith("cuda"):
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
