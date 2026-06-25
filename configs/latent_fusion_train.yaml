@@ -35,7 +35,7 @@ sam3:
   prompt: object
   # random_instance: sample a valid instance in each clip and use its class name
   # as the SAM3 text prompt. fixed: always use sam3.prompt.
-  prompt_mode: fixed
+  prompt_mode: random_instance
   resolution: 1008
   # Choices implemented: detector_fpn2, detector_fpn1, detector_fpn0,
   # vision_features, tracker_fpn2.

@@ -26,7 +26,7 @@ RGB 连续帧 + 语义文本 prompt
 wall / floor / ceiling
 ```
 
-默认 prompt 为固定 `"object"`，训练所有通过过滤的小物体 token；如果传入具体 prompt，例如 `--prompt chair`，则只训练对应类别过滤后的 token。
+默认 `prompt_mode=random_instance`：每个 clip 随机选择一个大小合理、跨帧可见、未被 blacklist 过滤的 instance，并使用它的类别名作为 SAM3 text prompt。如果传入具体 prompt，例如 `--prompt chair`，则切换为固定 prompt 并只训练对应类别过滤后的 token。
 
 ## 模型结构
 
@@ -104,7 +104,8 @@ outputs/latent_fusion_debug/visualizations/step_XXXXXX_crops.png
 2. 用该 instance 的 GT mask 取 ref object tokens。
 3. 求 ref object token embedding 的 prototype。
 4. 与每一帧所有 token embedding 计算相似度。
-5. 相似度图上采样回 RGB 尺寸，作为 propagated mask 显示。
+5. 每一帧选取与 ref prototype 最相似的 top-k token，k 等于 ref mask 覆盖的 token 数。
+6. top-k token map 上采样回 RGB 尺寸，作为 propagated mask 显示。
 ```
 
 因此现在的 mask 可视化是在验证“跨帧追踪/对应关系”，不是验证一个单帧 mask decoder。

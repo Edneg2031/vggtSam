@@ -812,9 +812,8 @@ def propagate_instance_from_reference(
 
     embeddings = F.normalize(embeddings.float(), dim=-1)
     prototype = F.normalize(embeddings[ref_mask].mean(dim=0), dim=0)
-    logits = embeddings @ prototype / max(float(temperature), 1e-6)
-    probs = torch.sigmoid(logits)
-    probs = probs * valid.to(probs.dtype)
+    scores = embeddings @ prototype
+    propagated = torch.zeros_like(scores)
 
     frames = int(frame_ids.max().item()) + 1
     if "token_grid" in batch:
@@ -827,7 +826,17 @@ def propagate_instance_from_reference(
                 "Cannot infer token grid from a non-square token count; pass token_grid in batch."
             )
         token_w = token_h
-    return probs.detach().cpu().reshape(frames, token_h, token_w)
+
+    ref_token_count = int(ref_mask.sum().item())
+    for frame_idx in range(frames):
+        frame_mask = valid & (frame_ids == frame_idx)
+        frame_indices = frame_mask.nonzero(as_tuple=False).flatten()
+        if frame_indices.numel() == 0:
+            continue
+        k = min(max(ref_token_count, 1), int(frame_indices.numel()))
+        _, topk = torch.topk(scores[frame_indices], k=k)
+        propagated[frame_indices[topk]] = 1.0
+    return propagated.detach().cpu().reshape(frames, token_h, token_w)
 
 
 def overlay_single_mask(
