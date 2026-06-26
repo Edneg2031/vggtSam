@@ -1,8 +1,13 @@
+## 任务
 输入： RGB序列或者视频、语义text
 输出：语义地图点云、mask对应关系
 方法结合流式重建的几何特征以及sam3的多目标开放词汇跟踪能力，做外观特征融合
 
 
-核心创新点
+## 核心创新点
 实例mask + 跨视角mask一致性约束 -> 减少几何层漂移
 rgb + 几何层特征 -> 增强跨视角mask一致性判别
+
+
+## 当前想法
+rgb 输入 sam3 和 streamVGGT 得到 geometry tokens 和 semantic tokens，融合两个特征

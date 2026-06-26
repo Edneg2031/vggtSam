@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare 2D semantic and instance labels for selected ScanNet++ DSLR frames."""
+"""Prepare 2D semantic and instance labels for ScanNet++ pinhole frames."""
 
 from __future__ import annotations
 

@@ -152,6 +152,7 @@ def read_images_text(path: Path) -> Dict[int, Image]:
 def read_colmap_text_model(
     colmap_dir: Path,
 ) -> Tuple[Dict[int, Camera], Dict[int, Image]]:
+    colmap_dir = resolve_colmap_text_dir(colmap_dir)
     cameras_path = colmap_dir / "cameras.txt"
     images_path = colmap_dir / "images.txt"
     if not cameras_path.is_file():
@@ -159,6 +160,27 @@ def read_colmap_text_model(
     if not images_path.is_file():
         raise FileNotFoundError(f"Missing COLMAP images file: {images_path}")
     return read_cameras_text(cameras_path), read_images_text(images_path)
+
+
+def resolve_colmap_text_dir(colmap_dir: Path) -> Path:
+    """Find a COLMAP text model directory under common ScanNet++ layouts."""
+    candidates = [
+        colmap_dir,
+        colmap_dir / "0",
+        colmap_dir / "sparse" / "0",
+        colmap_dir / "text",
+    ]
+    for candidate in candidates:
+        if (candidate / "cameras.txt").is_file() and (
+            candidate / "images.txt"
+        ).is_file():
+            return candidate
+    if colmap_dir.is_dir():
+        for candidate in sorted(colmap_dir.rglob("cameras.txt")):
+            model_dir = candidate.parent
+            if (model_dir / "images.txt").is_file():
+                return model_dir
+    return colmap_dir
 
 
 def ordered_images(images: Dict[int, Image]) -> List[Image]:

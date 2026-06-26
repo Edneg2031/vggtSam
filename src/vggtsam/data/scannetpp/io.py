@@ -37,13 +37,21 @@ def discover_scene_ids(data_root: Path) -> List[str]:
     for path in sorted(data_root.iterdir()):
         if not path.is_dir():
             continue
-        if (path / "scans").is_dir() and (path / "dslr").is_dir():
+        if (
+            (path / "images").is_dir()
+            and (path / "colmap").is_dir()
+            and (path / "mesh_aligned_0.05.ply").is_file()
+        ):
             scene_ids.append(path.name)
     return scene_ids
 
 
-def load_ply_mesh(path: Path, label_property: str = "label") -> Dict[str, np.ndarray]:
-    """Load vertices, triangle faces and optional per-vertex semantic labels."""
+def load_ply_mesh(
+    path: Path,
+    label_property: str = "label",
+    instance_property: Optional[str] = None,
+) -> Dict[str, np.ndarray]:
+    """Load vertices, triangle faces and optional per-vertex labels."""
     from plyfile import PlyData
 
     if not path.is_file():
@@ -59,8 +67,48 @@ def load_ply_mesh(path: Path, label_property: str = "label") -> Dict[str, np.nda
     labels = None
     if label_property in names:
         labels = np.asarray(vertices_raw[label_property], dtype=np.int32)
-    elif "semantic_label" in names:
-        labels = np.asarray(vertices_raw["semantic_label"], dtype=np.int32)
+    else:
+        semantic_property = _first_property(
+            names,
+            [
+                "semantic_label",
+                "semantic_id",
+                "semantic",
+                "label_id",
+                "class_id",
+                "category_id",
+                "nyu40id",
+            ],
+        )
+        if semantic_property is not None:
+            labels = np.asarray(vertices_raw[semantic_property], dtype=np.int32)
+
+    instances = None
+    if instance_property and instance_property in names:
+        instances = np.asarray(vertices_raw[instance_property], dtype=np.int32)
+    else:
+        mesh_instance_property = _first_property(
+            names,
+            [
+                "instance_id",
+                "instance",
+                "object_id",
+                "objectId",
+                "objectid",
+                "segment_id",
+                "segmentId",
+                "segmentid",
+            ],
+        )
+        if mesh_instance_property is not None:
+            instances = np.asarray(vertices_raw[mesh_instance_property], dtype=np.int32)
+
+    colors = None
+    if all(name in names for name in ("red", "green", "blue")):
+        colors = np.stack(
+            [vertices_raw["red"], vertices_raw["green"], vertices_raw["blue"]],
+            axis=1,
+        ).astype(np.uint8)
 
     faces_raw = ply["face"].data
     face_field = "vertex_indices"
@@ -68,47 +116,26 @@ def load_ply_mesh(path: Path, label_property: str = "label") -> Dict[str, np.nda
         face_field = "vertex_index"
     faces = np.asarray([row for row in faces_raw[face_field]], dtype=np.int32)
 
-    return {"vertices": vertices, "faces": faces, "labels": labels}
+    return {
+        "vertices": vertices,
+        "faces": faces,
+        "labels": labels,
+        "instances": instances,
+        "colors": colors,
+        "vertex_properties": list(names),
+    }
 
 
-def load_vertex_instances(
-    segments_path: Path,
-    annotation_path: Path,
-    num_vertices: int,
-) -> Dict[str, Any]:
-    """Create per-vertex object IDs from ScanNet++ segments annotations."""
-    if not segments_path.is_file():
-        raise FileNotFoundError(f"Missing segments file: {segments_path}")
-    if not annotation_path.is_file():
-        raise FileNotFoundError(f"Missing annotation file: {annotation_path}")
-
-    segments = read_json(segments_path)
-    annotations = read_json(annotation_path)
-    seg_indices = np.asarray(segments["segIndices"], dtype=np.int32)
-    if len(seg_indices) != num_vertices:
-        raise ValueError(
-            f"segments.json length {len(seg_indices)} does not match "
-            f"mesh vertex count {num_vertices}"
-        )
-
-    vertex_instance_ids = np.zeros(num_vertices, dtype=np.int32)
-    objects: Dict[int, Dict[str, Any]] = {}
-    for group in annotations.get("segGroups", []):
-        object_id = int(group.get("objectId", group.get("id", 0)))
-        if object_id <= 0:
-            continue
-        object_segments = np.asarray(group.get("segments", []), dtype=np.int32)
-        if object_segments.size == 0:
-            continue
-
-        mask = np.isin(seg_indices, object_segments)
-        vertex_instance_ids[mask] = object_id
-        objects[object_id] = {
-            key: value for key, value in group.items() if key not in {"segments"}
-        }
-        objects[object_id]["num_vertices"] = int(mask.sum())
-
-    return {"vertex_instance_ids": vertex_instance_ids, "objects": objects}
+def _first_property(names: Iterable[str], candidates: Iterable[str]) -> Optional[str]:
+    names_set = set(names)
+    lowered = {name.lower(): name for name in names}
+    for candidate in candidates:
+        if candidate in names_set:
+            return candidate
+        matched = lowered.get(candidate.lower())
+        if matched is not None:
+            return matched
+    return None
 
 
 def face_property_from_vertices(
@@ -146,42 +173,3 @@ def face_property_from_vertices(
     result[ab | ac] = a[ab | ac]
     result[bc] = b[bc]
     return result
-
-
-def load_train_test_lists(path: Path) -> Dict[str, List[str]]:
-    if not path.is_file():
-        return {}
-    payload = read_json(path)
-    if not isinstance(payload, dict):
-        return {}
-
-    result: Dict[str, List[str]] = {}
-    for key, value in payload.items():
-        if isinstance(value, list):
-            result[key.lower()] = [str(item) for item in value]
-    return result
-
-
-def filter_by_split(
-    image_names: List[str], train_test_lists: Dict[str, List[str]], split: str
-) -> List[str]:
-    split = split.lower()
-    if split == "all" or not train_test_lists:
-        return image_names
-
-    candidates = train_test_lists.get(split)
-    if candidates is None:
-        candidates = train_test_lists.get(f"{split}_frames")
-    if candidates is None:
-        candidates = train_test_lists.get(f"{split}_images")
-    if candidates is None:
-        raise ValueError(
-            f"Split '{split}' not found in train_test_lists.json. "
-            f"Available keys: {sorted(train_test_lists.keys())}"
-        )
-
-    allowed = set(candidates)
-    allowed.update(Path(name).name for name in candidates)
-    return [
-        name for name in image_names if name in allowed or Path(name).name in allowed
-    ]

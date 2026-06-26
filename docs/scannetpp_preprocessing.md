@@ -1,114 +1,134 @@
-# ScanNet++ Preprocessing
+# ScanNet++ Pinhole Preprocessing
 
-The downloaded ScanNet++ DSLR folders do not contain ready-to-use 2D semantic
-masks. The official ScanNet++ toolbox describes the intended path: rasterize the
-3D mesh onto DSLR or iPhone images to get pixel-to-face mappings, then transfer
-3D semantic and instance annotations to 2D images.
+This project now uses the undistorted/pinhole ScanNet++ layout only. The raw
+fish-eye DSLR/iPhone preprocessing path has been removed to keep the data flow
+unambiguous.
 
-For this project we implement a local preprocessing entry point that works on a
-selected subset of scenes and frames first, instead of forcing the whole dataset
-through a large offline job.
+## Input Layout
 
-## Expected Input
-
-One scene should look like:
+Expected dataset layout:
 
 ```text
-<data_root>/<scene_id>/
-  dslr/
-    colmap/
-      cameras.txt
-      images.txt
-      points3D.txt
-    resized_images/
-    resized_anon_masks/
-    train_test_lists.json
-  scans/
-    mesh_aligned_0.05.ply
-    mesh_aligned_0.05_semantic.ply
-    segments.json
-    segments_anno.json
+<dataset_root>/
+  data/
+    <scene_id>/
+      images/
+      masks/                  # optional; not used as semantic labels
+      colmap/
+        cameras.txt
+        images.txt
+        points3D.txt
+      mesh_aligned_0.05.ply
+      points3DfromMesh.ply    # optional, not used by rasterization
+  metadata/
+    semantic_classes.txt
+    instance_classes.txt
 ```
 
-`resized_anon_masks` are privacy/valid-pixel masks. They are often all 255 and
-should not be treated as semantic masks.
+The preprocessing step generates 2D semantic masks, cross-view consistent
+instance masks, and pointmaps by projecting `mesh_aligned_0.05.ply` into the
+pinhole RGB frames with COLMAP poses.
 
-## What Gets Generated
+Important assumptions:
+
+```text
+1. images.txt defines the frame order.
+2. cameras.txt/images.txt are in text COLMAP format.
+3. mesh_aligned_0.05.ply contains per-vertex semantic labels.
+4. mesh_aligned_0.05.ply also contains per-vertex instance/object ids.
+```
+
+If the mesh does not contain an instance property such as `instance_id` or
+`object_id`, cross-view instance masks cannot be generated.
+
+## Frame Sampling
+
+Frame sampling is deliberately simple:
+
+```text
+ordered frames from COLMAP images.txt
+  -> keep frames whose RGB file exists in images/
+  -> apply frame_step
+  -> truncate to max_frames
+```
+
+There is no random frame sampling, split file, or frame list in preprocessing.
+
+## Outputs
 
 For every selected frame:
 
-- `semantic_masks/<image>.png`: 16-bit semantic IDs. Invalid/unlabeled pixels use
-  `65535` by default.
-- `instance_masks/<image>.png`: 16-bit object IDs from `segments_anno.json`.
-  Background/invalid pixels use `0`.
-- `raster/<image>.npz`: optional pixel-to-face and z-buffer data.
-- `visualizations/*`: optional semantic and instance overlays for quick sanity
-  checks.
-- `scene_manifest.json` and top-level `manifest.json`: paths and frame metadata
-  for later training code.
-
-## Usage
-
-Process one scene and only a few frames:
-
-```bash
-PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
-  --data-root /home/bod/184Nas/open_source/scannet_pp/data \
-  --output-root data/processed/scannetpp_2d \
-  --scene-ids 0a5c013435 \
-  --max-frames 20 \
-  --frame-step 5 \
-  --save-visualizations
+```text
+semantic_masks/<image>.png
+instance_masks/<image>.png
+pointmaps/<image>.npz
+raster/<image>.npz
+visualizations/semantic/<image>.jpg
+visualizations/instance/<image>.jpg
+visualizations/summary/<image>.jpg
 ```
 
-Process scenes from a text file:
+`visualizations/summary` contains RGB / semantic projection / instance
+projection panels. Instance panels include labels such as
+`instance_id:class_name` when semantic class names are available.
 
-```bash
-PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
-  --data-root /home/bod/184Nas/open_source/scannet_pp/data \
-  --output-root data/processed/scannetpp_2d \
-  --scene-list data/splits/debug_scenes.txt \
-  --limit-scenes 3
+The top-level output also contains:
+
+```text
+manifest.json
+<scene_id>/scene_manifest.json
 ```
 
-Use the YAML config:
+These manifests are consumed by training code.
+
+## Commands
+
+First check paths and mesh attributes:
 
 ```bash
 PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
-  --config configs/scannetpp_2d.yaml \
-  --scene-ids 0a5c013435 \
-  --max-frames 10
-```
-
-Check paths and selected frames before rasterization:
-
-```bash
-PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
-  --config configs/scannetpp_2d.yaml \
-  --scene-ids 0a5c013435 \
+  --config configs/scannetpp_pinhole_2d.yaml \
+  --scene-ids 00a231a370 \
   --max-frames 5 \
   --dry-run
 ```
 
+Check the dry-run output:
+
+```text
+mesh_info.has_semantic_labels = true
+mesh_info.has_instance_ids = true
+mesh_info.vertex_properties = [...]
+```
+
+Then process a small debug slice:
+
+```bash
+PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
+  --config configs/scannetpp_pinhole_2d.yaml \
+  --scene-ids 00a231a370 \
+  --max-frames 20 \
+  --frame-step 2 \
+  --save-visualizations
+```
+
+Process several scenes from the configured scene list:
+
+```bash
+PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
+  --config configs/scannetpp_pinhole_2d.yaml \
+  --limit-scenes 3 \
+  --frame-step 2 \
+  --max-frames 100
+```
+
 ## Notes
 
-- The DSLR COLMAP camera is usually `OPENCV_FISHEYE`. The code projects mesh
-  vertices with the COLMAP world-to-camera pose and camera distortion model.
-- If actual image dimensions differ from COLMAP dimensions, intrinsics are scaled
-  to the loaded resized image size.
-- CPU rasterization is implemented locally with a z-buffer. Installing `numba`
-  is strongly recommended on the server for speed:
+- `masks/` is not treated as semantic or instance ground truth.
+- The output pointmap is generated by mesh rasterization, so it is an algorithmic
+  target rather than perfect ground truth.
+- Install `numba` on the server for faster CPU rasterization:
 
 ```bash
 pip install numba
 ```
-
-- Start with `--max-frames` and `--frame-step` while debugging; full scenes can
-  be much slower.
-
-## References
-
-- ScanNet++ toolbox README, semantics section:
-  https://github.com/scannetpp/scannetpp/#semantics
-- ScanNet++ dataset documentation, file structure and semantic mesh notes:
-  https://scannetpp.mlsg.cit.tum.de/scannetpp/documentation

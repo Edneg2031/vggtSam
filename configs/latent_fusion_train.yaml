@@ -3,8 +3,8 @@
 # SAM3 intermediate tokens are query, StreamVGGT latent geometry/camera tokens are context.
 
 dataset:
-  manifest: data/processed/scannetpp_2d/manifest.json
-  scene_id: 0b031f3119
+  manifest: data/processed/scannetpp_pinhole_2d/manifest.json
+  scene_id: 00a231a370
   sequence_length: 4
   frame_stride: 1
 

@@ -258,7 +258,7 @@ PYTHONPATH=src python scripts/train_latent_fusion.py \
 配置文件是 `configs/latent_fusion_train.yaml`。当前训练流程更具体地说是：
 
 ```text
-1. 从 data/processed/scannetpp_2d/manifest.json 读取已处理的 ScanNet++ 场景。
+1. 从 data/processed/scannetpp_pinhole_2d/manifest.json 读取已处理的 ScanNet++ pinhole 场景。
 2. 在一个场景内随机采样连续帧窗口，例如 sequence_length=4。
 3. 对每个窗口读取：
    - 原始 RGB 图片路径；

@@ -9,24 +9,24 @@ The current mainline is the latent fusion implementation described in:
 docs/latent_fusion_training_flow.md
 ```
 
-## ScanNet++ 2D Labels
+## ScanNet++ Pinhole 2D Labels
 
-Generate projected semantic and instance masks from ScanNet++ 3D annotations:
+Generate projected semantic and instance masks from the undistorted/pinhole
+ScanNet++ data:
 
 ```bash
 PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
-  --data-root /home/bod/184Nas/open_source/scannet_pp/data \
-  --output-root data/processed/scannetpp_2d \
-  --scene-ids 0a5c013435 \
+  --config configs/scannetpp_pinhole_2d.yaml \
+  --scene-ids 00a231a370 \
   --max-frames 20 \
-  --frame-step 5 \
+  --frame-step 2 \
   --save-visualizations
 ```
 
 Output structure:
 
 ```text
-data/processed/scannetpp_2d/
+data/processed/scannetpp_pinhole_2d/
   manifest.json
   <scene_id>/
     scene_manifest.json
@@ -37,8 +37,9 @@ data/processed/scannetpp_2d/
     visualizations/
 ```
 
-`pointmaps/*.npz` stores COLMAP/mesh-rasterized visible world-space XYZ
-targets. The latent fusion trainer uses these as the default point supervision.
+`pointmaps/*.npz` stores COLMAP/mesh-rasterized visible world-space XYZ targets.
+Frames are sampled in COLMAP `images.txt` order, then strided by `frame_step`
+and truncated by `max_frames`.
 
 More details:
 

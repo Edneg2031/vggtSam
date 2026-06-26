@@ -1,4 +1,4 @@
-"""ScanNet++ 3D-to-2D semantic/instance preprocessing."""
+"""ScanNet++ pinhole 3D-to-2D semantic/instance preprocessing."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import datetime as _dt
 import json
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from tqdm import tqdm
@@ -16,15 +16,12 @@ from .colmap import image_lookup, ordered_images, read_colmap_text_model
 from .io import (
     discover_scene_ids,
     face_property_from_vertices,
-    filter_by_split,
     load_ply_mesh,
-    load_train_test_lists,
-    load_vertex_instances,
     read_text_list,
     write_json,
 )
 from .rasterize import has_numba, rasterize_labels_and_points
-from .visualize import colorize_ids, overlay_labels, save_rgb
+from .visualize import colorize_ids, overlay_labels, save_labeled_summary, save_rgb
 
 
 @dataclass
@@ -34,20 +31,16 @@ class ScanNetPP2DConfig:
     scene_ids: List[str]
     scene_list: Optional[Path] = None
     limit_scenes: Optional[int] = None
-    image_subdir: str = "dslr/resized_images"
-    mask_subdir: str = "dslr/resized_anon_masks"
-    colmap_subdir: str = "dslr/colmap"
-    scan_subdir: str = "scans"
-    split: str = "all"
+    mesh_filename: str = "mesh_aligned_0.05.ply"
+    metadata_root: Optional[Path] = None
+    semantic_classes_file: Optional[Path] = None
     frame_step: int = 1
     max_frames: Optional[int] = None
-    frame_list: Optional[Path] = None
     near: float = 0.001
     semantic_ignore_label: int = 65535
     save_visualizations: bool = False
     save_raster: bool = True
     save_pointmaps: bool = True
-    apply_anon_mask: bool = True
     skip_existing: bool = True
     dry_run: bool = False
 
@@ -87,37 +80,52 @@ def prepare_scannetpp_2d(config: ScanNetPP2DConfig) -> Dict[str, Any]:
 
 
 def _inspect_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
-    scene_root = config.data_root / scene_id
-    scans_dir = scene_root / config.scan_subdir
-    image_dir = scene_root / config.image_subdir
-    colmap_dir = scene_root / config.colmap_subdir
+    assets = _resolve_scene_assets(scene_id, config)
+    scene_root = assets["scene_root"]
+    image_dir = assets["image_dir"]
+    colmap_dir = assets["colmap_dir"]
+    mesh_path = assets["mesh_path"]
 
     required = {
-        "semantic_mesh": scans_dir / "mesh_aligned_0.05_semantic.ply",
-        "segments": scans_dir / "segments.json",
-        "segments_anno": scans_dir / "segments_anno.json",
+        "mesh": mesh_path,
         "images": image_dir,
         "colmap": colmap_dir,
     }
     missing = [name for name, path in required.items() if not path.exists()]
-
     if "colmap" in missing or "images" in missing:
         cameras = {}
         colmap_images = {}
         frame_names = []
     else:
         cameras, colmap_images = read_colmap_text_model(colmap_dir)
-        image_by_name = image_lookup(ordered_images(colmap_images))
-        frame_names = _select_frame_names(scene_root, image_dir, image_by_name, config)
+        frame_names = _select_frame_names(
+            image_dir,
+            ordered_images(colmap_images),
+            config,
+        )
+    mesh_info: Dict[str, Any] = {}
+    if mesh_path.is_file():
+        mesh = load_ply_mesh(mesh_path)
+        mesh_info = {
+            "vertex_properties": mesh.get("vertex_properties", []),
+            "has_semantic_labels": mesh.get("labels") is not None,
+            "has_instance_ids": mesh.get("instances") is not None,
+            "has_vertex_colors": mesh.get("colors") is not None,
+            "num_vertices": int(len(mesh["vertices"])),
+            "num_faces": int(len(mesh["faces"])),
+        }
     print(
         f"[dry-run:{scene_id}] missing={missing} cameras={len(cameras)} "
-        f"colmap_images={len(colmap_images)} selected_frames={len(frame_names)}"
+        f"colmap_images={len(colmap_images)} selected_frames={len(frame_names)} "
+        f"mesh_info={mesh_info}"
     )
     return {
         "scene_id": scene_id,
         "scene_root": str(scene_root),
         "dry_run": True,
         "missing": missing,
+        "mesh_path": str(mesh_path),
+        "mesh_info": mesh_info,
         "num_cameras": int(len(cameras)),
         "num_colmap_images": int(len(colmap_images)),
         "num_selected_frames": int(len(frame_names)),
@@ -126,15 +134,11 @@ def _inspect_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
 
 
 def _process_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
-    scene_root = config.data_root / scene_id
-    scans_dir = scene_root / config.scan_subdir
-    image_dir = scene_root / config.image_subdir
-    anon_mask_dir = scene_root / config.mask_subdir
-    colmap_dir = scene_root / config.colmap_subdir
-
-    semantic_mesh_path = scans_dir / "mesh_aligned_0.05_semantic.ply"
-    segments_path = scans_dir / "segments.json"
-    annotations_path = scans_dir / "segments_anno.json"
+    assets = _resolve_scene_assets(scene_id, config)
+    scene_root = assets["scene_root"]
+    image_dir = assets["image_dir"]
+    colmap_dir = assets["colmap_dir"]
+    semantic_mesh_path = assets["mesh_path"]
 
     out_scene_dir = config.output_root / scene_id
     semantic_dir = out_scene_dir / "semantic_masks"
@@ -146,6 +150,7 @@ def _process_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
         path.mkdir(parents=True, exist_ok=True)
 
     print(f"\n[{scene_id}] loading mesh and annotations")
+    semantic_class_names = _load_semantic_class_names(config)
     mesh = load_ply_mesh(semantic_mesh_path)
     vertices = mesh["vertices"]
     faces = mesh["faces"]
@@ -155,9 +160,12 @@ def _process_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
             f"{semantic_mesh_path} does not contain a vertex 'label' property."
         )
 
-    instance_data = load_vertex_instances(segments_path, annotations_path, len(vertices))
-    vertex_instance_ids = instance_data["vertex_instance_ids"]
-    objects = instance_data["objects"]
+    vertex_instance_ids, objects = _load_instance_data(
+        mesh,
+        vertex_semantic_ids=vertex_semantic_ids,
+        semantic_class_names=semantic_class_names,
+        num_vertices=len(vertices),
+    )
 
     face_semantic_ids = face_property_from_vertices(
         vertex_semantic_ids,
@@ -173,16 +181,19 @@ def _process_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
     )
 
     cameras, colmap_images = read_colmap_text_model(colmap_dir)
-    image_by_name = image_lookup(ordered_images(colmap_images))
-    frame_names = _select_frame_names(scene_root, image_dir, image_by_name, config)
+    ordered_colmap_images = ordered_images(colmap_images)
+    image_by_name = image_lookup(ordered_colmap_images)
+    frame_names = _select_frame_names(image_dir, ordered_colmap_images, config)
     print(f"[{scene_id}] frames={len(frame_names)}")
 
     scene_manifest: Dict[str, Any] = {
         "scene_id": scene_id,
         "scene_root": str(scene_root),
         "output_dir": str(out_scene_dir),
+        "mesh_path": str(semantic_mesh_path),
         "num_vertices": int(len(vertices)),
         "num_faces": int(len(faces)),
+        "vertex_properties": mesh.get("vertex_properties", []),
         "objects": {
             str(object_id): value
             for object_id, value in sorted(objects.items(), key=lambda item: item[0])
@@ -194,7 +205,6 @@ def _process_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
         frame_record = _process_frame(
             frame_name=frame_name,
             image_dir=image_dir,
-            anon_mask_dir=anon_mask_dir,
             image_by_name=image_by_name,
             cameras=cameras,
             vertices=vertices,
@@ -206,6 +216,7 @@ def _process_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
             pointmap_dir=pointmap_dir,
             raster_dir=raster_dir,
             viz_dir=viz_dir,
+            objects=objects,
             config=config,
         )
         if frame_record is not None:
@@ -219,7 +230,6 @@ def _process_frame(
     *,
     frame_name: str,
     image_dir: Path,
-    anon_mask_dir: Path,
     image_by_name: Dict[str, Any],
     cameras: Dict[int, Any],
     vertices: np.ndarray,
@@ -231,6 +241,7 @@ def _process_frame(
     pointmap_dir: Path,
     raster_dir: Path,
     viz_dir: Path,
+    objects: Dict[int, Any],
     config: ScanNetPP2DConfig,
 ) -> Optional[Dict[str, Any]]:
     import cv2
@@ -292,16 +303,6 @@ def _process_frame(
         semantic_ignore_label=config.semantic_ignore_label,
     )
 
-    if config.apply_anon_mask:
-        anon_mask_path = anon_mask_dir / Path(frame_name).name
-        if anon_mask_path.is_file():
-            anon = cv2.imread(str(anon_mask_path), cv2.IMREAD_GRAYSCALE)
-            if anon is not None and anon.shape[:2] == semantic.shape:
-                invalid = anon == 0
-                semantic[invalid] = config.semantic_ignore_label
-                instance[invalid] = 0
-                pointmap[invalid] = np.nan
-
     _write_uint16_png(semantic_path, semantic, config.semantic_ignore_label)
     _write_uint16_png(instance_path, instance, 0)
 
@@ -332,6 +333,15 @@ def _process_frame(
             viz_dir / "instance" / f"{stem}.jpg",
             overlay_labels(image_rgb, instance, inst_color, alpha=0.55),
         )
+        save_labeled_summary(
+            viz_dir / "summary" / f"{stem}.jpg",
+            image_rgb,
+            semantic,
+            instance,
+            objects=objects,
+            semantic_ignore_label=config.semantic_ignore_label,
+            alpha=0.55,
+        )
 
     valid_semantic = semantic != config.semantic_ignore_label
     valid_instance = instance > 0
@@ -352,6 +362,100 @@ def _process_frame(
         "pointmap_pixels": int(valid_pointmap.sum()),
         "visible_instance_ids": visible_instances,
     }
+
+
+def _resolve_scene_assets(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
+    scene_root = config.data_root / scene_id
+    image_dir = scene_root / "images"
+    colmap_dir = scene_root / "colmap"
+    mesh_path = scene_root / config.mesh_filename
+    return {
+        "scene_root": scene_root,
+        "image_dir": image_dir,
+        "colmap_dir": colmap_dir,
+        "mesh_path": mesh_path,
+    }
+
+
+def _load_instance_data(
+    mesh: Dict[str, np.ndarray],
+    *,
+    vertex_semantic_ids: np.ndarray,
+    semantic_class_names: Sequence[str],
+    num_vertices: int,
+) -> Tuple[np.ndarray, Dict[int, Dict[str, Any]]]:
+    mesh_instances = mesh.get("instances")
+    if mesh_instances is not None:
+        vertex_instance_ids = np.asarray(mesh_instances, dtype=np.int32)
+        if len(vertex_instance_ids) != num_vertices:
+            raise ValueError(
+                f"Mesh instance property length {len(vertex_instance_ids)} does not "
+                f"match vertex count {num_vertices}"
+            )
+        objects = _objects_from_instance_semantics(
+            vertex_instance_ids,
+            vertex_semantic_ids,
+            semantic_class_names,
+        )
+        return vertex_instance_ids, objects
+
+    raise ValueError(
+        "No mesh instance annotations found. The pinhole preprocessing expects "
+        "mesh_aligned_0.05.ply to contain a vertex property such as "
+        "instance_id/object_id."
+    )
+
+
+def _objects_from_instance_semantics(
+    vertex_instance_ids: np.ndarray,
+    vertex_semantic_ids: np.ndarray,
+    semantic_class_names: Sequence[str],
+) -> Dict[int, Dict[str, Any]]:
+    objects: Dict[int, Dict[str, Any]] = {}
+    for instance_id in sorted(int(v) for v in np.unique(vertex_instance_ids) if v > 0):
+        mask = vertex_instance_ids == instance_id
+        semantic_values = vertex_semantic_ids[mask]
+        semantic_values = semantic_values[
+            (semantic_values >= 0) & (semantic_values != 65535)
+        ]
+        semantic_id = -1
+        if semantic_values.size:
+            values, counts = np.unique(semantic_values, return_counts=True)
+            semantic_id = int(values[int(np.argmax(counts))])
+        label = _semantic_name(semantic_id, semantic_class_names)
+        objects[instance_id] = {
+            "objectId": int(instance_id),
+            "semantic_id": int(semantic_id),
+            "label": label or f"instance_{instance_id}",
+            "num_vertices": int(mask.sum()),
+        }
+    return objects
+
+
+def _load_semantic_class_names(config: ScanNetPP2DConfig) -> List[str]:
+    candidates: List[Path] = []
+    if config.semantic_classes_file is not None:
+        candidates.append(Path(config.semantic_classes_file))
+    metadata_root = (
+        Path(config.metadata_root)
+        if config.metadata_root is not None
+        else config.data_root.parent / "metadata"
+    )
+    candidates.append(metadata_root / "semantic_classes.txt")
+    for path in candidates:
+        if path.is_file():
+            return read_text_list(path)
+    return []
+
+
+def _semantic_name(semantic_id: int, names: Sequence[str]) -> str:
+    if semantic_id < 0 or not names:
+        return ""
+    if semantic_id < len(names):
+        return names[semantic_id]
+    if 1 <= semantic_id <= len(names):
+        return names[semantic_id - 1]
+    return ""
 
 
 def _resolve_scene_ids(config: ScanNetPP2DConfig) -> List[str]:
@@ -378,24 +482,20 @@ def _resolve_scene_ids(config: ScanNetPP2DConfig) -> List[str]:
 
 
 def _select_frame_names(
-    scene_root: Path,
     image_dir: Path,
-    image_by_name: Dict[str, Any],
+    colmap_images: Sequence[Any],
     config: ScanNetPP2DConfig,
 ) -> List[str]:
-    if config.frame_list:
-        names = read_text_list(Path(config.frame_list))
-    else:
-        names = [Path(image.name).name for image in image_by_name.values()]
-        names = sorted(set(names))
-
+    names = [image.name for image in colmap_images]
+    seen = set()
     existing = []
     for name in names:
+        key = Path(name).name
+        if key in seen:
+            continue
+        seen.add(key)
         if (image_dir / Path(name).name).is_file() or (image_dir / name).is_file():
             existing.append(name)
-
-    train_test_lists = load_train_test_lists(scene_root / "dslr" / "train_test_lists.json")
-    existing = filter_by_split(existing, train_test_lists, config.split)
 
     if config.frame_step <= 0:
         raise ValueError(f"frame_step must be positive, got {config.frame_step}")
@@ -467,8 +567,10 @@ def _build_config(args: argparse.Namespace) -> ScanNetPP2DConfig:
     payload["output_root"] = Path(payload["output_root"])
     if payload.get("scene_list"):
         payload["scene_list"] = Path(payload["scene_list"])
-    if payload.get("frame_list"):
-        payload["frame_list"] = Path(payload["frame_list"])
+    if payload.get("metadata_root"):
+        payload["metadata_root"] = Path(payload["metadata_root"])
+    if payload.get("semantic_classes_file"):
+        payload["semantic_classes_file"] = Path(payload["semantic_classes_file"])
     payload["scene_ids"] = list(payload.get("scene_ids") or [])
 
     return ScanNetPP2DConfig(**payload)
@@ -476,7 +578,7 @@ def _build_config(args: argparse.Namespace) -> ScanNetPP2DConfig:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Rasterize ScanNet++ 3D semantic/instance labels to selected DSLR frames."
+        description="Rasterize ScanNet++ pinhole mesh semantic/instance labels to images."
     )
     parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--data-root", type=Path, default=None)
@@ -484,18 +586,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scene-ids", nargs="*", default=None)
     parser.add_argument("--scene-list", type=Path, default=None)
     parser.add_argument("--limit-scenes", type=int, default=None)
-    parser.add_argument("--image-subdir", default=None)
-    parser.add_argument("--mask-subdir", default=None)
-    parser.add_argument("--colmap-subdir", default=None)
-    parser.add_argument("--scan-subdir", default=None)
-    parser.add_argument(
-        "--split",
-        choices=["all", "train", "test", "val", "validation"],
-        default=None,
-    )
+    parser.add_argument("--mesh-filename", default=None)
+    parser.add_argument("--metadata-root", type=Path, default=None)
+    parser.add_argument("--semantic-classes-file", type=Path, default=None)
     parser.add_argument("--frame-step", type=int, default=None)
     parser.add_argument("--max-frames", type=int, default=None)
-    parser.add_argument("--frame-list", type=Path, default=None)
     parser.add_argument("--near", type=float, default=None)
     parser.add_argument("--semantic-ignore-label", type=int, default=None)
 
@@ -521,11 +616,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--no-pointmaps", dest="save_pointmaps", action="store_false"
     )
     parser.set_defaults(save_pointmaps=None)
-
-    anon = parser.add_mutually_exclusive_group()
-    anon.add_argument("--apply-anon-mask", dest="apply_anon_mask", action="store_true")
-    anon.add_argument("--ignore-anon-mask", dest="apply_anon_mask", action="store_false")
-    parser.set_defaults(apply_anon_mask=None)
 
     skip = parser.add_mutually_exclusive_group()
     skip.add_argument("--skip-existing", dest="skip_existing", action="store_true")

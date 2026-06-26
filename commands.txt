@@ -1,20 +1,27 @@
 PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
-  --config configs/scannetpp_2d.yaml \
-  --scene-ids 0a5c013435 \
-  --save-pointmaps
+  --config configs/scannetpp_pinhole_2d.yaml \
+  --scene-ids 00a231a370 \
+  --max-frames 20 \
+  --frame-step 2 \
+  --save-visualizations
 
 
-
-
-  PYTHONPATH=src python scripts/train_latent_fusion.py \
+PYTHONPATH=src python scripts/train_latent_fusion.py \
   --config configs/latent_fusion_train.yaml \
   --iterations 200 \
   --device cuda \
   --output-dir outputs/latent_fusion_correspondence
 
 
-  PYTHONPATH=src python scripts/export_latent_fusion_pointclouds.py \
-  --config configs/latent_fusion_train.yaml \
-  --checkpoint outputs/latent_fusion_debug/ckpt_step000200.pt \
-  --device cuda \
-  --export-all-tokens
+PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
+  --config configs/scannetpp_pinhole_2d.yaml \
+  --scene-ids 00a231a370 \
+  --max-frames 5 \
+  --dry-run
+
+  PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
+  --config configs/scannetpp_pinhole_2d.yaml \
+  --scene-ids 00a231a370 \
+  --max-frames 20 \
+  --frame-step 2 \
+  --save-visualizations
