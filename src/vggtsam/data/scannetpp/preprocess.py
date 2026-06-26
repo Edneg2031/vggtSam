@@ -175,8 +175,8 @@ def _process_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
     mesh = load_ply_mesh(semantic_mesh_path)
     vertices = mesh["vertices"]
     faces = mesh["faces"]
-    vertex_semantic_ids = mesh["labels"]
-    if vertex_semantic_ids is None:
+    raw_vertex_semantic_ids = mesh["labels"]
+    if raw_vertex_semantic_ids is None:
         raise ValueError(
             f"{semantic_mesh_path} does not contain a vertex 'label' property."
         )
@@ -185,9 +185,20 @@ def _process_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
         mesh,
         segments_path,
         annotations_path,
-        vertex_semantic_ids=vertex_semantic_ids,
+        vertex_semantic_ids=raw_vertex_semantic_ids,
         semantic_class_names=semantic_class_names,
         num_vertices=len(vertices),
+    )
+    vertex_semantic_ids, semantic_source, objects = _resolve_vertex_semantics(
+        raw_vertex_semantic_ids,
+        vertex_instance_ids,
+        objects,
+        semantic_class_names=semantic_class_names,
+        semantic_ignore_label=config.semantic_ignore_label,
+    )
+    print(
+        f"[{scene_id}] semantic_source={semantic_source} "
+        f"semantic_classes={len(semantic_class_names)}"
     )
 
     face_semantic_ids = face_property_from_vertices(
@@ -217,6 +228,8 @@ def _process_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
         "pinhole_mesh_path": str(assets["pinhole_mesh_path"]),
         "segments_path": str(segments_path),
         "annotations_path": str(annotations_path),
+        "semantic_source": semantic_source,
+        "num_semantic_classes": int(len(semantic_class_names)),
         "num_vertices": int(len(vertices)),
         "num_faces": int(len(faces)),
         "vertex_properties": mesh.get("vertex_properties", []),
@@ -446,6 +459,83 @@ def _load_instance_data(
         num_vertices,
     )
     return instance_data["vertex_instance_ids"], instance_data["objects"]
+
+
+def _resolve_vertex_semantics(
+    raw_vertex_semantic_ids: np.ndarray,
+    vertex_instance_ids: np.ndarray,
+    objects: Dict[int, Dict[str, Any]],
+    *,
+    semantic_class_names: Sequence[str],
+    semantic_ignore_label: int,
+) -> Tuple[np.ndarray, str, Dict[int, Dict[str, Any]]]:
+    """Prefer ScanNet++ object labels as compact semantic class ids.
+
+    The semantic PLY `label` property can contain large sparse annotation ids in
+    some releases. Training wants class ids, so we map each annotated object
+    label from segments_anno.json into semantic_classes.txt when possible.
+    """
+    label_to_id = _semantic_label_to_id(semantic_class_names)
+    if not label_to_id:
+        return raw_vertex_semantic_ids, "mesh_label_property", objects
+
+    vertex_semantic_ids = np.full(
+        len(vertex_instance_ids),
+        int(semantic_ignore_label),
+        dtype=np.int32,
+    )
+    updated_objects: Dict[int, Dict[str, Any]] = {}
+    assigned_objects = 0
+    assigned_vertices = 0
+    for instance_id, metadata in objects.items():
+        item = dict(metadata)
+        label = _metadata_label(item)
+        semantic_id = label_to_id.get(_normalize_label(label))
+        if semantic_id is not None:
+            mask = vertex_instance_ids == int(instance_id)
+            vertex_semantic_ids[mask] = int(semantic_id)
+            assigned_objects += 1
+            assigned_vertices += int(mask.sum())
+            item["semantic_id"] = int(semantic_id)
+            item["label"] = label
+        updated_objects[int(instance_id)] = item
+
+    if assigned_objects == 0 or assigned_vertices == 0:
+        return raw_vertex_semantic_ids, "mesh_label_property", objects
+    return vertex_semantic_ids, "segments_anno_label_to_semantic_classes", updated_objects
+
+
+def _semantic_label_to_id(names: Sequence[str]) -> Dict[str, int]:
+    mapping: Dict[str, int] = {}
+    for idx, name in enumerate(names):
+        normalized = _normalize_label(name)
+        if normalized and normalized not in mapping:
+            mapping[normalized] = int(idx)
+    return mapping
+
+
+def _metadata_label(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in (
+            "label",
+            "label_name",
+            "labelName",
+            "class",
+            "class_name",
+            "category",
+            "category_name",
+            "rawLabel",
+        ):
+            item = value.get(key)
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+    return ""
+
+
+def _normalize_label(value: str) -> str:
+    return " ".join(str(value).replace("_", " ").replace("-", " ").lower().split())
 
 
 def _objects_from_instance_semantics(

@@ -33,7 +33,7 @@ Expected dataset layout:
 ```
 
 The preprocessing step generates 2D semantic masks, cross-view consistent
-instance masks, and pointmaps by projecting the original ScanNet++ semantic
+instance masks, and pointmaps by projecting the original ScanNet++ annotated
 mesh into the pinhole RGB frames with pinhole COLMAP poses.
 
 Only the 3D annotation files are read from `<annotation_root>`. Fish-eye images,
@@ -44,13 +44,17 @@ Important assumptions:
 ```text
 1. The pinhole `images.txt` defines the frame order.
 2. The pinhole `cameras.txt/images.txt` are in text COLMAP format.
-3. The original `mesh_aligned_0.05_semantic.ply` contains per-vertex semantic labels.
-4. The original `segments.json + segments_anno.json` define cross-view object ids.
+3. The original `mesh_aligned_0.05_semantic.ply` supplies geometry and fallback labels.
+4. The original `segments.json + segments_anno.json` define cross-view object ids and class names.
 5. The pinhole mesh and original semantic mesh are in the same aligned world frame.
 ```
 
 The pinhole `mesh_aligned_0.05.ply` may contain only RGB vertex colors. That is
 fine: it is inspected for sanity, but labels are read from the annotation mesh.
+Semantic masks prefer `segments_anno.json` object labels mapped into
+`semantic_classes.txt` indices. The PLY `label` property is only a fallback
+because some releases store large sparse annotation ids there instead of compact
+class ids.
 
 ## Frame Sampling
 
@@ -85,6 +89,11 @@ visualizations/summary/<image>.jpg
 `visualizations/summary` contains RGB / semantic projection / instance
 projection panels. Instance panels include labels such as
 `instance_id:class_name` when semantic class names are available.
+
+`semantic_masks/*.png` is stored as `uint16`. The ignore value is `65535`; many
+image viewers render that as white. Valid class ids are small integers and can
+look black or very dark in raw PNG viewers. Use numeric inspection rather than
+black/white appearance to judge validity.
 
 The top-level output also contains:
 
