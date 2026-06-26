@@ -3,14 +3,7 @@ PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
   --scene-ids 0a5c013435 \
   --save-pointmaps
 
-PYTHONPATH=src python scripts/inspect_latent_fusion_features.py \
-  --config configs/latent_fusion_train.yaml \
-  --device cuda
 
-  PYTHONPATH=src python scripts/train_latent_fusion.py \
-  --config configs/latent_fusion_train.yaml \
-  --iterations 20 \
-  --device cuda
 
 
   PYTHONPATH=src python scripts/train_latent_fusion.py \
@@ -18,3 +11,10 @@ PYTHONPATH=src python scripts/inspect_latent_fusion_features.py \
   --iterations 200 \
   --device cuda \
   --output-dir outputs/latent_fusion_correspondence
+
+
+  PYTHONPATH=src python scripts/export_latent_fusion_pointclouds.py \
+  --config configs/latent_fusion_train.yaml \
+  --checkpoint outputs/latent_fusion_debug/ckpt_step000200.pt \
+  --device cuda \
+  --export-all-tokens
