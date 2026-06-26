@@ -6,6 +6,9 @@
 #     colmap/
 #     mesh_aligned_0.05.ply
 #     points3DfromMesh.ply   # optional, not used by rasterization
+# Semantic/instance annotations are read from the original ScanNet++ aligned
+# scans root. Only its 3D mesh/segments are used; its fisheye cameras/images
+# are not used by this pinhole preprocessing path.
 #
 # Command-line flags override these values.
 data_root: /home/bod/184Nas/open_source/scannet_pp_pinhole/data
@@ -17,6 +20,15 @@ scene_list: /home/bod/184Nas/open_source/scannet_pp_pinhole/scannetpp_part_valid
 limit_scenes:
 
 mesh_filename: mesh_aligned_0.05.ply
+
+# 3D annotation source. These paths should point to the original ScanNet++
+# release that has scans/mesh_aligned_0.05_semantic.ply and segments_anno.json.
+annotation_root: /home/bod/184Nas/open_source/scannet_pp/data
+annotation_scan_subdir: scans
+semantic_mesh_filename: mesh_aligned_0.05_semantic.ply
+segments_filename: segments.json
+annotations_filename: segments_anno.json
+
 metadata_root: /home/bod/184Nas/open_source/scannet_pp_pinhole/metadata
 semantic_classes_file:
 

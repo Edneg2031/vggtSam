@@ -138,6 +138,46 @@ def _first_property(names: Iterable[str], candidates: Iterable[str]) -> Optional
     return None
 
 
+def load_vertex_instances(
+    segments_path: Path,
+    annotation_path: Path,
+    num_vertices: int,
+) -> Dict[str, Any]:
+    """Create per-vertex object IDs from ScanNet++ segments annotations."""
+    if not segments_path.is_file():
+        raise FileNotFoundError(f"Missing segments file: {segments_path}")
+    if not annotation_path.is_file():
+        raise FileNotFoundError(f"Missing annotation file: {annotation_path}")
+
+    segments = read_json(segments_path)
+    annotations = read_json(annotation_path)
+    seg_indices = np.asarray(segments["segIndices"], dtype=np.int32)
+    if len(seg_indices) != num_vertices:
+        raise ValueError(
+            f"segments.json length {len(seg_indices)} does not match "
+            f"mesh vertex count {num_vertices}"
+        )
+
+    vertex_instance_ids = np.zeros(num_vertices, dtype=np.int32)
+    objects: Dict[int, Dict[str, Any]] = {}
+    for group in annotations.get("segGroups", []):
+        object_id = int(group.get("objectId", group.get("id", 0)))
+        if object_id <= 0:
+            continue
+        object_segments = np.asarray(group.get("segments", []), dtype=np.int32)
+        if object_segments.size == 0:
+            continue
+
+        mask = np.isin(seg_indices, object_segments)
+        vertex_instance_ids[mask] = object_id
+        objects[object_id] = {
+            key: value for key, value in group.items() if key not in {"segments"}
+        }
+        objects[object_id]["num_vertices"] = int(mask.sum())
+
+    return {"vertex_instance_ids": vertex_instance_ids, "objects": objects}
+
+
 def face_property_from_vertices(
     vertex_property: Optional[np.ndarray],
     faces: np.ndarray,

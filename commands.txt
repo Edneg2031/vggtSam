@@ -1,8 +1,16 @@
 PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
   --config configs/scannetpp_pinhole_2d.yaml \
   --scene-ids 00a231a370 \
-  --max-frames 20 \
-  --frame-step 2 \
+  --max-frames 5 \
+  --dry-run
+
+
+PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
+  --config configs/scannetpp_pinhole_2d.yaml \
+  --scene-ids 00a231a370 \
+  --max-frames 5 \
+  --frame-step 1 \
+  --overwrite \
   --save-visualizations
 
 
@@ -19,9 +27,23 @@ PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
   --max-frames 5 \
   --dry-run
 
+
+  
+
+
+PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
+  --config configs/scannetpp_pinhole_2d.yaml \
+  --scene-ids 00a231a370 \
+  --max-frames 5 \
+  --frame-step 1 \
+  --overwrite \
+  --save-visualizations
+
+
   PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
   --config configs/scannetpp_pinhole_2d.yaml \
   --scene-ids 00a231a370 \
-  --max-frames 20 \
-  --frame-step 2 \
+  --max-frames 600 \
+  --frame-step 1 \
+  --overwrite \
   --save-visualizations

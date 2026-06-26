@@ -17,6 +17,7 @@ from .io import (
     discover_scene_ids,
     face_property_from_vertices,
     load_ply_mesh,
+    load_vertex_instances,
     read_text_list,
     write_json,
 )
@@ -32,6 +33,11 @@ class ScanNetPP2DConfig:
     scene_list: Optional[Path] = None
     limit_scenes: Optional[int] = None
     mesh_filename: str = "mesh_aligned_0.05.ply"
+    annotation_root: Optional[Path] = None
+    annotation_scan_subdir: str = "scans"
+    semantic_mesh_filename: str = "mesh_aligned_0.05_semantic.ply"
+    segments_filename: str = "segments.json"
+    annotations_filename: str = "segments_anno.json"
     metadata_root: Optional[Path] = None
     semantic_classes_file: Optional[Path] = None
     frame_step: int = 1
@@ -84,10 +90,15 @@ def _inspect_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
     scene_root = assets["scene_root"]
     image_dir = assets["image_dir"]
     colmap_dir = assets["colmap_dir"]
-    mesh_path = assets["mesh_path"]
+    pinhole_mesh_path = assets["pinhole_mesh_path"]
+    annotation_mesh_path = assets["annotation_mesh_path"]
+    segments_path = assets["segments_path"]
+    annotations_path = assets["annotations_path"]
 
     required = {
-        "mesh": mesh_path,
+        "annotation_mesh": annotation_mesh_path,
+        "segments": segments_path,
+        "segments_anno": annotations_path,
         "images": image_dir,
         "colmap": colmap_dir,
     }
@@ -103,33 +114,41 @@ def _inspect_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
             ordered_images(colmap_images),
             config,
         )
-    mesh_info: Dict[str, Any] = {}
-    if mesh_path.is_file():
-        mesh = load_ply_mesh(mesh_path)
-        mesh_info = {
-            "vertex_properties": mesh.get("vertex_properties", []),
-            "has_semantic_labels": mesh.get("labels") is not None,
-            "has_instance_ids": mesh.get("instances") is not None,
-            "has_vertex_colors": mesh.get("colors") is not None,
-            "num_vertices": int(len(mesh["vertices"])),
-            "num_faces": int(len(mesh["faces"])),
-        }
+    pinhole_mesh_info = _inspect_mesh(pinhole_mesh_path)
+    annotation_mesh_info = _inspect_mesh(annotation_mesh_path)
     print(
         f"[dry-run:{scene_id}] missing={missing} cameras={len(cameras)} "
         f"colmap_images={len(colmap_images)} selected_frames={len(frame_names)} "
-        f"mesh_info={mesh_info}"
+        f"pinhole_mesh_info={pinhole_mesh_info} "
+        f"annotation_mesh_info={annotation_mesh_info}"
     )
     return {
         "scene_id": scene_id,
         "scene_root": str(scene_root),
         "dry_run": True,
         "missing": missing,
-        "mesh_path": str(mesh_path),
-        "mesh_info": mesh_info,
+        "pinhole_mesh_path": str(pinhole_mesh_path),
+        "annotation_mesh_path": str(annotation_mesh_path),
+        "pinhole_mesh_info": pinhole_mesh_info,
+        "annotation_mesh_info": annotation_mesh_info,
         "num_cameras": int(len(cameras)),
         "num_colmap_images": int(len(colmap_images)),
         "num_selected_frames": int(len(frame_names)),
         "selected_frame_preview": frame_names[:10],
+    }
+
+
+def _inspect_mesh(path: Path) -> Dict[str, Any]:
+    if not path.is_file():
+        return {}
+    mesh = load_ply_mesh(path)
+    return {
+        "vertex_properties": mesh.get("vertex_properties", []),
+        "has_semantic_labels": mesh.get("labels") is not None,
+        "has_instance_ids": mesh.get("instances") is not None,
+        "has_vertex_colors": mesh.get("colors") is not None,
+        "num_vertices": int(len(mesh["vertices"])),
+        "num_faces": int(len(mesh["faces"])),
     }
 
 
@@ -138,7 +157,9 @@ def _process_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
     scene_root = assets["scene_root"]
     image_dir = assets["image_dir"]
     colmap_dir = assets["colmap_dir"]
-    semantic_mesh_path = assets["mesh_path"]
+    semantic_mesh_path = assets["annotation_mesh_path"]
+    segments_path = assets["segments_path"]
+    annotations_path = assets["annotations_path"]
 
     out_scene_dir = config.output_root / scene_id
     semantic_dir = out_scene_dir / "semantic_masks"
@@ -162,6 +183,8 @@ def _process_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
 
     vertex_instance_ids, objects = _load_instance_data(
         mesh,
+        segments_path,
+        annotations_path,
         vertex_semantic_ids=vertex_semantic_ids,
         semantic_class_names=semantic_class_names,
         num_vertices=len(vertices),
@@ -190,7 +213,10 @@ def _process_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
         "scene_id": scene_id,
         "scene_root": str(scene_root),
         "output_dir": str(out_scene_dir),
-        "mesh_path": str(semantic_mesh_path),
+        "annotation_mesh_path": str(semantic_mesh_path),
+        "pinhole_mesh_path": str(assets["pinhole_mesh_path"]),
+        "segments_path": str(segments_path),
+        "annotations_path": str(annotations_path),
         "num_vertices": int(len(vertices)),
         "num_faces": int(len(faces)),
         "vertex_properties": mesh.get("vertex_properties", []),
@@ -366,19 +392,34 @@ def _process_frame(
 
 def _resolve_scene_assets(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
     scene_root = config.data_root / scene_id
+    annotation_root = (
+        Path(config.annotation_root) / scene_id
+        if config.annotation_root is not None
+        else scene_root
+    )
+    annotation_scan_dir = annotation_root / config.annotation_scan_subdir
     image_dir = scene_root / "images"
     colmap_dir = scene_root / "colmap"
-    mesh_path = scene_root / config.mesh_filename
+    pinhole_mesh_path = scene_root / config.mesh_filename
+    annotation_mesh_path = annotation_scan_dir / config.semantic_mesh_filename
+    segments_path = annotation_scan_dir / config.segments_filename
+    annotations_path = annotation_scan_dir / config.annotations_filename
     return {
         "scene_root": scene_root,
+        "annotation_root": annotation_root,
         "image_dir": image_dir,
         "colmap_dir": colmap_dir,
-        "mesh_path": mesh_path,
+        "pinhole_mesh_path": pinhole_mesh_path,
+        "annotation_mesh_path": annotation_mesh_path,
+        "segments_path": segments_path,
+        "annotations_path": annotations_path,
     }
 
 
 def _load_instance_data(
     mesh: Dict[str, np.ndarray],
+    segments_path: Path,
+    annotations_path: Path,
     *,
     vertex_semantic_ids: np.ndarray,
     semantic_class_names: Sequence[str],
@@ -399,11 +440,12 @@ def _load_instance_data(
         )
         return vertex_instance_ids, objects
 
-    raise ValueError(
-        "No mesh instance annotations found. The pinhole preprocessing expects "
-        "mesh_aligned_0.05.ply to contain a vertex property such as "
-        "instance_id/object_id."
+    instance_data = load_vertex_instances(
+        segments_path,
+        annotations_path,
+        num_vertices,
     )
+    return instance_data["vertex_instance_ids"], instance_data["objects"]
 
 
 def _objects_from_instance_semantics(
@@ -459,17 +501,21 @@ def _semantic_name(semantic_id: int, names: Sequence[str]) -> str:
 
 
 def _resolve_scene_ids(config: ScanNetPP2DConfig) -> List[str]:
-    scene_ids: List[str] = []
     if config.scene_ids:
-        scene_ids.extend(config.scene_ids)
-    if config.scene_list:
-        scene_ids.extend(read_text_list(Path(config.scene_list)))
-    if not scene_ids:
+        scene_ids = [_clean_scene_id(scene_id) for scene_id in config.scene_ids]
+    elif config.scene_list:
+        scene_ids = [
+            _clean_scene_id(scene_id)
+            for scene_id in read_text_list(Path(config.scene_list))
+        ]
+    else:
         scene_ids = discover_scene_ids(config.data_root)
 
     seen = set()
     unique = []
     for scene_id in scene_ids:
+        if not scene_id:
+            continue
         if scene_id in seen:
             continue
         seen.add(scene_id)
@@ -479,6 +525,10 @@ def _resolve_scene_ids(config: ScanNetPP2DConfig) -> List[str]:
     if not unique:
         raise ValueError("No scenes selected for preprocessing.")
     return unique
+
+
+def _clean_scene_id(value: str) -> str:
+    return str(value).strip().split()[0] if str(value).strip() else ""
 
 
 def _select_frame_names(
@@ -565,6 +615,8 @@ def _build_config(args: argparse.Namespace) -> ScanNetPP2DConfig:
 
     payload["data_root"] = Path(payload["data_root"])
     payload["output_root"] = Path(payload["output_root"])
+    if payload.get("annotation_root"):
+        payload["annotation_root"] = Path(payload["annotation_root"])
     if payload.get("scene_list"):
         payload["scene_list"] = Path(payload["scene_list"])
     if payload.get("metadata_root"):
@@ -587,6 +639,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scene-list", type=Path, default=None)
     parser.add_argument("--limit-scenes", type=int, default=None)
     parser.add_argument("--mesh-filename", default=None)
+    parser.add_argument("--annotation-root", type=Path, default=None)
+    parser.add_argument("--annotation-scan-subdir", default=None)
+    parser.add_argument("--semantic-mesh-filename", default=None)
+    parser.add_argument("--segments-filename", default=None)
+    parser.add_argument("--annotations-filename", default=None)
     parser.add_argument("--metadata-root", type=Path, default=None)
     parser.add_argument("--semantic-classes-file", type=Path, default=None)
     parser.add_argument("--frame-step", type=int, default=None)

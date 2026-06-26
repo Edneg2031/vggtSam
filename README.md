@@ -11,15 +11,18 @@ docs/latent_fusion_training_flow.md
 
 ## ScanNet++ Pinhole 2D Labels
 
-Generate projected semantic and instance masks from the undistorted/pinhole
-ScanNet++ data:
+Generate projected semantic and instance masks for the undistorted/pinhole
+ScanNet++ data. RGB images and COLMAP poses come from the pinhole dataset;
+3D semantic/instance annotations come from the original aligned ScanNet++
+`scans/` files configured by `annotation_root`.
 
 ```bash
 PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
   --config configs/scannetpp_pinhole_2d.yaml \
   --scene-ids 00a231a370 \
-  --max-frames 20 \
-  --frame-step 2 \
+  --max-frames 5 \
+  --frame-step 1 \
+  --overwrite \
   --save-visualizations
 ```
 

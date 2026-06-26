@@ -1,8 +1,8 @@
 # ScanNet++ Pinhole Preprocessing
 
-This project now uses the undistorted/pinhole ScanNet++ layout only. The raw
-fish-eye DSLR/iPhone preprocessing path has been removed to keep the data flow
-unambiguous.
+This project now uses the undistorted/pinhole ScanNet++ images and COLMAP
+poses only. Semantic and instance labels are taken from the original ScanNet++
+aligned 3D annotations, then rasterized into the pinhole frames.
 
 ## Input Layout
 
@@ -23,23 +23,34 @@ Expected dataset layout:
   metadata/
     semantic_classes.txt
     instance_classes.txt
+
+<annotation_root>/
+  <scene_id>/
+    scans/
+      mesh_aligned_0.05_semantic.ply
+      segments.json
+      segments_anno.json
 ```
 
 The preprocessing step generates 2D semantic masks, cross-view consistent
-instance masks, and pointmaps by projecting `mesh_aligned_0.05.ply` into the
-pinhole RGB frames with COLMAP poses.
+instance masks, and pointmaps by projecting the original ScanNet++ semantic
+mesh into the pinhole RGB frames with pinhole COLMAP poses.
+
+Only the 3D annotation files are read from `<annotation_root>`. Fish-eye images,
+fish-eye masks, and fish-eye camera parameters are not used.
 
 Important assumptions:
 
 ```text
-1. images.txt defines the frame order.
-2. cameras.txt/images.txt are in text COLMAP format.
-3. mesh_aligned_0.05.ply contains per-vertex semantic labels.
-4. mesh_aligned_0.05.ply also contains per-vertex instance/object ids.
+1. The pinhole `images.txt` defines the frame order.
+2. The pinhole `cameras.txt/images.txt` are in text COLMAP format.
+3. The original `mesh_aligned_0.05_semantic.ply` contains per-vertex semantic labels.
+4. The original `segments.json + segments_anno.json` define cross-view object ids.
+5. The pinhole mesh and original semantic mesh are in the same aligned world frame.
 ```
 
-If the mesh does not contain an instance property such as `instance_id` or
-`object_id`, cross-view instance masks cannot be generated.
+The pinhole `mesh_aligned_0.05.ply` may contain only RGB vertex colors. That is
+fine: it is inspected for sanity, but labels are read from the annotation mesh.
 
 ## Frame Sampling
 
@@ -53,6 +64,9 @@ ordered frames from COLMAP images.txt
 ```
 
 There is no random frame sampling, split file, or frame list in preprocessing.
+When `--scene-ids` is provided, it overrides the configured `scene_list`. Scene
+list rows may contain extra columns; only the first whitespace-separated token
+is treated as the scene id.
 
 ## Outputs
 
@@ -96,9 +110,11 @@ PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
 Check the dry-run output:
 
 ```text
-mesh_info.has_semantic_labels = true
-mesh_info.has_instance_ids = true
-mesh_info.vertex_properties = [...]
+scannetpp_preprocess scenes=1
+missing = []
+pinhole_mesh_info.has_semantic_labels = false   # OK for this dataset
+annotation_mesh_info.has_semantic_labels = true
+annotation_mesh_info.num_vertices matches segments.json length
 ```
 
 Then process a small debug slice:
@@ -107,10 +123,16 @@ Then process a small debug slice:
 PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
   --config configs/scannetpp_pinhole_2d.yaml \
   --scene-ids 00a231a370 \
-  --max-frames 20 \
-  --frame-step 2 \
+  --max-frames 5 \
+  --frame-step 1 \
+  --overwrite \
   --save-visualizations
 ```
+
+Open `data/processed/scannetpp_pinhole_2d/<scene_id>/visualizations/summary/`
+and check that semantic/instance overlays align with the RGB image. This is the
+most important verification that the original 3D annotations and pinhole COLMAP
+poses share the same world coordinate frame.
 
 Process several scenes from the configured scene list:
 
