@@ -71,6 +71,8 @@ class LatentFusionTrainConfig:
     semantic_weight: float
     point_weight: float
     match_weight: float
+    mask_weight: float
+    mask_dice_weight: float
     temperature: float
     device: str
     iterations: int
@@ -256,12 +258,12 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
         )
 
         history_buffer = []
-        frame_embeddings = []
         frame_losses = []
         semantic_losses = []
         point_losses = []
         match_losses = []
         selected_match_tokens = 0
+        frame_fused_tokens = []
 
         for frame_idx in range(num_frames):
             output = model(
@@ -318,7 +320,7 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
             point_losses.append(point_loss_t)
             match_losses.append(match_loss_t)
             selected_match_tokens += match_token_count_t
-            frame_embeddings.append(output.embeddings[0])
+            frame_fused_tokens.append(output.fused_tokens[0])
 
             history_buffer.append(
                 {
@@ -333,7 +335,25 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
         semantic_loss = torch.stack(semantic_losses).mean()
         point_loss = torch.stack(point_losses).mean()
         match_loss = torch.stack(match_losses).mean()
-        all_embeddings = torch.cat([item.detach() for item in frame_embeddings], dim=0)
+        fused_tokens = torch.stack(frame_fused_tokens, dim=0)
+        (
+            mask_loss,
+            mask_dice_loss,
+            mask_logits,
+            mask_instance_id,
+            mask_ref_frame,
+        ) = compute_instance_mask_decoder_loss(
+            model,
+            fused_tokens=fused_tokens,
+            batch=batch,
+            preferred_instance_id=prompt_selection.sampled_instance_id,
+            token_grid=config.token_grid,
+        )
+        loss = (
+            loss
+            + config.mask_weight * mask_loss
+            + config.mask_dice_weight * mask_dice_loss
+        )
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -347,11 +367,16 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
             "semantic_loss": float(semantic_loss.detach().cpu()),
             "point_loss": float(point_loss.detach().cpu()),
             "match_loss": float(match_loss.detach().cpu()),
+            "mask_loss": float(mask_loss.detach().cpu()),
+            "mask_dice_loss": float(mask_dice_loss.detach().cpu()),
             "num_tokens": int(batch["valid_tokens"].sum().item()),
+            "num_mask_tokens": int(batch["mask_supervision_tokens"].sum().item()),
             "num_match_tokens": int(selected_match_tokens),
             "num_instances": int(
                 batch["instance_ids"][batch["valid_tokens"]].unique().numel()
             ),
+            "mask_instance_id": int(mask_instance_id),
+            "mask_ref_frame": int(mask_ref_frame),
             "prompt": prompt_selection.prompt,
             "sampled_instance_id": int(prompt_selection.sampled_instance_id),
             "sampled_label": prompt_selection.sampled_label,
@@ -362,38 +387,38 @@ def train_latent_fusion(config: LatentFusionTrainConfig) -> None:
             print(
                 "step={step} loss={loss:.4f} semantic={semantic_loss:.4f} "
                 "point={point_loss:.4f} match={match_loss:.4f} "
-                "tokens={num_tokens} match_tokens={num_match_tokens} "
+                "mask={mask_loss:.4f} dice={mask_dice_loss:.4f} "
+                "tokens={num_tokens} mask_tokens={num_mask_tokens} "
+                "match_tokens={num_match_tokens} "
                 "instances={num_instances} prompt='{prompt}'".format(**row)
             )
         if config.visualize_every > 0 and (
             step % config.visualize_every == 0 or completed_steps == 1
         ):
             viz_path = config.output_dir / "visualizations" / f"step_{step:06d}.png"
-            save_correspondence_visualization(
+            save_decoder_mask_visualization(
                 viz_path,
                 image_paths=sequence.image_paths,
                 instance_masks=sequence.instance_masks,
                 object_labels=sequence.object_labels,
-                embeddings=all_embeddings,
-                batch=batch,
+                mask_logits=mask_logits.detach(),
+                target_instance_id=mask_instance_id,
                 prompt=prompt_selection.prompt,
-                preferred_instance_id=prompt_selection.sampled_instance_id,
+                ref_frame=mask_ref_frame,
                 step=step,
                 threshold=config.visualize_threshold,
-                temperature=config.temperature,
             )
-            save_correspondence_crop_visualization(
+            save_decoder_mask_crop_visualization(
                 viz_path.with_name(f"step_{step:06d}_crops.png"),
                 image_paths=sequence.image_paths,
                 instance_masks=sequence.instance_masks,
                 object_labels=sequence.object_labels,
-                embeddings=all_embeddings,
-                batch=batch,
+                mask_logits=mask_logits.detach(),
+                target_instance_id=mask_instance_id,
                 prompt=prompt_selection.prompt,
-                preferred_instance_id=prompt_selection.sampled_instance_id,
+                ref_frame=mask_ref_frame,
                 step=step,
                 threshold=config.visualize_threshold,
-                temperature=config.temperature,
             )
         if step % config.save_every == 0:
             save_checkpoint(
@@ -540,6 +565,141 @@ def streaming_correspondence_loss(
     )
 
 
+def compute_instance_mask_decoder_loss(
+    model: LatentSAMVGGTModel,
+    *,
+    fused_tokens: torch.Tensor,
+    batch: Dict[str, torch.Tensor],
+    preferred_instance_id: int,
+    token_grid: tuple[int, int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    if fused_tokens.ndim != 3:
+        raise ValueError(
+            f"fused_tokens must have shape [T, N, C], got {tuple(fused_tokens.shape)}"
+        )
+    zero = fused_tokens.sum() * 0.0
+    reference = select_mask_training_reference(batch, preferred_instance_id)
+    if reference is None:
+        empty_logits = fused_tokens.new_zeros(fused_tokens.shape[:2])
+        return zero, zero, empty_logits, -1, -1
+
+    target_instance_id, ref_frame = reference
+    target_masks, supervision_masks = build_token_instance_mask_targets(
+        batch,
+        target_instance_id=target_instance_id,
+        token_grid=token_grid,
+    )
+    ref_mask = target_masks[ref_frame] & supervision_masks[ref_frame]
+    if not ref_mask.any():
+        empty_logits = fused_tokens.new_zeros(fused_tokens.shape[:2])
+        return zero, zero, empty_logits, int(target_instance_id), int(ref_frame)
+
+    prototype = model.build_mask_prototype(
+        fused_tokens[ref_frame : ref_frame + 1],
+        ref_mask[None],
+    )
+    prototype = prototype.expand(fused_tokens.shape[0], -1)
+    mask_logits = model.decode_mask_from_prototype(fused_tokens, prototype)
+
+    if not supervision_masks.any():
+        return zero, zero, mask_logits, int(target_instance_id), int(ref_frame)
+    mask_loss = F.binary_cross_entropy_with_logits(
+        mask_logits[supervision_masks],
+        target_masks[supervision_masks].to(mask_logits.dtype),
+    )
+    mask_dice_loss = dice_loss_with_token_mask(
+        mask_logits,
+        target_masks,
+        supervision_masks,
+    )
+    return (
+        mask_loss,
+        mask_dice_loss,
+        mask_logits,
+        int(target_instance_id),
+        int(ref_frame),
+    )
+
+
+def select_mask_training_reference(
+    batch: Dict[str, torch.Tensor],
+    preferred_instance_id: int,
+) -> tuple[int, int] | None:
+    valid = batch["valid_tokens"]
+    instance_ids = batch["instance_ids"]
+    frame_ids = batch["frame_ids"]
+    if not valid.any():
+        return None
+
+    def choose_frame(instance_id: int) -> tuple[int, int] | None:
+        mask = valid & (instance_ids == int(instance_id))
+        if not mask.any():
+            return None
+        frames, counts = torch.unique(frame_ids[mask], return_counts=True)
+        best = int(torch.argmax(counts).item())
+        return int(instance_id), int(frames[best].item())
+
+    if preferred_instance_id > 0:
+        preferred = choose_frame(preferred_instance_id)
+        if preferred is not None:
+            return preferred
+
+    best_score: tuple[int, int] | None = None
+    best_reference: tuple[int, int] | None = None
+    for instance_id in torch.unique(instance_ids[valid]).tolist():
+        mask = valid & (instance_ids == int(instance_id))
+        frames, counts = torch.unique(frame_ids[mask], return_counts=True)
+        score = (int(frames.numel()), int(counts.sum().item()))
+        if best_score is None or score > best_score:
+            best_score = score
+            best = int(torch.argmax(counts).item())
+            best_reference = (int(instance_id), int(frames[best].item()))
+    return best_reference
+
+
+def build_token_instance_mask_targets(
+    batch: Dict[str, torch.Tensor],
+    *,
+    target_instance_id: int,
+    token_grid: tuple[int, int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    token_h, token_w = token_grid
+    tokens_per_frame = token_h * token_w
+    instance_ids = batch["instance_ids"]
+    valid = batch.get("mask_supervision_tokens", batch["valid_tokens"])
+    if instance_ids.numel() % tokens_per_frame != 0:
+        raise ValueError(
+            f"instance token count {instance_ids.numel()} is not divisible by "
+            f"tokens_per_frame={tokens_per_frame}"
+        )
+    frames = instance_ids.numel() // tokens_per_frame
+    target_masks = (instance_ids == int(target_instance_id)).reshape(
+        frames,
+        tokens_per_frame,
+    )
+    valid_masks = valid.reshape(frames, tokens_per_frame)
+    supervision_masks = valid_masks | target_masks
+    return target_masks, supervision_masks
+
+
+def dice_loss_with_token_mask(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    supervision_mask: torch.Tensor,
+    *,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    probs = logits.sigmoid() * supervision_mask.to(logits.dtype)
+    targets = targets.to(logits.dtype) * supervision_mask.to(logits.dtype)
+    valid_frames = targets.sum(dim=1) > 0
+    if not valid_frames.any():
+        return logits.sum() * 0.0
+    intersection = (probs * targets).sum(dim=1)
+    union = probs.sum(dim=1) + targets.sum(dim=1)
+    dice = 1.0 - (2.0 * intersection + eps) / (union + eps)
+    return dice[valid_frames].mean()
+
+
 def build_latent_batch(
     instance_masks: Sequence[np.ndarray],
     semantic_masks: Sequence[np.ndarray],
@@ -590,6 +750,7 @@ def build_latent_batch(
     valid_masks = []
     instance_grids = []
     semantic_grids = []
+    mask_valid_masks = []
 
     for frame_idx, (inst_np, sem_np) in enumerate(zip(instance_masks, semantic_masks)):
         inst_grid, inst_ratio = majority_pool_mask(inst_np, token_grid)
@@ -597,46 +758,50 @@ def build_latent_batch(
         instance_grids.append(inst_grid)
         semantic_grids.append(sem_grid)
 
-        valid = inst_grid != ignore_instance_id
-        valid &= inst_ratio >= min_token_majority
-        valid &= sem_ratio >= min_token_majority
-        valid &= sem_grid != semantic_ignore_label
-        valid &= (sem_grid >= 0) & (sem_grid < num_classes)
+        base_valid = inst_grid != ignore_instance_id
+        base_valid &= inst_ratio >= min_token_majority
+        base_valid &= sem_ratio >= min_token_majority
+        base_valid &= sem_grid != semantic_ignore_label
+        base_valid &= (sem_grid >= 0) & (sem_grid < num_classes)
         if excluded:
-            valid &= ~np.isin(sem_grid, list(excluded))
+            base_valid &= ~np.isin(sem_grid, list(excluded))
+        if excluded_instance_ids:
+            base_valid &= ~np.isin(inst_grid, excluded_instance_ids)
+
+        visible = keep_per_frame[frame_idx]
+        if visible:
+            base_valid &= np.isin(inst_grid, list(visible))
+        else:
+            base_valid &= False
+
+        mask_valid = filter_token_instances(
+            base_valid,
+            inst_grid,
+            min_tokens_per_instance=min_tokens_per_instance,
+            max_area_ratio=max_area_ratio,
+        )
+        valid = mask_valid.copy()
         if target_label_filters:
             if target_instance_ids:
                 valid &= np.isin(inst_grid, target_instance_ids)
             else:
                 valid &= False
-        if excluded_instance_ids:
-            valid &= ~np.isin(inst_grid, excluded_instance_ids)
-
-        visible = keep_per_frame[frame_idx]
-        if visible:
-            valid &= np.isin(inst_grid, list(visible))
-        else:
-            valid &= False
-
-        valid = filter_token_instances(
-            valid,
-            inst_grid,
-            min_tokens_per_instance=min_tokens_per_instance,
-            max_area_ratio=max_area_ratio,
-        )
 
         semantic_labels.append(torch.from_numpy(sem_grid.reshape(-1)).long())
         instance_ids.append(torch.from_numpy(inst_grid.reshape(-1)).long())
         frame_ids.append(torch.full((token_h * token_w,), frame_idx, dtype=torch.long))
         valid_masks.append(torch.from_numpy(valid.reshape(-1)).bool())
+        mask_valid_masks.append(torch.from_numpy(mask_valid.reshape(-1)).bool())
 
     labels = torch.cat(semantic_labels, dim=0).to(device)
     instances = torch.cat(instance_ids, dim=0).to(device)
     frames = torch.cat(frame_ids, dim=0).to(device)
     valid = torch.cat(valid_masks, dim=0).to(device)
+    mask_valid = torch.cat(mask_valid_masks, dim=0).to(device)
 
     points = pointmap_grid.reshape(-1, pointmap_grid.shape[-1]).to(device).float()
     valid &= torch.isfinite(points).all(dim=-1)
+    mask_valid &= torch.isfinite(points).all(dim=-1)
     if not valid.any():
         return None
 
@@ -645,6 +810,7 @@ def build_latent_batch(
         "instance_ids": instances,
         "frame_ids": frames,
         "valid_tokens": valid,
+        "mask_supervision_tokens": mask_valid,
         "point_targets": points,
         "token_grid": token_grid,
     }
@@ -745,36 +911,24 @@ def label_is_excluded(label: str | None, filters: Sequence[str]) -> bool:
     return any(item in normalized for item in filters)
 
 
-def save_correspondence_visualization(
+def save_decoder_mask_visualization(
     path: Path,
     *,
     image_paths: Sequence[Path],
     instance_masks: Sequence[np.ndarray],
     object_labels: Dict[int, str],
-    embeddings: torch.Tensor,
-    batch: Dict[str, torch.Tensor],
+    mask_logits: torch.Tensor,
+    target_instance_id: int,
     prompt: str,
-    preferred_instance_id: int,
+    ref_frame: int,
     step: int,
     threshold: float,
-    temperature: float,
 ) -> None:
     from PIL import Image, ImageDraw
 
-    reference = select_propagation_reference(batch, preferred_instance_id)
-    if reference is None:
+    if target_instance_id <= 0 or ref_frame < 0:
         return
-    target_instance_id, ref_frame = reference
-    pred_probs = propagate_instance_from_reference(
-        embeddings,
-        batch,
-        target_instance_id=target_instance_id,
-        ref_frame=ref_frame,
-        temperature=temperature,
-    )
-    if pred_probs is None:
-        return
-
+    pred_probs = mask_logits.sigmoid().detach().cpu()
     frames = len(image_paths)
     first_image = Image.open(image_paths[0]).convert("RGB")
     image_w, image_h = first_image.size
@@ -796,7 +950,7 @@ def save_correspondence_visualization(
         fill=(240, 240, 240),
     )
 
-    headings = ["RGB", "GT instance", "Propagated mask"]
+    headings = ["RGB", "GT instance", "Decoder mask"]
     for col, heading in enumerate(headings):
         draw.text(
             (margin + col * (panel_w + margin), title_h - 15),
@@ -805,6 +959,8 @@ def save_correspondence_visualization(
         )
 
     gt_color, pred_color = visualization_palette()[:2]
+    token_h, token_w = infer_token_grid_from_logits(pred_probs)
+    pred_probs = pred_probs.reshape(frames, token_h, token_w)
 
     for frame_idx in range(frames):
         base = Image.open(image_paths[frame_idx]).convert("RGB")
@@ -837,40 +993,30 @@ def save_correspondence_visualization(
     canvas.save(path)
 
 
-def save_correspondence_crop_visualization(
+def save_decoder_mask_crop_visualization(
     path: Path,
     *,
     image_paths: Sequence[Path],
     instance_masks: Sequence[np.ndarray],
     object_labels: Dict[int, str],
-    embeddings: torch.Tensor,
-    batch: Dict[str, torch.Tensor],
+    mask_logits: torch.Tensor,
+    target_instance_id: int,
     prompt: str,
-    preferred_instance_id: int,
+    ref_frame: int,
     step: int,
     threshold: float,
-    temperature: float,
     crop_size: int = 192,
 ) -> None:
     from PIL import Image, ImageDraw
 
-    reference = select_propagation_reference(batch, preferred_instance_id)
-    if reference is None:
+    if target_instance_id <= 0 or ref_frame < 0:
         return
-    target_instance_id, ref_frame = reference
-    pred_probs = propagate_instance_from_reference(
-        embeddings,
-        batch,
-        target_instance_id=target_instance_id,
-        ref_frame=ref_frame,
-        temperature=temperature,
-    )
-    if pred_probs is None:
-        return
-
+    pred_probs = mask_logits.sigmoid().detach().cpu()
+    frames = len(image_paths)
+    token_h, token_w = infer_token_grid_from_logits(pred_probs)
+    pred_probs = pred_probs.reshape(frames, token_h, token_w)
     gt_color, pred_color = visualization_palette()[:2]
     crop_specs = []
-    frames = len(image_paths)
     for frame_idx in range(frames):
         image = Image.open(image_paths[frame_idx]).convert("RGB")
         image_w, image_h = image.size
@@ -882,9 +1028,8 @@ def save_correspondence_crop_visualization(
             > threshold
         )
         bbox = mask_union_bbox(gt, pred, pad=16)
-        if bbox is None:
-            continue
-        crop_specs.append((frame_idx, bbox))
+        if bbox is not None:
+            crop_specs.append((frame_idx, bbox))
     if not crop_specs:
         return
 
@@ -904,7 +1049,7 @@ def save_correspondence_crop_visualization(
         f"ref_frame={ref_frame}",
         fill=(240, 240, 240),
     )
-    headings = ["RGB crop", "GT crop", "Prop crop"]
+    headings = ["RGB crop", "GT crop", "Pred crop"]
     for col, heading in enumerate(headings):
         draw.text(
             (margin + col * (crop_size + margin), title_h - 14),
@@ -948,88 +1093,12 @@ def save_correspondence_crop_visualization(
     canvas.save(path)
 
 
-def select_propagation_reference(
-    batch: Dict[str, torch.Tensor],
-    preferred_instance_id: int,
-) -> tuple[int, int] | None:
-    valid = batch["valid_tokens"].detach().cpu()
-    instance_ids = batch["instance_ids"].detach().cpu()
-    frame_ids = batch["frame_ids"].detach().cpu()
-    if not bool(valid.any()):
-        return None
-
-    def reference_for(instance_id: int) -> tuple[int, int] | None:
-        mask = valid & (instance_ids == int(instance_id))
-        if not bool(mask.any()):
-            return None
-        frames, counts = torch.unique(frame_ids[mask], return_counts=True)
-        best = int(torch.argmax(counts).item())
-        return int(instance_id), int(frames[best].item())
-
-    if preferred_instance_id > 0:
-        preferred = reference_for(preferred_instance_id)
-        if preferred is not None:
-            return preferred
-
-    best_score: tuple[int, int] | None = None
-    best_reference: tuple[int, int] | None = None
-    for instance_id in torch.unique(instance_ids[valid]).tolist():
-        mask = valid & (instance_ids == int(instance_id))
-        frames, counts = torch.unique(frame_ids[mask], return_counts=True)
-        score = (int(frames.numel()), int(counts.sum().item()))
-        if best_score is None or score > best_score:
-            best_score = score
-            best = int(torch.argmax(counts).item())
-            best_reference = (int(instance_id), int(frames[best].item()))
-    return best_reference
-
-
-def propagate_instance_from_reference(
-    embeddings: torch.Tensor,
-    batch: Dict[str, torch.Tensor],
-    *,
-    target_instance_id: int,
-    ref_frame: int,
-    temperature: float,
-) -> torch.Tensor | None:
-    valid = batch["valid_tokens"]
-    instance_ids = batch["instance_ids"]
-    frame_ids = batch["frame_ids"]
-    ref_mask = (
-        valid
-        & (instance_ids == int(target_instance_id))
-        & (frame_ids == int(ref_frame))
-    )
-    if not bool(ref_mask.any()):
-        return None
-
-    embeddings = F.normalize(embeddings.float(), dim=-1)
-    prototype = F.normalize(embeddings[ref_mask].mean(dim=0), dim=0)
-    scores = embeddings @ prototype
-    propagated = torch.zeros_like(scores)
-
-    frames = int(frame_ids.max().item()) + 1
-    if "token_grid" in batch:
-        token_h, token_w = tuple(int(v) for v in batch["token_grid"])
-    else:
-        tokens_per_frame = int(probs.numel() // max(frames, 1))
-        token_h = int(round(math.sqrt(tokens_per_frame)))
-        if token_h * token_h != tokens_per_frame:
-            raise ValueError(
-                "Cannot infer token grid from a non-square token count; pass token_grid in batch."
-            )
-        token_w = token_h
-
-    ref_token_count = int(ref_mask.sum().item())
-    for frame_idx in range(frames):
-        frame_mask = valid & (frame_ids == frame_idx)
-        frame_indices = frame_mask.nonzero(as_tuple=False).flatten()
-        if frame_indices.numel() == 0:
-            continue
-        k = min(max(ref_token_count, 1), int(frame_indices.numel()))
-        _, topk = torch.topk(scores[frame_indices], k=k)
-        propagated[frame_indices[topk]] = 1.0
-    return propagated.detach().cpu().reshape(frames, token_h, token_w)
+def infer_token_grid_from_logits(mask_logits: torch.Tensor) -> tuple[int, int]:
+    tokens = int(mask_logits.shape[-1])
+    side = int(round(math.sqrt(tokens)))
+    if side * side != tokens:
+        raise ValueError(f"Cannot infer square token grid from {tokens} mask logits.")
+    return side, side
 
 
 def overlay_single_mask(
@@ -1251,9 +1320,14 @@ def write_metrics_header(path: Path) -> None:
                 "semantic_loss",
                 "point_loss",
                 "match_loss",
+                "mask_loss",
+                "mask_dice_loss",
                 "num_tokens",
+                "num_mask_tokens",
                 "num_match_tokens",
                 "num_instances",
+                "mask_instance_id",
+                "mask_ref_frame",
                 "prompt",
                 "sampled_instance_id",
                 "sampled_label",

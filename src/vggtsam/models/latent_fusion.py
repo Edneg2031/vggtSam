@@ -47,6 +47,17 @@ class LatentSAMVGGTModel(nn.Module):
             num_classes=num_classes,
             dropout=dropout,
         )
+        self.mask_feature_head = nn.Sequential(
+            nn.Linear(d_fuse, d_fuse),
+            nn.GELU(),
+            nn.Linear(d_fuse, d_fuse),
+        )
+        self.mask_query_head = nn.Sequential(
+            nn.Linear(d_fuse, d_fuse),
+            nn.GELU(),
+            nn.Linear(d_fuse, d_fuse),
+        )
+        self.mask_logit_scale = nn.Parameter(torch.tensor(10.0))
 
     def forward(
         self,
@@ -80,3 +91,44 @@ class LatentSAMVGGTModel(nn.Module):
             current_embeddings,
             history_embeddings.transpose(-1, -2),
         ) / max(float(temperature), 1e-6)
+
+    def build_mask_prototype(
+        self,
+        ref_fused_tokens: torch.Tensor,
+        ref_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build an instance prototype from fused tokens inside a reference mask."""
+        if ref_fused_tokens.ndim != 3:
+            raise ValueError(
+                "ref_fused_tokens must have shape [B, N, C], "
+                f"got {tuple(ref_fused_tokens.shape)}"
+            )
+        if ref_mask.ndim == 1:
+            ref_mask = ref_mask[None]
+        if ref_mask.shape != ref_fused_tokens.shape[:2]:
+            raise ValueError(
+                f"ref_mask must have shape {tuple(ref_fused_tokens.shape[:2])}, "
+                f"got {tuple(ref_mask.shape)}"
+            )
+        weights = ref_mask.to(ref_fused_tokens.dtype).unsqueeze(-1)
+        query_features = self.mask_query_head(ref_fused_tokens)
+        prototype = (query_features * weights).sum(dim=1)
+        prototype = prototype / weights.sum(dim=1).clamp_min(1.0)
+        return F.normalize(prototype, dim=-1)
+
+    def decode_mask_from_prototype(
+        self,
+        fused_tokens: torch.Tensor,
+        prototype: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode token-level instance mask logits from a reference prototype."""
+        if fused_tokens.ndim != 3:
+            raise ValueError(
+                f"fused_tokens must have shape [B, N, C], got {tuple(fused_tokens.shape)}"
+            )
+        if prototype.ndim == 1:
+            prototype = prototype[None]
+        mask_features = F.normalize(self.mask_feature_head(fused_tokens), dim=-1)
+        prototype = F.normalize(prototype, dim=-1)
+        scale = self.mask_logit_scale.clamp(1.0, 100.0)
+        return torch.einsum("bnc,bc->bn", mask_features, prototype) * scale

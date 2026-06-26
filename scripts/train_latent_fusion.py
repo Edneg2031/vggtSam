@@ -107,6 +107,8 @@ def build_train_config(raw: dict) -> LatentFusionTrainConfig:
         semantic_weight=float(loss["semantic_weight"]),
         point_weight=float(loss["point_weight"]),
         match_weight=float(loss["match_weight"]),
+        mask_weight=float(loss.get("mask_weight", 1.0)),
+        mask_dice_weight=float(loss.get("mask_dice_weight", 1.0)),
         temperature=float(loss["temperature"]),
         device=training["device"],
         iterations=int(training["iterations"]),

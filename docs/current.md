@@ -5,10 +5,10 @@
 ```text
 SAM3 semantic tokens + StreamVGGT geometry tokens
   -> latent fusion
-  -> semantic / 3D point / cross-frame correspondence
+  -> semantic / 3D point / cross-frame correspondence / instance mask
 ```
 
-当前代码还没有最终的高质量 mask decoder，也还没有全局语义点云融合导出模块。
+当前代码已经加入 token-level instance mask decoder；全局语义点云融合导出模块还没有实现。
 
 ## 1. 输入数据
 
@@ -230,7 +230,7 @@ fused tokens:
 
 ## 5. Fused Tokens 的输出头
 
-当前 fused tokens 进入三个 head：
+当前 fused tokens 进入四类输出：
 
 ```text
 semantic_head:
@@ -247,16 +247,32 @@ match_head:
   input  [1, 5184, 256]
   output [1, 5184, 256]
   meaning: normalized token embedding for cross-frame matching
+
+mask decoder:
+  ref GT instance mask + ref fused tokens
+    -> instance prototype [1, 256]
+
+  current/all fused tokens
+    -> mask logits [T, 5184]
+    -> reshape to [T, 72, 72]
 ```
 
-另外模型提供：
+mask decoder 的实现位置：
+
+```text
+src/vggtsam/models/latent_fusion.py
+  build_mask_prototype()
+  decode_mask_from_prototype()
+```
+
+另外模型仍然提供：
 
 ```text
 compute_mask_correspondence(curr_embeddings, hist_embeddings)
   -> [N_curr, N_hist] correspondence logits
 ```
 
-这里的 `mask correspondence` 不是最终 binary mask，而是 token-to-token 跨帧对应关系矩阵。
+这里的 `mask correspondence` 不是最终 binary mask，而是 token-to-token 跨帧对应关系矩阵，用来保持同一个 instance 在历史帧和当前帧中的 embedding 一致。
 
 ## 6. 当前训练方式
 
@@ -272,6 +288,15 @@ for t in range(T):
   6. 计算 current-to-history correspondence matrix
   7. 用 instance id 构造 GT match matrix
   8. 将当前 embedding 写入 history buffer
+
+clip-level mask decoder:
+  1. 优先使用 prompt 采样到的 instance id 作为目标实例。
+  2. 选择该 instance 在 token 数最多的一帧作为 ref frame。
+  3. 用 ref frame 的 GT instance mask 提取 ref fused token prototype。
+  4. 用 prototype 对 T 帧 fused tokens 解码 mask logits。
+  5. 用 GT instance mask 的 token grid 监督 decoder 输出。
+  6. mask decoder 的负样本来自 mask_supervision_tokens，
+     包含同一 clip 中其它经过清洗的有效物体 token。
 ```
 
 Loss：
@@ -291,64 +316,78 @@ match_loss:
 
   negative:
     different instance id across frames
+
+mask_loss:
+  decoder mask logits vs GT instance mask token label
+  supervision tokens include other valid objects as negatives
+
+mask_dice_loss:
+  decoder mask probability vs GT instance mask token label
 ```
 
-## 7. 当前 Mask 可视化
+## 7. 当前 Mask Decoder 与可视化
 
-当前可视化不是最终 mask decoder 输出。
+当前可视化已经改成 mask decoder 输出，而不是旧的 top-k 相似度传播。
 
 当前流程：
 
 ```text
-1. 选一个 ref instance。
-2. 用 ref frame 的 GT instance mask 找到 ref object tokens。
-3. 对 ref object tokens 的 match embedding 求 prototype。
-4. 每帧计算 token embedding 与 prototype 的相似度。
-5. 每帧取 top-k token 作为 propagated mask。
+1. 选一个 target instance。
+2. 选择 target instance token 数最多的一帧作为 ref frame。
+3. 用 ref frame 的 GT instance mask 和 ref fused tokens 构造 prototype。
+4. 对 clip 内每一帧 fused tokens 解码 mask logits。
+5. 将 logits reshape 为 [T, 72, 72] 并上采样到原 RGB 分辨率可视化。
 ```
 
-这个 top-k 方法只是为了诊断 correspondence 是否能追踪同一个 instance。它会有明显问题：
+训练监督：
 
 ```text
-1. k 来自 ref mask 面积，目标尺度变化时会不准。
-2. 同类物体 embedding 接近时，容易选到其他同类物体。
-3. 它没有利用真实 instance mask 训练一个高分辨率 decoder。
-4. 它不应该作为最终 mask 输出方式。
+GT instance mask:
+  original resized image space
+  -> majority pooling to 72 x 72 token grid
+
+mask supervision tokens:
+  all visible / non-excluded / size-filtered object tokens
+  target instance = positive
+  other valid object tokens = negative
+
+decoder output:
+  mask_logits [T, 5184]
+  -> [T, 72, 72]
+
+loss:
+  BCEWithLogits + Dice
 ```
 
-## 8. 关于 Mask Decoder
-
-你的判断是对的：如果最终任务需要输出 mask，就应该使用真实 instance mask 训练 mask decoder。
-
-之前 object-query mask decoder 效果差，不代表 mask decoder 方向错，主要问题可能是：
+可视化输出：
 
 ```text
-1. query slot 分配不稳定。
-2. 当时 prompt 还是 fixed "object"，语义条件太弱。
-3. BCE 背景占比太大，loss 下降不代表 mask 形状好。
-4. decoder 没有显式使用 ref mask / history correspondence。
-5. 直接从 72x72 token 上采样到高分辨率，边界能力有限。
+outputs/latent_fusion_debug/visualizations/step_xxxxxx.png
+  RGB / GT instance / Decoder mask
+
+outputs/latent_fusion_debug/visualizations/step_xxxxxx_crops.png
+  RGB crop / GT crop / Pred crop
 ```
 
-更合理的下一版 mask decoder 应该是：
+## 8. 当前 Mask Decoder 的边界
 
 ```text
-ref GT mask
-  -> ref object token prototype / object query
-
-current fused tokens
-  -> mask decoder
-  -> mask logits [T, 72, 72] or higher resolution
-
-supervision:
-  GT instance mask pooled/resized to token grid
-  BCE + Dice / Focal
-
-additional supervision:
-  correspondence loss keeps same instance embedding close
+1. 当前 mask decoder 是 token-level，输出分辨率仍然是 72 x 72。
+2. 可视化会上采样到原 RGB 尺寸，所以边界不会像原始 mask 一样精细。
+3. decoder 使用 ref mask prototype，但还没有接入 SAM3/SAM2 原生高分辨率 mask decoder。
+4. 当前是每个 clip 训练一个 target instance 的 decoder mask；后续可扩展到多实例并行。
+5. correspondence loss 已经使用历史帧，但 mask decoder 目前是 ref prototype -> all frames，还不是显式 recurrent memory decoder。
 ```
 
-也就是说，mask decoder 应该和 correspondence/history 结合，而不是单独靠固定 object query。
+后续更贴近最终 idea 的方向：
+
+```text
+1. 引入更高分辨率特征，例如 detector_fpn1 / detector_fpn0。
+2. 将 72 x 72 mask logits 送入 refinement decoder，恢复更清晰边界。
+3. 让 mask decoder 显式读 history memory / correspondence matrix。
+4. 支持一个 clip 内多个 instance 同时解码。
+5. 输出 pred semantic point cloud 与 GT semantic point cloud 用于对比。
+```
 
 ## 9. 语义点云与 GT 点云
 
@@ -357,6 +396,13 @@ additional supervision:
 ```text
 pred_pointmap:
   [T, 72, 72, 3]
+```
+
+也有 per-token semantic prediction：
+
+```text
+pred_semantic_logits:
+  [T, 72, 72, 1024]
 ```
 
 也有 GT pointmap：
@@ -385,12 +431,33 @@ GT semantic point cloud:
 3. point/semantic/mask 指标评估
 ```
 
+当前新增了 per-clip pointmap 可视化脚本：
+
+```text
+scripts/export_latent_fusion_pointclouds.py
+```
+
+它会导出：
+
+```text
+gt_*:
+  ScanNet++ mesh + COLMAP camera rasterization 得到的 pointmap
+
+streamvggt_*:
+  frozen StreamVGGT 原始 pointmap 输出
+
+pred_*:
+  当前 latent fusion 模型 point head 输出
+```
+
+这些 `.ply` 用于检查 pointmap 监督和模型预测质量；它还不是跨帧去重、融合后的全局语义点云。
+
 ## 10. 当前边界
 
 ```text
 1. SAM3 和 StreamVGGT 仍然 frozen。
 2. 当前 fusion 训练是逐帧 streaming-style，但 SAM3 / StreamVGGT adapter 仍然是先一次性抽 clip 特征。
 3. StreamVGGT camera tokens 默认关闭。
-4. 当前 mask 是 correspondence top-k 可视化，不是最终 mask decoder。
+4. 当前 mask decoder 是 72 x 72 token-level decoder，不是高分辨率边界 decoder。
 5. 当前还没有全局语义点云融合导出。
 ```

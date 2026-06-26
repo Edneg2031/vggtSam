@@ -83,6 +83,8 @@ loss:
   semantic_weight: 1.0
   point_weight: 1.0
   match_weight: 0.5
+  mask_weight: 1.0
+  mask_dice_weight: 1.0
   temperature: 0.07
 
 training:
