@@ -1,130 +1,347 @@
-# 当前进展
+# 当前模型结构梳理
 
-当前目标是搭建一个面向室内小物体追踪的多模态模型：
-
-```text
-RGB 连续帧 + 语义文本 prompt
-  -> 融合 SAM3 语义特征与 StreamVGGT 几何特征
-  -> 输出语义点云 token、3D pointmap token、跨帧对应 embedding
-  -> 通过 ref mask + token correspondence 推出跨帧 mask 追踪结果
-```
-
-## 数据输入
-
-训练使用已经处理好的 ScanNet++ 数据：
+本文档用于 PPT 对齐当前代码状态、已实现模块和下一步需要补齐的模块。当前实现目标是验证：
 
 ```text
-1. resized RGB 连续帧
-2. instance masks / semantic masks
-3. mesh + COLMAP pose/intrinsics 光栅化得到的 GT pointmap
-4. object metadata label，例如 office chair / monitor / cabinet
+SAM3 semantic tokens + StreamVGGT geometry tokens
+  -> latent fusion
+  -> semantic / 3D point / cross-frame correspondence
 ```
 
-当前默认过滤：
+当前代码还没有最终的高质量 mask decoder，也还没有全局语义点云融合导出模块。
+
+## 1. 输入数据
+
+每次训练采样一个 ScanNet++ 连续帧 clip：
 
 ```text
-wall / floor / ceiling
+RGB sequence:
+  T = 4
+  resized RGB image paths
+
+GT supervision:
+  semantic_masks
+  instance_masks
+  GT pointmaps from mesh + COLMAP camera rasterization
+  object metadata labels
 ```
 
-默认 `prompt_mode=random_instance`：每个 clip 随机选择一个大小合理、跨帧可见、未被 blacklist 过滤的 instance，并使用它的类别名作为 SAM3 text prompt。若当前 clip 中存在同类别的多个可见 instance，会优先从这些类别中采样，让 correspondence loss 有更强的同类负例。如果传入具体 prompt，例如 `--prompt chair`，则切换为固定 prompt 并只训练对应类别过滤后的 token。
-
-## 模型结构
-
-当前代码已经回到更接近 `idea/ours_model.py` 的结构：
+默认过滤大结构和不需要追踪的类别：
 
 ```text
-RGB sequence
-  -> frozen SAM3 image/text backbone
-     -> detector_fpn2 semantic tokens
-
-RGB sequence
-  -> frozen StreamVGGT aggregator
-     -> geometry tokens
-
-SAM3 tokens as query
-StreamVGGT tokens as key/value
-  -> cross-attention fusion
-  -> fused tokens
+wall, floor, ceiling, window, door, door frame, pillar,
+table, cabinet, storage cabinet, whiteboard,
+electrical duct, electric duct
 ```
 
-当前模型显式输出：
+默认 prompt 策略：
 
 ```text
-pred_logits:
-  每个 token 的 semantic logits
-
-pred_pointmap:
-  每个 token 的 3D 坐标
-
-fused_tokens:
-  融合后的语义-几何 token
-
-embeddings:
-  用于跨帧 correspondence 的 token embedding
+prompt_mode = random_instance
 ```
 
-当前模型 **不再显式输出 `mask_logits`**。mask 追踪结果不是直接 decode 出来的，而是用 ref frame 的 GT instance mask 选出 object tokens，再用这些 token 的 embedding 和后续帧 token 做相似度传播得到。
+每个 clip 随机选择一个大小合理、跨帧可见、未被 blacklist 过滤的 instance，并使用它的类别名作为 SAM3 text prompt。若当前 clip 中存在同类别多个可见 instance，会优先采样这些类别，让 correspondence loss 具备同类负例。
 
-## 训练监督
+## 2. SAM3 分支
 
-当前训练 loss 为三项：
+代码位置：
+
+```text
+src/vggtsam/adapters/sam3_intermediate.py
+```
+
+当前使用：
+
+```text
+SAM3 image backbone:
+  model.backbone.forward_image(images)
+
+SAM3 text backbone:
+  model.backbone.forward_text([prompt])
+```
+
+当前选择的视觉层：
+
+```text
+feature_source = detector_fpn2
+source tensor = backbone_out["backbone_fpn"][-1]
+```
+
+当前 token 处理：
+
+```text
+SAM3 输入分辨率:
+  1008 x 1008
+
+SAM3 spatial feature:
+  detector_fpn2
+  resized to 72 x 72
+
+text conditioning:
+  concat pooled language feature to every spatial token
+```
+
+实测 shape：
+
+```text
+SAM3 tokens:
+  [1, T * 72 * 72, 512]
+
+per frame:
+  [1, 5184, 512]
+```
+
+其中 `512 = 256 detector_fpn2 channels + 256 pooled text feature`。
+
+## 3. StreamVGGT 分支
+
+代码位置：
+
+```text
+src/vggtsam/adapters/streamvggt_latent.py
+```
+
+当前使用：
+
+```text
+StreamVGGT aggregator:
+  aggregated_tokens_list, patch_start_idx = model.aggregator(batch_images)
+
+selected layer:
+  aggregated_tokens_list[layer_index]
+  layer_index = -1
+```
+
+当前 token 处理：
+
+```text
+patch tokens:
+  remove prefix tokens before patch_start_idx
+
+original patch grid:
+  depends on StreamVGGT image preprocessing
+  example observed: 25 x 37
+
+geometry context grid:
+  resized to 12 x 12
+
+dense geometry grid:
+  resized to 72 x 72
+  used as aux / point target alignment reference
+```
+
+实测 shape：
+
+```text
+geometry tokens:
+  [1, T * 12 * 12, 2048]
+
+per frame:
+  [1, 144, 2048]
+
+pointmap_grid:
+  [T, 72, 72, 3]
+
+camera_tokens:
+  observed [1, T, 9]
+  当前默认 use_camera_tokens = false
+```
+
+## 4. Fusion 模型
+
+代码位置：
+
+```text
+src/vggtsam/models/fusion.py
+src/vggtsam/models/latent_fusion.py
+```
+
+每一帧流式处理：
+
+```text
+SAM3 semantic tokens:
+  [1, 5184, 512]
+
+StreamVGGT geometry tokens:
+  [1, 144, 2048]
+
+projection:
+  SAM3 512  -> d_fuse 256
+  VGGT 2048 -> d_fuse 256
+
+cross attention:
+  query = SAM3 tokens
+  key/value = StreamVGGT geometry tokens
+
+fused tokens:
+  [1, 5184, 256]
+```
+
+当前不是直接把 RGB 输入到一个端到端模型中，而是先用 frozen SAM3 / StreamVGGT 抽中间特征，再训练 fusion heads。
+
+## 5. Fused Tokens 的输出头
+
+当前 fused tokens 进入三个 head：
+
+```text
+semantic_head:
+  input  [1, 5184, 256]
+  output [1, 5184, 1024]
+  meaning: per-token semantic logits
+
+point_head:
+  input  [1, 5184, 256]
+  output [1, 5184, 3]
+  meaning: per-token 3D point prediction
+
+match_head:
+  input  [1, 5184, 256]
+  output [1, 5184, 256]
+  meaning: normalized token embedding for cross-frame matching
+```
+
+另外模型提供：
+
+```text
+compute_mask_correspondence(curr_embeddings, hist_embeddings)
+  -> [N_curr, N_hist] correspondence logits
+```
+
+这里的 `mask correspondence` 不是最终 binary mask，而是 token-to-token 跨帧对应关系矩阵。
+
+## 6. 当前训练方式
+
+当前训练已经改成逐帧 streaming-style fusion：
+
+```text
+for t in range(T):
+  1. 取第 t 帧 SAM3 tokens
+  2. 取第 t 帧 StreamVGGT geometry tokens
+  3. fusion 得到 fused tokens
+  4. 预测 semantic logits / pointmap / match embeddings
+  5. 从历史帧随机选 hist_t
+  6. 计算 current-to-history correspondence matrix
+  7. 用 instance id 构造 GT match matrix
+  8. 将当前 embedding 写入 history buffer
+```
+
+Loss：
 
 ```text
 semantic_loss:
-  pred_logits -> ScanNet++ semantic mask token label
+  pred semantic logits -> semantic mask token label
 
 point_loss:
-  pred_pointmap -> GT pointmap token
+  pred pointmap -> GT pointmap token
 
 match_loss:
-  计算跨帧 token correspondence matrix。
-  同一 instance id 的跨帧 token pair 为正样本，不同 instance id 为负样本，
-  使用 BCEWithLogits 监督。
+  current token 与 history token 的 correspondence BCE
+
+  positive:
+    same instance id across frames
+
+  negative:
+    different instance id across frames
 ```
 
-这对应 `idea/ours_training.py` 里的核心逻辑：
+## 7. 当前 Mask 可视化
+
+当前可视化不是最终 mask decoder 输出。
+
+当前流程：
 
 ```text
-gt_match_matrix[i, j] = instance_id_curr[i] == instance_id_hist[j]
+1. 选一个 ref instance。
+2. 用 ref frame 的 GT instance mask 找到 ref object tokens。
+3. 对 ref object tokens 的 match embedding 求 prototype。
+4. 每帧计算 token embedding 与 prototype 的相似度。
+5. 每帧取 top-k token 作为 propagated mask。
 ```
 
-## Mask 可视化
-
-训练过程会保存 correspondence mask propagation 可视化：
+这个 top-k 方法只是为了诊断 correspondence 是否能追踪同一个 instance。它会有明显问题：
 
 ```text
-outputs/latent_fusion_debug/visualizations/step_XXXXXX.png
-outputs/latent_fusion_debug/visualizations/step_XXXXXX_crops.png
+1. k 来自 ref mask 面积，目标尺度变化时会不准。
+2. 同类物体 embedding 接近时，容易选到其他同类物体。
+3. 它没有利用真实 instance mask 训练一个高分辨率 decoder。
+4. 它不应该作为最终 mask 输出方式。
 ```
 
-可视化含义：
+## 8. 关于 Mask Decoder
+
+你的判断是对的：如果最终任务需要输出 mask，就应该使用真实 instance mask 训练 mask decoder。
+
+之前 object-query mask decoder 效果差，不代表 mask decoder 方向错，主要问题可能是：
 
 ```text
-1. 从一个可见 instance 中选 ref frame。
-2. 用该 instance 的 GT mask 取 ref object tokens。
-3. 求 ref object token embedding 的 prototype。
-4. 与每一帧所有 token embedding 计算相似度。
-5. 每一帧选取与 ref prototype 最相似的 top-k token，k 等于 ref mask 覆盖的 token 数。
-6. top-k token map 上采样回 RGB 尺寸，作为 propagated mask 显示。
+1. query slot 分配不稳定。
+2. 当时 prompt 还是 fixed "object"，语义条件太弱。
+3. BCE 背景占比太大，loss 下降不代表 mask 形状好。
+4. decoder 没有显式使用 ref mask / history correspondence。
+5. 直接从 72x72 token 上采样到高分辨率，边界能力有限。
 ```
 
-因此现在的 mask 可视化是在验证“跨帧追踪/对应关系”，不是验证一个单帧 mask decoder。
+更合理的下一版 mask decoder 应该是：
 
-## 当前边界
+```text
+ref GT mask
+  -> ref object token prototype / object query
+
+current fused tokens
+  -> mask decoder
+  -> mask logits [T, 72, 72] or higher resolution
+
+supervision:
+  GT instance mask pooled/resized to token grid
+  BCE + Dice / Focal
+
+additional supervision:
+  correspondence loss keeps same instance embedding close
+```
+
+也就是说，mask decoder 应该和 correspondence/history 结合，而不是单独靠固定 object query。
+
+## 9. 语义点云与 GT 点云
+
+当前已经有 per-token point prediction：
+
+```text
+pred_pointmap:
+  [T, 72, 72, 3]
+```
+
+也有 GT pointmap：
+
+```text
+gt_pointmap:
+  generated from ScanNet++ mesh + COLMAP camera rasterization
+  [T, 72, 72, 3] after pooling
+```
+
+下一步需要实现全局融合导出：
+
+```text
+pred semantic point cloud:
+  pred_pointmap + pred semantic logits + predicted/refined masks
+
+GT semantic point cloud:
+  gt_pointmap + GT semantic masks + GT instance masks
+```
+
+这样后续可以做：
+
+```text
+1. 语义点云可视化对比
+2. instance tracking 对比
+3. point/semantic/mask 指标评估
+```
+
+## 10. 当前边界
 
 ```text
 1. SAM3 和 StreamVGGT 仍然 frozen。
-2. 当前是单卡训练，没有做 DDP。
-3. StreamVGGT camera tokens 默认关闭，用于先验证普通 geometry tokens。
-4. 当前还没有最终的全局语义地图点云聚合模块。
-5. 当前 mask 是 correspondence propagation 结果，还不是独立高分辨率分割 decoder。
-```
-
-## 推荐运行
-
-```bash
-PYTHONPATH=src python scripts/train_latent_fusion.py \
-  --config configs/latent_fusion_train.yaml \
-  --iterations 200 \
-  --device cuda
+2. 当前 fusion 训练是逐帧 streaming-style，但 SAM3 / StreamVGGT adapter 仍然是先一次性抽 clip 特征。
+3. StreamVGGT camera tokens 默认关闭。
+4. 当前 mask 是 correspondence top-k 可视化，不是最终 mask decoder。
+5. 当前还没有全局语义点云融合导出。
 ```
