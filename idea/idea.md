@@ -24,7 +24,9 @@ gt_pointmaps: [B, T, N, 3] (3D 真值)
 gt_semantic_masks: [B, T, N] (每个像素/Token对应的类别真值)
 gt_instance_ids: [B, T, N] (跨视角同实体对齐真值)
 ```
-
+### loss
+gt semantic mask 对应的区域的 pred pointmap 与 gt pointmap 进行损失
+gt semantic 和 pred semantic logits
 
 
 
