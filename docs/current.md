@@ -72,6 +72,8 @@ source tensor = backbone_out["backbone_fpn"][-1]
 ```text
 SAM3 输入分辨率:
   1008 x 1008
+  实际输入 tensor: [T, 3, 1008, 1008]
+  其中 3 是 RGB 通道
 
 SAM3 spatial feature:
   detector_fpn2
@@ -79,6 +81,48 @@ SAM3 spatial feature:
 
 text conditioning:
   concat pooled language feature to every spatial token
+```
+
+选择 `detector_fpn2` 的原因：
+
+```text
+1. SAM3 1008 输入下，ViT patch size = 14，因此 1008 / 14 = 72。
+2. detector_fpn2 对应较低分辨率、语义更强的 FPN 层，空间大小与 72 x 72 token grid 对齐。
+3. 当前阶段希望先验证 latent-level fusion 和 correspondence，72 x 72 计算量较可控。
+4. 这不是最终结论；detector_fpn1 / detector_fpn0 应作为后续高分辨率 ablation。
+```
+
+`resized to 72 x 72` 的实现：
+
+```text
+spatial = select_sam3_spatial_feature(backbone_out, source="detector_fpn2")
+spatial = ensure_bchw_tensor(spatial).float()
+spatial = F.interpolate(spatial, size=(72, 72), mode="bilinear")
+```
+
+如果原始 spatial feature 已经是 72 x 72，则不会发生实际 resize。
+
+Prompt 编码：
+
+```text
+text_out = model.backbone.forward_text([prompt])
+language_features = text_out["language_features"]
+pooled language feature -> [1, 256]
+```
+
+当前 `text_conditioning=concat`：
+
+```text
+SAM3 visual token:
+  [1, T * 72 * 72, 256]
+
+pooled prompt token:
+  [1, 256]
+  expand to [1, T * 72 * 72, 256]
+
+concat:
+  [1, T * 72 * 72, 256 + 256]
+  = [1, T * 72 * 72, 512]
 ```
 
 实测 shape：
@@ -91,7 +135,12 @@ per frame:
   [1, 5184, 512]
 ```
 
-其中 `512 = 256 detector_fpn2 channels + 256 pooled text feature`。
+其中：
+
+```text
+72 * 72 = 5184
+512 = 256 detector_fpn2 channels + 256 pooled prompt feature
+```
 
 ## 3. StreamVGGT 分支
 
