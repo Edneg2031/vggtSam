@@ -616,7 +616,7 @@ def build_dense_batch(
         }
         if target_mode in {"instance", "sampled_instance"}:
             target_id = int(prompt_selection.sampled_instance_id)
-            target_instances = {target_id} if target_id in visible else set()
+            target_instances = {target_id} if np.any(inst == target_id) else set()
         else:
             target_instances = {
                 instance_id
