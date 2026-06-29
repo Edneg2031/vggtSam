@@ -28,6 +28,7 @@ def main() -> None:
     parser.add_argument("--scene-id", default=None)
     parser.add_argument("--sequence-length", type=int, default=None)
     parser.add_argument("--frame-stride", type=int, default=None)
+    parser.add_argument("--frame-indices", type=int, nargs="+", default=None)
     parser.add_argument("--output-size", type=int, nargs=2, metavar=("H", "W"))
     parser.add_argument("--visualize-every", type=int, default=None)
     parser.add_argument("--target-mode", choices=["class", "instance"], default=None)
@@ -52,6 +53,8 @@ def main() -> None:
         raw["dataset"]["sequence_length"] = args.sequence_length
     if args.frame_stride is not None:
         raw["dataset"]["frame_stride"] = args.frame_stride
+    if args.frame_indices is not None:
+        raw["dataset"]["frame_indices"] = list(args.frame_indices)
     if args.output_size is not None:
         raw["model"]["output_size"] = list(args.output_size)
     if args.target_mode is not None:
@@ -92,6 +95,7 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         scene_id=dataset.get("scene_id"),
         sequence_length=int(dataset["sequence_length"]),
         frame_stride=int(dataset.get("frame_stride", 1)),
+        frame_indices=optional_int_list(dataset.get("frame_indices")),
         min_pixels=int(objects["min_pixels"]),
         max_area_ratio=float(objects["max_area_ratio"]),
         min_visible_frames=int(objects["min_visible_frames"]),
@@ -160,6 +164,12 @@ def optional_int(value) -> int | None:
     if value is None or value == "":
         return None
     return int(value)
+
+
+def optional_int_list(value) -> list[int] | None:
+    if value is None or value == "":
+        return None
+    return [int(item) for item in value]
 
 
 if __name__ == "__main__":

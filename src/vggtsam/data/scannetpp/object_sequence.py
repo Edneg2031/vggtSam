@@ -45,12 +45,14 @@ class ScanNetPPObjectSequenceDataset:
         scene_id: Optional[str] = None,
         sequence_length: int = 4,
         frame_stride: int = 1,
+        frame_indices: Optional[List[int]] = None,
         object_config: Optional[ObjectSamplingConfig] = None,
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.manifest = read_json(self.manifest_path)
         self.sequence_length = int(sequence_length)
         self.frame_stride = int(frame_stride)
+        self.frame_indices = list(frame_indices) if frame_indices is not None else None
         self.object_config = object_config or ObjectSamplingConfig()
 
         scenes = self.manifest.get("scenes", [])
@@ -65,6 +67,18 @@ class ScanNetPPObjectSequenceDataset:
         self.windows: List[Dict[str, Any]] = []
         for scene in scenes:
             frames = scene.get("frames", [])
+            if self.frame_indices is not None:
+                indices = [int(index) for index in self.frame_indices]
+                if not indices:
+                    raise ValueError("frame_indices must not be empty.")
+                bad = [index for index in indices if index < 0 or index >= len(frames)]
+                if bad:
+                    raise ValueError(
+                        f"frame_indices out of range for scene {scene.get('scene_id')}: "
+                        f"{bad}; num_frames={len(frames)}"
+                    )
+                self.windows.append({"scene": scene, "indices": indices})
+                continue
             window_size = (self.sequence_length - 1) * self.frame_stride + 1
             if len(frames) < window_size:
                 continue
@@ -77,7 +91,7 @@ class ScanNetPPObjectSequenceDataset:
         if not self.windows:
             raise ValueError(
                 f"No valid windows in {self.manifest_path}; sequence_length={sequence_length}, "
-                f"frame_stride={frame_stride}"
+                f"frame_stride={frame_stride}, frame_indices={self.frame_indices}"
             )
 
     def __len__(self) -> int:

@@ -47,6 +47,7 @@ class DenseFusionTrainConfig:
     scene_id: str | None
     sequence_length: int
     frame_stride: int
+    frame_indices: List[int] | None
     min_pixels: int
     max_area_ratio: float
     min_visible_frames: int
@@ -178,6 +179,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
         scene_id=config.scene_id,
         sequence_length=config.sequence_length,
         frame_stride=config.frame_stride,
+        frame_indices=config.frame_indices,
         object_config=object_config,
     )
 
