@@ -78,3 +78,24 @@ PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
   --device cuda \
   --visualize-every 10 \
   --output-dir outputs/dense_fusion_overfit
+
+
+
+
+  ####### 找合适窗口######
+  PYTHONPATH=src python scripts/inspect_scannetpp_instances.py \
+  --scene-id 00a231a370 \
+  --label picture \
+  --top-k 20 \
+  --min-visible-frames 2
+
+  PYTHONPATH=src python scripts/train_dense_fusion.py \
+  --config configs/dense_fusion_train.yaml \
+  --scene-id 00a231a370 \
+  --instance-id XX \
+  --window-index YY \
+  --output-size 256 384 \
+  --iterations 300 \
+  --device cuda \
+  --visualize-every 10 \
+  --output-dir outputs/dense_fusion_overfit_picture
