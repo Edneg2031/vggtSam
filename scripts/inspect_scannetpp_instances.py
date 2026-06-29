@@ -25,7 +25,8 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=30)
     parser.add_argument("--min-visible-frames", type=int, default=1)
     parser.add_argument("--max-frames", type=int, default=None)
-    parser.add_argument("--window-size", type=int, default=4)
+    parser.add_argument("--sequence-length", type=int, default=4)
+    parser.add_argument("--frame-stride", type=int, default=1)
     args = parser.parse_args()
 
     manifest = read_json(args.manifest)
@@ -42,21 +43,25 @@ def main() -> None:
         frames = frames[: args.max_frames]
     object_labels = extract_object_labels(scene.get("objects", {}))
 
+    per_frame_counts = []
     stats = defaultdict(lambda: {"frames": 0, "pixels": 0, "max_pixels": 0, "first_frame": None})
     for frame_idx, frame in enumerate(frames):
         mask = read_mask(frame["instance_mask"])
         ids, counts = np.unique(mask, return_counts=True)
+        frame_counts = {}
         for instance_id, count in zip(ids, counts):
             instance_id = int(instance_id)
             if instance_id <= 0:
                 continue
             count = int(count)
+            frame_counts[instance_id] = count
             item = stats[instance_id]
             item["frames"] += 1
             item["pixels"] += count
             item["max_pixels"] = max(item["max_pixels"], count)
             if item["first_frame"] is None:
                 item["first_frame"] = frame_idx
+        per_frame_counts.append(frame_counts)
 
     label_filter = args.label.strip().lower() if args.label else None
     rows = []
@@ -66,6 +71,15 @@ def main() -> None:
             continue
         if int(item["frames"]) < args.min_visible_frames:
             continue
+        window = best_window_for_instance(
+            per_frame_counts,
+            instance_id=instance_id,
+            sequence_length=args.sequence_length,
+            frame_stride=args.frame_stride,
+            min_visible_frames=args.min_visible_frames,
+        )
+        if window is None:
+            continue
         rows.append(
             {
                 "instance_id": instance_id,
@@ -74,42 +88,84 @@ def main() -> None:
                 "pixels": int(item["pixels"]),
                 "max_pixels": int(item["max_pixels"]),
                 "first_frame": int(item["first_frame"]),
+                "window_index": int(window["window_index"]),
+                "window_pixels": int(window["window_pixels"]),
+                "window_visible_frames": int(window["window_visible_frames"]),
+                "frame_indices": window["frame_indices"],
             }
         )
 
-    rows.sort(key=lambda row: (row["max_pixels"], row["pixels"]), reverse=True)
+    rows.sort(
+        key=lambda row: (
+            row["window_visible_frames"],
+            row["window_pixels"],
+            row["max_pixels"],
+        ),
+        reverse=True,
+    )
     rows = rows[: max(1, args.top_k)]
     if not rows:
         raise SystemExit("No matching instances found.")
 
     print(
         "instance_id\tlabel\tvisible_frames\ttotal_pixels\tmax_pixels\t"
-        "first_frame\twindow_index"
+        "window_visible\twindow_pixels\twindow_index\tframe_indices"
     )
     for row in rows:
-        window_index = max(
-            0,
-            min(
-                row["first_frame"],
-                max(0, len(frames) - max(1, args.window_size)),
-            ),
-        )
         print(
             f"{row['instance_id']}\t{row['label']}\t{row['frames']}\t"
-            f"{row['pixels']}\t{row['max_pixels']}\t{row['first_frame']}\t"
-            f"{window_index}"
+            f"{row['pixels']}\t{row['max_pixels']}\t"
+            f"{row['window_visible_frames']}\t{row['window_pixels']}\t"
+            f"{row['window_index']}\t{row['frame_indices']}"
         )
 
     best = rows[0]
-    best_window = max(
-        0,
-        min(
-            best["first_frame"],
-            max(0, len(frames) - max(1, args.window_size)),
-        ),
-    )
     print("\nSuggested overfit args:")
-    print(f"  --instance-id {best['instance_id']} --window-index {best_window}")
+    print(
+        f"  --instance-id {best['instance_id']} "
+        f"--window-index {best['window_index']} "
+        f"--sequence-length {args.sequence_length} "
+        f"--frame-stride {args.frame_stride}"
+    )
+
+
+def best_window_for_instance(
+    per_frame_counts: list[dict[int, int]],
+    *,
+    instance_id: int,
+    sequence_length: int,
+    frame_stride: int,
+    min_visible_frames: int,
+) -> dict | None:
+    sequence_length = max(1, int(sequence_length))
+    frame_stride = max(1, int(frame_stride))
+    window_size = (sequence_length - 1) * frame_stride + 1
+    if len(per_frame_counts) < window_size:
+        return None
+
+    best = None
+    for start in range(0, len(per_frame_counts) - window_size + 1):
+        frame_indices = [start + i * frame_stride for i in range(sequence_length)]
+        counts = [
+            int(per_frame_counts[frame_idx].get(instance_id, 0))
+            for frame_idx in frame_indices
+        ]
+        visible = sum(count > 0 for count in counts)
+        if visible < min_visible_frames:
+            continue
+        pixels = sum(counts)
+        candidate = {
+            "window_index": start,
+            "frame_indices": frame_indices,
+            "window_pixels": pixels,
+            "window_visible_frames": visible,
+        }
+        if best is None:
+            best = candidate
+            continue
+        if (visible, pixels) > (best["window_visible_frames"], best["window_pixels"]):
+            best = candidate
+    return best
 
 
 if __name__ == "__main__":

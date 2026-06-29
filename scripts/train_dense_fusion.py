@@ -26,6 +26,8 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--prompt", default=None)
     parser.add_argument("--scene-id", default=None)
+    parser.add_argument("--sequence-length", type=int, default=None)
+    parser.add_argument("--frame-stride", type=int, default=None)
     parser.add_argument("--output-size", type=int, nargs=2, metavar=("H", "W"))
     parser.add_argument("--visualize-every", type=int, default=None)
     parser.add_argument("--target-mode", choices=["class", "instance"], default=None)
@@ -46,6 +48,10 @@ def main() -> None:
         raw["training"]["visualize_every"] = args.visualize_every
     if args.scene_id is not None:
         raw["dataset"]["scene_id"] = args.scene_id
+    if args.sequence_length is not None:
+        raw["dataset"]["sequence_length"] = args.sequence_length
+    if args.frame_stride is not None:
+        raw["dataset"]["frame_stride"] = args.frame_stride
     if args.output_size is not None:
         raw["model"]["output_size"] = list(args.output_size)
     if args.target_mode is not None:
