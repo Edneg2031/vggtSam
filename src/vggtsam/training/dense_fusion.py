@@ -87,11 +87,14 @@ class DenseFusionTrainConfig:
     mask_weight: float
     dice_weight: float
     point_weight: float
+    chamfer_weight: float
+    reprojection_weight: float
     text_weight: float
     aux_cls_weight: float
     match_weight: float
     temperature: float
     max_match_pixels: int
+    max_chamfer_points: int
     negative_ratio: int
     history_enabled: bool
     history_update_source: str
@@ -335,6 +338,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             .cpu()
             .tolist()
         ]
+        preview_has_camera = "intrinsics" in preview_batch
         del preview_batch
         print(
             "overfit target "
@@ -344,7 +348,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             f"label='{overfit_prompt_selection.sampled_label}' "
             f"target_mode={config.target_mode} "
             f"reference_frame={preview_reference_frame_idx} "
-            f"prompt_pixels={preview_prompt_pixels}"
+            f"prompt_pixels={preview_prompt_pixels} "
+            f"camera={'yes' if preview_has_camera else 'no'}"
         )
 
     for step in range(1, config.iterations + 1):
@@ -505,6 +510,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
         mask_losses: List[torch.Tensor] = []
         dice_losses: List[torch.Tensor] = []
         point_losses: List[torch.Tensor] = []
+        chamfer_losses: List[torch.Tensor] = []
+        reprojection_losses: List[torch.Tensor] = []
         text_losses: List[torch.Tensor] = []
         aux_losses: List[torch.Tensor] = []
         match_losses: List[torch.Tensor] = []
@@ -536,6 +543,19 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 output.pointmap[0],
                 target["pointmap"],
                 target["point_valid"] & target["prompt_mask"],
+            )
+            chamfer_loss = dense_chamfer_loss(
+                output.pointmap[0],
+                target["pointmap"],
+                target["point_valid"] & target["prompt_mask"],
+                max_points=config.max_chamfer_points,
+            )
+            reprojection_loss = dense_reprojection_mask_loss(
+                output.pointmap[0],
+                output.mask_logits[0],
+                target["prompt_mask"],
+                target.get("intrinsics"),
+                target.get("world_to_camera"),
             )
             text_loss = dense_mask_bce_loss(
                 output.prompt_score[0],
@@ -571,6 +591,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 config.mask_weight * mask_loss
                 + config.dice_weight * dice_loss
                 + config.point_weight * point_loss
+                + config.chamfer_weight * chamfer_loss
+                + config.reprojection_weight * reprojection_loss
                 + config.text_weight * text_loss
                 + config.aux_cls_weight * aux_loss
                 + config.match_weight * match_loss
@@ -579,6 +601,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             mask_losses.append(mask_loss)
             dice_losses.append(dice_loss)
             point_losses.append(point_loss)
+            chamfer_losses.append(chamfer_loss)
+            reprojection_losses.append(reprojection_loss)
             text_losses.append(text_loss)
             aux_losses.append(aux_loss)
             match_losses.append(match_loss)
@@ -616,6 +640,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "mask_loss": mean_metric(mask_losses),
             "dice_loss": mean_metric(dice_losses),
             "point_loss": mean_metric(point_losses),
+            "chamfer_loss": mean_metric(chamfer_losses),
+            "reprojection_loss": mean_metric(reprojection_losses),
             "text_loss": mean_metric(text_losses),
             "aux_cls_loss": mean_metric(aux_losses),
             "match_loss": mean_metric(match_losses),
@@ -636,8 +662,10 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
         if step % config.log_every == 0 or completed_steps == 1:
             print(
                 "step={step} loss={loss:.4f} mask={mask_loss:.4f} "
-                "dice={dice_loss:.4f} point={point_loss:.4f} text={text_loss:.4f} "
-                "match={match_loss:.4f} prompt_pixels={num_prompt_pixels} "
+                "dice={dice_loss:.4f} point={point_loss:.4f} "
+                "chamfer={chamfer_loss:.4f} reproj={reprojection_loss:.4f} "
+                "text={text_loss:.4f} match={match_loss:.4f} "
+                "prompt_pixels={num_prompt_pixels} "
                 "prompt='{prompt}'".format(**row)
             )
 
@@ -725,6 +753,12 @@ def build_dense_batch(
     instances = []
     semantics = []
     pointmaps = []
+    intrinsics = []
+    world_to_cameras = []
+    has_camera = (
+        sequence.camera_intrinsics is not None
+        and sequence.world_to_camera is not None
+    )
 
     for frame_idx, (inst_np, sem_np, point_np) in enumerate(
         zip(sequence.instance_masks, sequence.semantic_masks, sequence.pointmaps or [])
@@ -732,6 +766,19 @@ def build_dense_batch(
         inst = resize_label_mask(inst_np, output_size)
         sem = resize_label_mask(sem_np, output_size)
         point, point_valid = resize_pointmap(point_np, output_size)
+        if has_camera:
+            intrinsics.append(
+                torch.from_numpy(
+                    scale_intrinsics(
+                        sequence.camera_intrinsics[frame_idx],
+                        source_hw=inst_np.shape[:2],
+                        output_hw=output_size,
+                    )
+                ).float()
+            )
+            world_to_cameras.append(
+                torch.from_numpy(sequence.world_to_camera[frame_idx]).float()
+            )
 
         visible = {
             int(instance_id)
@@ -789,7 +836,7 @@ def build_dense_batch(
     visible_frames = prompt_stack.flatten(1).any(dim=1).nonzero(as_tuple=False).flatten()
     reference_frame_idx = int(visible_frames[0].detach().cpu().item())
 
-    return {
+    batch = {
         "prompt_mask": prompt_stack,
         "mask_supervision": stack(mask_supervision),
         "instance_valid": stack(instance_valids),
@@ -801,6 +848,26 @@ def build_dense_batch(
         "reference_mask": prompt_stack[reference_frame_idx],
         "reference_frame_idx": torch.tensor(reference_frame_idx, device=device),
     }
+    if has_camera:
+        batch["intrinsics"] = stack(intrinsics)
+        batch["world_to_camera"] = stack(world_to_cameras)
+    return batch
+
+
+def scale_intrinsics(
+    intrinsics: np.ndarray,
+    *,
+    source_hw: tuple[int, int],
+    output_hw: tuple[int, int],
+) -> np.ndarray:
+    scaled = np.asarray(intrinsics, dtype=np.float32).copy()
+    src_h, src_w = int(source_hw[0]), int(source_hw[1])
+    out_h, out_w = int(output_hw[0]), int(output_hw[1])
+    scaled[0, 0] *= out_w / float(src_w)
+    scaled[0, 2] *= out_w / float(src_w)
+    scaled[1, 1] *= out_h / float(src_h)
+    scaled[1, 2] *= out_h / float(src_h)
+    return scaled
 
 
 def frame_target(batch: Dict[str, torch.Tensor], frame_idx: int) -> Dict[str, torch.Tensor]:
@@ -889,6 +956,168 @@ def dense_point_loss(
     if not valid.any():
         return prediction.sum() * 0.0
     return F.smooth_l1_loss(prediction[valid], target[valid])
+
+
+def dense_chamfer_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    max_points: int,
+) -> torch.Tensor:
+    if not valid.any():
+        return prediction.sum() * 0.0
+    pred_points = prediction[valid]
+    target_points = target[valid]
+    if pred_points.shape[0] < 2 or target_points.shape[0] < 2:
+        return prediction.sum() * 0.0
+    pred_points = sample_rows(pred_points, max_points)
+    target_points = sample_rows(target_points, max_points)
+    distances = torch.cdist(pred_points[None], target_points[None], p=2).squeeze(0)
+    return 0.5 * (
+        distances.min(dim=1).values.mean() + distances.min(dim=0).values.mean()
+    )
+
+
+def sample_rows(values: torch.Tensor, max_rows: int) -> torch.Tensor:
+    max_rows = int(max_rows)
+    if max_rows <= 0 or values.shape[0] <= max_rows:
+        return values
+    indices = torch.randperm(values.shape[0], device=values.device)[:max_rows]
+    return values[indices]
+
+
+def dense_reprojection_mask_loss(
+    pointmap: torch.Tensor,
+    mask_logits: torch.Tensor,
+    target_mask: torch.Tensor,
+    intrinsics: torch.Tensor | None,
+    world_to_camera: torch.Tensor | None,
+) -> torch.Tensor:
+    if intrinsics is None or world_to_camera is None:
+        return pointmap.sum() * 0.0
+    projected = project_weighted_pointmap_mask(
+        pointmap,
+        weights=mask_logits.sigmoid(),
+        intrinsics=intrinsics,
+        world_to_camera=world_to_camera,
+    )
+    target = target_mask.to(projected.dtype)
+    logits = torch.logit(projected.clamp(1e-4, 1.0 - 1e-4))
+    pos = target.sum()
+    neg = target.numel() - pos
+    pos_weight = (neg / pos.clamp_min(1.0)).clamp(1.0, 20.0)
+    bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pos_weight)
+    dice = probability_dice_loss(projected, target)
+    return bce + dice
+
+
+def project_weighted_pointmap_mask(
+    pointmap: torch.Tensor,
+    *,
+    weights: torch.Tensor,
+    intrinsics: torch.Tensor,
+    world_to_camera: torch.Tensor,
+) -> torch.Tensor:
+    height, width = pointmap.shape[:2]
+    points = pointmap.reshape(-1, 3)
+    weights_flat = weights.reshape(-1).to(points.dtype)
+    ones = torch.ones(points.shape[0], 1, dtype=points.dtype, device=points.device)
+    points_h = torch.cat([points, ones], dim=-1)
+    cam = (world_to_camera.to(points.dtype) @ points_h.transpose(0, 1)).transpose(0, 1)
+    z = cam[:, 2].clamp_min(1e-6)
+    fx = intrinsics[0, 0].to(points.dtype)
+    fy = intrinsics[1, 1].to(points.dtype)
+    cx = intrinsics[0, 2].to(points.dtype)
+    cy = intrinsics[1, 2].to(points.dtype)
+    u = fx * (cam[:, 0] / z) + cx
+    v = fy * (cam[:, 1] / z) + cy
+    valid = (
+        torch.isfinite(u)
+        & torch.isfinite(v)
+        & torch.isfinite(z)
+        & (cam[:, 2] > 1e-6)
+        & (weights_flat > 1e-6)
+        & (u >= -1.0)
+        & (u <= width)
+        & (v >= -1.0)
+        & (v <= height)
+    )
+    if not valid.any():
+        return weights.sum() * 0.0 + torch.zeros_like(weights)
+
+    u = u[valid]
+    v = v[valid]
+    source_weight = weights_flat[valid]
+    u0 = torch.floor(u)
+    v0 = torch.floor(v)
+    du = u - u0
+    dv = v - v0
+    u0 = u0.long()
+    v0 = v0.long()
+
+    flat = torch.zeros(height * width, dtype=points.dtype, device=points.device)
+    flat = splat_to_flat(
+        flat,
+        u0,
+        v0,
+        (1.0 - du) * (1.0 - dv) * source_weight,
+        width,
+        height,
+    )
+    flat = splat_to_flat(
+        flat,
+        u0 + 1,
+        v0,
+        du * (1.0 - dv) * source_weight,
+        width,
+        height,
+    )
+    flat = splat_to_flat(
+        flat,
+        u0,
+        v0 + 1,
+        (1.0 - du) * dv * source_weight,
+        width,
+        height,
+    )
+    flat = splat_to_flat(
+        flat,
+        u0 + 1,
+        v0 + 1,
+        du * dv * source_weight,
+        width,
+        height,
+    )
+    return (1.0 - torch.exp(-flat.reshape(height, width))).clamp(0.0, 1.0)
+
+
+def splat_to_flat(
+    flat: torch.Tensor,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    values: torch.Tensor,
+    width: int,
+    height: int,
+) -> torch.Tensor:
+    valid = (x >= 0) & (x < width) & (y >= 0) & (y < height)
+    if not valid.any():
+        return flat
+    indices = y[valid] * width + x[valid]
+    return flat.scatter_add(0, indices, values[valid])
+
+
+def probability_dice_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    if not target.any():
+        return prediction.mean()
+    intersection = (prediction * target).sum()
+    union = prediction.sum() + target.sum()
+    return 1.0 - (2.0 * intersection + eps) / (union + eps)
 
 
 def dense_instance_match_loss(
@@ -1149,6 +1378,8 @@ def write_metrics_header(path: Path) -> None:
         "mask_loss",
         "dice_loss",
         "point_loss",
+        "chamfer_loss",
+        "reprojection_loss",
         "text_loss",
         "aux_cls_loss",
         "match_loss",

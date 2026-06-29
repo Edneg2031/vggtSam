@@ -84,11 +84,14 @@ loss:
   mask_weight: 1.0
   dice_weight: 1.0
   point_weight: 1.0
+  chamfer_weight: 0.1
+  reprojection_weight: 0.1
   text_weight: 0.5
   aux_cls_weight: 0.1
   match_weight: 0.25
   temperature: 0.07
   max_match_pixels: 2048
+  max_chamfer_points: 1024
   negative_ratio: 8
 
 history:

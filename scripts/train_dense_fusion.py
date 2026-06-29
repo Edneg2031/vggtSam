@@ -43,6 +43,8 @@ def main() -> None:
     parser.add_argument("--frame-indices", type=int, nargs="+", default=None)
     parser.add_argument("--output-size", type=int, nargs=2, metavar=("H", "W"))
     parser.add_argument("--visualize-every", type=int, default=None)
+    parser.add_argument("--chamfer-weight", type=float, default=None)
+    parser.add_argument("--reprojection-weight", type=float, default=None)
     parser.add_argument("--target-mode", choices=["class", "instance"], default=None)
     parser.add_argument("--overfit", action="store_true")
     parser.add_argument("--no-overfit", action="store_true")
@@ -73,6 +75,10 @@ def main() -> None:
         raw["training"]["output_dir"] = str(args.output_dir)
     if args.visualize_every is not None:
         raw["training"]["visualize_every"] = args.visualize_every
+    if args.chamfer_weight is not None:
+        raw["loss"]["chamfer_weight"] = args.chamfer_weight
+    if args.reprojection_weight is not None:
+        raw["loss"]["reprojection_weight"] = args.reprojection_weight
     if args.scene_id is not None:
         raw["dataset"]["scene_id"] = args.scene_id
     if args.sequence_length is not None:
@@ -169,11 +175,14 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         mask_weight=float(loss["mask_weight"]),
         dice_weight=float(loss["dice_weight"]),
         point_weight=float(loss["point_weight"]),
+        chamfer_weight=float(loss.get("chamfer_weight", 0.0)),
+        reprojection_weight=float(loss.get("reprojection_weight", 0.0)),
         text_weight=float(loss["text_weight"]),
         aux_cls_weight=float(loss.get("aux_cls_weight", 0.0)),
         match_weight=float(loss["match_weight"]),
         temperature=float(loss["temperature"]),
         max_match_pixels=int(loss["max_match_pixels"]),
+        max_chamfer_points=int(loss.get("max_chamfer_points", 1024)),
         negative_ratio=int(loss.get("negative_ratio", 8)),
         history_enabled=bool(history.get("enabled", True)),
         history_update_source=str(history.get("update_source", "gt")),

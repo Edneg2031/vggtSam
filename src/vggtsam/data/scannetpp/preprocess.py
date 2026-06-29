@@ -297,23 +297,6 @@ def _process_frame(
     instance_path = instance_dir / f"{stem}.png"
     pointmap_path = pointmap_dir / f"{stem}.npz"
     raster_path = raster_dir / f"{stem}.npz"
-    pointmap_exists = (not config.save_pointmaps) or pointmap_path.exists()
-    if (
-        config.skip_existing
-        and semantic_path.exists()
-        and instance_path.exists()
-        and pointmap_exists
-    ):
-        return {
-            "image_name": frame_name,
-            "image_path": str(image_path),
-            "semantic_mask": str(semantic_path),
-            "instance_mask": str(instance_path),
-            "pointmap": str(pointmap_path) if pointmap_path.exists() else None,
-            "raster": str(raster_path) if raster_path.exists() else None,
-            "skipped_existing": True,
-        }
-
     image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if image_bgr is None:
         print(f"Skipping unreadable image: {image_path}")
@@ -328,6 +311,27 @@ def _process_frame(
         print(f"Skipping image not present in COLMAP images.txt: {frame_name}")
         return None
     camera = cameras[colmap_image.camera_id].scaled_to(width, height)
+    camera_record = _camera_record(colmap_image, camera)
+
+    pointmap_exists = (not config.save_pointmaps) or pointmap_path.exists()
+    if (
+        config.skip_existing
+        and semantic_path.exists()
+        and instance_path.exists()
+        and pointmap_exists
+    ):
+        return {
+            "image_name": frame_name,
+            "image_path": str(image_path),
+            "semantic_mask": str(semantic_path),
+            "instance_mask": str(instance_path),
+            "pointmap": str(pointmap_path) if pointmap_path.exists() else None,
+            "raster": str(raster_path) if raster_path.exists() else None,
+            "width": int(width),
+            "height": int(height),
+            **camera_record,
+            "skipped_existing": True,
+        }
 
     semantic, instance, pix_to_face, zbuf, pointmap = rasterize_labels_and_points(
         vertices,
@@ -395,12 +399,58 @@ def _process_frame(
         "raster": str(raster_path) if config.save_raster else None,
         "width": int(width),
         "height": int(height),
-        "camera_id": int(colmap_image.camera_id),
+        **camera_record,
         "semantic_pixels": int(valid_semantic.sum()),
         "instance_pixels": int(valid_instance.sum()),
         "pointmap_pixels": int(valid_pointmap.sum()),
         "visible_instance_ids": visible_instances,
     }
+
+
+def _camera_record(colmap_image: Any, camera: Any) -> Dict[str, Any]:
+    return {
+        "camera_id": int(colmap_image.camera_id),
+        "camera_model": str(camera.model),
+        "camera_width": int(camera.width),
+        "camera_height": int(camera.height),
+        "camera_params": [float(v) for v in np.asarray(camera.params).tolist()],
+        "intrinsics": _camera_intrinsics(camera).astype(float).tolist(),
+        "world_to_camera": colmap_image.world_to_camera.astype(float).tolist(),
+    }
+
+
+def _camera_intrinsics(camera: Any) -> np.ndarray:
+    params = np.asarray(camera.params, dtype=np.float64)
+    if camera.model == "SIMPLE_PINHOLE":
+        f, cx, cy = params[:3]
+        fx = fy = f
+    elif camera.model in {
+        "PINHOLE",
+        "OPENCV",
+        "OPENCV_FISHEYE",
+        "FULL_OPENCV",
+        "FOV",
+        "THIN_PRISM_FISHEYE",
+    }:
+        fx, fy, cx, cy = params[:4]
+    elif camera.model in {
+        "SIMPLE_RADIAL",
+        "RADIAL",
+        "SIMPLE_RADIAL_FISHEYE",
+        "RADIAL_FISHEYE",
+    }:
+        f, cx, cy = params[:3]
+        fx = fy = f
+    else:
+        raise NotImplementedError(f"Unsupported camera model: {camera.model}")
+    return np.array(
+        [
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
 
 
 def _resolve_scene_assets(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:

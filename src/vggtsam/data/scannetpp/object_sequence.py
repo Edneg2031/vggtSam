@@ -33,6 +33,8 @@ class ObjectSequence:
     visible_instance_ids: List[List[int]]
     object_labels: Dict[int, str]
     pointmaps: Optional[List[np.ndarray]] = None
+    camera_intrinsics: Optional[List[np.ndarray]] = None
+    world_to_camera: Optional[List[np.ndarray]] = None
 
 
 class ScanNetPPObjectSequenceDataset:
@@ -113,6 +115,16 @@ class ScanNetPPObjectSequenceDataset:
             if all(pointmap_paths)
             else None
         )
+        intrinsics = [read_matrix(frame.get("intrinsics"), (3, 3)) for frame in selected]
+        world_to_camera = [
+            read_matrix(frame.get("world_to_camera"), (4, 4)) for frame in selected
+        ]
+        intrinsics = intrinsics if all(item is not None for item in intrinsics) else None
+        world_to_camera = (
+            world_to_camera
+            if all(item is not None for item in world_to_camera)
+            else None
+        )
         visible_instance_ids = [
             filter_visible_instances(
                 inst,
@@ -130,6 +142,8 @@ class ScanNetPPObjectSequenceDataset:
             visible_instance_ids=visible_instance_ids,
             object_labels=object_labels,
             pointmaps=pointmaps,
+            camera_intrinsics=intrinsics,
+            world_to_camera=world_to_camera,
         )
 
     def sample(self, rng: random.Random) -> ObjectSequence:
@@ -159,6 +173,15 @@ def read_pointmap(path: str | Path) -> np.ndarray:
             f"Pointmap must have shape [H, W, 3], got {pointmap.shape}: {path}"
         )
     return pointmap
+
+
+def read_matrix(value: Any, shape: tuple[int, int]) -> Optional[np.ndarray]:
+    if value is None:
+        return None
+    matrix = np.asarray(value, dtype=np.float32)
+    if matrix.shape != shape:
+        return None
+    return matrix
 
 
 def extract_object_labels(objects: Dict[str, Any]) -> Dict[int, str]:
