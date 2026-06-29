@@ -43,8 +43,14 @@ def main() -> None:
     parser.add_argument("--frame-indices", type=int, nargs="+", default=None)
     parser.add_argument("--output-size", type=int, nargs=2, metavar=("H", "W"))
     parser.add_argument("--visualize-every", type=int, default=None)
+    parser.add_argument("--mask-weight", type=float, default=None)
+    parser.add_argument("--dice-weight", type=float, default=None)
+    parser.add_argument("--point-weight", type=float, default=None)
     parser.add_argument("--chamfer-weight", type=float, default=None)
     parser.add_argument("--reprojection-weight", type=float, default=None)
+    parser.add_argument("--text-weight", type=float, default=None)
+    parser.add_argument("--aux-cls-weight", type=float, default=None)
+    parser.add_argument("--match-weight", type=float, default=None)
     parser.add_argument("--target-mode", choices=["class", "instance"], default=None)
     parser.add_argument("--overfit", action="store_true")
     parser.add_argument("--no-overfit", action="store_true")
@@ -75,10 +81,22 @@ def main() -> None:
         raw["training"]["output_dir"] = str(args.output_dir)
     if args.visualize_every is not None:
         raw["training"]["visualize_every"] = args.visualize_every
+    if args.mask_weight is not None:
+        raw["loss"]["mask_weight"] = args.mask_weight
+    if args.dice_weight is not None:
+        raw["loss"]["dice_weight"] = args.dice_weight
+    if args.point_weight is not None:
+        raw["loss"]["point_weight"] = args.point_weight
     if args.chamfer_weight is not None:
         raw["loss"]["chamfer_weight"] = args.chamfer_weight
     if args.reprojection_weight is not None:
         raw["loss"]["reprojection_weight"] = args.reprojection_weight
+    if args.text_weight is not None:
+        raw["loss"]["text_weight"] = args.text_weight
+    if args.aux_cls_weight is not None:
+        raw["loss"]["aux_cls_weight"] = args.aux_cls_weight
+    if args.match_weight is not None:
+        raw["loss"]["match_weight"] = args.match_weight
     if args.scene_id is not None:
         raw["dataset"]["scene_id"] = args.scene_id
     if args.sequence_length is not None:
