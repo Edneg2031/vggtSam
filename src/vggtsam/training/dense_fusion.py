@@ -72,6 +72,7 @@ class DenseFusionTrainConfig:
     streamvggt_repo: Path
     streamvggt_checkpoint: Path
     geometry_device: str
+    geometry_streaming_cache: bool
     feature_grid: tuple[int, int]
     context_grid: tuple[int, int]
     streamvggt_layer_index: int
@@ -92,6 +93,9 @@ class DenseFusionTrainConfig:
     temperature: float
     max_match_pixels: int
     negative_ratio: int
+    history_enabled: bool
+    history_update_source: str
+    history_pred_threshold: float
     device: str
     iterations: int
     lr: float
@@ -319,6 +323,18 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 "different --window-index / --instance-id, or lower min_pixels / "
                 "min_visible_frames."
             )
+        preview_reference_frame_idx = int(
+            preview_batch["reference_frame_idx"].detach().cpu().item()
+        )
+        preview_prompt_pixels = [
+            int(value)
+            for value in preview_batch["prompt_mask"]
+            .flatten(1)
+            .sum(dim=1)
+            .detach()
+            .cpu()
+            .tolist()
+        ]
         del preview_batch
         print(
             "overfit target "
@@ -326,7 +342,9 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             f"frames={overfit_sequence.frame_indices} "
             f"instance={overfit_prompt_selection.sampled_instance_id} "
             f"label='{overfit_prompt_selection.sampled_label}' "
-            f"target_mode={config.target_mode}"
+            f"target_mode={config.target_mode} "
+            f"reference_frame={preview_reference_frame_idx} "
+            f"prompt_pixels={preview_prompt_pixels}"
         )
 
     for step in range(1, config.iterations + 1):
@@ -366,6 +384,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 geo_out = geometry.extract_from_paths(
                     sequence.image_paths,
                     return_pointmap=False,
+                    streaming_cache=config.geometry_streaming_cache,
                 )
                 text_embedding = pool_language_features(sam_out.text_out)
                 if text_embedding is None:
@@ -571,6 +590,18 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                     "valid": target["instance_valid"].detach(),
                 }
             )
+            if config.history_enabled:
+                update_mask = select_history_update_mask(
+                    output=output,
+                    target=target,
+                    source=config.history_update_source,
+                    pred_threshold=config.history_pred_threshold,
+                )
+                object_query = model.update_object_query(
+                    object_query,
+                    fused_frame_tokens[frame_idx],
+                    update_mask,
+                )
 
         loss = torch.stack(frame_losses).mean()
         optimizer.zero_grad(set_to_none=True)
@@ -923,6 +954,29 @@ def dense_instance_match_loss(
             targets.reshape(-1)[selected],
         ),
         int(current_indices.numel() + history_indices.numel()),
+    )
+
+
+def select_history_update_mask(
+    *,
+    output: Any,
+    target: Dict[str, torch.Tensor],
+    source: str,
+    pred_threshold: float,
+) -> torch.Tensor:
+    source = source.strip().lower()
+    if source in {"gt", "target", "teacher"}:
+        return target["prompt_mask"]
+    if source in {"pred", "prediction"}:
+        return output.mask_logits[0].detach().sigmoid() > float(pred_threshold)
+    if source in {"gt_or_pred", "teacher_or_pred"}:
+        gt = target["prompt_mask"]
+        if gt.any():
+            return gt
+        return output.mask_logits[0].detach().sigmoid() > float(pred_threshold)
+    raise ValueError(
+        "history.update_source must be 'gt', 'pred', or 'gt_or_pred', "
+        f"got {source!r}"
     )
 
 

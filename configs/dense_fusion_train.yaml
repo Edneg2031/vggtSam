@@ -60,6 +60,8 @@ geometry:
   checkpoint: /home/bod/86Nas/95_data_bak/FoundationModels/StreamVGGT/checkpoints.pth
   # Empty means use training.device. Set e.g. cuda:1 to split GPUs.
   device:
+  # True: frame-by-frame StreamVGGT KV cache. Set false for whole-clip extraction.
+  streaming_cache: true
   # Internal latent fusion grid. This is not the supervision/output resolution.
   feature_grid: [72, 72]
   context_grid: [12, 12]
@@ -88,6 +90,13 @@ loss:
   temperature: 0.07
   max_match_pixels: 2048
   negative_ratio: 8
+
+history:
+  # Update object_query over time using frame-level evidence.
+  enabled: true
+  # gt is stable for overfit training; pred is closer to inference-time memory.
+  update_source: gt
+  pred_threshold: 0.5
 
 training:
   device: cuda

@@ -25,6 +25,15 @@ def main() -> None:
     parser.add_argument("--device", default=None)
     parser.add_argument("--sam3-device", default=None)
     parser.add_argument("--geometry-device", default=None)
+    geometry_streaming = parser.add_mutually_exclusive_group()
+    geometry_streaming.add_argument("--geometry-streaming-cache", action="store_true")
+    geometry_streaming.add_argument("--no-geometry-streaming-cache", action="store_true")
+    parser.add_argument("--no-history", action="store_true")
+    parser.add_argument(
+        "--history-update-source",
+        choices=["gt", "pred", "gt_or_pred"],
+        default=None,
+    )
     parser.add_argument("--sam3-frame-chunk-size", type=int, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--prompt", default=None)
@@ -50,6 +59,14 @@ def main() -> None:
         raw["sam3"]["device"] = args.sam3_device
     if args.geometry_device is not None:
         raw["geometry"]["device"] = args.geometry_device
+    if args.geometry_streaming_cache:
+        raw["geometry"]["streaming_cache"] = True
+    if args.no_geometry_streaming_cache:
+        raw["geometry"]["streaming_cache"] = False
+    if args.no_history:
+        raw.setdefault("history", {})["enabled"] = False
+    if args.history_update_source is not None:
+        raw.setdefault("history", {})["update_source"] = args.history_update_source
     if args.sam3_frame_chunk_size is not None:
         raw["sam3"]["frame_chunk_size"] = args.sam3_frame_chunk_size
     if args.output_dir is not None:
@@ -97,6 +114,7 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
     geometry = raw["geometry"]
     model = raw["model"]
     loss = raw["loss"]
+    history = raw.get("history", {})
     training = raw["training"]
     visualization = raw.get("visualization", {})
     return DenseFusionTrainConfig(
@@ -136,6 +154,7 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         streamvggt_repo=Path(geometry["repo"]),
         streamvggt_checkpoint=Path(geometry["checkpoint"]),
         geometry_device=str(geometry.get("device") or training["device"]),
+        geometry_streaming_cache=bool(geometry.get("streaming_cache", False)),
         feature_grid=tuple(int(v) for v in geometry["feature_grid"]),
         context_grid=tuple(int(v) for v in geometry["context_grid"]),
         streamvggt_layer_index=int(geometry["layer_index"]),
@@ -156,6 +175,9 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         temperature=float(loss["temperature"]),
         max_match_pixels=int(loss["max_match_pixels"]),
         negative_ratio=int(loss.get("negative_ratio", 8)),
+        history_enabled=bool(history.get("enabled", True)),
+        history_update_source=str(history.get("update_source", "gt")),
+        history_pred_threshold=float(history.get("pred_threshold", 0.5)),
         device=training["device"],
         iterations=int(training["iterations"]),
         lr=float(training["lr"]),

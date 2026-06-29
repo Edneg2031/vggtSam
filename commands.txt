@@ -14,72 +14,6 @@ PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
   --save-visualizations
 
 
-PYTHONPATH=src python scripts/train_latent_fusion.py \
-  --config configs/latent_fusion_train.yaml \
-  --iterations 200 \
-  --device cuda \
-  --output-dir outputs/latent_fusion_correspondence
-
-
-PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
-  --config configs/scannetpp_pinhole_2d.yaml \
-  --scene-ids 00a231a370 \
-  --max-frames 5 \
-  --dry-run
-
-
-  
-
-
-PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
-  --config configs/scannetpp_pinhole_2d.yaml \
-  --scene-ids 00a231a370 \
-  --max-frames 5 \
-  --frame-step 1 \
-  --overwrite \
-  --save-visualizations
-
-
-  PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
-  --config configs/scannetpp_pinhole_2d.yaml \
-  --scene-ids 00a231a370 \
-  --max-frames 600 \
-  --frame-step 1 \
-  --overwrite \
-  --save-visualizations
-
-
-
-
-  PYTHONPATH=src python scripts/train_dense_fusion.py \
-  --config configs/dense_fusion_train.yaml \
-  --scene-id 00a231a370 \
-  --iterations 20 \
-  --device cuda \
-  --visualize-every 5
-
-
-
-  PYTHONPATH=src python scripts/train_dense_fusion.py \
-  --config configs/dense_fusion_train.yaml \
-  --scene-id 00a231a370 \
-  --output-size 350 518 \
-  --iterations 20 \
-  --device cuda \
-  --visualize-every 5
-
-
-
-  PYTHONPATH=src python scripts/train_dense_fusion.py \
-  --config configs/dense_fusion_train.yaml \
-  --scene-id 00a231a370 \
-  --output-size 256 384 \
-  --iterations 300 \
-  --device cuda \
-  --visualize-every 10 \
-  --output-dir outputs/dense_fusion_overfit
-
-
 
 
   ####### 找合适窗口######
@@ -146,3 +80,37 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --scene-id 00a231a370 \
   --instance-id 73 \
   --frame-indices 0 52 58 65 81 139 142
+
+
+
+
+  PYTHONPATH=src python scripts/train_dense_fusion.py \
+  --config configs/dense_fusion_train.yaml \
+  --scene-id 00a231a370 \
+  --instance-id 73 \
+  --frame-indices 0 52 58 65 81 139 142 \
+  --sam3-device cuda:0 \
+  --geometry-device cuda:1 \
+  --device cuda:2 \
+  --sam3-frame-chunk-size 1 \
+  --output-size 256 384 \
+  --iterations 700 \
+  --visualize-every 10 \
+  --history-update-source gt \
+  --output-dir outputs/dense_fusion_overfit_history_gt
+
+
+  PYTHONPATH=src python scripts/train_dense_fusion.py \
+  --config configs/dense_fusion_train.yaml \
+  --scene-id 00a231a370 \
+  --instance-id 73 \
+  --frame-indices 0 52 58 65 81 139 142 \
+  --sam3-device cuda:0 \
+  --geometry-device cuda:1 \
+  --device cuda:2 \
+  --sam3-frame-chunk-size 1 \
+  --output-size 256 384 \
+  --iterations 700 \
+  --visualize-every 10 \
+  --history-update-source gt_or_pred \
+  --output-dir outputs/dense_fusion_overfit_history_gt_or_pred
