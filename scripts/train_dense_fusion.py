@@ -23,6 +23,9 @@ def main() -> None:
     )
     parser.add_argument("--iterations", type=int, default=None)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--sam3-device", default=None)
+    parser.add_argument("--geometry-device", default=None)
+    parser.add_argument("--sam3-frame-chunk-size", type=int, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--prompt", default=None)
     parser.add_argument("--scene-id", default=None)
@@ -43,6 +46,12 @@ def main() -> None:
         raw["training"]["iterations"] = args.iterations
     if args.device is not None:
         raw["training"]["device"] = args.device
+    if args.sam3_device is not None:
+        raw["sam3"]["device"] = args.sam3_device
+    if args.geometry_device is not None:
+        raw["geometry"]["device"] = args.geometry_device
+    if args.sam3_frame_chunk_size is not None:
+        raw["sam3"]["frame_chunk_size"] = args.sam3_frame_chunk_size
     if args.output_dir is not None:
         raw["training"]["output_dir"] = str(args.output_dir)
     if args.visualize_every is not None:
@@ -122,8 +131,11 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         sam3_enable_inst_interactivity=bool(
             sam3.get("enable_inst_interactivity", False)
         ),
+        sam3_device=str(sam3.get("device") or training["device"]),
+        sam3_frame_chunk_size=int(sam3.get("frame_chunk_size", 0)),
         streamvggt_repo=Path(geometry["repo"]),
         streamvggt_checkpoint=Path(geometry["checkpoint"]),
+        geometry_device=str(geometry.get("device") or training["device"]),
         feature_grid=tuple(int(v) for v in geometry["feature_grid"]),
         context_grid=tuple(int(v) for v in geometry["context_grid"]),
         streamvggt_layer_index=int(geometry["layer_index"]),

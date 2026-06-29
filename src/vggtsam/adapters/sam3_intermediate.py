@@ -57,7 +57,7 @@ def load_sam3_image_model(
             ) from exc
         raise
 
-    build_device = "cuda" if device == "cuda" else "cpu"
+    build_device = "cuda" if str(device).startswith("cuda") else "cpu"
     model = build_sam3_image_model(
         checkpoint_path=str(checkpoint_path),
         device=build_device,

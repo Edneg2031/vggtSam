@@ -132,8 +132,17 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --scene-id 00a231a370 \
   --instance-id 73 \
   --frame-indices 0 52 58 65 81 139 142 \
+  --sam3-device cuda:0 \
+  --geometry-device cuda:1 \
+  --device cuda:2 \
+  --sam3-frame-chunk-size 1 \
   --output-size 256 384 \
   --iterations 700 \
-  --device cuda \
   --visualize-every 10 \
   --output-dir outputs/dense_fusion_overfit_manual_7f
+
+
+  PYTHONPATH=src python scripts/inspect_scannetpp_instances.py \
+  --scene-id 00a231a370 \
+  --instance-id 73 \
+  --frame-indices 0 52 58 65 81 139 142

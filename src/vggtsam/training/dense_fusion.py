@@ -6,6 +6,7 @@ import csv
 import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Sequence
 
 import numpy as np
@@ -66,8 +67,11 @@ class DenseFusionTrainConfig:
     sam3_feature_source: str
     sam3_text_conditioning: str
     sam3_enable_inst_interactivity: bool
+    sam3_device: str
+    sam3_frame_chunk_size: int
     streamvggt_repo: Path
     streamvggt_checkpoint: Path
+    geometry_device: str
     feature_grid: tuple[int, int]
     context_grid: tuple[int, int]
     streamvggt_layer_index: int
@@ -157,6 +161,68 @@ def select_overfit_sequence(
     )
 
 
+def extract_sam3_sequence(
+    sam3: SAM3IntermediateAdapter,
+    image_paths: Sequence[Path],
+    *,
+    prompt: str,
+    chunk_size: int,
+):
+    chunk_size = int(chunk_size)
+    if chunk_size <= 0 or chunk_size >= len(image_paths):
+        return sam3.extract_from_paths(image_paths, prompt=prompt)
+
+    token_chunks = []
+    text_out = None
+    spatial_shape = None
+    aux = None
+    for start in range(0, len(image_paths), chunk_size):
+        out = sam3.extract_from_paths(
+            image_paths[start : start + chunk_size],
+            prompt=prompt,
+        )
+        token_chunks.append(out.semantic.tokens.detach().cpu())
+        if text_out is None:
+            text_out = detach_to_cpu(out.text_out)
+            spatial_shape = out.semantic.spatial_shape
+            aux = dict(out.semantic.aux)
+        del out
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return SimpleNamespace(
+        semantic=SimpleNamespace(
+            tokens=torch.cat(token_chunks, dim=1),
+            spatial_shape=spatial_shape,
+            aux=aux or {},
+        ),
+        text_out=text_out or {},
+    )
+
+
+def detach_to_cpu(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: detach_to_cpu(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [detach_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(detach_to_cpu(item) for item in value)
+    return value
+
+
+def batch_to_cpu(batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    return {key: value.detach().cpu() for key, value in batch.items()}
+
+
+def batch_to_device(
+    batch: Dict[str, torch.Tensor],
+    device: str,
+) -> Dict[str, torch.Tensor]:
+    return {key: value.to(device) for key, value in batch.items()}
+
+
 def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
     rng = random.Random(config.seed)
     torch.manual_seed(config.seed)
@@ -180,13 +246,13 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
     sam3_model = load_sam3_image_model(
         repo_path=config.sam3_repo,
         checkpoint_path=config.sam3_checkpoint,
-        device=config.device,
+        device=config.sam3_device,
         enable_inst_interactivity=config.sam3_enable_inst_interactivity,
     )
     sam3_model.requires_grad_(False)
     sam3 = SAM3IntermediateAdapter(
         sam3_model,
-        device=config.device,
+        device=config.sam3_device,
         resolution=config.sam3_resolution,
         source=config.sam3_feature_source,
         text_conditioning=config.sam3_text_conditioning,
@@ -196,13 +262,13 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
     streamvggt_model = load_streamvggt_latent_model(
         repo_path=config.streamvggt_repo,
         checkpoint_path=config.streamvggt_checkpoint,
-        device=config.device,
+        device=config.geometry_device,
         strict=True,
     )
     streamvggt_model.requires_grad_(False)
     geometry = StreamVGGTLatentAdapter(
         streamvggt_model,
-        device=config.device,
+        device=config.geometry_device,
         token_grid=config.feature_grid,
         context_grid=config.context_grid,
         layer_index=config.streamvggt_layer_index,
@@ -218,6 +284,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
     completed_steps = 0
     overfit_sequence: ObjectSequence | None = None
     overfit_prompt_selection: ObjectPromptSelection | None = None
+    overfit_feature_cache: Dict[str, Any] | None = None
+    backbones_released = False
 
     if config.overfit:
         overfit_sequence, overfit_prompt_selection, resolved_window_index = (
@@ -281,26 +349,58 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 "Re-run scripts/prepare_scannetpp_2d.py with --save-pointmaps."
             )
 
-        with torch.no_grad():
-            sam_out = sam3.extract_from_paths(
-                sequence.image_paths,
-                prompt=prompt_selection.prompt,
-            )
-            geo_out = geometry.extract_from_paths(
-                sequence.image_paths,
-                return_pointmap=False,
-            )
-            text_embedding = pool_language_features(sam_out.text_out)
-            if text_embedding is None:
-                raise RuntimeError("SAM3 did not return language_features for text alignment.")
-            text_embedding = text_embedding.to(config.device).float()
+        if config.overfit and overfit_feature_cache is not None:
+            sam_tokens_all = overfit_feature_cache["sam_tokens"]
+            geometry_tokens_all = overfit_feature_cache["geometry_tokens"]
+            geometry_camera_tokens = overfit_feature_cache["camera_tokens"]
+            text_embedding = overfit_feature_cache["text_embedding"].to(config.device)
+            batch = batch_to_device(overfit_feature_cache["batch"], config.device)
+        else:
+            with torch.no_grad():
+                sam_out = extract_sam3_sequence(
+                    sam3,
+                    sequence.image_paths,
+                    prompt=prompt_selection.prompt,
+                    chunk_size=config.sam3_frame_chunk_size,
+                )
+                geo_out = geometry.extract_from_paths(
+                    sequence.image_paths,
+                    return_pointmap=False,
+                )
+                text_embedding = pool_language_features(sam_out.text_out)
+                if text_embedding is None:
+                    raise RuntimeError("SAM3 did not return language_features for text alignment.")
+                text_embedding = text_embedding.to(config.device).float()
+                sam_tokens_all = sam_out.semantic.tokens.detach().cpu()
+                geometry_tokens_all = geo_out.geometry.tokens.detach().cpu()
+                geometry_camera_tokens = (
+                    geo_out.geometry.camera_tokens.detach().cpu()
+                    if geo_out.geometry.camera_tokens is not None
+                    else None
+                )
 
-        batch = build_dense_batch(
-            sequence,
-            prompt_selection,
-            config=config,
-            device=config.device,
-        )
+            batch = build_dense_batch(
+                sequence,
+                prompt_selection,
+                config=config,
+                device=config.device,
+            )
+            if config.overfit and batch is not None:
+                overfit_feature_cache = {
+                    "sam_tokens": sam_tokens_all,
+                    "geometry_tokens": geometry_tokens_all,
+                    "camera_tokens": geometry_camera_tokens,
+                    "text_embedding": text_embedding.detach().cpu(),
+                    "batch": batch_to_cpu(batch),
+                }
+                if not backbones_released:
+                    del sam3
+                    del sam3_model
+                    del geometry
+                    del streamvggt_model
+                    backbones_released = True
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
         if batch is None:
             if config.overfit:
                 raise RuntimeError(
@@ -311,12 +411,12 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             continue
 
         if model is None:
-            sam_dim = int(sam_out.semantic.tokens.shape[-1])
-            geometry_dim = int(geo_out.geometry.tokens.shape[-1])
+            sam_dim = int(sam_tokens_all.shape[-1])
+            geometry_dim = int(geometry_tokens_all.shape[-1])
             camera_dim = (
-                int(geo_out.geometry.camera_tokens.shape[-1])
+                int(geometry_camera_tokens.shape[-1])
                 if config.use_camera_tokens
-                and geo_out.geometry.camera_tokens is not None
+                and geometry_camera_tokens is not None
                 else None
             )
             model = DenseSAMVGGTModel(
@@ -345,20 +445,20 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
         feature_tokens_per_frame = config.feature_grid[0] * config.feature_grid[1]
         context_tokens_per_frame = config.context_grid[0] * config.context_grid[1]
         sam_frame_tokens = split_sequence_tokens(
-            sam_out.semantic.tokens.float(),
+            sam_tokens_all.float().to(config.device),
             num_frames=num_frames,
             tokens_per_frame=feature_tokens_per_frame,
             name="sam_tokens",
         )
         geometry_frame_tokens = split_sequence_tokens(
-            geo_out.geometry.tokens.float(),
+            geometry_tokens_all.float().to(config.device),
             num_frames=num_frames,
             tokens_per_frame=context_tokens_per_frame,
             name="geometry_tokens",
         )
         camera_tokens = (
-            geo_out.geometry.camera_tokens.float()
-            if config.use_camera_tokens and geo_out.geometry.camera_tokens is not None
+            geometry_camera_tokens.float().to(config.device)
+            if config.use_camera_tokens and geometry_camera_tokens is not None
             else None
         )
 

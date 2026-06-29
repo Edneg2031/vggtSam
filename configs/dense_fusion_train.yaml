@@ -44,6 +44,10 @@ objects:
 sam3:
   repo: externals/sam3
   checkpoint: /home/bod/86Nas/95_data_bak/FoundationModels/sam3/sam3.pt
+  # Empty means use training.device. Set e.g. cuda:0 to split GPUs.
+  device:
+  # 1 is safest for long manual overfit sequences; set 0 to process all frames at once.
+  frame_chunk_size: 1
   prompt: object
   prompt_mode: random_instance
   resolution: 1008
@@ -54,6 +58,8 @@ sam3:
 geometry:
   repo: externals/streamvggt
   checkpoint: /home/bod/86Nas/95_data_bak/FoundationModels/StreamVGGT/checkpoints.pth
+  # Empty means use training.device. Set e.g. cuda:1 to split GPUs.
+  device:
   # Internal latent fusion grid. This is not the supervision/output resolution.
   feature_grid: [72, 72]
   context_grid: [12, 12]
