@@ -39,7 +39,7 @@ model.output_size: [256, 384]
 
 ## 3. Prompt 构造
 
-当前 prompt 是纯文本，没有 box、point、click、reference mask 等空间提示。
+当前 prompt 的文本部分仍然是纯文本类别名；为了做 overfit sanity check，训练还会使用一个 `reference_mask`，但它只来自训练 GT，不是 SAM3 的交互提示。
 
 默认配置：
 
@@ -47,12 +47,14 @@ model.output_size: [256, 384]
 sam3.prompt_mode: random_instance
 ```
 
-每个训练 step：
+当前默认是 overfit-instance 模式：
 
 1. 从 clip 中找出跨至少 `min_visible_frames` 可见的有效 instance。
 2. 过滤掉太小、太大、以及 wall / floor / ceiling 等类别。
-3. 随机选择一个有效 instance。
-4. 读取该 instance 的类别名作为 prompt。
+3. 固定一个窗口重复训练。
+4. 选择一个有效 instance 作为 `sampled_instance_id`。
+5. 读取该 instance 的类别名作为 prompt。
+6. 使用该 instance 在第一个可见帧的 GT mask 作为 `reference_mask`，池化 fused feature 得到 object query。
 
 例如日志里的：
 
@@ -62,7 +64,7 @@ prompt='satchel'
 prompt='picture'
 ```
 
-这些 prompt 都是从 ScanNet++ instance metadata 里采样出来的类别名称。
+这些 prompt 都是从 ScanNet++ instance metadata 里采样出来的类别名称。`object / objects / unknown` 这类泛化标签已经默认排除。
 
 如果使用命令行：
 
@@ -70,7 +72,7 @@ prompt='picture'
 --prompt chair
 ```
 
-则会切到 fixed prompt，并只训练 label 匹配 `chair` 的 instance 区域。
+则会切到 fixed prompt；如果仍使用 instance target，需要同时指定具体 `--instance-id`，否则更适合配合 `--target-mode class` 使用。
 
 ## 4. GT 构造
 
@@ -78,29 +80,22 @@ prompt='picture'
 
 ```text
 prompt_mask:
-  当前 prompt 对应类别的所有有效 instance 区域
+  当前 sampled_instance_id 的区域
 
 mask_supervision:
-  有效 object 区域 union prompt_mask
+  有效 semantic 区域 union prompt_mask
 
 point_valid:
   pointmap 有效区域
 
 semantic_valid:
-  semantic label 有效且没有被过滤的 object 区域
+  semantic label 有效区域
 
 instance_valid:
-  有效 object 且 pointmap 有效的区域
+  sampled_instance_id 且 pointmap 有效的区域
 ```
 
-当前 `prompt_mask` 是“类别级”的：
-
-```text
-prompt='picture'
--> 所有有效 picture instances 都是 foreground
-```
-
-不是“只追踪被随机选中的那个具体 instance”。具体 instance identity 目前由 `instance_embedding` 和 match loss 监督。
+因此当前 `prompt_mask` 是“实例级”的，不再是“同类别所有物体”。例如 `prompt='picture'` 时，只监督被采样的那个 picture instance。
 
 ## 5. 模型流程
 
@@ -121,6 +116,7 @@ StreamVGGT geometry tokens as key/value
   -> fused tokens
 
 fused tokens
+  + reference_mask pooled object query
   -> dense decoder upsample 到 output_size
   -> mask head
   -> pointmap head
@@ -180,7 +176,7 @@ L_aux_cls = CrossEntropy(aux_cls_logits[semantic_valid], gt_semantic[semantic_va
 
 ### Instance Match Loss
 
-从当前帧和历史帧采样有效 object 像素对：
+从当前帧和历史帧采样目标 instance 像素对：
 
 ```text
 match = 1 if instance_id_curr == instance_id_hist

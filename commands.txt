@@ -67,3 +67,14 @@ PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
   --iterations 20 \
   --device cuda \
   --visualize-every 5
+
+
+
+  PYTHONPATH=src python scripts/train_dense_fusion.py \
+  --config configs/dense_fusion_train.yaml \
+  --scene-id 00a231a370 \
+  --output-size 256 384 \
+  --iterations 300 \
+  --device cuda \
+  --visualize-every 10 \
+  --output-dir outputs/dense_fusion_overfit

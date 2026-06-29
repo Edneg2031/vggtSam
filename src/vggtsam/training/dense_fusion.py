@@ -56,6 +56,7 @@ class DenseFusionTrainConfig:
     excluded_semantic_labels: List[int]
     target_object_labels: List[str]
     excluded_object_labels: List[str]
+    target_mode: str
     sam3_repo: Path
     sam3_checkpoint: Path
     sam3_prompt: str
@@ -94,8 +95,71 @@ class DenseFusionTrainConfig:
     save_every: int
     visualize_every: int
     visualize_threshold: float
+    overfit: bool
+    overfit_window_index: int
+    overfit_instance_id: int | None
     max_visual_points: int
     output_dir: Path
+
+
+def select_training_prompt(
+    sequence: ObjectSequence,
+    *,
+    config: DenseFusionTrainConfig,
+    rng: random.Random,
+) -> ObjectPromptSelection | None:
+    if config.overfit_instance_id is not None and config.overfit_instance_id > 0:
+        instance_id = int(config.overfit_instance_id)
+        label = sequence.object_labels.get(instance_id)
+        if not label:
+            return None
+        if label_is_excluded(label, normalize_label_filters(config.excluded_object_labels)):
+            return None
+        keep_per_frame = keep_instances_visible_in_multiple_frames(
+            [list(ids) for ids in sequence.visible_instance_ids],
+            min_visible_frames=config.min_visible_frames,
+        )
+        if not any(instance_id in set(frame_ids) for frame_ids in keep_per_frame):
+            return None
+        return ObjectPromptSelection(
+            prompt=label,
+            target_object_labels=[label],
+            sampled_instance_id=instance_id,
+            sampled_label=label,
+        )
+    return select_object_prompt(
+        sequence.visible_instance_ids,
+        sequence.object_labels,
+        rng=rng,
+        min_visible_frames=config.min_visible_frames,
+        mode=config.sam3_prompt_mode,
+        fallback_prompt=config.sam3_prompt,
+        target_object_labels=config.target_object_labels,
+        excluded_object_labels=config.excluded_object_labels,
+    )
+
+
+def select_overfit_sequence(
+    dataset: ScanNetPPObjectSequenceDataset,
+    *,
+    config: DenseFusionTrainConfig,
+    rng: random.Random,
+) -> tuple[ObjectSequence, ObjectPromptSelection, int]:
+    start = int(config.overfit_window_index)
+    for offset in range(len(dataset)):
+        window_index = (start + offset) % len(dataset)
+        sequence = dataset[window_index]
+        prompt_selection = select_training_prompt(
+            sequence,
+            config=config,
+            rng=rng,
+        )
+        if prompt_selection is not None:
+            return sequence, prompt_selection, window_index
+    raise RuntimeError(
+        "Could not select an overfit target from any window. Try lowering "
+        "object filters or clearing excluded_object_labels."
+    )
 
 
 def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
@@ -156,19 +220,63 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
     model: DenseSAMVGGTModel | None = None
     optimizer: torch.optim.Optimizer | None = None
     completed_steps = 0
+    overfit_sequence: ObjectSequence | None = None
+    overfit_prompt_selection: ObjectPromptSelection | None = None
+
+    if config.overfit:
+        overfit_sequence, overfit_prompt_selection, resolved_window_index = (
+            select_overfit_sequence(
+                dataset,
+                config=config,
+                rng=rng,
+            )
+        )
+        if config.overfit_window_index != resolved_window_index:
+            print(
+                "overfit window adjusted "
+                f"requested={config.overfit_window_index} "
+                f"resolved={resolved_window_index}"
+            )
+        if overfit_prompt_selection is None:
+            raise RuntimeError(
+                "Could not select an overfit target for "
+                f"window_index={config.overfit_window_index}. Try a different "
+                "--window-index, lower object filters, or pass --instance-id."
+            )
+        preview_batch = build_dense_batch(
+            overfit_sequence,
+            overfit_prompt_selection,
+            config=config,
+            device=config.device,
+        )
+        if preview_batch is None:
+            raise RuntimeError(
+                "Selected overfit target produced no prompt_mask. Try a "
+                "different --window-index / --instance-id, or lower min_pixels / "
+                "min_visible_frames."
+            )
+        del preview_batch
+        print(
+            "overfit target "
+            f"scene={overfit_sequence.scene_id} "
+            f"frames={overfit_sequence.frame_indices} "
+            f"instance={overfit_prompt_selection.sampled_instance_id} "
+            f"label='{overfit_prompt_selection.sampled_label}' "
+            f"target_mode={config.target_mode}"
+        )
 
     for step in range(1, config.iterations + 1):
-        sequence = dataset.sample(rng)
-        prompt_selection = select_object_prompt(
-            sequence.visible_instance_ids,
-            sequence.object_labels,
-            rng=rng,
-            min_visible_frames=config.min_visible_frames,
-            mode=config.sam3_prompt_mode,
-            fallback_prompt=config.sam3_prompt,
-            target_object_labels=config.target_object_labels,
-            excluded_object_labels=config.excluded_object_labels,
-        )
+        if config.overfit:
+            assert overfit_sequence is not None and overfit_prompt_selection is not None
+            sequence = overfit_sequence
+            prompt_selection = overfit_prompt_selection
+        else:
+            sequence = dataset.sample(rng)
+            prompt_selection = select_training_prompt(
+                sequence,
+                config=config,
+                rng=rng,
+            )
         if prompt_selection is None:
             continue
         if sequence.pointmaps is None:
@@ -198,6 +306,12 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             device=config.device,
         )
         if batch is None:
+            if config.overfit:
+                raise RuntimeError(
+                    "Overfit target produced no prompt_mask. Try a different "
+                    "--window-index / --instance-id, or lower min_pixels / "
+                    "min_visible_frames."
+                )
             continue
 
         if model is None:
@@ -252,6 +366,26 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             else None
         )
 
+        fused_frame_tokens: List[torch.Tensor] = []
+        for frame_idx in range(num_frames):
+            fused_frame_tokens.append(
+                model.fuse_tokens(
+                    sam_tokens=sam_frame_tokens[frame_idx],
+                    geometry_tokens=geometry_frame_tokens[frame_idx],
+                    camera_tokens=slice_camera_tokens(
+                        camera_tokens,
+                        frame_idx=frame_idx,
+                        num_frames=num_frames,
+                    ),
+                )
+            )
+
+        reference_frame_idx = int(batch["reference_frame_idx"].detach().cpu().item())
+        object_query = model.pool_object_query(
+            fused_frame_tokens[reference_frame_idx],
+            batch["reference_mask"],
+        )
+
         frame_losses: List[torch.Tensor] = []
         mask_losses: List[torch.Tensor] = []
         dice_losses: List[torch.Tensor] = []
@@ -264,15 +398,10 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
         selected_match_pixels = 0
 
         for frame_idx in range(num_frames):
-            output = model(
-                sam_tokens=sam_frame_tokens[frame_idx],
-                geometry_tokens=geometry_frame_tokens[frame_idx],
+            output = model.decode(
+                fused_tokens=fused_frame_tokens[frame_idx],
                 text_embedding=text_embedding,
-                camera_tokens=slice_camera_tokens(
-                    camera_tokens,
-                    frame_idx=frame_idx,
-                    num_frames=num_frames,
-                ),
+                object_query=object_query,
             )
             outputs.append(output)
             target = frame_target(batch, frame_idx)
@@ -372,6 +501,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "prompt": prompt_selection.prompt,
             "sampled_instance_id": int(prompt_selection.sampled_instance_id),
             "sampled_label": prompt_selection.sampled_label,
+            "target_mode": config.target_mode,
+            "reference_frame_idx": reference_frame_idx,
         }
         append_metric(metrics_path, row)
 
@@ -445,6 +576,12 @@ def build_dense_batch(
     device: str,
 ) -> Dict[str, torch.Tensor] | None:
     output_size = config.output_size
+    target_mode = config.target_mode.strip().lower()
+    if target_mode not in {"class", "category", "instance", "sampled_instance"}:
+        raise ValueError(
+            "objects.target_mode must be 'class' or 'instance', "
+            f"got {config.target_mode!r}"
+        )
     keep_per_frame = keep_instances_visible_in_multiple_frames(
         [list(ids) for ids in sequence.visible_instance_ids],
         min_visible_frames=config.min_visible_frames,
@@ -477,13 +614,17 @@ def build_dense_batch(
                 excluded_filters,
             )
         }
-        target_instances = {
-            instance_id
-            for instance_id in visible
-            if label_matches(sequence.object_labels.get(instance_id), target_filters)
-        }
-        if not target_filters:
-            target_instances = set(visible)
+        if target_mode in {"instance", "sampled_instance"}:
+            target_id = int(prompt_selection.sampled_instance_id)
+            target_instances = {target_id} if target_id in visible else set()
+        else:
+            target_instances = {
+                instance_id
+                for instance_id in visible
+                if label_matches(sequence.object_labels.get(instance_id), target_filters)
+            }
+            if not target_filters:
+                target_instances = set(visible)
 
         object_valid = np.isin(inst, list(visible)) if visible else np.zeros_like(inst, dtype=bool)
         prompt_mask = (
@@ -495,8 +636,12 @@ def build_dense_batch(
         semantic_valid &= sem < config.num_classes
         if excluded_semantic:
             semantic_valid &= ~np.isin(sem, list(excluded_semantic))
-        supervision = object_valid & semantic_valid
-        instance_valid = object_valid & point_valid
+        if target_mode in {"instance", "sampled_instance"}:
+            supervision = semantic_valid
+            instance_valid = prompt_mask & point_valid
+        else:
+            supervision = object_valid & semantic_valid
+            instance_valid = object_valid & point_valid
 
         prompt_masks.append(torch.from_numpy(prompt_mask).bool())
         mask_supervision.append(torch.from_numpy(supervision | prompt_mask).bool())
@@ -513,8 +658,12 @@ def build_dense_batch(
     def stack(items: Sequence[torch.Tensor]) -> torch.Tensor:
         return torch.stack(list(items), dim=0).to(device)
 
+    prompt_stack = stack(prompt_masks)
+    visible_frames = prompt_stack.flatten(1).any(dim=1).nonzero(as_tuple=False).flatten()
+    reference_frame_idx = int(visible_frames[0].detach().cpu().item())
+
     return {
-        "prompt_mask": stack(prompt_masks),
+        "prompt_mask": prompt_stack,
         "mask_supervision": stack(mask_supervision),
         "instance_valid": stack(instance_valids),
         "semantic_valid": stack(semantic_valids),
@@ -522,6 +671,8 @@ def build_dense_batch(
         "instance": stack(instances),
         "semantic": stack(semantics),
         "pointmap": stack(pointmaps),
+        "reference_mask": prompt_stack[reference_frame_idx],
+        "reference_frame_idx": torch.tensor(reference_frame_idx, device=device),
     }
 
 
@@ -732,7 +883,10 @@ def export_dense_pointclouds(
     output_dir.mkdir(parents=True, exist_ok=True)
     rgb = torch.stack(
         [
-            torch.from_numpy(np.asarray(load_rgb(path, batch["prompt_mask"].shape[1:]))).float() / 255.0
+            torch.from_numpy(
+                np.asarray(load_rgb(path, batch["prompt_mask"].shape[1:])).copy()
+            ).float()
+            / 255.0
             for path in sequence.image_paths
         ],
         dim=0,
@@ -848,6 +1002,8 @@ def write_metrics_header(path: Path) -> None:
         "prompt",
         "sampled_instance_id",
         "sampled_label",
+        "target_mode",
+        "reference_frame_idx",
     ]
     with path.open("w", newline="", encoding="utf8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)

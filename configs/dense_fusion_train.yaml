@@ -18,7 +18,13 @@ objects:
   excluded_semantic_labels: []
   # Empty means sample a valid instance class dynamically.
   target_object_labels: []
+  # instance: supervise only the sampled instance mask.
+  # class: supervise all visible instances with the sampled class label.
+  target_mode: instance
   excluded_object_labels:
+    - object
+    - objects
+    - unknown
     - wall
     - floor
     - ceiling
@@ -80,6 +86,11 @@ training:
   iterations: 200
   lr: 0.0003
   seed: 0
+  # Overfit repeats one window and one target instance. This is the first sanity
+  # test for instance tracking; turn it off for random-window training.
+  overfit: true
+  overfit_window_index: 0
+  overfit_instance_id:
   log_every: 10
   save_every: 100
   visualize_every: 20

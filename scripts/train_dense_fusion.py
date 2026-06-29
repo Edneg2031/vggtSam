@@ -28,6 +28,11 @@ def main() -> None:
     parser.add_argument("--scene-id", default=None)
     parser.add_argument("--output-size", type=int, nargs=2, metavar=("H", "W"))
     parser.add_argument("--visualize-every", type=int, default=None)
+    parser.add_argument("--target-mode", choices=["class", "instance"], default=None)
+    parser.add_argument("--overfit", action="store_true")
+    parser.add_argument("--no-overfit", action="store_true")
+    parser.add_argument("--window-index", type=int, default=None)
+    parser.add_argument("--instance-id", type=int, default=None)
     args = parser.parse_args()
 
     raw = load_config(args.config)
@@ -43,6 +48,16 @@ def main() -> None:
         raw["dataset"]["scene_id"] = args.scene_id
     if args.output_size is not None:
         raw["model"]["output_size"] = list(args.output_size)
+    if args.target_mode is not None:
+        raw["objects"]["target_mode"] = args.target_mode
+    if args.overfit:
+        raw["training"]["overfit"] = True
+    if args.no_overfit:
+        raw["training"]["overfit"] = False
+    if args.window_index is not None:
+        raw["training"]["overfit_window_index"] = args.window_index
+    if args.instance_id is not None:
+        raw["training"]["overfit_instance_id"] = args.instance_id
     if args.prompt is not None:
         raw["sam3"]["prompt"] = args.prompt
         raw["sam3"]["prompt_mode"] = "fixed"
@@ -86,6 +101,7 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         excluded_object_labels=[
             str(label) for label in objects.get("excluded_object_labels", [])
         ],
+        target_mode=str(objects.get("target_mode", "class")),
         sam3_repo=Path(sam3["repo"]),
         sam3_checkpoint=Path(sam3["checkpoint"]),
         sam3_prompt=str(sam3["prompt"]),
@@ -126,9 +142,18 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         save_every=int(training["save_every"]),
         visualize_every=int(training.get("visualize_every", 0)),
         visualize_threshold=float(training.get("visualize_threshold", 0.5)),
+        overfit=bool(training.get("overfit", False)),
+        overfit_window_index=int(training.get("overfit_window_index", 0)),
+        overfit_instance_id=optional_int(training.get("overfit_instance_id")),
         max_visual_points=int(visualization.get("max_visual_points", 100_000)),
         output_dir=Path(training["output_dir"]),
     )
+
+
+def optional_int(value) -> int | None:
+    if value is None or value == "":
+        return None
+    return int(value)
 
 
 if __name__ == "__main__":

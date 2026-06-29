@@ -89,7 +89,10 @@ class DenseSAMVGGTModel(nn.Module):
             if num_classes is not None and int(num_classes) > 0
             else None
         )
+        self.object_query_proj = nn.Linear(d_fuse, d_fuse)
+        self.object_query_to_embedding = nn.Linear(d_fuse, self.embedding_dim)
         self.prompt_logit_scale = nn.Parameter(torch.tensor(10.0))
+        self.instance_logit_scale = nn.Parameter(torch.tensor(10.0))
 
     def forward(
         self,
@@ -98,17 +101,50 @@ class DenseSAMVGGTModel(nn.Module):
         geometry_tokens: torch.Tensor,
         text_embedding: torch.Tensor,
         camera_tokens: torch.Tensor | None = None,
+        object_query: torch.Tensor | None = None,
     ) -> DenseFusionOutput:
         fused_tokens = self.fuse_tokens(
             sam_tokens=sam_tokens,
             geometry_tokens=geometry_tokens,
             camera_tokens=camera_tokens,
         )
+        return self.decode(
+            fused_tokens=fused_tokens,
+            text_embedding=text_embedding,
+            object_query=object_query,
+        )
+
+    def decode(
+        self,
+        *,
+        fused_tokens: torch.Tensor,
+        text_embedding: torch.Tensor,
+        object_query: torch.Tensor | None = None,
+    ) -> DenseFusionOutput:
         dense = self.tokens_to_dense(fused_tokens)
+        object_query = self._prepare_object_query(
+            object_query,
+            batch_size=dense.shape[0],
+            device=dense.device,
+        )
+        if object_query is not None:
+            dense = dense + self.object_query_proj(object_query)[:, :, None, None]
         mask_logits = self.mask_head(dense).squeeze(1)
         pointmap = self.point_head(dense).permute(0, 2, 3, 1).contiguous()
         semantic_embedding = self.semantic_head(dense)
-        instance_embedding = F.normalize(self.instance_head(dense), dim=1)
+        instance_embedding_chw = F.normalize(self.instance_head(dense), dim=1)
+        if object_query is not None:
+            object_embedding = F.normalize(
+                self.object_query_to_embedding(object_query),
+                dim=-1,
+            )
+            instance_score = torch.einsum(
+                "bchw,bc->bhw",
+                instance_embedding_chw,
+                object_embedding,
+            )
+            scale = self.instance_logit_scale.clamp(1.0, 100.0)
+            mask_logits = mask_logits + instance_score * scale
         prompt_score = self.compute_prompt_score(
             semantic_embedding,
             text_embedding,
@@ -120,7 +156,7 @@ class DenseSAMVGGTModel(nn.Module):
             pointmap=pointmap,
             semantic_embedding=semantic_embedding.permute(0, 2, 3, 1).contiguous(),
             prompt_score=prompt_score,
-            instance_embedding=instance_embedding.permute(0, 2, 3, 1).contiguous(),
+            instance_embedding=instance_embedding_chw.permute(0, 2, 3, 1).contiguous(),
             aux_logits=aux_logits,
         )
 
@@ -166,6 +202,34 @@ class DenseSAMVGGTModel(nn.Module):
         )
         return self.decoder(dense)
 
+    def pool_object_query(
+        self,
+        fused_tokens: torch.Tensor,
+        reference_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        fused_tokens = self._ensure_batched(fused_tokens)
+        if reference_mask.ndim == 2:
+            reference_mask = reference_mask[None]
+        if reference_mask.ndim != 3:
+            raise ValueError(
+                "reference_mask must have shape [H, W] or [B, H, W], "
+                f"got {tuple(reference_mask.shape)}"
+            )
+        reference_mask = reference_mask.to(
+            device=fused_tokens.device,
+            dtype=fused_tokens.dtype,
+        )
+        if reference_mask.shape[0] == 1 and fused_tokens.shape[0] > 1:
+            reference_mask = reference_mask.expand(fused_tokens.shape[0], -1, -1)
+        mask_grid = F.interpolate(
+            reference_mask[:, None],
+            size=self.feature_grid,
+            mode="nearest",
+        )
+        weights = mask_grid.flatten(2).transpose(1, 2)
+        denom = weights.sum(dim=1).clamp_min(1.0)
+        return (fused_tokens * weights).sum(dim=1) / denom
+
     def compute_prompt_score(
         self,
         semantic_embedding: torch.Tensor,
@@ -196,3 +260,27 @@ class DenseSAMVGGTModel(nn.Module):
         if tokens.ndim != 3:
             raise ValueError(f"Expected tokens [B, N, C] or [N, C], got {tuple(tokens.shape)}")
         return tokens
+
+    @staticmethod
+    def _prepare_object_query(
+        object_query: torch.Tensor | None,
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if object_query is None:
+            return None
+        if object_query.ndim == 1:
+            object_query = object_query[None]
+        if object_query.ndim != 2:
+            raise ValueError(
+                f"object_query must have shape [C] or [B, C], got {tuple(object_query.shape)}"
+            )
+        object_query = object_query.to(device=device)
+        if object_query.shape[0] == 1 and batch_size > 1:
+            object_query = object_query.expand(batch_size, -1)
+        if object_query.shape[0] != batch_size:
+            raise ValueError(
+                f"object_query batch size {object_query.shape[0]} does not match {batch_size}"
+            )
+        return object_query
