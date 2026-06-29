@@ -677,7 +677,14 @@ def build_dense_batch(
 
 
 def frame_target(batch: Dict[str, torch.Tensor], frame_idx: int) -> Dict[str, torch.Tensor]:
-    return {key: value[frame_idx] for key, value in batch.items()}
+    num_frames = int(batch["prompt_mask"].shape[0])
+    target: Dict[str, torch.Tensor] = {}
+    for key, value in batch.items():
+        if value.ndim > 0 and value.shape[0] == num_frames:
+            target[key] = value[frame_idx]
+        else:
+            target[key] = value
+    return target
 
 
 def resize_label_mask(mask: np.ndarray, output_size: tuple[int, int]) -> np.ndarray:
