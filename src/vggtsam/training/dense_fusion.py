@@ -114,13 +114,7 @@ def select_training_prompt(
         label = sequence.object_labels.get(instance_id)
         if not label:
             return None
-        if label_is_excluded(label, normalize_label_filters(config.excluded_object_labels)):
-            return None
-        keep_per_frame = keep_instances_visible_in_multiple_frames(
-            [list(ids) for ids in sequence.visible_instance_ids],
-            min_visible_frames=config.min_visible_frames,
-        )
-        if not any(instance_id in set(frame_ids) for frame_ids in keep_per_frame):
+        if not any(np.any(mask == instance_id) for mask in sequence.instance_masks):
             return None
         return ObjectPromptSelection(
             prompt=label,

@@ -27,6 +27,8 @@ def main() -> None:
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--sequence-length", type=int, default=4)
     parser.add_argument("--frame-stride", type=int, default=1)
+    parser.add_argument("--instance-id", type=int, default=None)
+    parser.add_argument("--frame-indices", type=int, nargs="+", default=None)
     args = parser.parse_args()
 
     manifest = read_json(args.manifest)
@@ -62,6 +64,15 @@ def main() -> None:
             if item["first_frame"] is None:
                 item["first_frame"] = frame_idx
         per_frame_counts.append(frame_counts)
+
+    if args.instance_id is not None:
+        print_instance_timeline(
+            per_frame_counts,
+            object_labels,
+            instance_id=int(args.instance_id),
+            frame_indices=args.frame_indices,
+        )
+        return
 
     label_filter = args.label.strip().lower() if args.label else None
     rows = []
@@ -127,6 +138,26 @@ def main() -> None:
         f"--sequence-length {args.sequence_length} "
         f"--frame-stride {args.frame_stride}"
     )
+
+
+def print_instance_timeline(
+    per_frame_counts: list[dict[int, int]],
+    object_labels: dict[int, str],
+    *,
+    instance_id: int,
+    frame_indices: list[int] | None,
+) -> None:
+    if frame_indices is None:
+        frame_indices = list(range(len(per_frame_counts)))
+    label = object_labels.get(instance_id, "")
+    print(f"instance_id={instance_id} label='{label}'")
+    print("frame_idx\tpixels\tpresent")
+    for frame_idx in frame_indices:
+        if frame_idx < 0 or frame_idx >= len(per_frame_counts):
+            print(f"{frame_idx}\tOUT_OF_RANGE\tFalse")
+            continue
+        pixels = int(per_frame_counts[frame_idx].get(instance_id, 0))
+        print(f"{frame_idx}\t{pixels}\t{pixels > 0}")
 
 
 def best_window_for_instance(
