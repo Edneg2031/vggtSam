@@ -114,3 +114,27 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --visualize-every 10 \
   --history-update-source gt_or_pred \
   --output-dir outputs/dense_fusion_overfit_history_gt_or_pred
+
+
+
+  PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
+  --config configs/scannetpp_pinhole_2d.yaml \
+  --scene-ids 00a231a370 \
+  --max-frames 600 \
+  --frame-step 1
+
+
+  PYTHONPATH=src python scripts/train_dense_fusion.py \
+  --config configs/dense_fusion_train.yaml \
+  --scene-id 00a231a370 \
+  --instance-id 73 \
+  --frame-indices 0 52 58 65 81 139 142 \
+  --sam3-device cuda:0 \
+  --geometry-device cuda:1 \
+  --device cuda:2 \
+  --output-size 256 384 \
+  --iterations 700 \
+  --visualize-every 10 \
+  --chamfer-weight 0.1 \
+  --reprojection-weight 0.1 \
+  --output-dir outputs/dense_fusion_overfit_chamfer_reproj
