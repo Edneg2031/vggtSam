@@ -138,3 +138,55 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --chamfer-weight 0.1 \
   --reprojection-weight 0.1 \
   --output-dir outputs/dense_fusion_overfit_chamfer_reproj
+
+
+  PYTHONPATH=src python scripts/train_dense_fusion.py \
+  --config configs/dense_fusion_train.yaml \
+  --scene-id 00a231a370 \
+  --instance-id 73 \
+  --frame-indices 0 52 58 65 81 139 142 \
+  --sam3-device cuda:0 \
+  --geometry-device cuda:1 \
+  --device cuda:2 \
+  --output-size 256 384 \
+  --iterations 700 \
+  --visualize-every 10 \
+  --chamfer-weight 0 \
+  --reprojection-weight 0 \
+  --output-dir outputs/dense_fusion_ablate_l1_history
+
+
+  PYTHONPATH=src python scripts/train_dense_fusion.py \
+  --config configs/dense_fusion_train.yaml \
+  --scene-id 00a231a370 \
+  --instance-id 73 \
+  --frame-indices 0 52 58 65 81 139 142 \
+  --sam3-device cuda:0 \
+  --geometry-device cuda:1 \
+  --device cuda:2 \
+  --output-size 256 384 \
+  --iterations 700 \
+  --visualize-every 10 \
+  --chamfer-weight 0 \
+  --reprojection-weight 0 \
+  --no-history \
+  --output-dir outputs/dense_fusion_ablate_l1_no_history
+
+
+
+  PYTHONPATH=src python scripts/train_dense_fusion.py \
+  --config configs/dense_fusion_train.yaml \
+  --scene-id 00a231a370 \
+  --instance-id 73 \
+  --frame-indices 0 52 58 65 81 139 142 \
+  --sam3-device cuda:0 \
+  --geometry-device cuda:1 \
+  --device cuda:2 \
+  --output-size 256 384 \
+  --iterations 700 \
+  --visualize-every 10 \
+  --chamfer-weight 0 \
+  --reprojection-weight 0 \
+  --no-history \
+  --no-geometry-streaming-cache \
+  --output-dir outputs/dense_fusion_ablate_l1_no_history_no_stream
