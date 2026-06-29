@@ -15,8 +15,8 @@ rgb 和 prompt 输入 sam3 和 streamVGGT 得到 geometry tokens 和 semantic to
 融合两个特征得到 fused tokens，通过一个 head 得到 pointmap[H, W, 3] semantic_feat [H, W, semantic_dim]。
 然后 semantic_feat 经过一个分类头 cls_head 进行分类，得到 semantic_mask [H,W,cls_num]这个流程
 
-## trainning
-### 数据准备
+## 4 trainning
+### 4.1 数据准备
 ```
 frames: [B, T, C, H, W] (连续时序图像)
 text_prompts: 文本提示词
@@ -24,9 +24,10 @@ gt_pointmaps: [B, T, N, 3] (3D 真值)
 gt_semantic_masks: [B, T, N] (每个像素/Token对应的类别真值)
 gt_instance_ids: [B, T, N] (跨视角同实体对齐真值)
 ```
-### loss
+### 4.2 loss
 gt semantic mask 对应的区域的 pred pointmap 与 gt pointmap 进行损失
-gt semantic 和 pred semantic logits
+gt semantic 和 pred semantic logits 做逐像素的损失
 
 
-
+## 5 当前表述
+给定无位姿 RGB 视频流与一个文本提示，系统在线输出带持久身份的 2D masklets、统一世界坐标中的 3D pointmap/point cloud、以及 prompt-conditioned 3D instance mask。

@@ -1,0 +1,90 @@
+# Dense SAM3/StreamVGGT fusion training.
+# This is the full first baseline: losses are computed on an image grid, not on
+# the 72x72 latent token grid. Increase model.output_size if memory allows.
+
+dataset:
+  manifest: data/processed/scannetpp_pinhole_2d/manifest.json
+  scene_id: 00a231a370
+  sequence_length: 4
+  frame_stride: 1
+
+objects:
+  min_pixels: 128
+  max_area_ratio: 0.25
+  min_visible_frames: 2
+  max_objects_per_frame: 32
+  ignore_instance_id: 0
+  semantic_ignore_label: 65535
+  excluded_semantic_labels: []
+  # Empty means sample a valid instance class dynamically.
+  target_object_labels: []
+  excluded_object_labels:
+    - wall
+    - floor
+    - ceiling
+    - window
+    - door
+    - door frame
+    - pillar
+    - table
+    - cabinet
+    - storage cabinet
+    - whiteboard
+    - electrical duct
+    - electric duct
+
+sam3:
+  repo: externals/sam3
+  checkpoint: /home/bod/86Nas/95_data_bak/FoundationModels/sam3/sam3.pt
+  prompt: object
+  prompt_mode: random_instance
+  resolution: 1008
+  feature_source: detector_fpn2
+  text_conditioning: concat
+  enable_inst_interactivity: false
+
+geometry:
+  repo: externals/streamvggt
+  checkpoint: /home/bod/86Nas/95_data_bak/FoundationModels/StreamVGGT/checkpoints.pth
+  # Internal latent fusion grid. This is not the supervision/output resolution.
+  feature_grid: [72, 72]
+  context_grid: [12, 12]
+  layer_index: -1
+  image_mode: crop
+  use_camera_tokens: false
+
+model:
+  # Dense output/loss grid. Set to [350, 518] or larger if memory allows.
+  output_size: [256, 384]
+  d_fuse: 256
+  num_heads: 8
+  embedding_dim: 256
+  # Auxiliary closed-set semantic classifier. Must be larger than processed
+  # semantic class ids; the open-vocabulary path uses text alignment.
+  num_classes: 1024
+  dropout: 0.0
+
+loss:
+  mask_weight: 1.0
+  dice_weight: 1.0
+  point_weight: 1.0
+  text_weight: 0.5
+  aux_cls_weight: 0.1
+  match_weight: 0.25
+  temperature: 0.07
+  max_match_pixels: 2048
+  negative_ratio: 8
+
+training:
+  device: cuda
+  iterations: 200
+  lr: 0.0003
+  seed: 0
+  log_every: 10
+  save_every: 100
+  visualize_every: 20
+  visualize_threshold: 0.5
+  output_dir: outputs/dense_fusion_debug
+
+visualization:
+  max_visual_points: 100000
