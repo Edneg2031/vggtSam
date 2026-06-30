@@ -134,6 +134,53 @@ fused tokens
 geometry.streaming_cache: true
 ```
 
+### StreamVGGT Memory
+
+当 `geometry.streaming_cache=true` 时，StreamVGGT 不是一次性把整段 clip 当普通 batch 处理，而是在 adapter 里逐帧调用 aggregator：
+
+```text
+past_key_values = [None] * aggregator.depth
+
+for frame_idx in range(T):
+  current_frame
+    + past_key_values
+    -> StreamVGGT aggregator(use_cache=True, past_frame_idx=frame_idx)
+    -> aggregated_tokens_list
+    -> updated past_key_values
+```
+
+因此第 `t` 帧输出的 StreamVGGT tokens 已经包含前面帧通过 KV cache 带来的历史信息。当前代码会从这些带历史的 tokens 中取两类特征：
+
+```text
+1. layer_index 对应 tokens
+   -> resize 到 context_grid
+   -> cross-attention 里的 geometry context
+
+2. layers [4, 11, 17, 23]
+   -> stream_dpt point decoder 的 DPT tokens
+```
+
+所以 StreamVGGT memory 会影响两条路径：
+
+```text
+StreamVGGT KV cache
+  -> geometry tokens
+  -> fused tokens
+  -> mask / simple point head
+
+StreamVGGT KV cache
+  -> DPT layer tokens
+  -> stream_dpt point decoder
+```
+
+如果设置：
+
+```bash
+--no-geometry-streaming-cache
+```
+
+则不使用逐帧 KV cache，而是走普通 clip-level aggregator 前向。这个设置可用于消融 StreamVGGT 原生历史信息。
+
 SAM3 使用 image / detector intermediate feature，不是 video tracker memory。
 
 ### Pointmap Decoder
