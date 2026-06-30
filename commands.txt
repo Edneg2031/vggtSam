@@ -69,4 +69,5 @@
   --visualize-every 10 \
   --output-dir outputs/dense_fusion_simple_predmask_l1
 
-  --geometry-streaming-cache --no-history
+# 测我们自己的可推理 object memory
+--geometry-streaming-cache --history-update-source pred
