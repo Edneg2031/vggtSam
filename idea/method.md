@@ -12,6 +12,7 @@
 输出：
   pred_mask_logits: [T, H, W]
   pred_pointmap: [T, H, W, 3]
+  pred_point_conf: [T, H, W]  # 仅 stream_dpt point decoder 输出
   prompt_score: [T, H, W]
   instance_embedding: [T, H, W, D]
 ```
@@ -119,7 +120,7 @@ fused tokens
   + reference_mask pooled object query
   -> dense decoder upsample 到 output_size
   -> mask head
-  -> pointmap head
+  -> pointmap decoder
   -> semantic/text alignment head
   -> instance embedding head
   -> auxiliary closed-set semantic head
@@ -127,7 +128,74 @@ fused tokens
 
 当前 StreamVGGT 和 SAM3 都是 frozen，只训练 fusion module 和 dense heads。
 
-当前 StreamVGGT 使用的是 clip-level 多帧输入，不是 streaming KV cache。SAM3 使用 image backbone intermediate feature，不是 video tracker memory。
+当前 StreamVGGT 默认使用 streaming KV cache：
+
+```yaml
+geometry.streaming_cache: true
+```
+
+SAM3 使用 image / detector intermediate feature，不是 video tracker memory。
+
+### Pointmap Decoder
+
+当前支持两种 point decoder：
+
+```yaml
+model.point_decoder: simple | stream_dpt
+```
+
+`simple` 是早期 baseline：
+
+```text
+dense fused feature
+  -> shallow Conv point head
+  -> pred_pointmap
+```
+
+`stream_dpt` 是当前默认配置：
+
+```text
+StreamVGGT aggregator layers [4, 11, 17, 23]
+  -> StreamVGGT DPTHead
+  -> pred_pointmap + pred_point_conf
+```
+
+`stream_dpt` 会加载原 StreamVGGT `point_head` 权重。融合方式不是替换 StreamVGGT token，而是把 `fused_tokens + object_query` 投影到 StreamVGGT token 维度后，作为 residual condition 加到 DPT patch tokens 上：
+
+```text
+condition = Linear(interp(fused_tokens + object_query))
+stream_patch_tokens = stream_patch_tokens + scale * condition
+```
+
+其中 `scale` 是可学习参数，初始化为 `0.1`。
+
+### Object Query Memory
+
+当前还有一个轻量 object query memory，它不是 SAM3 原生 tracker memory。
+
+初始化：
+
+```text
+reference_mask + fused tokens
+  -> masked pooling
+  -> object_query
+```
+
+逐帧更新：
+
+```text
+update_mask + fused tokens
+  -> candidate object query
+  -> GRUCell(object_query, candidate)
+```
+
+更新 mask 来源由配置控制：
+
+```yaml
+history.update_source: gt | pred | gt_or_pred
+```
+
+`gt` 是训练阶段 oracle / teacher forcing，`pred` 更接近推理时设置。
 
 ## 6. Loss 设计
 
@@ -144,14 +212,49 @@ L_dice = Dice(pred_mask_logits, prompt_mask)
 
 ### Pointmap Loss
 
-只在 prompt foreground 且 pointmap 有效的位置计算：
+默认只在 prompt foreground 且 pointmap 有效的位置计算：
 
 ```text
 valid = prompt_mask & point_valid
 L_point = SmoothL1(pred_pointmap[valid], gt_pointmap[valid])
 ```
 
-所以当前模型不会被要求重建全场景点云，只监督 prompt 相关物体区域的 3D 点。
+也可以切到 pred mask 筛选：
+
+```yaml
+loss.point_valid_source: gt | pred
+loss.point_valid_threshold: 0.5
+```
+
+当 `point_valid_source=pred` 时：
+
+```text
+valid = point_valid & (sigmoid(pred_mask_logits) > threshold)
+```
+
+这个设置用于消融 hard pred-mask point supervision。当前观察是它容易受 mask 错选区域影响，因此不能直接替代 GT valid。
+
+所以当前模型不会被要求重建全场景点云，只监督 prompt 相关物体区域或 pred mask 选中的区域。
+
+### Chamfer / Reprojection Loss
+
+当前代码保留两个几何辅助项：
+
+```text
+L_chamfer:
+  在 point valid 区域采样 pred / GT points，计算双向 Chamfer
+
+L_reprojection:
+  用 pred mask 概率作为 soft weight，把 pred pointmap 投影回当前帧，
+  与 GT prompt mask 做 BCE + Dice
+```
+
+当前消融中经常把它们设为 0，只看 L1 point loss：
+
+```bash
+--chamfer-weight 0
+--reprojection-weight 0
+```
 
 ### Text Alignment Loss
 
@@ -195,6 +298,8 @@ L_match = BCEWithLogits(sim(instance_embedding_curr, instance_embedding_hist), m
 L = 1.0 * L_mask
   + 1.0 * L_dice
   + 1.0 * L_point
+  + 0.1 * L_chamfer
+  + 0.1 * L_reprojection
   + 0.5 * L_text
   + 0.1 * L_aux_cls
   + 0.25 * L_match
@@ -233,11 +338,18 @@ Pred prompt object point cloud
 当前 baseline 已经是 dense image-grid 训练，但仍然有几个限制：
 
 ```text
-1. prompt 只有 text，没有空间 reference。
-2. random_instance 采样的是一个 instance，但 GT foreground 是该类别所有有效 instances。
-3. SAM3 没有使用 video tracker memory。
-4. StreamVGGT 没有使用 streaming KV cache。
-5. object memory 目前只是通过导出 point cloud 可视化，还没有实现长期在线维护。
+1. prompt 的文本部分仍是类别名；reference_mask 来自训练 GT，不是 SAM3 交互 prompt。
+2. SAM3 没有使用 video tracker memory。
+3. object query memory 是当前代码自定义实现，不是 SAM3 原生 memory。
+4. hard pred-mask point supervision 容易受 mask 错选区域影响。
+5. stream_dpt 当前只是 residual token conditioning，mask / occupancy 还没有进入 DPT 解码过程。
+6. 当前输出的是 visible object pointmap，还没有 canonical / amodal object memory。
 ```
 
-下一步如果要做“具体 instance 追踪”，需要加入 reference mask / box / point prompt，或者用第一帧 GT instance mask 构造 instance prototype。
+下一步如果要做更稳定的 object geometry，优先考虑：
+
+```text
+1. 先做 simple / stream_dpt 与 GT valid / pred valid 的消融。
+2. 再把 pred mask 从 hard selector 改成 soft weighting。
+3. 最后把 soft occupancy 作为 point decoder 的条件，而不是只用于 loss / export。
+```
