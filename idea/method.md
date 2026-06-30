@@ -1,7 +1,7 @@
 # 当前 Dense Fusion Baseline
 
 ## 1. 当前任务
-
+2026 6 30
 当前代码实现的是一个 dense baseline：
 
 ```text
