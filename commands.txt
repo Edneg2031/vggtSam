@@ -68,3 +68,5 @@
   --device cuda \
   --visualize-every 10 \
   --output-dir outputs/dense_fusion_simple_predmask_l1
+
+  --geometry-streaming-cache --no-history
