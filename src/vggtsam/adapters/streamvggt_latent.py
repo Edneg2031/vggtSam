@@ -48,6 +48,7 @@ class StreamVGGTLatentAdapter:
         token_grid: Tuple[int, int] = (72, 72),
         context_grid: Tuple[int, int] = (24, 24),
         layer_index: int = -1,
+        dpt_layer_indices: Sequence[int] = (4, 11, 17, 23),
         image_mode: str = "crop",
     ) -> None:
         self.model = model.eval()
@@ -55,6 +56,7 @@ class StreamVGGTLatentAdapter:
         self.token_grid = token_grid
         self.context_grid = context_grid
         self.layer_index = int(layer_index)
+        self.dpt_layer_indices = tuple(int(index) for index in dpt_layer_indices)
         self.image_mode = image_mode
 
     @torch.no_grad()
@@ -88,6 +90,9 @@ class StreamVGGTLatentAdapter:
         batch_images = images.unsqueeze(0)  # [1, T, 3, H, W]
 
         aggregated_tokens_list, patch_start_idx = self.model.aggregator(batch_images)
+        dpt_tokens = [
+            aggregated_tokens_list[index].float() for index in self.dpt_layer_indices
+        ]
         tokens = aggregated_tokens_list[self.layer_index].float()
         patch_tokens = tokens[:, :, patch_start_idx:, :]
         patch_shape = patch_grid_from_images(images, patch_size=self.model.aggregator.patch_size)
@@ -132,7 +137,11 @@ class StreamVGGTLatentAdapter:
                 "context_grid": self.context_grid,
                 "patch_shape": patch_shape,
                 "layer_index": self.layer_index,
+                "dpt_layer_indices": self.dpt_layer_indices,
                 "dense_tokens": dense_tokens.reshape(1, -1, dense_tokens.shape[-1]),
+                "stream_dpt_tokens": dpt_tokens,
+                "stream_images": images,
+                "patch_start_idx": patch_start_idx,
             },
         )
         return StreamVGGTLatentOutput(
@@ -160,6 +169,7 @@ class StreamVGGTLatentAdapter:
         past_key_values = [None] * self.model.aggregator.depth
         context_chunks = []
         dense_chunks = []
+        dpt_layer_chunks = [[] for _ in self.dpt_layer_indices]
         pointmap_chunks = []
         confidence_chunks = []
         patch_start_idx = None
@@ -181,6 +191,9 @@ class StreamVGGTLatentAdapter:
                 aggregated_tokens_list, patch_start_idx, past_key_values = aggregator_output
             else:
                 aggregated_tokens_list, patch_start_idx = aggregator_output
+
+            for layer_out, layer_index in zip(dpt_layer_chunks, self.dpt_layer_indices):
+                layer_out.append(aggregated_tokens_list[layer_index].float())
 
             tokens = aggregated_tokens_list[self.layer_index].float()
             patch_tokens = tokens[:, :, patch_start_idx:, :]
@@ -207,6 +220,7 @@ class StreamVGGTLatentAdapter:
 
         context_tokens = torch.cat(context_chunks, dim=1)
         dense_tokens = torch.cat(dense_chunks, dim=1)
+        dpt_tokens = [torch.cat(chunks, dim=1) for chunks in dpt_layer_chunks]
         pointmap_grid = torch.cat(pointmap_chunks, dim=0) if pointmap_chunks else None
         confidence_grid = torch.cat(confidence_chunks, dim=0) if confidence_chunks else None
         geometry = GeometryTokens(
@@ -223,7 +237,11 @@ class StreamVGGTLatentAdapter:
                 "context_grid": self.context_grid,
                 "patch_shape": patch_shape,
                 "layer_index": self.layer_index,
+                "dpt_layer_indices": self.dpt_layer_indices,
                 "dense_tokens": dense_tokens.reshape(1, -1, dense_tokens.shape[-1]),
+                "stream_dpt_tokens": dpt_tokens,
+                "stream_images": images,
+                "patch_start_idx": patch_start_idx,
                 "streaming_cache": True,
             },
         )

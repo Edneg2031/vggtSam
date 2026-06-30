@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 import torch
 from torch import nn
@@ -16,6 +17,7 @@ class DenseFusionOutput:
     fused_tokens: torch.Tensor
     mask_logits: torch.Tensor
     pointmap: torch.Tensor
+    point_conf: torch.Tensor | None
     semantic_embedding: torch.Tensor
     prompt_score: torch.Tensor
     instance_embedding: torch.Tensor
@@ -39,12 +41,20 @@ class DenseSAMVGGTModel(nn.Module):
         embedding_dim: int = 256,
         num_classes: int | None = None,
         dropout: float = 0.0,
+        point_decoder: str = "simple",
+        stream_dpt_freeze: bool = False,
     ) -> None:
         super().__init__()
         self.feature_grid = tuple(int(v) for v in feature_grid)
         self.output_size = tuple(int(v) for v in output_size)
         self.text_dim = int(text_dim)
         self.embedding_dim = int(embedding_dim)
+        self.point_decoder = point_decoder.strip().lower()
+        if self.point_decoder not in {"simple", "stream_dpt"}:
+            raise ValueError(
+                "point_decoder must be 'simple' or 'stream_dpt', "
+                f"got {point_decoder!r}"
+            )
 
         self.proj_sam = nn.Linear(sam_dim, d_fuse)
         self.proj_geometry = nn.Linear(geometry_dim, d_fuse)
@@ -69,11 +79,33 @@ class DenseSAMVGGTModel(nn.Module):
             nn.GELU(),
         )
         self.mask_head = nn.Conv2d(d_fuse, 1, kernel_size=1)
-        self.point_head = nn.Sequential(
-            nn.Conv2d(d_fuse, d_fuse, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(d_fuse, 3, kernel_size=1),
-        )
+        if self.point_decoder == "simple":
+            self.point_head = nn.Sequential(
+                nn.Conv2d(d_fuse, d_fuse, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(d_fuse, 3, kernel_size=1),
+            )
+            self.stream_point_decoder = None
+            self.stream_condition_proj = None
+            self.stream_condition_norm = None
+            self.stream_condition_scale = None
+        else:
+            from streamvggt.heads.dpt_head import DPTHead
+
+            self.point_head = None
+            self.stream_point_decoder = DPTHead(
+                dim_in=geometry_dim,
+                output_dim=4,
+                activation="inv_log",
+                conf_activation="expp1",
+                intermediate_layer_idx=[0, 1, 2, 3],
+            )
+            self.stream_condition_proj = nn.Linear(d_fuse, geometry_dim)
+            self.stream_condition_norm = nn.LayerNorm(geometry_dim)
+            self.stream_condition_scale = nn.Parameter(torch.tensor(0.1))
+            if stream_dpt_freeze:
+                for param in self.stream_point_decoder.parameters():
+                    param.requires_grad = False
         self.semantic_head = nn.Sequential(
             nn.Conv2d(d_fuse, d_fuse, kernel_size=3, padding=1),
             nn.GELU(),
@@ -104,6 +136,9 @@ class DenseSAMVGGTModel(nn.Module):
         text_embedding: torch.Tensor,
         camera_tokens: torch.Tensor | None = None,
         object_query: torch.Tensor | None = None,
+        stream_tokens: Sequence[torch.Tensor] | None = None,
+        stream_images: torch.Tensor | None = None,
+        stream_patch_start_idx: int | None = None,
     ) -> DenseFusionOutput:
         fused_tokens = self.fuse_tokens(
             sam_tokens=sam_tokens,
@@ -114,6 +149,9 @@ class DenseSAMVGGTModel(nn.Module):
             fused_tokens=fused_tokens,
             text_embedding=text_embedding,
             object_query=object_query,
+            stream_tokens=stream_tokens,
+            stream_images=stream_images,
+            stream_patch_start_idx=stream_patch_start_idx,
         )
 
     def decode(
@@ -122,6 +160,9 @@ class DenseSAMVGGTModel(nn.Module):
         fused_tokens: torch.Tensor,
         text_embedding: torch.Tensor,
         object_query: torch.Tensor | None = None,
+        stream_tokens: Sequence[torch.Tensor] | None = None,
+        stream_images: torch.Tensor | None = None,
+        stream_patch_start_idx: int | None = None,
     ) -> DenseFusionOutput:
         dense = self.tokens_to_dense(fused_tokens)
         object_query = self._prepare_object_query(
@@ -132,7 +173,18 @@ class DenseSAMVGGTModel(nn.Module):
         if object_query is not None:
             dense = dense + self.object_query_proj(object_query)[:, :, None, None]
         mask_logits = self.mask_head(dense).squeeze(1)
-        pointmap = self.point_head(dense).permute(0, 2, 3, 1).contiguous()
+        if self.point_decoder == "simple":
+            assert self.point_head is not None
+            pointmap = self.point_head(dense).permute(0, 2, 3, 1).contiguous()
+            point_conf = None
+        else:
+            pointmap, point_conf = self.decode_stream_pointmap(
+                fused_tokens=fused_tokens,
+                object_query=object_query,
+                stream_tokens=stream_tokens,
+                stream_images=stream_images,
+                stream_patch_start_idx=stream_patch_start_idx,
+            )
         semantic_embedding = self.semantic_head(dense)
         instance_embedding_chw = F.normalize(self.instance_head(dense), dim=1)
         if object_query is not None:
@@ -156,11 +208,128 @@ class DenseSAMVGGTModel(nn.Module):
             fused_tokens=fused_tokens,
             mask_logits=mask_logits,
             pointmap=pointmap,
+            point_conf=point_conf,
             semantic_embedding=semantic_embedding.permute(0, 2, 3, 1).contiguous(),
             prompt_score=prompt_score,
             instance_embedding=instance_embedding_chw.permute(0, 2, 3, 1).contiguous(),
             aux_logits=aux_logits,
         )
+
+    def decode_stream_pointmap(
+        self,
+        *,
+        fused_tokens: torch.Tensor,
+        object_query: torch.Tensor | None,
+        stream_tokens: Sequence[torch.Tensor] | None,
+        stream_images: torch.Tensor | None,
+        stream_patch_start_idx: int | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            stream_tokens is None
+            or stream_images is None
+            or stream_patch_start_idx is None
+        ):
+            raise ValueError(
+                "stream_dpt point decoder requires stream_tokens, stream_images, "
+                "and stream_patch_start_idx."
+            )
+        assert self.stream_point_decoder is not None
+        conditioned_tokens = self.condition_stream_tokens(
+            stream_tokens,
+            fused_tokens=fused_tokens,
+            object_query=object_query,
+            stream_images=stream_images,
+            patch_start_idx=int(stream_patch_start_idx),
+        )
+        points, confidence = self.stream_point_decoder(
+            list(conditioned_tokens),
+            images=stream_images,
+            patch_start_idx=int(stream_patch_start_idx),
+            frames_chunk_size=None,
+        )
+        points = points[:, 0]
+        confidence = confidence[:, 0]
+        if points.shape[1:3] != self.output_size:
+            points = resize_bhwc(points, self.output_size)
+            confidence = resize_bhw(confidence, self.output_size)
+        return points.contiguous(), confidence.contiguous()
+
+    def condition_stream_tokens(
+        self,
+        stream_tokens: Sequence[torch.Tensor],
+        *,
+        fused_tokens: torch.Tensor,
+        object_query: torch.Tensor | None,
+        stream_images: torch.Tensor,
+        patch_start_idx: int,
+    ) -> list[torch.Tensor]:
+        assert self.stream_condition_proj is not None
+        assert self.stream_condition_norm is not None
+        assert self.stream_condition_scale is not None
+        fused_tokens = self._ensure_batched(fused_tokens)
+        object_query = self._prepare_object_query(
+            object_query,
+            batch_size=fused_tokens.shape[0],
+            device=fused_tokens.device,
+        )
+        if object_query is not None:
+            fused_tokens = fused_tokens + self.object_query_proj(object_query)[:, None]
+
+        _, _, _, image_h, image_w = stream_images.shape
+        patch_size = int(self.stream_point_decoder.patch_size)
+        patch_shape = (int(image_h // patch_size), int(image_w // patch_size))
+        condition = self.fused_tokens_to_patch_condition(fused_tokens, patch_shape)
+        scale = self.stream_condition_scale
+
+        conditioned = []
+        for tokens in stream_tokens:
+            tokens = tokens.to(device=fused_tokens.device, dtype=fused_tokens.dtype)
+            patch_tokens = tokens[:, :, patch_start_idx:, :]
+            if patch_tokens.shape[2] != condition.shape[1]:
+                raise ValueError(
+                    "Stream DPT patch token count does not match fused condition: "
+                    f"{patch_tokens.shape[2]} vs {condition.shape[1]}"
+            )
+            updated = tokens.clone()
+            updated[:, :, patch_start_idx:, :] = (
+                patch_tokens + scale * condition[:, None]
+            )
+            conditioned.append(updated)
+        return conditioned
+
+    def fused_tokens_to_patch_condition(
+        self,
+        fused_tokens: torch.Tensor,
+        patch_shape: tuple[int, int],
+    ) -> torch.Tensor:
+        batch, tokens, channels = fused_tokens.shape
+        grid_h, grid_w = self.feature_grid
+        expected = grid_h * grid_w
+        if tokens != expected:
+            raise ValueError(
+                f"Expected {expected} fused tokens from feature_grid={self.feature_grid}, "
+                f"got {tokens}"
+            )
+        dense = fused_tokens.transpose(1, 2).reshape(batch, channels, grid_h, grid_w)
+        dense = F.interpolate(
+            dense,
+            size=patch_shape,
+            mode="bilinear",
+            align_corners=False,
+        )
+        condition = dense.flatten(2).transpose(1, 2)
+        condition = self.stream_condition_proj(condition)
+        return self.stream_condition_norm(condition)
+
+    def load_stream_point_decoder_state_dict(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        strict: bool = False,
+    ):
+        if self.stream_point_decoder is None:
+            return [], []
+        return self.stream_point_decoder.load_state_dict(state_dict, strict=strict)
 
     def fuse_tokens(
         self,
@@ -307,3 +476,17 @@ class DenseSAMVGGTModel(nn.Module):
                 f"object_query batch size {object_query.shape[0]} does not match {batch_size}"
             )
         return object_query
+
+
+def resize_bhwc(values: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+    """Resize a dense map with channels in the last dimension."""
+    x = values.permute(0, 3, 1, 2)
+    x = F.interpolate(x, size=size, mode="bilinear", align_corners=False)
+    return x.permute(0, 2, 3, 1).contiguous()
+
+
+def resize_bhw(values: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+    """Resize a dense scalar map."""
+    x = values[:, None]
+    x = F.interpolate(x, size=size, mode="bilinear", align_corners=False)
+    return x[:, 0].contiguous()

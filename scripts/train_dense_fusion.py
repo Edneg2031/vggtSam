@@ -42,10 +42,33 @@ def main() -> None:
     parser.add_argument("--frame-stride", type=int, default=None)
     parser.add_argument("--frame-indices", type=int, nargs="+", default=None)
     parser.add_argument("--output-size", type=int, nargs=2, metavar=("H", "W"))
+    parser.add_argument(
+        "--point-decoder",
+        choices=["simple", "stream_dpt"],
+        default=None,
+    )
+    stream_dpt_pretrained = parser.add_mutually_exclusive_group()
+    stream_dpt_pretrained.add_argument(
+        "--stream-dpt-use-pretrained",
+        action="store_true",
+    )
+    stream_dpt_pretrained.add_argument(
+        "--no-stream-dpt-use-pretrained",
+        action="store_true",
+    )
+    stream_dpt_freeze = parser.add_mutually_exclusive_group()
+    stream_dpt_freeze.add_argument("--stream-dpt-freeze", action="store_true")
+    stream_dpt_freeze.add_argument("--no-stream-dpt-freeze", action="store_true")
     parser.add_argument("--visualize-every", type=int, default=None)
     parser.add_argument("--mask-weight", type=float, default=None)
     parser.add_argument("--dice-weight", type=float, default=None)
     parser.add_argument("--point-weight", type=float, default=None)
+    parser.add_argument(
+        "--point-valid-source",
+        choices=["gt", "pred"],
+        default=None,
+    )
+    parser.add_argument("--point-valid-threshold", type=float, default=None)
     parser.add_argument("--chamfer-weight", type=float, default=None)
     parser.add_argument("--reprojection-weight", type=float, default=None)
     parser.add_argument("--text-weight", type=float, default=None)
@@ -87,6 +110,10 @@ def main() -> None:
         raw["loss"]["dice_weight"] = args.dice_weight
     if args.point_weight is not None:
         raw["loss"]["point_weight"] = args.point_weight
+    if args.point_valid_source is not None:
+        raw["loss"]["point_valid_source"] = args.point_valid_source
+    if args.point_valid_threshold is not None:
+        raw["loss"]["point_valid_threshold"] = args.point_valid_threshold
     if args.chamfer_weight is not None:
         raw["loss"]["chamfer_weight"] = args.chamfer_weight
     if args.reprojection_weight is not None:
@@ -107,6 +134,16 @@ def main() -> None:
         raw["dataset"]["frame_indices"] = list(args.frame_indices)
     if args.output_size is not None:
         raw["model"]["output_size"] = list(args.output_size)
+    if args.point_decoder is not None:
+        raw["model"]["point_decoder"] = args.point_decoder
+    if args.stream_dpt_use_pretrained:
+        raw["model"]["stream_dpt_use_pretrained"] = True
+    if args.no_stream_dpt_use_pretrained:
+        raw["model"]["stream_dpt_use_pretrained"] = False
+    if args.stream_dpt_freeze:
+        raw["model"]["stream_dpt_freeze"] = True
+    if args.no_stream_dpt_freeze:
+        raw["model"]["stream_dpt_freeze"] = False
     if args.target_mode is not None:
         raw["objects"]["target_mode"] = args.target_mode
     if args.overfit:
@@ -182,6 +219,9 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         feature_grid=tuple(int(v) for v in geometry["feature_grid"]),
         context_grid=tuple(int(v) for v in geometry["context_grid"]),
         streamvggt_layer_index=int(geometry["layer_index"]),
+        streamvggt_dpt_layer_indices=[
+            int(v) for v in geometry.get("dpt_layer_indices", [4, 11, 17, 23])
+        ],
         streamvggt_image_mode=str(geometry["image_mode"]),
         use_camera_tokens=bool(geometry.get("use_camera_tokens", False)),
         output_size=tuple(int(v) for v in model["output_size"]),
@@ -190,9 +230,16 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         embedding_dim=int(model["embedding_dim"]),
         num_classes=int(model["num_classes"]),
         dropout=float(model.get("dropout", 0.0)),
+        point_decoder=str(model.get("point_decoder", "simple")),
+        stream_dpt_use_pretrained=bool(
+            model.get("stream_dpt_use_pretrained", True)
+        ),
+        stream_dpt_freeze=bool(model.get("stream_dpt_freeze", False)),
         mask_weight=float(loss["mask_weight"]),
         dice_weight=float(loss["dice_weight"]),
         point_weight=float(loss["point_weight"]),
+        point_valid_source=str(loss.get("point_valid_source", "gt")),
+        point_valid_threshold=float(loss.get("point_valid_threshold", 0.5)),
         chamfer_weight=float(loss.get("chamfer_weight", 0.0)),
         reprojection_weight=float(loss.get("reprojection_weight", 0.0)),
         text_weight=float(loss["text_weight"]),

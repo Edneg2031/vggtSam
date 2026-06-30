@@ -76,6 +76,7 @@ class DenseFusionTrainConfig:
     feature_grid: tuple[int, int]
     context_grid: tuple[int, int]
     streamvggt_layer_index: int
+    streamvggt_dpt_layer_indices: List[int]
     streamvggt_image_mode: str
     use_camera_tokens: bool
     output_size: tuple[int, int]
@@ -84,9 +85,14 @@ class DenseFusionTrainConfig:
     embedding_dim: int
     num_classes: int
     dropout: float
+    point_decoder: str
+    stream_dpt_use_pretrained: bool
+    stream_dpt_freeze: bool
     mask_weight: float
     dice_weight: float
     point_weight: float
+    point_valid_source: str
+    point_valid_threshold: float
     chamfer_weight: float
     reprojection_weight: float
     text_weight: float
@@ -219,6 +225,35 @@ def detach_to_cpu(value):
     return value
 
 
+def slice_stream_dpt_tokens(
+    tokens: Sequence[torch.Tensor] | None,
+    *,
+    frame_idx: int,
+    device: str,
+) -> List[torch.Tensor] | None:
+    if tokens is None:
+        return None
+    return [
+        value[:, frame_idx : frame_idx + 1].float().to(device)
+        for value in tokens
+    ]
+
+
+def slice_stream_images(
+    images: torch.Tensor | None,
+    *,
+    frame_idx: int,
+    device: str,
+) -> torch.Tensor | None:
+    if images is None:
+        return None
+    if images.ndim == 4:
+        return images[frame_idx : frame_idx + 1].unsqueeze(0).float().to(device)
+    if images.ndim == 5:
+        return images[:, frame_idx : frame_idx + 1].float().to(device)
+    raise ValueError(f"Expected stream images [T, C, H, W], got {tuple(images.shape)}")
+
+
 def batch_to_cpu(batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     return {key: value.detach().cpu() for key, value in batch.items()}
 
@@ -273,12 +308,25 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
         strict=True,
     )
     streamvggt_model.requires_grad_(False)
+    stream_point_head_state = None
+    if config.point_decoder == "stream_dpt" and config.stream_dpt_use_pretrained:
+        point_head = getattr(streamvggt_model, "point_head", None)
+        if point_head is None:
+            raise RuntimeError(
+                "model.point_decoder='stream_dpt' with stream_dpt_use_pretrained=True "
+                "requires StreamVGGT to expose point_head."
+            )
+        stream_point_head_state = {
+            key: value.detach().cpu()
+            for key, value in point_head.state_dict().items()
+        }
     geometry = StreamVGGTLatentAdapter(
         streamvggt_model,
         device=config.geometry_device,
         token_grid=config.feature_grid,
         context_grid=config.context_grid,
         layer_index=config.streamvggt_layer_index,
+        dpt_layer_indices=config.streamvggt_dpt_layer_indices,
         image_mode=config.streamvggt_image_mode,
     )
 
@@ -376,6 +424,9 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             sam_tokens_all = overfit_feature_cache["sam_tokens"]
             geometry_tokens_all = overfit_feature_cache["geometry_tokens"]
             geometry_camera_tokens = overfit_feature_cache["camera_tokens"]
+            stream_dpt_tokens_all = overfit_feature_cache.get("stream_dpt_tokens")
+            stream_images_all = overfit_feature_cache.get("stream_images")
+            stream_patch_start_idx = overfit_feature_cache.get("stream_patch_start_idx")
             text_embedding = overfit_feature_cache["text_embedding"].to(config.device)
             batch = batch_to_device(overfit_feature_cache["batch"], config.device)
         else:
@@ -402,6 +453,29 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                     if geo_out.geometry.camera_tokens is not None
                     else None
                 )
+                if config.point_decoder == "stream_dpt":
+                    stream_dpt_tokens_all = detach_to_cpu(
+                        geo_out.geometry.aux.get("stream_dpt_tokens")
+                    )
+                    stream_images_all = detach_to_cpu(
+                        geo_out.geometry.aux.get("stream_images")
+                    )
+                    stream_patch_start_idx = geo_out.geometry.aux.get("patch_start_idx")
+                    if (
+                        stream_dpt_tokens_all is None
+                        or stream_images_all is None
+                        or stream_patch_start_idx is None
+                    ):
+                        raise RuntimeError(
+                            "StreamVGGT adapter did not return stream_dpt_tokens, "
+                            "stream_images, and patch_start_idx required by "
+                            "model.point_decoder='stream_dpt'."
+                        )
+                    stream_patch_start_idx = int(stream_patch_start_idx)
+                else:
+                    stream_dpt_tokens_all = None
+                    stream_images_all = None
+                    stream_patch_start_idx = None
 
             batch = build_dense_batch(
                 sequence,
@@ -414,6 +488,9 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                     "sam_tokens": sam_tokens_all,
                     "geometry_tokens": geometry_tokens_all,
                     "camera_tokens": geometry_camera_tokens,
+                    "stream_dpt_tokens": stream_dpt_tokens_all,
+                    "stream_images": stream_images_all,
+                    "stream_patch_start_idx": stream_patch_start_idx,
                     "text_embedding": text_embedding.detach().cpu(),
                     "batch": batch_to_cpu(batch),
                 }
@@ -455,13 +532,30 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 embedding_dim=config.embedding_dim,
                 num_classes=config.num_classes,
                 dropout=config.dropout,
+                point_decoder=config.point_decoder,
+                stream_dpt_freeze=config.stream_dpt_freeze,
             ).to(config.device)
+            if config.point_decoder == "stream_dpt" and stream_point_head_state is not None:
+                load_result = model.load_stream_point_decoder_state_dict(
+                    stream_point_head_state,
+                    strict=False,
+                )
+                if hasattr(load_result, "missing_keys"):
+                    missing_keys = load_result.missing_keys
+                    unexpected_keys = load_result.unexpected_keys
+                else:
+                    missing_keys, unexpected_keys = load_result
+                print(
+                    "loaded StreamVGGT point_head into stream_dpt decoder "
+                    f"missing={len(missing_keys)} unexpected={len(unexpected_keys)}"
+                )
             optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
             print(
                 "initialized DenseSAMVGGTModel "
                 f"sam_dim={sam_dim} geometry_dim={geometry_dim} "
                 f"text_dim={int(text_embedding.shape[-1])} camera_dim={camera_dim} "
-                f"output_size={config.output_size}"
+                f"output_size={config.output_size} "
+                f"point_decoder={config.point_decoder}"
             )
 
         assert model is not None and optimizer is not None
@@ -518,12 +612,27 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
         history_buffer: List[Dict[str, torch.Tensor]] = []
         outputs = []
         selected_match_pixels = 0
+        selected_point_pixels = 0
+        gt_point_pixels = int(
+            (batch["prompt_mask"] & batch["point_valid"]).sum().item()
+        )
 
         for frame_idx in range(num_frames):
             output = model.decode(
                 fused_tokens=fused_frame_tokens[frame_idx],
                 text_embedding=text_embedding,
                 object_query=object_query,
+                stream_tokens=slice_stream_dpt_tokens(
+                    stream_dpt_tokens_all,
+                    frame_idx=frame_idx,
+                    device=config.device,
+                ),
+                stream_images=slice_stream_images(
+                    stream_images_all,
+                    frame_idx=frame_idx,
+                    device=config.device,
+                ),
+                stream_patch_start_idx=stream_patch_start_idx,
             )
             outputs.append(output)
             target = frame_target(batch, frame_idx)
@@ -539,15 +648,21 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 target["prompt_mask"],
                 target["mask_supervision"],
             )
+            point_valid = select_point_supervision_mask(
+                output=output,
+                target=target,
+                source=config.point_valid_source,
+                pred_threshold=config.point_valid_threshold,
+            )
             point_loss = dense_point_loss(
                 output.pointmap[0],
                 target["pointmap"],
-                target["point_valid"] & target["prompt_mask"],
+                point_valid,
             )
             chamfer_loss = dense_chamfer_loss(
                 output.pointmap[0],
                 target["pointmap"],
-                target["point_valid"] & target["prompt_mask"],
+                point_valid,
                 max_points=config.max_chamfer_points,
             )
             reprojection_loss = dense_reprojection_mask_loss(
@@ -607,6 +722,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             aux_losses.append(aux_loss)
             match_losses.append(match_loss)
             selected_match_pixels += match_pixels
+            selected_point_pixels += int(point_valid.sum().detach().cpu().item())
             history_buffer.append(
                 {
                     "embeddings": output.instance_embedding[0].detach(),
@@ -647,10 +763,10 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "match_loss": mean_metric(match_losses),
             "num_prompt_pixels": int(batch["prompt_mask"].sum().item()),
             "num_supervised_pixels": int(batch["mask_supervision"].sum().item()),
-            "num_point_pixels": int(
-                (batch["prompt_mask"] & batch["point_valid"]).sum().item()
-            ),
+            "num_point_pixels": selected_point_pixels,
+            "num_gt_point_pixels": gt_point_pixels,
             "num_match_pixels": int(selected_match_pixels),
+            "point_valid_source": config.point_valid_source,
             "prompt": prompt_selection.prompt,
             "sampled_instance_id": int(prompt_selection.sampled_instance_id),
             "sampled_label": prompt_selection.sampled_label,
@@ -946,6 +1062,26 @@ def dense_dice_loss(
     intersection = (probs * target_f).sum()
     union = probs.sum() + target_f.sum()
     return 1.0 - (2.0 * intersection + eps) / (union + eps)
+
+
+def select_point_supervision_mask(
+    *,
+    output: Any,
+    target: Dict[str, torch.Tensor],
+    source: str,
+    pred_threshold: float,
+) -> torch.Tensor:
+    source = source.strip().lower()
+    point_valid = target["point_valid"]
+    if source in {"gt", "target", "teacher"}:
+        return point_valid & target["prompt_mask"]
+    if source in {"pred", "prediction"}:
+        pred_mask = output.mask_logits[0].detach().sigmoid() > float(pred_threshold)
+        return point_valid & pred_mask
+    raise ValueError(
+        "loss.point_valid_source must be 'gt' or 'pred', "
+        f"got {source!r}"
+    )
 
 
 def dense_point_loss(
@@ -1386,7 +1522,9 @@ def write_metrics_header(path: Path) -> None:
         "num_prompt_pixels",
         "num_supervised_pixels",
         "num_point_pixels",
+        "num_gt_point_pixels",
         "num_match_pixels",
+        "point_valid_source",
         "prompt",
         "sampled_instance_id",
         "sampled_label",

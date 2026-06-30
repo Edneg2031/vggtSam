@@ -66,6 +66,8 @@ geometry:
   feature_grid: [72, 72]
   context_grid: [12, 12]
   layer_index: -1
+  # StreamVGGT DPT point decoder uses these original aggregator layers.
+  dpt_layer_indices: [4, 11, 17, 23]
   image_mode: crop
   use_camera_tokens: false
 
@@ -79,11 +81,20 @@ model:
   # semantic class ids; the open-vocabulary path uses text alignment.
   num_classes: 1024
   dropout: 0.0
+  # simple: old shallow Conv point head.
+  # stream_dpt: StreamVGGT DPT point decoder, conditioned by fused/object tokens.
+  point_decoder: stream_dpt
+  stream_dpt_use_pretrained: true
+  stream_dpt_freeze: false
 
 loss:
   mask_weight: 1.0
   dice_weight: 1.0
   point_weight: 1.0
+  # gt: point loss only on GT object mask.
+  # pred: point loss only where the current predicted mask is above threshold.
+  point_valid_source: gt
+  point_valid_threshold: 0.5
   chamfer_weight: 0.1
   reprojection_weight: 0.1
   text_weight: 0.5
