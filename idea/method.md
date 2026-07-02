@@ -192,20 +192,18 @@ RGB sequence + text prompt + reference bbox
   -> tracked masklet
 ```
 
-这个分支默认不参与训练 loss，只用于和当前模型 `pred mask` 做可视化对比。开启
-`history.update_source=sam3` 时，`tracked masklet` 也可以作为 object query memory 的
-更新区域，用来消融“原生 SAM3 memory 是否比当前自定义 history 更稳”。
-
-实现上支持两种用法：
+这个分支不作为最终输出，也不进入 mask loss。当前只在 dense 训练里作为
+当前帧 object query 的生成信号：
 
 ```text
-1. --sam3-tracker
-   训练进程里实时调用 SAM3 video predictor。
-
-2. --sam3-track-only -> tracked_masks.pt
-   先离线生成 SAM3 memory track cache；
-   训练时用 --sam3-track-cache 读取缓存，避免训练进程再次加载 SAM3 video predictor。
+SAM3 tracked masklet
+  -> masked pooling over fused tokens
+  -> current-frame object_query
+  -> lightweight decoder predicts final mask / pointmap
 ```
+
+因此当前验证的问题是：**SAM3 原生 video memory 是否能让我们的 lightweight
+decoder 输出更稳定的 prompt object mask**，而不是“纯 SAM3 是否能分割成功”。
 
 ### Pointmap Decoder
 
@@ -240,33 +238,40 @@ stream_patch_tokens = stream_patch_tokens + scale * condition
 
 其中 `scale` 是可学习参数，初始化为 `0.1`。
 
-### Object Query Memory
+### Object Query Conditioning
 
-当前还有一个轻量 object query memory，它不是 SAM3 原生 tracker memory。
+当前已经移除了早期自定义 GRU object-query memory。`object_query` 仍然保留，
+但它只是 decoder 的当前帧条件向量，不再跨帧递归更新。
 
-初始化：
+每帧的 query 由当前帧 fused tokens 和一个 mask source 直接得到：
 
 ```text
-reference_mask + fused tokens
+mask source + current fused tokens
   -> masked pooling
-  -> object_query
+  -> current object_query
+  -> lightweight decoder
 ```
 
-逐帧更新：
-
-```text
-update_mask + fused tokens
-  -> candidate object query
-  -> GRUCell(object_query, candidate)
-```
-
-更新 mask 来源由配置控制：
+mask source 由配置控制：
 
 ```yaml
-history.update_source: gt | pred | gt_or_pred
+history.update_source: sam3 | gt | pred | gt_or_pred
 ```
 
-`gt` 是训练阶段 oracle / teacher forcing，`pred` 更接近推理时设置。
+当前默认是：
+
+```yaml
+history.update_source: sam3
+```
+
+含义如下：
+
+```text
+sam3: 使用 SAM3 video memory tracked mask，在当前 fused tokens 上 pooling。
+gt: 使用 GT instance mask，作为 teacher-forced 对照组。
+pred: 先用 reference query 粗解一次，再用当前预测 mask pooling 后重解码。
+gt_or_pred: 当前帧 GT 存在则用 GT，否则退回 pred。
+```
 
 ## 6. Loss 设计
 
@@ -410,8 +415,8 @@ Pred prompt object point cloud
 
 ```text
 1. prompt 的文本部分仍是类别名；reference_mask 来自训练 GT，不是 SAM3 交互 prompt。
-2. SAM3 video tracker memory 已接入为验证 / history-update 分支，但还没有替换 fusion 使用的 SAM3 image feature。
-3. object query memory 主体仍是当前代码自定义实现；SAM3 tracked mask 只是可选更新信号。
+2. SAM3 video tracker memory 已接入为 object-query 条件分支，但还没有替换 fusion 使用的 SAM3 image feature。
+3. 早期自定义 GRU object-query memory 已移除；当前 object query 由 SAM3 / GT / pred mask 直接在当前帧 fused tokens 上 pooling 得到。
 4. hard pred-mask point supervision 容易受 mask 错选区域影响。
 5. stream_dpt 当前只是 residual token conditioning，mask / occupancy 还没有进入 DPT 解码过程。
 6. 当前输出的是 visible object pointmap，还没有 canonical / amodal object memory。

@@ -61,9 +61,6 @@ sam3:
   tracker_prompt_with_box: true
   tracker_output_prob_thresh: 0.5
   tracker_async_loading_frames: false
-  # Optional .pt written by --sam3-track-only. If set, dense training reuses
-  # cached SAM3 memory masks and does not instantiate SAM3 video predictor.
-  tracker_cache:
 
 geometry:
   repo: externals/streamvggt
@@ -116,10 +113,12 @@ loss:
   negative_ratio: 8
 
 history:
-  # Update object_query over time using frame-level evidence.
+  # Provide a per-frame object query to the decoder. This is not a GRU memory;
+  # it pools the current frame's fused tokens using the selected mask source.
   enabled: true
-  # gt is stable for overfit training; pred is closer to inference-time memory.
-  update_source: gt
+  # sam3 uses SAM3 video memory masks. gt is a teacher-forced ablation.
+  # pred is a self-conditioned ablation that re-decodes the current frame.
+  update_source: sam3
   pred_threshold: 0.5
 
 training:

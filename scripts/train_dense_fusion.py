@@ -11,7 +11,6 @@ import yaml
 from vggtsam.training.dense_fusion import (
     DenseFusionTrainConfig,
     train_dense_fusion,
-    validate_sam3_tracker,
 )
 
 
@@ -28,8 +27,6 @@ def main() -> None:
     parser.add_argument("--sam3-tracker-device", default=None)
     parser.add_argument("--sam3-tracker", action="store_true")
     parser.add_argument("--no-sam3-tracker", action="store_true")
-    parser.add_argument("--sam3-track-only", action="store_true")
-    parser.add_argument("--sam3-track-cache", type=Path, default=None)
     parser.add_argument("--no-sam3-tracker-box", action="store_true")
     parser.add_argument("--sam3-tracker-threshold", type=float, default=None)
     parser.add_argument("--geometry-device", default=None)
@@ -102,8 +99,6 @@ def main() -> None:
         raw["sam3"]["tracker_enabled"] = True
     if args.no_sam3_tracker:
         raw["sam3"]["tracker_enabled"] = False
-    if args.sam3_track_cache is not None:
-        raw["sam3"]["tracker_cache"] = str(args.sam3_track_cache)
     if args.no_sam3_tracker_box:
         raw["sam3"]["tracker_prompt_with_box"] = False
     if args.sam3_tracker_threshold is not None:
@@ -180,11 +175,7 @@ def main() -> None:
         if args.prompt.strip().lower() != "object":
             raw["objects"]["target_object_labels"] = [args.prompt]
 
-    config = build_train_config(raw)
-    if args.sam3_track_only:
-        validate_sam3_tracker(config)
-    else:
-        train_dense_fusion(config)
+    train_dense_fusion(build_train_config(raw))
 
 
 def load_config(path: Path) -> dict:
@@ -249,7 +240,6 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         sam3_tracker_async_loading_frames=bool(
             sam3.get("tracker_async_loading_frames", False)
         ),
-        sam3_tracker_cache=optional_path(sam3.get("tracker_cache")),
         streamvggt_repo=Path(geometry["repo"]),
         streamvggt_checkpoint=Path(geometry["checkpoint"]),
         geometry_device=str(geometry.get("device") or training["device"]),
@@ -288,7 +278,7 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         max_chamfer_points=int(loss.get("max_chamfer_points", 1024)),
         negative_ratio=int(loss.get("negative_ratio", 8)),
         history_enabled=bool(history.get("enabled", True)),
-        history_update_source=str(history.get("update_source", "gt")),
+        history_update_source=str(history.get("update_source", "sam3")),
         history_pred_threshold=float(history.get("pred_threshold", 0.5)),
         device=training["device"],
         iterations=int(training["iterations"]),
@@ -310,12 +300,6 @@ def optional_int(value) -> int | None:
     if value is None or value == "":
         return None
     return int(value)
-
-
-def optional_path(value) -> Path | None:
-    if value is None or value == "":
-        return None
-    return Path(value)
 
 
 def optional_int_list(value) -> list[int] | None:
