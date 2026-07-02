@@ -88,3 +88,20 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --sam3-tracker \
   --history-update-source sam3 \
   --output-dir outputs/dense_fusion_simple_sam3_query_inst73
+
+# point map come back
+PYTHONPATH=src python scripts/train_dense_fusion.py \
+  --config configs/dense_fusion_train.yaml \
+  --scene-id 00a231a370 \
+  --instance-id 37 \
+  --frame-indices 91 133 162 163 228 163 273 \
+  --point-decoder stream_dpt \
+  --point-conditioning object_query \
+  --point-valid-source gt \
+  --chamfer-weight 0 \
+  --reprojection-weight 0 \
+  --iterations 700 \
+  --device cuda \
+  --visualize-every 10 \
+  --history-update-source sam3 \
+  --output-dir outputs/dense_fusion_streamdpt_objectquery_inst37

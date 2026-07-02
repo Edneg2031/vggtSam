@@ -266,7 +266,7 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         num_classes=int(model["num_classes"]),
         dropout=float(model.get("dropout", 0.0)),
         point_decoder=str(model.get("point_decoder", "simple")),
-        point_conditioning=str(model.get("point_conditioning", "none")),
+        point_conditioning=str(model.get("point_conditioning", "object_query")),
         stream_dpt_use_pretrained=bool(
             model.get("stream_dpt_use_pretrained", True)
         ),

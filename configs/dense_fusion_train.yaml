@@ -91,9 +91,9 @@ model:
   # simple: old shallow Conv point head.
   # stream_dpt: StreamVGGT DPT point decoder, conditioned by fused/object tokens.
   point_decoder: stream_dpt
-  # none keeps pointmap geometry independent from the object query. object_query
-  # is an ablation for prompt-conditioned pointmap decoding.
-  point_conditioning: none
+  # object_query matches the stronger 2026-06-30 baseline: the point decoder is
+  # conditioned on the selected/tracked object. Use none only as an ablation.
+  point_conditioning: object_query
   stream_dpt_use_pretrained: true
   stream_dpt_freeze: false
 

@@ -42,7 +42,7 @@ class DenseSAMVGGTModel(nn.Module):
         num_classes: int | None = None,
         dropout: float = 0.0,
         point_decoder: str = "simple",
-        point_conditioning: str = "none",
+        point_conditioning: str = "object_query",
         stream_dpt_freeze: bool = False,
     ) -> None:
         super().__init__()
