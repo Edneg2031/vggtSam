@@ -92,7 +92,7 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --config configs/dense_fusion_train.yaml \
   --scene-id 00a231a370 \
   --instance-id 37 \
-  --frame-indices 91 133 162 163 228 163 273 \
+  --frame-indices 91 133 162 163 228 263 273 \
   --point-decoder stream_dpt \
   --point-valid-source gt \
   --chamfer-weight 0 \
