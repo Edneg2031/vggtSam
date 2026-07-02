@@ -54,6 +54,12 @@ sam3:
   feature_source: detector_fpn2
   text_conditioning: concat
   enable_inst_interactivity: false
+  # Direct SAM3 video tracker mask provider. This bypasses fused-token SAM decoding
+  # and is only used when history.update_source or loss.point_valid_source is sam3_direct.
+  direct_device:
+  direct_prompt_with_box: true
+  direct_output_prob_thresh: 0.5
+  direct_async_loading_frames: false
 
 geometry:
   repo: externals/streamvggt
@@ -93,6 +99,7 @@ loss:
   point_weight: 1.0
   # gt: point loss only on GT object mask.
   # pred: point loss only where the current predicted mask is above threshold.
+  # sam3_direct: point loss only on SAM3 video-tracker mask.
   point_valid_source: gt
   point_valid_threshold: 0.5
   chamfer_weight: 0.1
@@ -111,6 +118,7 @@ history:
   # gt is stable for overfit training; pred is closer to inference-time memory.
   # fused_sam routes fused tokens through SAM3 prompt/mask decoder and uses that
   # mask to update object memory.
+  # sam3_direct uses SAM3's original video tracker mask as the update mask.
   update_source: gt
   pred_threshold: 0.5
   fused_sam_prompt_source: pred

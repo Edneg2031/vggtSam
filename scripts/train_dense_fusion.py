@@ -31,7 +31,7 @@ def main() -> None:
     parser.add_argument("--no-history", action="store_true")
     parser.add_argument(
         "--history-update-source",
-        choices=["gt", "pred", "gt_or_pred", "fused_sam"],
+        choices=["gt", "pred", "gt_or_pred", "fused_sam", "sam3_direct"],
         default=None,
     )
     parser.add_argument(
@@ -41,6 +41,20 @@ def main() -> None:
     )
     parser.add_argument("--fused-sam-mask-weight", type=float, default=None)
     parser.add_argument("--fused-sam-dice-weight", type=float, default=None)
+    parser.add_argument("--sam3-direct-device", default=None)
+    sam3_direct_box = parser.add_mutually_exclusive_group()
+    sam3_direct_box.add_argument("--sam3-direct-box", action="store_true")
+    sam3_direct_box.add_argument("--no-sam3-direct-box", action="store_true")
+    parser.add_argument("--sam3-direct-threshold", type=float, default=None)
+    sam3_direct_async = parser.add_mutually_exclusive_group()
+    sam3_direct_async.add_argument(
+        "--sam3-direct-async-loading-frames",
+        action="store_true",
+    )
+    sam3_direct_async.add_argument(
+        "--no-sam3-direct-async-loading-frames",
+        action="store_true",
+    )
     parser.add_argument("--sam3-frame-chunk-size", type=int, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--prompt", default=None)
@@ -72,7 +86,7 @@ def main() -> None:
     parser.add_argument("--point-weight", type=float, default=None)
     parser.add_argument(
         "--point-valid-source",
-        choices=["gt", "pred"],
+        choices=["gt", "pred", "sam3_direct"],
         default=None,
     )
     parser.add_argument("--point-valid-threshold", type=float, default=None)
@@ -113,6 +127,18 @@ def main() -> None:
         raw.setdefault("fused_sam", {})["mask_weight"] = args.fused_sam_mask_weight
     if args.fused_sam_dice_weight is not None:
         raw.setdefault("fused_sam", {})["dice_weight"] = args.fused_sam_dice_weight
+    if args.sam3_direct_device is not None:
+        raw["sam3"]["direct_device"] = args.sam3_direct_device
+    if args.sam3_direct_box:
+        raw["sam3"]["direct_prompt_with_box"] = True
+    if args.no_sam3_direct_box:
+        raw["sam3"]["direct_prompt_with_box"] = False
+    if args.sam3_direct_threshold is not None:
+        raw["sam3"]["direct_output_prob_thresh"] = args.sam3_direct_threshold
+    if args.sam3_direct_async_loading_frames:
+        raw["sam3"]["direct_async_loading_frames"] = True
+    if args.no_sam3_direct_async_loading_frames:
+        raw["sam3"]["direct_async_loading_frames"] = False
     if args.sam3_frame_chunk_size is not None:
         raw["sam3"]["frame_chunk_size"] = args.sam3_frame_chunk_size
     if args.output_dir is not None:
@@ -228,6 +254,18 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         ),
         sam3_device=str(sam3.get("device") or training["device"]),
         sam3_frame_chunk_size=int(sam3.get("frame_chunk_size", 0)),
+        sam3_direct_device=str(
+            sam3.get("direct_device") or sam3.get("device") or training["device"]
+        ),
+        sam3_direct_prompt_with_box=bool(
+            sam3.get("direct_prompt_with_box", True)
+        ),
+        sam3_direct_output_prob_thresh=float(
+            sam3.get("direct_output_prob_thresh", 0.5)
+        ),
+        sam3_direct_async_loading_frames=bool(
+            sam3.get("direct_async_loading_frames", False)
+        ),
         streamvggt_repo=Path(geometry["repo"]),
         streamvggt_checkpoint=Path(geometry["checkpoint"]),
         geometry_device=str(geometry.get("device") or training["device"]),

@@ -17,6 +17,7 @@ class DenseFusionOutput:
     fused_tokens: torch.Tensor
     mask_logits: torch.Tensor
     fused_sam_mask_logits: torch.Tensor | None
+    sam3_direct_mask: torch.Tensor | None
     pointmap: torch.Tensor
     point_conf: torch.Tensor | None
     semantic_embedding: torch.Tensor
@@ -231,6 +232,7 @@ class DenseSAMVGGTModel(nn.Module):
             fused_tokens=fused_tokens,
             mask_logits=mask_logits,
             fused_sam_mask_logits=None,
+            sam3_direct_mask=None,
             pointmap=pointmap,
             point_conf=point_conf,
             semantic_embedding=semantic_embedding.permute(0, 2, 3, 1).contiguous(),
