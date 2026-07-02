@@ -97,6 +97,7 @@ class DenseFusionTrainConfig:
     num_classes: int
     dropout: float
     point_decoder: str
+    point_conditioning: str
     stream_dpt_use_pretrained: bool
     stream_dpt_freeze: bool
     mask_weight: float
@@ -606,6 +607,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 num_classes=config.num_classes,
                 dropout=config.dropout,
                 point_decoder=config.point_decoder,
+                point_conditioning=config.point_conditioning,
                 stream_dpt_freeze=config.stream_dpt_freeze,
             ).to(config.device)
             if config.point_decoder == "stream_dpt" and stream_point_head_state is not None:
@@ -1632,6 +1634,13 @@ def export_dense_pointclouds(
         pred_points,
         rgb,
         pred_masks,
+        max_points=max_points,
+    )
+    write_pointcloud_ply(
+        output_dir / f"step_{step:06d}_pred_points_gt_mask.ply",
+        pred_points,
+        rgb,
+        gt_mask,
         max_points=max_points,
     )
 

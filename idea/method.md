@@ -229,7 +229,31 @@ StreamVGGT aggregator layers [4, 11, 17, 23]
   -> pred_pointmap + pred_point_conf
 ```
 
-`stream_dpt` 会加载原 StreamVGGT `point_head` 权重。融合方式不是替换 StreamVGGT token，而是把 `fused_tokens + object_query` 投影到 StreamVGGT token 维度后，作为 residual condition 加到 DPT patch tokens 上：
+`stream_dpt` 会加载原 StreamVGGT `point_head` 权重。
+
+当前默认配置是：
+
+```yaml
+model.point_conditioning: none
+```
+
+也就是说，pointmap 几何默认不吃 `object_query`，避免 SAM3 memory / mask
+分支把几何头带偏。这个设置下：
+
+```text
+fused tokens
+  -> point decoder
+  -> pred_pointmap
+```
+
+如果显式设置：
+
+```yaml
+model.point_conditioning: object_query
+```
+
+则会把 `fused_tokens + object_query` 投影到 StreamVGGT token 维度后，作为 residual
+condition 加到 DPT patch tokens 上：
 
 ```text
 condition = Linear(interp(fused_tokens + object_query))

@@ -42,6 +42,7 @@ class DenseSAMVGGTModel(nn.Module):
         num_classes: int | None = None,
         dropout: float = 0.0,
         point_decoder: str = "simple",
+        point_conditioning: str = "none",
         stream_dpt_freeze: bool = False,
     ) -> None:
         super().__init__()
@@ -54,6 +55,12 @@ class DenseSAMVGGTModel(nn.Module):
             raise ValueError(
                 "point_decoder must be 'simple' or 'stream_dpt', "
                 f"got {point_decoder!r}"
+            )
+        self.point_conditioning = point_conditioning.strip().lower()
+        if self.point_conditioning not in {"none", "object_query"}:
+            raise ValueError(
+                "point_conditioning must be 'none' or 'object_query', "
+                f"got {point_conditioning!r}"
             )
 
         self.proj_sam = nn.Linear(sam_dim, d_fuse)
@@ -162,23 +169,29 @@ class DenseSAMVGGTModel(nn.Module):
         stream_images: torch.Tensor | None = None,
         stream_patch_start_idx: int | None = None,
     ) -> DenseFusionOutput:
-        dense = self.tokens_to_dense(fused_tokens)
+        base_dense = self.tokens_to_dense(fused_tokens)
         object_query = self._prepare_object_query(
             object_query,
-            batch_size=dense.shape[0],
-            device=dense.device,
+            batch_size=base_dense.shape[0],
+            device=base_dense.device,
         )
+        dense = base_dense
         if object_query is not None:
             dense = dense + self.object_query_proj(object_query)[:, :, None, None]
         mask_logits = self.mask_head(dense).squeeze(1)
         if self.point_decoder == "simple":
             assert self.point_head is not None
-            pointmap = self.point_head(dense).permute(0, 2, 3, 1).contiguous()
+            point_dense = dense if self.point_conditioning == "object_query" else base_dense
+            pointmap = self.point_head(point_dense).permute(0, 2, 3, 1).contiguous()
             point_conf = None
         else:
             pointmap, point_conf = self.decode_stream_pointmap(
                 fused_tokens=fused_tokens,
-                object_query=object_query,
+                object_query=(
+                    object_query
+                    if self.point_conditioning == "object_query"
+                    else None
+                ),
                 stream_tokens=stream_tokens,
                 stream_images=stream_images,
                 stream_patch_start_idx=stream_patch_start_idx,
