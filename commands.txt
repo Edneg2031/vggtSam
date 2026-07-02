@@ -102,3 +102,16 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --sam3-tracker \
   --sam3-tracker-device cuda:0 \
   --output-dir outputs/dense_fusion_sam3_compare_inst73
+
+
+# 单独生成缓存
+PYTHONPATH=src python scripts/train_dense_fusion.py \
+  --config configs/dense_fusion_train.yaml \
+  --scene-id 00a231a370 \
+  --instance-id 73 \
+  --frame-indices 0 52 58 65 81 139 142 \
+  --output-size 256 384 \
+  --device cuda \
+  --sam3-tracker-device cuda:0 \
+  --sam3-track-only \
+  --output-dir outputs/sam3_tracker_memory_inst73

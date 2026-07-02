@@ -196,6 +196,17 @@ RGB sequence + text prompt + reference bbox
 `history.update_source=sam3` 时，`tracked masklet` 也可以作为 object query memory 的
 更新区域，用来消融“原生 SAM3 memory 是否比当前自定义 history 更稳”。
 
+实现上支持两种用法：
+
+```text
+1. --sam3-tracker
+   训练进程里实时调用 SAM3 video predictor。
+
+2. --sam3-track-only -> tracked_masks.pt
+   先离线生成 SAM3 memory track cache；
+   训练时用 --sam3-track-cache 读取缓存，避免训练进程再次加载 SAM3 video predictor。
+```
+
 ### Pointmap Decoder
 
 当前支持两种 point decoder：

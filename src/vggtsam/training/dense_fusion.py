@@ -80,6 +80,7 @@ class DenseFusionTrainConfig:
     sam3_tracker_prompt_with_box: bool
     sam3_tracker_output_prob_thresh: float
     sam3_tracker_async_loading_frames: bool
+    sam3_tracker_cache: Path | None
     streamvggt_repo: Path
     streamvggt_checkpoint: Path
     geometry_device: str
@@ -237,9 +238,50 @@ def detach_to_cpu(value):
 
 
 def should_run_sam3_tracker(config: DenseFusionTrainConfig) -> bool:
+    if config.sam3_tracker_cache is not None:
+        return True
     return bool(config.sam3_tracker_enabled) or (
         config.history_update_source.strip().lower() == "sam3"
     )
+
+
+def load_sam3_track_cache(
+    path: Path,
+    *,
+    output_size: tuple[int, int],
+    num_frames: int,
+) -> tuple[torch.Tensor, Dict[str, Any]]:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if torch.is_tensor(payload):
+        masks = payload
+        aux: Dict[str, Any] = {}
+    elif isinstance(payload, dict):
+        masks = payload.get("masks")
+        if masks is None:
+            masks = payload.get("sam3_track_masks")
+        if masks is None:
+            raise KeyError(f"SAM3 track cache {path} does not contain 'masks'.")
+        aux = dict(payload.get("aux", {}))
+        for key in ("selected_obj_id", "prompt_frame_idx", "prompt_box_xywh"):
+            if key in payload:
+                aux[key] = payload[key]
+    else:
+        raise TypeError(f"Unsupported SAM3 track cache payload: {type(payload).__name__}")
+
+    masks = torch.as_tensor(masks).detach().cpu().bool()
+    if masks.ndim != 3:
+        raise ValueError(f"Expected SAM3 cached masks [T, H, W], got {tuple(masks.shape)}")
+    if masks.shape[0] != int(num_frames):
+        raise ValueError(
+            f"SAM3 cached masks have {masks.shape[0]} frames, but current sequence has {num_frames}."
+        )
+    if tuple(masks.shape[-2:]) != tuple(output_size):
+        masks = F.interpolate(
+            masks.float().unsqueeze(1),
+            size=output_size,
+            mode="nearest",
+        ).squeeze(1).bool()
+    return masks, aux
 
 
 def extract_sam3_track_masks(
@@ -249,6 +291,20 @@ def extract_sam3_track_masks(
     batch: Dict[str, torch.Tensor],
     prompt: str,
 ) -> SAM3TrackOutput:
+    if config.sam3_tracker_cache is not None:
+        masks, aux = load_sam3_track_cache(
+            config.sam3_tracker_cache,
+            output_size=config.output_size,
+            num_frames=len(sequence.image_paths),
+        )
+        return SAM3TrackOutput(
+            masks=masks,
+            selected_obj_id=aux.get("selected_obj_id"),
+            prompt_frame_idx=int(aux.get("prompt_frame_idx", 0)),
+            prompt_box_xywh=aux.get("prompt_box_xywh"),
+            aux=aux,
+        )
+
     predictor = load_sam3_video_predictor(
         repo_path=config.sam3_repo,
         checkpoint_path=config.sam3_checkpoint,
@@ -989,6 +1045,23 @@ def validate_sam3_tracker(config: DenseFusionTrainConfig) -> None:
         "prompt_box_xywh": track.prompt_box_xywh,
     }
     output_path = config.output_dir / "sam3_tracker" / "track_validation.png"
+    cache_path = config.output_dir / "sam3_tracker" / "tracked_masks.pt"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "masks": track.masks.detach().cpu(),
+            "selected_obj_id": track.selected_obj_id,
+            "prompt_frame_idx": track.prompt_frame_idx,
+            "prompt_box_xywh": track.prompt_box_xywh,
+            "prompt": prompt_selection.prompt,
+            "scene_id": sequence.scene_id,
+            "frame_indices": sequence.frame_indices,
+            "instance_id": prompt_selection.sampled_instance_id,
+            "sampled_label": prompt_selection.sampled_label,
+            "aux": aux,
+        },
+        cache_path,
+    )
     save_sam3_track_visualization(
         output_path,
         sequence=sequence,
@@ -1002,7 +1075,8 @@ def validate_sam3_tracker(config: DenseFusionTrainConfig) -> None:
         "sam3 tracker result "
         f"selected_obj_id={track.selected_obj_id} "
         f"mean_iou={iou:.4f} "
-        f"visualization={output_path}"
+        f"visualization={output_path} "
+        f"cache={cache_path}"
     )
 
 

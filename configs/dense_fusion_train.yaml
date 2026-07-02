@@ -61,6 +61,9 @@ sam3:
   tracker_prompt_with_box: true
   tracker_output_prob_thresh: 0.5
   tracker_async_loading_frames: false
+  # Optional .pt written by --sam3-track-only. If set, dense training reuses
+  # cached SAM3 memory masks and does not instantiate SAM3 video predictor.
+  tracker_cache:
 
 geometry:
   repo: externals/streamvggt

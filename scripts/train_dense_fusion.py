@@ -29,6 +29,7 @@ def main() -> None:
     parser.add_argument("--sam3-tracker", action="store_true")
     parser.add_argument("--no-sam3-tracker", action="store_true")
     parser.add_argument("--sam3-track-only", action="store_true")
+    parser.add_argument("--sam3-track-cache", type=Path, default=None)
     parser.add_argument("--no-sam3-tracker-box", action="store_true")
     parser.add_argument("--sam3-tracker-threshold", type=float, default=None)
     parser.add_argument("--geometry-device", default=None)
@@ -101,6 +102,8 @@ def main() -> None:
         raw["sam3"]["tracker_enabled"] = True
     if args.no_sam3_tracker:
         raw["sam3"]["tracker_enabled"] = False
+    if args.sam3_track_cache is not None:
+        raw["sam3"]["tracker_cache"] = str(args.sam3_track_cache)
     if args.no_sam3_tracker_box:
         raw["sam3"]["tracker_prompt_with_box"] = False
     if args.sam3_tracker_threshold is not None:
@@ -246,6 +249,7 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         sam3_tracker_async_loading_frames=bool(
             sam3.get("tracker_async_loading_frames", False)
         ),
+        sam3_tracker_cache=optional_path(sam3.get("tracker_cache")),
         streamvggt_repo=Path(geometry["repo"]),
         streamvggt_checkpoint=Path(geometry["checkpoint"]),
         geometry_device=str(geometry.get("device") or training["device"]),
@@ -306,6 +310,12 @@ def optional_int(value) -> int | None:
     if value is None or value == "":
         return None
     return int(value)
+
+
+def optional_path(value) -> Path | None:
+    if value is None or value == "":
+        return None
+    return Path(value)
 
 
 def optional_int_list(value) -> list[int] | None:
