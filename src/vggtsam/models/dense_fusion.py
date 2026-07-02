@@ -16,6 +16,7 @@ from .tokens import GeometryTokens, SemanticTokens
 class DenseFusionOutput:
     fused_tokens: torch.Tensor
     mask_logits: torch.Tensor
+    fused_sam_mask_logits: torch.Tensor | None
     pointmap: torch.Tensor
     point_conf: torch.Tensor | None
     semantic_embedding: torch.Tensor
@@ -43,12 +44,14 @@ class DenseSAMVGGTModel(nn.Module):
         dropout: float = 0.0,
         point_decoder: str = "simple",
         stream_dpt_freeze: bool = False,
+        enable_fused_sam_decoder: bool = False,
     ) -> None:
         super().__init__()
         self.feature_grid = tuple(int(v) for v in feature_grid)
         self.output_size = tuple(int(v) for v in output_size)
         self.text_dim = int(text_dim)
         self.embedding_dim = int(embedding_dim)
+        self.enable_fused_sam_decoder = bool(enable_fused_sam_decoder)
         self.point_decoder = point_decoder.strip().lower()
         if self.point_decoder not in {"simple", "stream_dpt"}:
             raise ValueError(
@@ -125,6 +128,26 @@ class DenseSAMVGGTModel(nn.Module):
         self.object_query_to_embedding = nn.Linear(d_fuse, self.embedding_dim)
         self.object_memory_update = nn.GRUCell(d_fuse, d_fuse)
         self.object_memory_norm = nn.LayerNorm(d_fuse)
+        if self.enable_fused_sam_decoder:
+            self.fused_sam_image_proj = nn.Sequential(
+                nn.Conv2d(d_fuse, d_fuse, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(d_fuse, d_fuse, kernel_size=1),
+            )
+            self.fused_sam_high_s1 = nn.Sequential(
+                nn.Conv2d(d_fuse, d_fuse, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(d_fuse, d_fuse // 4, kernel_size=1),
+            )
+            self.fused_sam_high_s0 = nn.Sequential(
+                nn.Conv2d(d_fuse, d_fuse, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(d_fuse, d_fuse // 8, kernel_size=1),
+            )
+        else:
+            self.fused_sam_image_proj = None
+            self.fused_sam_high_s1 = None
+            self.fused_sam_high_s0 = None
         self.prompt_logit_scale = nn.Parameter(torch.tensor(10.0))
         self.instance_logit_scale = nn.Parameter(torch.tensor(10.0))
 
@@ -207,6 +230,7 @@ class DenseSAMVGGTModel(nn.Module):
         return DenseFusionOutput(
             fused_tokens=fused_tokens,
             mask_logits=mask_logits,
+            fused_sam_mask_logits=None,
             pointmap=pointmap,
             point_conf=point_conf,
             semantic_embedding=semantic_embedding.permute(0, 2, 3, 1).contiguous(),
@@ -372,6 +396,92 @@ class DenseSAMVGGTModel(nn.Module):
             align_corners=False,
         )
         return self.decoder(dense)
+
+    def tokens_to_feature_grid(self, fused_tokens: torch.Tensor) -> torch.Tensor:
+        batch, tokens, channels = fused_tokens.shape
+        grid_h, grid_w = self.feature_grid
+        expected = grid_h * grid_w
+        if tokens != expected:
+            raise ValueError(
+                f"Expected {expected} fused tokens from feature_grid={self.feature_grid}, "
+                f"got {tokens}"
+            )
+        return fused_tokens.transpose(1, 2).reshape(batch, channels, grid_h, grid_w)
+
+    def decode_fused_sam_mask(
+        self,
+        *,
+        fused_tokens: torch.Tensor,
+        sam_tracker,
+        mask_prompt: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run SAM3's prompt encoder + mask decoder on adapted fused tokens."""
+        if not self.enable_fused_sam_decoder:
+            raise RuntimeError("Fused SAM decoder is disabled for this model.")
+        assert self.fused_sam_image_proj is not None
+        assert self.fused_sam_high_s1 is not None
+        assert self.fused_sam_high_s0 is not None
+
+        fused_tokens = self._ensure_batched(fused_tokens)
+        feature = self.tokens_to_feature_grid(fused_tokens)
+        image_embed = self.fused_sam_image_proj(feature)
+        high_s1 = self.fused_sam_high_s1(
+            F.interpolate(feature, size=(144, 144), mode="bilinear", align_corners=False)
+        )
+        high_s0 = self.fused_sam_high_s0(
+            F.interpolate(feature, size=(288, 288), mode="bilinear", align_corners=False)
+        )
+
+        if mask_prompt is not None:
+            if mask_prompt.ndim == 2:
+                mask_prompt = mask_prompt[None, None]
+            elif mask_prompt.ndim == 3:
+                mask_prompt = mask_prompt[:, None]
+            elif mask_prompt.ndim != 4:
+                raise ValueError(
+                    "mask_prompt must have shape [H, W], [B, H, W], or [B, 1, H, W], "
+                    f"got {tuple(mask_prompt.shape)}"
+                )
+            mask_prompt = mask_prompt.to(device=feature.device, dtype=feature.dtype)
+
+        batch = image_embed.shape[0]
+        device = image_embed.device
+        point_coords = torch.zeros(batch, 1, 2, device=device, dtype=image_embed.dtype)
+        point_labels = -torch.ones(batch, 1, device=device, dtype=torch.int32)
+        if mask_prompt is not None:
+            mask_size = sam_tracker.sam_prompt_encoder.mask_input_size
+            if tuple(mask_prompt.shape[-2:]) != tuple(mask_size):
+                mask_prompt = F.interpolate(
+                    mask_prompt.float(),
+                    size=mask_size,
+                    mode="bilinear",
+                    align_corners=False,
+                ).to(dtype=image_embed.dtype)
+        sparse_embeddings, dense_embeddings = sam_tracker.sam_prompt_encoder(
+            points=(point_coords, point_labels),
+            boxes=None,
+            masks=mask_prompt,
+        )
+        mask_logits, _, _, _ = sam_tracker.sam_mask_decoder(
+            image_embeddings=image_embed,
+            image_pe=sam_tracker.sam_prompt_encoder.get_dense_pe().to(
+                device=device,
+                dtype=image_embed.dtype,
+            ),
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=False,
+            repeat_image=False,
+            high_res_features=[high_s0, high_s1],
+        )
+        if mask_logits.shape[-2:] != self.output_size:
+            mask_logits = F.interpolate(
+                mask_logits.float(),
+                size=self.output_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        return mask_logits[:, 0].contiguous()
 
     def pool_object_query(
         self,

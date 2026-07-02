@@ -84,3 +84,24 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --device cuda \
   --visualize-every 10 \
   --output-dir outputs/dense_fusion_0630_last_inst37
+
+
+### 测试sam流程的接入
+
+  PYTHONPATH=src python scripts/train_dense_fusion.py \
+  --config configs/dense_fusion_train.yaml \
+  --scene-id 00a231a370 \
+  --instance-id 37 \
+  --frame-indices 91 133 162 163 228 163 273 \
+  --point-decoder stream_dpt \
+  --point-valid-source gt \
+  --chamfer-weight 0 \
+  --reprojection-weight 0 \
+  --history-update-source fused_sam \
+  --fused-sam-prompt-source pred \
+  --fused-sam-mask-weight 1.0 \
+  --fused-sam-dice-weight 1.0 \
+  --iterations 700 \
+  --device cuda \
+  --visualize-every 10 \
+  --output-dir outputs/dense_fusion_fused_sam_inst37

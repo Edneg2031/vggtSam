@@ -109,8 +109,15 @@ history:
   # Update object_query over time using frame-level evidence.
   enabled: true
   # gt is stable for overfit training; pred is closer to inference-time memory.
+  # fused_sam routes fused tokens through SAM3 prompt/mask decoder and uses that
+  # mask to update object memory.
   update_source: gt
   pred_threshold: 0.5
+  fused_sam_prompt_source: pred
+
+fused_sam:
+  mask_weight: 0.0
+  dice_weight: 0.0
 
 training:
   device: cuda

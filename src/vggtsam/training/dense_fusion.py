@@ -105,6 +105,9 @@ class DenseFusionTrainConfig:
     history_enabled: bool
     history_update_source: str
     history_pred_threshold: float
+    fused_sam_prompt_source: str
+    fused_sam_mask_weight: float
+    fused_sam_dice_weight: float
     device: str
     iterations: int
     lr: float
@@ -225,6 +228,14 @@ def detach_to_cpu(value):
     return value
 
 
+def uses_fused_sam_decoder(config: DenseFusionTrainConfig) -> bool:
+    return (
+        config.history_update_source.strip().lower() in {"fused_sam", "sam_decoder"}
+        or config.fused_sam_mask_weight > 0.0
+        or config.fused_sam_dice_weight > 0.0
+    )
+
+
 def slice_stream_dpt_tokens(
     tokens: Sequence[torch.Tensor] | None,
     *,
@@ -268,6 +279,7 @@ def batch_to_device(
 def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
     rng = random.Random(config.seed)
     torch.manual_seed(config.seed)
+    use_fused_sam = uses_fused_sam_decoder(config)
     object_config = ObjectSamplingConfig(
         min_pixels=config.min_pixels,
         max_area_ratio=config.max_area_ratio,
@@ -289,9 +301,21 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
         repo_path=config.sam3_repo,
         checkpoint_path=config.sam3_checkpoint,
         device=config.sam3_device,
-        enable_inst_interactivity=config.sam3_enable_inst_interactivity,
+        enable_inst_interactivity=(
+            config.sam3_enable_inst_interactivity or use_fused_sam
+        ),
     )
     sam3_model.requires_grad_(False)
+    sam_tracker_model = None
+    if use_fused_sam:
+        inst_predictor = getattr(sam3_model, "inst_interactive_predictor", None)
+        if inst_predictor is None:
+            raise RuntimeError(
+                "history.update_source='fused_sam' requires SAM3 instance "
+                "interactivity. The SAM3 model did not expose inst_interactive_predictor."
+            )
+        sam_tracker_model = inst_predictor.model.to(config.device).eval()
+        sam_tracker_model.requires_grad_(False)
     sam3 = SAM3IntermediateAdapter(
         sam3_model,
         device=config.sam3_device,
@@ -534,6 +558,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 dropout=config.dropout,
                 point_decoder=config.point_decoder,
                 stream_dpt_freeze=config.stream_dpt_freeze,
+                enable_fused_sam_decoder=use_fused_sam,
             ).to(config.device)
             if config.point_decoder == "stream_dpt" and stream_point_head_state is not None:
                 load_result = model.load_stream_point_decoder_state_dict(
@@ -606,6 +631,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
         point_losses: List[torch.Tensor] = []
         chamfer_losses: List[torch.Tensor] = []
         reprojection_losses: List[torch.Tensor] = []
+        fused_sam_mask_losses: List[torch.Tensor] = []
+        fused_sam_dice_losses: List[torch.Tensor] = []
         text_losses: List[torch.Tensor] = []
         aux_losses: List[torch.Tensor] = []
         match_losses: List[torch.Tensor] = []
@@ -634,9 +661,34 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 ),
                 stream_patch_start_idx=stream_patch_start_idx,
             )
-            outputs.append(output)
             target = frame_target(batch, frame_idx)
             zero = output.mask_logits.sum() * 0.0
+            fused_sam_mask_loss = zero
+            fused_sam_dice_loss = zero
+            if use_fused_sam:
+                if sam_tracker_model is None:
+                    raise RuntimeError("Fused SAM decoder requested but SAM tracker model is missing.")
+                fused_sam_prompt = select_fused_sam_prompt_mask(
+                    output=output,
+                    target=target,
+                    source=config.fused_sam_prompt_source,
+                )
+                output.fused_sam_mask_logits = model.decode_fused_sam_mask(
+                    fused_tokens=fused_frame_tokens[frame_idx],
+                    sam_tracker=sam_tracker_model,
+                    mask_prompt=fused_sam_prompt,
+                )
+                fused_sam_mask_loss = dense_mask_bce_loss(
+                    output.fused_sam_mask_logits[0],
+                    target["prompt_mask"],
+                    target["mask_supervision"],
+                )
+                fused_sam_dice_loss = dense_dice_loss(
+                    output.fused_sam_mask_logits[0],
+                    target["prompt_mask"],
+                    target["mask_supervision"],
+                )
+            outputs.append(output)
 
             mask_loss = dense_mask_bce_loss(
                 output.mask_logits[0],
@@ -708,6 +760,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 + config.point_weight * point_loss
                 + config.chamfer_weight * chamfer_loss
                 + config.reprojection_weight * reprojection_loss
+                + config.fused_sam_mask_weight * fused_sam_mask_loss
+                + config.fused_sam_dice_weight * fused_sam_dice_loss
                 + config.text_weight * text_loss
                 + config.aux_cls_weight * aux_loss
                 + config.match_weight * match_loss
@@ -718,6 +772,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             point_losses.append(point_loss)
             chamfer_losses.append(chamfer_loss)
             reprojection_losses.append(reprojection_loss)
+            fused_sam_mask_losses.append(fused_sam_mask_loss)
+            fused_sam_dice_losses.append(fused_sam_dice_loss)
             text_losses.append(text_loss)
             aux_losses.append(aux_loss)
             match_losses.append(match_loss)
@@ -758,6 +814,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "point_loss": mean_metric(point_losses),
             "chamfer_loss": mean_metric(chamfer_losses),
             "reprojection_loss": mean_metric(reprojection_losses),
+            "fused_sam_mask_loss": mean_metric(fused_sam_mask_losses),
+            "fused_sam_dice_loss": mean_metric(fused_sam_dice_losses),
             "text_loss": mean_metric(text_losses),
             "aux_cls_loss": mean_metric(aux_losses),
             "match_loss": mean_metric(match_losses),
@@ -767,6 +825,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "num_gt_point_pixels": gt_point_pixels,
             "num_match_pixels": int(selected_match_pixels),
             "point_valid_source": config.point_valid_source,
+            "history_update_source": config.history_update_source,
+            "fused_sam_prompt_source": config.fused_sam_prompt_source,
             "prompt": prompt_selection.prompt,
             "sampled_instance_id": int(prompt_selection.sampled_instance_id),
             "sampled_label": prompt_selection.sampled_label,
@@ -780,6 +840,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 "step={step} loss={loss:.4f} mask={mask_loss:.4f} "
                 "dice={dice_loss:.4f} point={point_loss:.4f} "
                 "chamfer={chamfer_loss:.4f} reproj={reprojection_loss:.4f} "
+                "fused_sam={fused_sam_mask_loss:.4f}/{fused_sam_dice_loss:.4f} "
                 "text={text_loss:.4f} match={match_loss:.4f} "
                 "prompt_pixels={num_prompt_pixels} "
                 "prompt='{prompt}'".format(**row)
@@ -1334,13 +1395,45 @@ def select_history_update_mask(
         return target["prompt_mask"]
     if source in {"pred", "prediction"}:
         return output.mask_logits[0].detach().sigmoid() > float(pred_threshold)
+    if source in {"fused_sam", "sam_decoder"}:
+        fused_sam_logits = getattr(output, "fused_sam_mask_logits", None)
+        if fused_sam_logits is None:
+            raise RuntimeError(
+                "history.update_source='fused_sam' requires fused_sam_mask_logits. "
+                "Enable the fused SAM decoder path."
+            )
+        return fused_sam_logits[0].detach().sigmoid() > float(pred_threshold)
     if source in {"gt_or_pred", "teacher_or_pred"}:
         gt = target["prompt_mask"]
         if gt.any():
             return gt
         return output.mask_logits[0].detach().sigmoid() > float(pred_threshold)
     raise ValueError(
-        "history.update_source must be 'gt', 'pred', or 'gt_or_pred', "
+        "history.update_source must be 'gt', 'pred', 'gt_or_pred', or 'fused_sam', "
+        f"got {source!r}"
+    )
+
+
+def select_fused_sam_prompt_mask(
+    *,
+    output: Any,
+    target: Dict[str, torch.Tensor],
+    source: str,
+) -> torch.Tensor | None:
+    source = source.strip().lower()
+    if source in {"none", "no", "disabled"}:
+        return None
+    if source in {"pred", "prediction"}:
+        return output.mask_logits.detach()
+    if source in {"gt", "target", "teacher"}:
+        return target["prompt_mask"].float()
+    if source in {"gt_or_pred", "teacher_or_pred"}:
+        gt = target["prompt_mask"]
+        if gt.any():
+            return gt.float()
+        return output.mask_logits.detach()
+    raise ValueError(
+        "history.fused_sam_prompt_source must be 'none', 'pred', 'gt', or 'gt_or_pred', "
         f"got {source!r}"
     )
 
@@ -1360,7 +1453,11 @@ def save_dense_visualization(
     panel_h = int(round(panel_w * batch["prompt_mask"].shape[1] / batch["prompt_mask"].shape[2]))
     title_h = 26
     margin = 6
-    columns = 4
+    show_fused_sam = any(
+        getattr(output, "fused_sam_mask_logits", None) is not None
+        for output in outputs
+    )
+    columns = 5 if show_fused_sam else 4
     canvas = Image.new(
         "RGB",
         (columns * panel_w + (columns + 1) * margin, title_h + frames * (panel_h + margin) + margin),
@@ -1368,21 +1465,31 @@ def save_dense_visualization(
     )
     draw = ImageDraw.Draw(canvas)
     draw.text((margin, 5), f"step={step} prompt='{prompt}' threshold={threshold:.2f}", fill=(240, 240, 240))
-    headings = ["RGB", "GT prompt", "Pred mask", "Pred score"]
+    headings = ["RGB", "GT prompt", "Pred mask"]
+    if show_fused_sam:
+        headings.append("Fused SAM")
+    headings.append("Pred score")
     for col, heading in enumerate(headings):
         draw.text((margin + col * (panel_w + margin), title_h - 14), heading, fill=(220, 220, 220))
 
     for frame_idx, output in enumerate(outputs):
         image = load_rgb(sequence.image_paths[frame_idx], batch["prompt_mask"].shape[1:])
         gt = batch["prompt_mask"][frame_idx].detach().cpu().numpy()
-        pred = output.mask_logits[0].sigmoid().detach().cpu().numpy()
-        score = output.prompt_score[0].sigmoid().detach().cpu().numpy()
+        pred = output.mask_logits[0].sigmoid().detach().float().cpu().numpy()
+        score = output.prompt_score[0].sigmoid().detach().float().cpu().numpy()
         panels = [
             image,
             overlay_mask(image, gt, (230, 57, 70), threshold=0.5),
             overlay_mask(image, pred, (69, 123, 157), threshold=threshold),
-            heatmap_overlay(image, score),
         ]
+        fused_sam_logits = getattr(output, "fused_sam_mask_logits", None)
+        if show_fused_sam:
+            if fused_sam_logits is None:
+                panels.append(image)
+            else:
+                fused_sam = fused_sam_logits[0].sigmoid().detach().float().cpu().numpy()
+                panels.append(overlay_mask(image, fused_sam, (42, 157, 143), threshold=threshold))
+        panels.append(heatmap_overlay(image, score))
         row_y = title_h + margin + frame_idx * (panel_h + margin)
         for col, panel in enumerate(panels):
             panel = panel.resize((panel_w, panel_h), Image.BILINEAR)
@@ -1416,11 +1523,11 @@ def export_dense_pointclouds(
     gt_mask = batch["prompt_mask"].detach().cpu()
     gt_points = batch["pointmap"].detach().cpu()
     pred_masks = torch.stack(
-        [output.mask_logits[0].sigmoid().detach().cpu() > threshold for output in outputs],
+        [output.mask_logits[0].sigmoid().detach().float().cpu() > threshold for output in outputs],
         dim=0,
     )
     pred_points = torch.stack(
-        [output.pointmap[0].detach().cpu() for output in outputs],
+        [output.pointmap[0].detach().float().cpu() for output in outputs],
         dim=0,
     )
     write_pointcloud_ply(
@@ -1437,6 +1544,24 @@ def export_dense_pointclouds(
         pred_masks,
         max_points=max_points,
     )
+    fused_sam_logits = [
+        getattr(output, "fused_sam_mask_logits", None) for output in outputs
+    ]
+    if all(logits is not None for logits in fused_sam_logits):
+        fused_sam_masks = torch.stack(
+            [
+                logits[0].sigmoid().detach().float().cpu() > threshold
+                for logits in fused_sam_logits
+            ],
+            dim=0,
+        )
+        write_pointcloud_ply(
+            output_dir / f"step_{step:06d}_pred_object_fused_sam.ply",
+            pred_points,
+            rgb,
+            fused_sam_masks,
+            max_points=max_points,
+        )
 
 
 def load_rgb(path: Path, output_hw: Sequence[int]) -> Image.Image:
@@ -1516,6 +1641,8 @@ def write_metrics_header(path: Path) -> None:
         "point_loss",
         "chamfer_loss",
         "reprojection_loss",
+        "fused_sam_mask_loss",
+        "fused_sam_dice_loss",
         "text_loss",
         "aux_cls_loss",
         "match_loss",
@@ -1525,6 +1652,8 @@ def write_metrics_header(path: Path) -> None:
         "num_gt_point_pixels",
         "num_match_pixels",
         "point_valid_source",
+        "history_update_source",
+        "fused_sam_prompt_source",
         "prompt",
         "sampled_instance_id",
         "sampled_label",

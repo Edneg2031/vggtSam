@@ -31,9 +31,16 @@ def main() -> None:
     parser.add_argument("--no-history", action="store_true")
     parser.add_argument(
         "--history-update-source",
-        choices=["gt", "pred", "gt_or_pred"],
+        choices=["gt", "pred", "gt_or_pred", "fused_sam"],
         default=None,
     )
+    parser.add_argument(
+        "--fused-sam-prompt-source",
+        choices=["none", "pred", "gt", "gt_or_pred"],
+        default=None,
+    )
+    parser.add_argument("--fused-sam-mask-weight", type=float, default=None)
+    parser.add_argument("--fused-sam-dice-weight", type=float, default=None)
     parser.add_argument("--sam3-frame-chunk-size", type=int, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--prompt", default=None)
@@ -98,6 +105,14 @@ def main() -> None:
         raw.setdefault("history", {})["enabled"] = False
     if args.history_update_source is not None:
         raw.setdefault("history", {})["update_source"] = args.history_update_source
+    if args.fused_sam_prompt_source is not None:
+        raw.setdefault("history", {})[
+            "fused_sam_prompt_source"
+        ] = args.fused_sam_prompt_source
+    if args.fused_sam_mask_weight is not None:
+        raw.setdefault("fused_sam", {})["mask_weight"] = args.fused_sam_mask_weight
+    if args.fused_sam_dice_weight is not None:
+        raw.setdefault("fused_sam", {})["dice_weight"] = args.fused_sam_dice_weight
     if args.sam3_frame_chunk_size is not None:
         raw["sam3"]["frame_chunk_size"] = args.sam3_frame_chunk_size
     if args.output_dir is not None:
@@ -176,6 +191,7 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
     model = raw["model"]
     loss = raw["loss"]
     history = raw.get("history", {})
+    fused_sam = raw.get("fused_sam", {})
     training = raw["training"]
     visualization = raw.get("visualization", {})
     return DenseFusionTrainConfig(
@@ -252,6 +268,9 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         history_enabled=bool(history.get("enabled", True)),
         history_update_source=str(history.get("update_source", "gt")),
         history_pred_threshold=float(history.get("pred_threshold", 0.5)),
+        fused_sam_prompt_source=str(history.get("fused_sam_prompt_source", "pred")),
+        fused_sam_mask_weight=float(fused_sam.get("mask_weight", 0.0)),
+        fused_sam_dice_weight=float(fused_sam.get("dice_weight", 0.0)),
         device=training["device"],
         iterations=int(training["iterations"]),
         lr=float(training["lr"]),
