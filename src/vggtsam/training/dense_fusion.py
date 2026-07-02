@@ -1566,8 +1566,8 @@ def save_dense_visualization(
     for frame_idx, output in enumerate(outputs):
         image = load_rgb(sequence.image_paths[frame_idx], batch["prompt_mask"].shape[1:])
         gt = batch["prompt_mask"][frame_idx].detach().cpu().numpy()
-        pred = output.mask_logits[0].sigmoid().detach().cpu().numpy()
-        score = output.prompt_score[0].sigmoid().detach().cpu().numpy()
+        pred = output.mask_logits[0].sigmoid().detach().float().cpu().numpy()
+        score = output.prompt_score[0].sigmoid().detach().float().cpu().numpy()
         panels = [
             image,
             overlay_mask(image, gt, (230, 57, 70), threshold=0.5),
@@ -1610,11 +1610,14 @@ def export_dense_pointclouds(
     gt_mask = batch["prompt_mask"].detach().cpu()
     gt_points = batch["pointmap"].detach().cpu()
     pred_masks = torch.stack(
-        [output.mask_logits[0].sigmoid().detach().cpu() > threshold for output in outputs],
+        [
+            output.mask_logits[0].sigmoid().detach().float().cpu() > threshold
+            for output in outputs
+        ],
         dim=0,
     )
     pred_points = torch.stack(
-        [output.pointmap[0].detach().cpu() for output in outputs],
+        [output.pointmap[0].detach().float().cpu() for output in outputs],
         dim=0,
     )
     write_pointcloud_ply(
@@ -1678,8 +1681,8 @@ def write_pointcloud_ply(
         indices = torch.randperm(pts.shape[0])[:max_points]
         pts = pts[indices]
         colors = colors[indices]
-    pts_np = pts.numpy()
-    colors_np = (colors.numpy() * 255.0).clip(0, 255).astype(np.uint8)
+    pts_np = pts.float().numpy()
+    colors_np = (colors.float().numpy() * 255.0).clip(0, 255).astype(np.uint8)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf8") as handle:
         handle.write("ply\nformat ascii 1.0\n")
