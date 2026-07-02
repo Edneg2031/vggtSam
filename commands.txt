@@ -115,3 +115,20 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --sam3-tracker-device cuda:0 \
   --sam3-track-only \
   --output-dir outputs/sam3_tracker_memory_inst73
+
+# 用训练缓存
+PYTHONPATH=src python scripts/train_dense_fusion.py \
+  --config configs/dense_fusion_train.yaml \
+  --scene-id 00a231a370 \
+  --instance-id 73 \
+  --frame-indices 0 52 58 65 81 139 142 \
+  --point-decoder simple \
+  --point-valid-source gt \
+  --chamfer-weight 0 \
+  --reprojection-weight 0 \
+  --iterations 700 \
+  --device cuda \
+  --visualize-every 10 \
+  --history-update-source sam3 \
+  --sam3-track-cache outputs/sam3_tracker_memory_inst73/sam3_tracker/tracked_masks.pt \
+  --output-dir outputs/dense_fusion_sam3_history_inst73
