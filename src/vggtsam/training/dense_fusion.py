@@ -19,6 +19,12 @@ from vggtsam.adapters.sam3_intermediate import (
     load_sam3_image_model,
     pool_language_features,
 )
+from vggtsam.adapters.sam3_video import (
+    SAM3TrackOutput,
+    SAM3VideoTrackerAdapter,
+    binary_iou,
+    load_sam3_video_predictor,
+)
 from vggtsam.adapters.streamvggt_latent import (
     StreamVGGTLatentAdapter,
     load_streamvggt_latent_model,
@@ -69,6 +75,11 @@ class DenseFusionTrainConfig:
     sam3_enable_inst_interactivity: bool
     sam3_device: str
     sam3_frame_chunk_size: int
+    sam3_tracker_enabled: bool
+    sam3_tracker_device: str
+    sam3_tracker_prompt_with_box: bool
+    sam3_tracker_output_prob_thresh: float
+    sam3_tracker_async_loading_frames: bool
     streamvggt_repo: Path
     streamvggt_checkpoint: Path
     geometry_device: str
@@ -223,6 +234,46 @@ def detach_to_cpu(value):
     if isinstance(value, tuple):
         return tuple(detach_to_cpu(item) for item in value)
     return value
+
+
+def should_run_sam3_tracker(config: DenseFusionTrainConfig) -> bool:
+    return bool(config.sam3_tracker_enabled) or (
+        config.history_update_source.strip().lower() == "sam3"
+    )
+
+
+def extract_sam3_track_masks(
+    *,
+    config: DenseFusionTrainConfig,
+    sequence: ObjectSequence,
+    batch: Dict[str, torch.Tensor],
+    prompt: str,
+) -> SAM3TrackOutput:
+    predictor = load_sam3_video_predictor(
+        repo_path=config.sam3_repo,
+        checkpoint_path=config.sam3_checkpoint,
+        device=config.sam3_tracker_device,
+        async_loading_frames=config.sam3_tracker_async_loading_frames,
+    )
+    tracker = SAM3VideoTrackerAdapter(
+        predictor,
+        output_prob_thresh=config.sam3_tracker_output_prob_thresh,
+        prompt_with_box=config.sam3_tracker_prompt_with_box,
+    )
+    try:
+        reference_frame_idx = int(batch["reference_frame_idx"].detach().cpu().item())
+        return tracker.track_from_paths(
+            sequence.image_paths,
+            prompt=prompt,
+            output_size=config.output_size,
+            prompt_frame_idx=reference_frame_idx,
+            reference_mask=batch["reference_mask"].detach().cpu(),
+        )
+    finally:
+        del tracker
+        del predictor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def slice_stream_dpt_tokens(
@@ -427,9 +478,13 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             stream_dpt_tokens_all = overfit_feature_cache.get("stream_dpt_tokens")
             stream_images_all = overfit_feature_cache.get("stream_images")
             stream_patch_start_idx = overfit_feature_cache.get("stream_patch_start_idx")
+            sam3_track_masks = overfit_feature_cache.get("sam3_track_masks")
+            sam3_track_aux = overfit_feature_cache.get("sam3_track_aux", {})
             text_embedding = overfit_feature_cache["text_embedding"].to(config.device)
             batch = batch_to_device(overfit_feature_cache["batch"], config.device)
         else:
+            sam3_track_masks = None
+            sam3_track_aux: Dict[str, Any] = {}
             with torch.no_grad():
                 sam_out = extract_sam3_sequence(
                     sam3,
@@ -510,6 +565,24 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                     "min_visible_frames."
                 )
             continue
+
+        if should_run_sam3_tracker(config) and sam3_track_masks is None:
+            sam3_track = extract_sam3_track_masks(
+                config=config,
+                sequence=sequence,
+                batch=batch,
+                prompt=prompt_selection.prompt,
+            )
+            sam3_track_masks = sam3_track.masks.detach().cpu()
+            sam3_track_aux = {
+                **sam3_track.aux,
+                "selected_obj_id": sam3_track.selected_obj_id,
+                "prompt_frame_idx": sam3_track.prompt_frame_idx,
+                "prompt_box_xywh": sam3_track.prompt_box_xywh,
+            }
+            if config.overfit and overfit_feature_cache is not None:
+                overfit_feature_cache["sam3_track_masks"] = sam3_track_masks
+                overfit_feature_cache["sam3_track_aux"] = sam3_track_aux
 
         if model is None:
             sam_dim = int(sam_tokens_all.shape[-1])
@@ -615,6 +688,11 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
         selected_point_pixels = 0
         gt_point_pixels = int(
             (batch["prompt_mask"] & batch["point_valid"]).sum().item()
+        )
+        sam3_track_masks_device = (
+            sam3_track_masks.to(config.device)
+            if sam3_track_masks is not None
+            else None
         )
 
         for frame_idx in range(num_frames):
@@ -736,6 +814,11 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                     target=target,
                     source=config.history_update_source,
                     pred_threshold=config.history_pred_threshold,
+                    sam3_mask=(
+                        sam3_track_masks_device[frame_idx]
+                        if sam3_track_masks_device is not None
+                        else None
+                    ),
                 )
                 object_query = model.update_object_query(
                     object_query,
@@ -773,6 +856,13 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "target_mode": config.target_mode,
             "reference_frame_idx": reference_frame_idx,
         }
+        if sam3_track_masks is not None:
+            row["sam3_track_iou"] = mean_binary_iou(
+                sam3_track_masks,
+                batch["prompt_mask"].detach().cpu(),
+            )
+            row["sam3_selected_obj_id"] = sam3_track_aux.get("selected_obj_id")
+            row["sam3_prompt_frame_idx"] = sam3_track_aux.get("prompt_frame_idx")
         append_metric(metrics_path, row)
 
         if step % config.log_every == 0 or completed_steps == 1:
@@ -796,6 +886,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 prompt=prompt_selection.prompt,
                 step=step,
                 threshold=config.visualize_threshold,
+                sam3_track_masks=sam3_track_masks,
+                sam3_track_aux=sam3_track_aux,
             )
             export_dense_pointclouds(
                 config.output_dir / "pointclouds",
@@ -837,6 +929,81 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
     )
     print(f"training history: {metrics_path}")
     print(f"training curves: {config.output_dir / 'training_curves.png'}")
+
+
+def validate_sam3_tracker(config: DenseFusionTrainConfig) -> None:
+    rng = random.Random(config.seed)
+    object_config = ObjectSamplingConfig(
+        min_pixels=config.min_pixels,
+        max_area_ratio=config.max_area_ratio,
+        min_visible_frames=config.min_visible_frames,
+        max_objects_per_frame=config.max_objects_per_frame,
+        ignore_instance_id=config.ignore_instance_id,
+        semantic_ignore_label=config.semantic_ignore_label,
+    )
+    dataset = ScanNetPPObjectSequenceDataset(
+        config.manifest,
+        scene_id=config.scene_id,
+        sequence_length=config.sequence_length,
+        frame_stride=config.frame_stride,
+        frame_indices=config.frame_indices,
+        object_config=object_config,
+    )
+    sequence, prompt_selection, resolved_window_index = select_overfit_sequence(
+        dataset,
+        config=config,
+        rng=rng,
+    )
+    batch = build_dense_batch(
+        sequence,
+        prompt_selection,
+        config=config,
+        device="cpu",
+    )
+    if batch is None:
+        raise RuntimeError(
+            "Selected SAM3 tracker validation target produced no prompt_mask. "
+            "Try a different --window-index / --instance-id."
+        )
+    reference_frame_idx = int(batch["reference_frame_idx"].item())
+    print(
+        "sam3 tracker target "
+        f"scene={sequence.scene_id} "
+        f"frames={sequence.frame_indices} "
+        f"window={resolved_window_index} "
+        f"instance={prompt_selection.sampled_instance_id} "
+        f"label='{prompt_selection.sampled_label}' "
+        f"prompt='{prompt_selection.prompt}' "
+        f"reference_frame={reference_frame_idx}"
+    )
+    track = extract_sam3_track_masks(
+        config=config,
+        sequence=sequence,
+        batch=batch,
+        prompt=prompt_selection.prompt,
+    )
+    aux = {
+        **track.aux,
+        "selected_obj_id": track.selected_obj_id,
+        "prompt_frame_idx": track.prompt_frame_idx,
+        "prompt_box_xywh": track.prompt_box_xywh,
+    }
+    output_path = config.output_dir / "sam3_tracker" / "track_validation.png"
+    save_sam3_track_visualization(
+        output_path,
+        sequence=sequence,
+        batch=batch,
+        sam3_track_masks=track.masks,
+        prompt=prompt_selection.prompt,
+        aux=aux,
+    )
+    iou = mean_binary_iou(track.masks, batch["prompt_mask"].detach().cpu())
+    print(
+        "sam3 tracker result "
+        f"selected_obj_id={track.selected_obj_id} "
+        f"mean_iou={iou:.4f} "
+        f"visualization={output_path}"
+    )
 
 
 def build_dense_batch(
@@ -1328,6 +1495,7 @@ def select_history_update_mask(
     target: Dict[str, torch.Tensor],
     source: str,
     pred_threshold: float,
+    sam3_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     source = source.strip().lower()
     if source in {"gt", "target", "teacher"}:
@@ -1339,8 +1507,15 @@ def select_history_update_mask(
         if gt.any():
             return gt
         return output.mask_logits[0].detach().sigmoid() > float(pred_threshold)
+    if source in {"sam3", "sam3_tracker", "tracker"}:
+        if sam3_mask is None:
+            raise RuntimeError(
+                "history.update_source='sam3' requires sam3.tracker_enabled=true "
+                "or the --sam3-tracker CLI flag."
+            )
+        return sam3_mask.bool()
     raise ValueError(
-        "history.update_source must be 'gt', 'pred', or 'gt_or_pred', "
+        "history.update_source must be 'gt', 'pred', 'gt_or_pred', or 'sam3', "
         f"got {source!r}"
     )
 
@@ -1354,21 +1529,36 @@ def save_dense_visualization(
     prompt: str,
     step: int,
     threshold: float,
+    sam3_track_masks: torch.Tensor | None = None,
+    sam3_track_aux: Dict[str, Any] | None = None,
 ) -> None:
     frames = len(sequence.image_paths)
     panel_w = 320
     panel_h = int(round(panel_w * batch["prompt_mask"].shape[1] / batch["prompt_mask"].shape[2]))
     title_h = 26
     margin = 6
-    columns = 4
+    columns = 5 if sam3_track_masks is not None else 4
     canvas = Image.new(
         "RGB",
         (columns * panel_w + (columns + 1) * margin, title_h + frames * (panel_h + margin) + margin),
         color=(20, 20, 20),
     )
     draw = ImageDraw.Draw(canvas)
-    draw.text((margin, 5), f"step={step} prompt='{prompt}' threshold={threshold:.2f}", fill=(240, 240, 240))
-    headings = ["RGB", "GT prompt", "Pred mask", "Pred score"]
+    track_msg = ""
+    if sam3_track_aux:
+        track_msg = (
+            f" sam3_obj={sam3_track_aux.get('selected_obj_id')} "
+            f"sam3_ref={sam3_track_aux.get('prompt_frame_idx')}"
+        )
+    draw.text(
+        (margin, 5),
+        f"step={step} prompt='{prompt}' threshold={threshold:.2f}{track_msg}",
+        fill=(240, 240, 240),
+    )
+    headings = ["RGB", "GT prompt", "Pred mask"]
+    if sam3_track_masks is not None:
+        headings.append("SAM3 track")
+    headings.append("Pred score")
     for col, heading in enumerate(headings):
         draw.text((margin + col * (panel_w + margin), title_h - 14), heading, fill=(220, 220, 220))
 
@@ -1381,7 +1571,68 @@ def save_dense_visualization(
             image,
             overlay_mask(image, gt, (230, 57, 70), threshold=0.5),
             overlay_mask(image, pred, (69, 123, 157), threshold=threshold),
-            heatmap_overlay(image, score),
+        ]
+        if sam3_track_masks is not None:
+            sam3_mask = sam3_track_masks[frame_idx].detach().cpu().numpy()
+            panels.append(overlay_mask(image, sam3_mask, (42, 157, 143), threshold=0.5))
+        panels.append(heatmap_overlay(image, score))
+        row_y = title_h + margin + frame_idx * (panel_h + margin)
+        for col, panel in enumerate(panels):
+            panel = panel.resize((panel_w, panel_h), Image.BILINEAR)
+            canvas.paste(panel, (margin + col * (panel_w + margin), row_y))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path)
+
+
+def save_sam3_track_visualization(
+    path: Path,
+    *,
+    sequence: ObjectSequence,
+    batch: Dict[str, torch.Tensor],
+    sam3_track_masks: torch.Tensor,
+    prompt: str,
+    aux: Dict[str, Any],
+) -> None:
+    frames = len(sequence.image_paths)
+    panel_w = 360
+    panel_h = int(round(panel_w * batch["prompt_mask"].shape[1] / batch["prompt_mask"].shape[2]))
+    title_h = 30
+    margin = 6
+    columns = 4
+    canvas = Image.new(
+        "RGB",
+        (
+            columns * panel_w + (columns + 1) * margin,
+            title_h + frames * (panel_h + margin) + margin,
+        ),
+        color=(20, 20, 20),
+    )
+    draw = ImageDraw.Draw(canvas)
+    draw.text(
+        (margin, 6),
+        "SAM3 tracker validation "
+        f"prompt='{prompt}' obj={aux.get('selected_obj_id')} "
+        f"ref={aux.get('prompt_frame_idx')}",
+        fill=(240, 240, 240),
+    )
+    headings = ["RGB", "GT prompt", "SAM3 track", "GT + SAM3"]
+    for col, heading in enumerate(headings):
+        draw.text(
+            (margin + col * (panel_w + margin), title_h - 14),
+            heading,
+            fill=(220, 220, 220),
+        )
+
+    for frame_idx in range(frames):
+        image = load_rgb(sequence.image_paths[frame_idx], batch["prompt_mask"].shape[1:])
+        gt = batch["prompt_mask"][frame_idx].detach().cpu().numpy()
+        sam3_mask = sam3_track_masks[frame_idx].detach().cpu().numpy()
+        panels = [
+            image,
+            overlay_mask(image, gt, (230, 57, 70), threshold=0.5),
+            overlay_mask(image, sam3_mask, (42, 157, 143), threshold=0.5),
+            overlay_two_masks(image, gt, sam3_mask),
         ]
         row_y = title_h + margin + frame_idx * (panel_h + margin)
         for col, panel in enumerate(panels):
@@ -1459,6 +1710,28 @@ def overlay_mask(
     return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
 
 
+def overlay_two_masks(
+    image: Image.Image,
+    first: np.ndarray,
+    second: np.ndarray,
+    *,
+    alpha: float = 0.55,
+) -> Image.Image:
+    arr = np.asarray(image).astype(np.float32)
+    first_bool = np.asarray(first) > 0.5
+    second_bool = np.asarray(second) > 0.5
+    colors = np.zeros_like(arr)
+    colors[first_bool] += np.asarray((230, 57, 70), dtype=np.float32)
+    colors[second_bool] += np.asarray((42, 157, 143), dtype=np.float32)
+    overlap = first_bool & second_bool
+    if overlap.any():
+        colors[overlap] = np.asarray((245, 190, 75), dtype=np.float32)
+    mask = first_bool | second_bool
+    if mask.any():
+        arr[mask] = arr[mask] * (1.0 - alpha) + colors[mask] * alpha
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+
 def heatmap_overlay(image: Image.Image, heatmap: np.ndarray) -> Image.Image:
     arr = np.asarray(image).astype(np.float32)
     heat = np.clip(np.asarray(heatmap, dtype=np.float32), 0.0, 1.0)
@@ -1506,6 +1779,19 @@ def mean_metric(values: Sequence[torch.Tensor]) -> float:
     return float(torch.stack([value.detach() for value in values]).mean().cpu())
 
 
+def mean_binary_iou(pred_masks: torch.Tensor, target_masks: torch.Tensor) -> float:
+    pred = pred_masks.detach().cpu().bool()
+    target = target_masks.detach().cpu().bool()
+    if pred.shape != target.shape:
+        raise ValueError(
+            f"Mask IoU requires matching shapes, got {tuple(pred.shape)} and {tuple(target.shape)}"
+        )
+    values = [binary_iou(pred[i], target[i]) for i in range(pred.shape[0])]
+    if not values:
+        return 0.0
+    return float(sum(values) / len(values))
+
+
 def write_metrics_header(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
@@ -1530,6 +1816,9 @@ def write_metrics_header(path: Path) -> None:
         "sampled_label",
         "target_mode",
         "reference_frame_idx",
+        "sam3_track_iou",
+        "sam3_selected_obj_id",
+        "sam3_prompt_frame_idx",
     ]
     with path.open("w", newline="", encoding="utf8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -1537,8 +1826,11 @@ def write_metrics_header(path: Path) -> None:
 
 
 def append_metric(path: Path, row: Dict[str, Any]) -> None:
+    with path.open("r", newline="", encoding="utf8") as handle:
+        reader = csv.reader(handle)
+        fieldnames = next(reader)
     with path.open("a", newline="", encoding="utf8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writerow(row)
 
 

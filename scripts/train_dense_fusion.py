@@ -11,6 +11,7 @@ import yaml
 from vggtsam.training.dense_fusion import (
     DenseFusionTrainConfig,
     train_dense_fusion,
+    validate_sam3_tracker,
 )
 
 
@@ -24,6 +25,12 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--sam3-device", default=None)
+    parser.add_argument("--sam3-tracker-device", default=None)
+    parser.add_argument("--sam3-tracker", action="store_true")
+    parser.add_argument("--no-sam3-tracker", action="store_true")
+    parser.add_argument("--sam3-track-only", action="store_true")
+    parser.add_argument("--no-sam3-tracker-box", action="store_true")
+    parser.add_argument("--sam3-tracker-threshold", type=float, default=None)
     parser.add_argument("--geometry-device", default=None)
     geometry_streaming = parser.add_mutually_exclusive_group()
     geometry_streaming.add_argument("--geometry-streaming-cache", action="store_true")
@@ -31,7 +38,7 @@ def main() -> None:
     parser.add_argument("--no-history", action="store_true")
     parser.add_argument(
         "--history-update-source",
-        choices=["gt", "pred", "gt_or_pred"],
+        choices=["gt", "pred", "gt_or_pred", "sam3"],
         default=None,
     )
     parser.add_argument("--sam3-frame-chunk-size", type=int, default=None)
@@ -88,6 +95,16 @@ def main() -> None:
         raw["training"]["device"] = args.device
     if args.sam3_device is not None:
         raw["sam3"]["device"] = args.sam3_device
+    if args.sam3_tracker_device is not None:
+        raw["sam3"]["tracker_device"] = args.sam3_tracker_device
+    if args.sam3_tracker:
+        raw["sam3"]["tracker_enabled"] = True
+    if args.no_sam3_tracker:
+        raw["sam3"]["tracker_enabled"] = False
+    if args.no_sam3_tracker_box:
+        raw["sam3"]["tracker_prompt_with_box"] = False
+    if args.sam3_tracker_threshold is not None:
+        raw["sam3"]["tracker_output_prob_thresh"] = args.sam3_tracker_threshold
     if args.geometry_device is not None:
         raw["geometry"]["device"] = args.geometry_device
     if args.geometry_streaming_cache:
@@ -160,7 +177,11 @@ def main() -> None:
         if args.prompt.strip().lower() != "object":
             raw["objects"]["target_object_labels"] = [args.prompt]
 
-    train_dense_fusion(build_train_config(raw))
+    config = build_train_config(raw)
+    if args.sam3_track_only:
+        validate_sam3_tracker(config)
+    else:
+        train_dense_fusion(config)
 
 
 def load_config(path: Path) -> dict:
@@ -212,6 +233,19 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         ),
         sam3_device=str(sam3.get("device") or training["device"]),
         sam3_frame_chunk_size=int(sam3.get("frame_chunk_size", 0)),
+        sam3_tracker_enabled=bool(sam3.get("tracker_enabled", False)),
+        sam3_tracker_device=str(
+            sam3.get("tracker_device") or sam3.get("device") or training["device"]
+        ),
+        sam3_tracker_prompt_with_box=bool(
+            sam3.get("tracker_prompt_with_box", True)
+        ),
+        sam3_tracker_output_prob_thresh=float(
+            sam3.get("tracker_output_prob_thresh", 0.5)
+        ),
+        sam3_tracker_async_loading_frames=bool(
+            sam3.get("tracker_async_loading_frames", False)
+        ),
         streamvggt_repo=Path(geometry["repo"]),
         streamvggt_checkpoint=Path(geometry["checkpoint"]),
         geometry_device=str(geometry.get("device") or training["device"]),

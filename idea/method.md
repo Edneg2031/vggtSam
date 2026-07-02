@@ -181,7 +181,20 @@ StreamVGGT KV cache
 
 则不使用逐帧 KV cache，而是走普通 clip-level aggregator 前向。这个设置可用于消融 StreamVGGT 原生历史信息。
 
-SAM3 使用 image / detector intermediate feature，不是 video tracker memory。
+SAM3 默认仍使用 image / detector intermediate feature 进入 fusion。
+
+当前新增一个独立验证分支，可以调用 SAM3 原生 video predictor：
+
+```text
+RGB sequence + text prompt + reference bbox
+  -> SAM3 video predictor
+  -> SAM3 tracker memory propagation
+  -> tracked masklet
+```
+
+这个分支默认不参与训练 loss，只用于和当前模型 `pred mask` 做可视化对比。开启
+`history.update_source=sam3` 时，`tracked masklet` 也可以作为 object query memory 的
+更新区域，用来消融“原生 SAM3 memory 是否比当前自定义 history 更稳”。
 
 ### Pointmap Decoder
 
@@ -386,8 +399,8 @@ Pred prompt object point cloud
 
 ```text
 1. prompt 的文本部分仍是类别名；reference_mask 来自训练 GT，不是 SAM3 交互 prompt。
-2. SAM3 没有使用 video tracker memory。
-3. object query memory 是当前代码自定义实现，不是 SAM3 原生 memory。
+2. SAM3 video tracker memory 已接入为验证 / history-update 分支，但还没有替换 fusion 使用的 SAM3 image feature。
+3. object query memory 主体仍是当前代码自定义实现；SAM3 tracked mask 只是可选更新信号。
 4. hard pred-mask point supervision 容易受 mask 错选区域影响。
 5. stream_dpt 当前只是 residual token conditioning，mask / occupancy 还没有进入 DPT 解码过程。
 6. 当前输出的是 visible object pointmap，还没有 canonical / amodal object memory。

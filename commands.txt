@@ -71,3 +71,34 @@
 
 # 测我们自己的可推理 object memory
 --geometry-streaming-cache --history-update-source pred
+
+
+# 验证sam3 memory
+PYTHONPATH=src python scripts/train_dense_fusion.py \
+  --config configs/dense_fusion_train.yaml \
+  --scene-id 00a231a370 \
+  --instance-id 37 \
+  --frame-indices 91 133 162 163 228 163 273\
+  --output-size 256 384 \
+  --device cuda \
+  --sam3-tracker-device cuda:0 \
+  --sam3-track-only \
+  --output-dir outputs/sam3_tracker_memory_inst73
+
+
+# 并排对比
+PYTHONPATH=src python scripts/train_dense_fusion.py \
+  --config configs/dense_fusion_train.yaml \
+  --scene-id 00a231a370 \
+  --instance-id 37 \
+  --frame-indices 91 133 162 163 228 163 273 \
+  --point-decoder simple \
+  --point-valid-source gt \
+  --chamfer-weight 0 \
+  --reprojection-weight 0 \
+  --iterations 700 \
+  --device cuda \
+  --visualize-every 10 \
+  --sam3-tracker \
+  --sam3-tracker-device cuda:0 \
+  --output-dir outputs/dense_fusion_sam3_compare_inst73

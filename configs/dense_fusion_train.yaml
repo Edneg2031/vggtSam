@@ -54,6 +54,13 @@ sam3:
   feature_source: detector_fpn2
   text_conditioning: concat
   enable_inst_interactivity: false
+  # Optional validation branch using SAM3's original video predictor memory.
+  # It is off by default so existing dense training behavior is unchanged.
+  tracker_enabled: false
+  tracker_device:
+  tracker_prompt_with_box: true
+  tracker_output_prob_thresh: 0.5
+  tracker_async_loading_frames: false
 
 geometry:
   repo: externals/streamvggt
