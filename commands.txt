@@ -71,3 +71,16 @@
 
 # 测我们自己的可推理 object memory
 --geometry-streaming-cache --history-update-source pred
+
+PYTHONPATH=src python scripts/train_dense_fusion.py \
+  --config configs/dense_fusion_train.yaml \
+  --scene-id 00a231a370 \
+  --instance-id 37 \
+  --frame-indices 91 133 162 163 228 163 273 \
+  --point-decoder stream_dpt \
+  --chamfer-weight 0 \
+  --reprojection-weight 0 \
+  --iterations 700 \
+  --device cuda \
+  --visualize-every 10 \
+  --output-dir outputs/dense_fusion_0630_last_inst37
