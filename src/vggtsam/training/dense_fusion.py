@@ -19,12 +19,6 @@ from vggtsam.adapters.sam3_intermediate import (
     load_sam3_image_model,
     pool_language_features,
 )
-from vggtsam.adapters.sam3_video import (
-    SAM3TrackOutput,
-    SAM3VideoTrackerAdapter,
-    binary_iou,
-    load_sam3_video_predictor,
-)
 from vggtsam.adapters.streamvggt_latent import (
     StreamVGGTLatentAdapter,
     load_streamvggt_latent_model,
@@ -75,11 +69,6 @@ class DenseFusionTrainConfig:
     sam3_enable_inst_interactivity: bool
     sam3_device: str
     sam3_frame_chunk_size: int
-    sam3_tracker_enabled: bool
-    sam3_tracker_device: str
-    sam3_tracker_prompt_with_box: bool
-    sam3_tracker_output_prob_thresh: float
-    sam3_tracker_async_loading_frames: bool
     streamvggt_repo: Path
     streamvggt_checkpoint: Path
     geometry_device: str
@@ -97,7 +86,6 @@ class DenseFusionTrainConfig:
     num_classes: int
     dropout: float
     point_decoder: str
-    point_conditioning: str
     stream_dpt_use_pretrained: bool
     stream_dpt_freeze: bool
     mask_weight: float
@@ -235,46 +223,6 @@ def detach_to_cpu(value):
     if isinstance(value, tuple):
         return tuple(detach_to_cpu(item) for item in value)
     return value
-
-
-def should_run_sam3_tracker(config: DenseFusionTrainConfig) -> bool:
-    return bool(config.sam3_tracker_enabled) or (
-        config.history_update_source.strip().lower() == "sam3"
-    )
-
-
-def extract_sam3_track_masks(
-    *,
-    config: DenseFusionTrainConfig,
-    sequence: ObjectSequence,
-    batch: Dict[str, torch.Tensor],
-    prompt: str,
-) -> SAM3TrackOutput:
-    predictor = load_sam3_video_predictor(
-        repo_path=config.sam3_repo,
-        checkpoint_path=config.sam3_checkpoint,
-        device=config.sam3_tracker_device,
-        async_loading_frames=config.sam3_tracker_async_loading_frames,
-    )
-    tracker = SAM3VideoTrackerAdapter(
-        predictor,
-        output_prob_thresh=config.sam3_tracker_output_prob_thresh,
-        prompt_with_box=config.sam3_tracker_prompt_with_box,
-    )
-    try:
-        reference_frame_idx = int(batch["reference_frame_idx"].detach().cpu().item())
-        return tracker.track_from_paths(
-            sequence.image_paths,
-            prompt=prompt,
-            output_size=config.output_size,
-            prompt_frame_idx=reference_frame_idx,
-            reference_mask=batch["reference_mask"].detach().cpu(),
-        )
-    finally:
-        del tracker
-        del predictor
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
 
 def slice_stream_dpt_tokens(
@@ -479,13 +427,9 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             stream_dpt_tokens_all = overfit_feature_cache.get("stream_dpt_tokens")
             stream_images_all = overfit_feature_cache.get("stream_images")
             stream_patch_start_idx = overfit_feature_cache.get("stream_patch_start_idx")
-            sam3_track_masks = overfit_feature_cache.get("sam3_track_masks")
-            sam3_track_aux = overfit_feature_cache.get("sam3_track_aux", {})
             text_embedding = overfit_feature_cache["text_embedding"].to(config.device)
             batch = batch_to_device(overfit_feature_cache["batch"], config.device)
         else:
-            sam3_track_masks = None
-            sam3_track_aux: Dict[str, Any] = {}
             with torch.no_grad():
                 sam_out = extract_sam3_sequence(
                     sam3,
@@ -567,24 +511,6 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 )
             continue
 
-        if should_run_sam3_tracker(config) and sam3_track_masks is None:
-            sam3_track = extract_sam3_track_masks(
-                config=config,
-                sequence=sequence,
-                batch=batch,
-                prompt=prompt_selection.prompt,
-            )
-            sam3_track_masks = sam3_track.masks.detach().cpu()
-            sam3_track_aux = {
-                **sam3_track.aux,
-                "selected_obj_id": sam3_track.selected_obj_id,
-                "prompt_frame_idx": sam3_track.prompt_frame_idx,
-                "prompt_box_xywh": sam3_track.prompt_box_xywh,
-            }
-            if config.overfit and overfit_feature_cache is not None:
-                overfit_feature_cache["sam3_track_masks"] = sam3_track_masks
-                overfit_feature_cache["sam3_track_aux"] = sam3_track_aux
-
         if model is None:
             sam_dim = int(sam_tokens_all.shape[-1])
             geometry_dim = int(geometry_tokens_all.shape[-1])
@@ -607,7 +533,6 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 num_classes=config.num_classes,
                 dropout=config.dropout,
                 point_decoder=config.point_decoder,
-                point_conditioning=config.point_conditioning,
                 stream_dpt_freeze=config.stream_dpt_freeze,
             ).to(config.device)
             if config.point_decoder == "stream_dpt" and stream_point_head_state is not None:
@@ -670,7 +595,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             )
 
         reference_frame_idx = int(batch["reference_frame_idx"].detach().cpu().item())
-        reference_object_query = model.pool_object_query(
+        object_query = model.pool_object_query(
             fused_frame_tokens[reference_frame_idx],
             batch["reference_mask"],
         )
@@ -691,31 +616,12 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
         gt_point_pixels = int(
             (batch["prompt_mask"] & batch["point_valid"]).sum().item()
         )
-        sam3_track_masks_device = (
-            sam3_track_masks.to(config.device)
-            if sam3_track_masks is not None
-            else None
-        )
 
         for frame_idx in range(num_frames):
-            target = frame_target(batch, frame_idx)
-            frame_object_query = select_frame_object_query(
-                model=model,
-                fused_tokens=fused_frame_tokens[frame_idx],
-                target=target,
-                source=config.history_update_source,
-                enabled=config.history_enabled,
-                reference_object_query=reference_object_query,
-                sam3_mask=(
-                    sam3_track_masks_device[frame_idx]
-                    if sam3_track_masks_device is not None
-                    else None
-                ),
-            )
             output = model.decode(
                 fused_tokens=fused_frame_tokens[frame_idx],
                 text_embedding=text_embedding,
-                object_query=frame_object_query,
+                object_query=object_query,
                 stream_tokens=slice_stream_dpt_tokens(
                     stream_dpt_tokens_all,
                     frame_idx=frame_idx,
@@ -728,38 +634,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 ),
                 stream_patch_start_idx=stream_patch_start_idx,
             )
-            if config.history_enabled and config.history_update_source.strip().lower() in {
-                "pred",
-                "prediction",
-                "gt_or_pred",
-                "teacher_or_pred",
-            }:
-                pred_query = select_predicted_frame_object_query(
-                    model=model,
-                    fused_tokens=fused_frame_tokens[frame_idx],
-                    output=output,
-                    target=target,
-                    source=config.history_update_source,
-                    pred_threshold=config.history_pred_threshold,
-                    reference_object_query=reference_object_query,
-                )
-                output = model.decode(
-                    fused_tokens=fused_frame_tokens[frame_idx],
-                    text_embedding=text_embedding,
-                    object_query=pred_query,
-                    stream_tokens=slice_stream_dpt_tokens(
-                        stream_dpt_tokens_all,
-                        frame_idx=frame_idx,
-                        device=config.device,
-                    ),
-                    stream_images=slice_stream_images(
-                        stream_images_all,
-                        frame_idx=frame_idx,
-                        device=config.device,
-                    ),
-                    stream_patch_start_idx=stream_patch_start_idx,
-                )
             outputs.append(output)
+            target = frame_target(batch, frame_idx)
             zero = output.mask_logits.sum() * 0.0
 
             mask_loss = dense_mask_bce_loss(
@@ -854,6 +730,18 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                     "valid": target["instance_valid"].detach(),
                 }
             )
+            if config.history_enabled:
+                update_mask = select_history_update_mask(
+                    output=output,
+                    target=target,
+                    source=config.history_update_source,
+                    pred_threshold=config.history_pred_threshold,
+                )
+                object_query = model.update_object_query(
+                    object_query,
+                    fused_frame_tokens[frame_idx],
+                    update_mask,
+                )
 
         loss = torch.stack(frame_losses).mean()
         optimizer.zero_grad(set_to_none=True)
@@ -885,13 +773,6 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "target_mode": config.target_mode,
             "reference_frame_idx": reference_frame_idx,
         }
-        if sam3_track_masks is not None:
-            row["sam3_track_iou"] = mean_binary_iou(
-                sam3_track_masks,
-                batch["prompt_mask"].detach().cpu(),
-            )
-            row["sam3_selected_obj_id"] = sam3_track_aux.get("selected_obj_id")
-            row["sam3_prompt_frame_idx"] = sam3_track_aux.get("prompt_frame_idx")
         append_metric(metrics_path, row)
 
         if step % config.log_every == 0 or completed_steps == 1:
@@ -915,8 +796,6 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 prompt=prompt_selection.prompt,
                 step=step,
                 threshold=config.visualize_threshold,
-                sam3_track_masks=sam3_track_masks,
-                sam3_track_aux=sam3_track_aux,
             )
             export_dense_pointclouds(
                 config.output_dir / "pointclouds",
@@ -1443,84 +1322,27 @@ def dense_instance_match_loss(
     )
 
 
-def select_frame_object_query(
+def select_history_update_mask(
     *,
-    model: DenseSAMVGGTModel,
-    fused_tokens: torch.Tensor,
-    target: Dict[str, torch.Tensor],
-    source: str,
-    enabled: bool,
-    reference_object_query: torch.Tensor,
-    sam3_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    if not enabled:
-        return reference_object_query
-
-    source = source.strip().lower()
-    if source in {"gt", "target", "teacher"}:
-        return pool_query_or_reference(
-            model,
-            fused_tokens,
-            target["prompt_mask"],
-            reference_object_query,
-        )
-    if source in {"sam3", "sam3_tracker", "tracker"}:
-        if sam3_mask is None:
-            raise RuntimeError(
-                "history.update_source='sam3' requires --sam3-tracker so SAM3 "
-                "video memory masks are available."
-            )
-        return pool_query_or_reference(
-            model,
-            fused_tokens,
-            sam3_mask,
-            reference_object_query,
-        )
-    if source in {"pred", "prediction", "gt_or_pred", "teacher_or_pred"}:
-        return reference_object_query
-    raise ValueError(
-        "history.update_source must be 'gt', 'pred', 'gt_or_pred', or 'sam3', "
-        f"got {source!r}"
-    )
-
-
-def select_predicted_frame_object_query(
-    *,
-    model: DenseSAMVGGTModel,
-    fused_tokens: torch.Tensor,
     output: Any,
     target: Dict[str, torch.Tensor],
     source: str,
     pred_threshold: float,
-    reference_object_query: torch.Tensor,
 ) -> torch.Tensor:
     source = source.strip().lower()
-    if source in {"gt_or_pred", "teacher_or_pred"} and target["prompt_mask"].any():
-        return pool_query_or_reference(
-            model,
-            fused_tokens,
-            target["prompt_mask"],
-            reference_object_query,
-        )
-    pred_mask = output.mask_logits[0].detach().sigmoid() > float(pred_threshold)
-    return pool_query_or_reference(
-        model,
-        fused_tokens,
-        pred_mask,
-        reference_object_query,
+    if source in {"gt", "target", "teacher"}:
+        return target["prompt_mask"]
+    if source in {"pred", "prediction"}:
+        return output.mask_logits[0].detach().sigmoid() > float(pred_threshold)
+    if source in {"gt_or_pred", "teacher_or_pred"}:
+        gt = target["prompt_mask"]
+        if gt.any():
+            return gt
+        return output.mask_logits[0].detach().sigmoid() > float(pred_threshold)
+    raise ValueError(
+        "history.update_source must be 'gt', 'pred', or 'gt_or_pred', "
+        f"got {source!r}"
     )
-
-
-def pool_query_or_reference(
-    model: DenseSAMVGGTModel,
-    fused_tokens: torch.Tensor,
-    mask: torch.Tensor,
-    reference_object_query: torch.Tensor,
-) -> torch.Tensor:
-    has_mask = bool(mask.any().detach().cpu().item())
-    if not has_mask:
-        return reference_object_query
-    return model.pool_object_query(fused_tokens, mask)
 
 
 def save_dense_visualization(
@@ -1532,53 +1354,35 @@ def save_dense_visualization(
     prompt: str,
     step: int,
     threshold: float,
-    sam3_track_masks: torch.Tensor | None = None,
-    sam3_track_aux: Dict[str, Any] | None = None,
 ) -> None:
     frames = len(sequence.image_paths)
     panel_w = 320
     panel_h = int(round(panel_w * batch["prompt_mask"].shape[1] / batch["prompt_mask"].shape[2]))
     title_h = 26
     margin = 6
-    columns = 5 if sam3_track_masks is not None else 4
+    columns = 4
     canvas = Image.new(
         "RGB",
         (columns * panel_w + (columns + 1) * margin, title_h + frames * (panel_h + margin) + margin),
         color=(20, 20, 20),
     )
     draw = ImageDraw.Draw(canvas)
-    track_msg = ""
-    if sam3_track_aux:
-        track_msg = (
-            f" sam3_obj={sam3_track_aux.get('selected_obj_id')} "
-            f"sam3_ref={sam3_track_aux.get('prompt_frame_idx')}"
-        )
-    draw.text(
-        (margin, 5),
-        f"step={step} prompt='{prompt}' threshold={threshold:.2f}{track_msg}",
-        fill=(240, 240, 240),
-    )
-    headings = ["RGB", "GT prompt", "Pred mask"]
-    if sam3_track_masks is not None:
-        headings.append("SAM3 track")
-    headings.append("Pred score")
+    draw.text((margin, 5), f"step={step} prompt='{prompt}' threshold={threshold:.2f}", fill=(240, 240, 240))
+    headings = ["RGB", "GT prompt", "Pred mask", "Pred score"]
     for col, heading in enumerate(headings):
         draw.text((margin + col * (panel_w + margin), title_h - 14), heading, fill=(220, 220, 220))
 
     for frame_idx, output in enumerate(outputs):
         image = load_rgb(sequence.image_paths[frame_idx], batch["prompt_mask"].shape[1:])
         gt = batch["prompt_mask"][frame_idx].detach().cpu().numpy()
-        pred = output.mask_logits[0].sigmoid().detach().float().cpu().numpy()
-        score = output.prompt_score[0].sigmoid().detach().float().cpu().numpy()
+        pred = output.mask_logits[0].sigmoid().detach().cpu().numpy()
+        score = output.prompt_score[0].sigmoid().detach().cpu().numpy()
         panels = [
             image,
             overlay_mask(image, gt, (230, 57, 70), threshold=0.5),
             overlay_mask(image, pred, (69, 123, 157), threshold=threshold),
+            heatmap_overlay(image, score),
         ]
-        if sam3_track_masks is not None:
-            sam3_mask = sam3_track_masks[frame_idx].detach().cpu().numpy()
-            panels.append(overlay_mask(image, sam3_mask, (42, 157, 143), threshold=0.5))
-        panels.append(heatmap_overlay(image, score))
         row_y = title_h + margin + frame_idx * (panel_h + margin)
         for col, panel in enumerate(panels):
             panel = panel.resize((panel_w, panel_h), Image.BILINEAR)
@@ -1612,14 +1416,11 @@ def export_dense_pointclouds(
     gt_mask = batch["prompt_mask"].detach().cpu()
     gt_points = batch["pointmap"].detach().cpu()
     pred_masks = torch.stack(
-        [
-            output.mask_logits[0].sigmoid().detach().float().cpu() > threshold
-            for output in outputs
-        ],
+        [output.mask_logits[0].sigmoid().detach().cpu() > threshold for output in outputs],
         dim=0,
     )
     pred_points = torch.stack(
-        [output.pointmap[0].detach().float().cpu() for output in outputs],
+        [output.pointmap[0].detach().cpu() for output in outputs],
         dim=0,
     )
     write_pointcloud_ply(
@@ -1634,13 +1435,6 @@ def export_dense_pointclouds(
         pred_points,
         rgb,
         pred_masks,
-        max_points=max_points,
-    )
-    write_pointcloud_ply(
-        output_dir / f"step_{step:06d}_pred_points_gt_mask.ply",
-        pred_points,
-        rgb,
-        gt_mask,
         max_points=max_points,
     )
 
@@ -1690,8 +1484,8 @@ def write_pointcloud_ply(
         indices = torch.randperm(pts.shape[0])[:max_points]
         pts = pts[indices]
         colors = colors[indices]
-    pts_np = pts.float().numpy()
-    colors_np = (colors.float().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+    pts_np = pts.numpy()
+    colors_np = (colors.numpy() * 255.0).clip(0, 255).astype(np.uint8)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf8") as handle:
         handle.write("ply\nformat ascii 1.0\n")
@@ -1710,19 +1504,6 @@ def mean_metric(values: Sequence[torch.Tensor]) -> float:
     if not values:
         return 0.0
     return float(torch.stack([value.detach() for value in values]).mean().cpu())
-
-
-def mean_binary_iou(pred_masks: torch.Tensor, target_masks: torch.Tensor) -> float:
-    pred = pred_masks.detach().cpu().bool()
-    target = target_masks.detach().cpu().bool()
-    if pred.shape != target.shape:
-        raise ValueError(
-            f"Mask IoU requires matching shapes, got {tuple(pred.shape)} and {tuple(target.shape)}"
-        )
-    values = [binary_iou(pred[i], target[i]) for i in range(pred.shape[0])]
-    if not values:
-        return 0.0
-    return float(sum(values) / len(values))
 
 
 def write_metrics_header(path: Path) -> None:
@@ -1749,9 +1530,6 @@ def write_metrics_header(path: Path) -> None:
         "sampled_label",
         "target_mode",
         "reference_frame_idx",
-        "sam3_track_iou",
-        "sam3_selected_obj_id",
-        "sam3_prompt_frame_idx",
     ]
     with path.open("w", newline="", encoding="utf8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -1759,11 +1537,8 @@ def write_metrics_header(path: Path) -> None:
 
 
 def append_metric(path: Path, row: Dict[str, Any]) -> None:
-    with path.open("r", newline="", encoding="utf8") as handle:
-        reader = csv.reader(handle)
-        fieldnames = next(reader)
     with path.open("a", newline="", encoding="utf8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
         writer.writerow(row)
 
 

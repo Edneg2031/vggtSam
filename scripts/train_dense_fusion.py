@@ -24,11 +24,6 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--sam3-device", default=None)
-    parser.add_argument("--sam3-tracker-device", default=None)
-    parser.add_argument("--sam3-tracker", action="store_true")
-    parser.add_argument("--no-sam3-tracker", action="store_true")
-    parser.add_argument("--no-sam3-tracker-box", action="store_true")
-    parser.add_argument("--sam3-tracker-threshold", type=float, default=None)
     parser.add_argument("--geometry-device", default=None)
     geometry_streaming = parser.add_mutually_exclusive_group()
     geometry_streaming.add_argument("--geometry-streaming-cache", action="store_true")
@@ -36,7 +31,7 @@ def main() -> None:
     parser.add_argument("--no-history", action="store_true")
     parser.add_argument(
         "--history-update-source",
-        choices=["gt", "pred", "gt_or_pred", "sam3"],
+        choices=["gt", "pred", "gt_or_pred"],
         default=None,
     )
     parser.add_argument("--sam3-frame-chunk-size", type=int, default=None)
@@ -50,11 +45,6 @@ def main() -> None:
     parser.add_argument(
         "--point-decoder",
         choices=["simple", "stream_dpt"],
-        default=None,
-    )
-    parser.add_argument(
-        "--point-conditioning",
-        choices=["none", "object_query"],
         default=None,
     )
     stream_dpt_pretrained = parser.add_mutually_exclusive_group()
@@ -98,16 +88,6 @@ def main() -> None:
         raw["training"]["device"] = args.device
     if args.sam3_device is not None:
         raw["sam3"]["device"] = args.sam3_device
-    if args.sam3_tracker_device is not None:
-        raw["sam3"]["tracker_device"] = args.sam3_tracker_device
-    if args.sam3_tracker:
-        raw["sam3"]["tracker_enabled"] = True
-    if args.no_sam3_tracker:
-        raw["sam3"]["tracker_enabled"] = False
-    if args.no_sam3_tracker_box:
-        raw["sam3"]["tracker_prompt_with_box"] = False
-    if args.sam3_tracker_threshold is not None:
-        raw["sam3"]["tracker_output_prob_thresh"] = args.sam3_tracker_threshold
     if args.geometry_device is not None:
         raw["geometry"]["device"] = args.geometry_device
     if args.geometry_streaming_cache:
@@ -156,8 +136,6 @@ def main() -> None:
         raw["model"]["output_size"] = list(args.output_size)
     if args.point_decoder is not None:
         raw["model"]["point_decoder"] = args.point_decoder
-    if args.point_conditioning is not None:
-        raw["model"]["point_conditioning"] = args.point_conditioning
     if args.stream_dpt_use_pretrained:
         raw["model"]["stream_dpt_use_pretrained"] = True
     if args.no_stream_dpt_use_pretrained:
@@ -234,19 +212,6 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         ),
         sam3_device=str(sam3.get("device") or training["device"]),
         sam3_frame_chunk_size=int(sam3.get("frame_chunk_size", 0)),
-        sam3_tracker_enabled=bool(sam3.get("tracker_enabled", False)),
-        sam3_tracker_device=str(
-            sam3.get("tracker_device") or sam3.get("device") or training["device"]
-        ),
-        sam3_tracker_prompt_with_box=bool(
-            sam3.get("tracker_prompt_with_box", True)
-        ),
-        sam3_tracker_output_prob_thresh=float(
-            sam3.get("tracker_output_prob_thresh", 0.5)
-        ),
-        sam3_tracker_async_loading_frames=bool(
-            sam3.get("tracker_async_loading_frames", False)
-        ),
         streamvggt_repo=Path(geometry["repo"]),
         streamvggt_checkpoint=Path(geometry["checkpoint"]),
         geometry_device=str(geometry.get("device") or training["device"]),
@@ -266,7 +231,6 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         num_classes=int(model["num_classes"]),
         dropout=float(model.get("dropout", 0.0)),
         point_decoder=str(model.get("point_decoder", "simple")),
-        point_conditioning=str(model.get("point_conditioning", "object_query")),
         stream_dpt_use_pretrained=bool(
             model.get("stream_dpt_use_pretrained", True)
         ),
@@ -286,7 +250,7 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         max_chamfer_points=int(loss.get("max_chamfer_points", 1024)),
         negative_ratio=int(loss.get("negative_ratio", 8)),
         history_enabled=bool(history.get("enabled", True)),
-        history_update_source=str(history.get("update_source", "sam3")),
+        history_update_source=str(history.get("update_source", "gt")),
         history_pred_threshold=float(history.get("pred_threshold", 0.5)),
         device=training["device"],
         iterations=int(training["iterations"]),

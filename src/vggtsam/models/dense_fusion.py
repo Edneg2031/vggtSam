@@ -42,7 +42,6 @@ class DenseSAMVGGTModel(nn.Module):
         num_classes: int | None = None,
         dropout: float = 0.0,
         point_decoder: str = "simple",
-        point_conditioning: str = "object_query",
         stream_dpt_freeze: bool = False,
     ) -> None:
         super().__init__()
@@ -55,12 +54,6 @@ class DenseSAMVGGTModel(nn.Module):
             raise ValueError(
                 "point_decoder must be 'simple' or 'stream_dpt', "
                 f"got {point_decoder!r}"
-            )
-        self.point_conditioning = point_conditioning.strip().lower()
-        if self.point_conditioning not in {"none", "object_query"}:
-            raise ValueError(
-                "point_conditioning must be 'none' or 'object_query', "
-                f"got {point_conditioning!r}"
             )
 
         self.proj_sam = nn.Linear(sam_dim, d_fuse)
@@ -130,6 +123,8 @@ class DenseSAMVGGTModel(nn.Module):
         )
         self.object_query_proj = nn.Linear(d_fuse, d_fuse)
         self.object_query_to_embedding = nn.Linear(d_fuse, self.embedding_dim)
+        self.object_memory_update = nn.GRUCell(d_fuse, d_fuse)
+        self.object_memory_norm = nn.LayerNorm(d_fuse)
         self.prompt_logit_scale = nn.Parameter(torch.tensor(10.0))
         self.instance_logit_scale = nn.Parameter(torch.tensor(10.0))
 
@@ -169,29 +164,23 @@ class DenseSAMVGGTModel(nn.Module):
         stream_images: torch.Tensor | None = None,
         stream_patch_start_idx: int | None = None,
     ) -> DenseFusionOutput:
-        base_dense = self.tokens_to_dense(fused_tokens)
+        dense = self.tokens_to_dense(fused_tokens)
         object_query = self._prepare_object_query(
             object_query,
-            batch_size=base_dense.shape[0],
-            device=base_dense.device,
+            batch_size=dense.shape[0],
+            device=dense.device,
         )
-        dense = base_dense
         if object_query is not None:
             dense = dense + self.object_query_proj(object_query)[:, :, None, None]
         mask_logits = self.mask_head(dense).squeeze(1)
         if self.point_decoder == "simple":
             assert self.point_head is not None
-            point_dense = dense if self.point_conditioning == "object_query" else base_dense
-            pointmap = self.point_head(point_dense).permute(0, 2, 3, 1).contiguous()
+            pointmap = self.point_head(dense).permute(0, 2, 3, 1).contiguous()
             point_conf = None
         else:
             pointmap, point_conf = self.decode_stream_pointmap(
                 fused_tokens=fused_tokens,
-                object_query=(
-                    object_query
-                    if self.point_conditioning == "object_query"
-                    else None
-                ),
+                object_query=object_query,
                 stream_tokens=stream_tokens,
                 stream_images=stream_images,
                 stream_patch_start_idx=stream_patch_start_idx,
@@ -411,6 +400,27 @@ class DenseSAMVGGTModel(nn.Module):
         weights = mask_grid.flatten(2).transpose(1, 2)
         denom = weights.sum(dim=1).clamp_min(1.0)
         return (fused_tokens * weights).sum(dim=1) / denom
+
+    def update_object_query(
+        self,
+        object_query: torch.Tensor,
+        fused_tokens: torch.Tensor,
+        update_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        object_query = self._prepare_object_query(
+            object_query,
+            batch_size=self._ensure_batched(fused_tokens).shape[0],
+            device=fused_tokens.device,
+        )
+        if update_mask.ndim == 2:
+            has_update = bool(update_mask.any().detach().cpu().item())
+        else:
+            has_update = bool(update_mask.flatten(1).any(dim=1).all().detach().cpu().item())
+        if not has_update:
+            return object_query
+        candidate = self.pool_object_query(fused_tokens, update_mask)
+        updated = self.object_memory_update(candidate, object_query)
+        return self.object_memory_norm(updated + object_query)
 
     def compute_prompt_score(
         self,

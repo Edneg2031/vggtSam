@@ -54,13 +54,6 @@ sam3:
   feature_source: detector_fpn2
   text_conditioning: concat
   enable_inst_interactivity: false
-  # Optional validation branch using SAM3's original video predictor memory.
-  # It is off by default so existing dense training behavior is unchanged.
-  tracker_enabled: false
-  tracker_device:
-  tracker_prompt_with_box: true
-  tracker_output_prob_thresh: 0.5
-  tracker_async_loading_frames: false
 
 geometry:
   repo: externals/streamvggt
@@ -91,9 +84,6 @@ model:
   # simple: old shallow Conv point head.
   # stream_dpt: StreamVGGT DPT point decoder, conditioned by fused/object tokens.
   point_decoder: stream_dpt
-  # object_query matches the stronger 2026-06-30 baseline: the point decoder is
-  # conditioned on the selected/tracked object. Use none only as an ablation.
-  point_conditioning: object_query
   stream_dpt_use_pretrained: true
   stream_dpt_freeze: false
 
@@ -116,12 +106,10 @@ loss:
   negative_ratio: 8
 
 history:
-  # Provide a per-frame object query to the decoder. This is not a GRU memory;
-  # it pools the current frame's fused tokens using the selected mask source.
+  # Update object_query over time using frame-level evidence.
   enabled: true
-  # sam3 uses SAM3 video memory masks. gt is a teacher-forced ablation.
-  # pred is a self-conditioned ablation that re-decodes the current frame.
-  update_source: sam3
+  # gt is stable for overfit training; pred is closer to inference-time memory.
+  update_source: gt
   pred_threshold: 0.5
 
 training:

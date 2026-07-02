@@ -181,29 +181,7 @@ StreamVGGT KV cache
 
 则不使用逐帧 KV cache，而是走普通 clip-level aggregator 前向。这个设置可用于消融 StreamVGGT 原生历史信息。
 
-SAM3 默认仍使用 image / detector intermediate feature 进入 fusion。
-
-当前新增一个独立验证分支，可以调用 SAM3 原生 video predictor：
-
-```text
-RGB sequence + text prompt + reference bbox
-  -> SAM3 video predictor
-  -> SAM3 tracker memory propagation
-  -> tracked masklet
-```
-
-这个分支不作为最终输出，也不进入 mask loss。当前只在 dense 训练里作为
-当前帧 object query 的生成信号：
-
-```text
-SAM3 tracked masklet
-  -> masked pooling over fused tokens
-  -> current-frame object_query
-  -> lightweight decoder predicts final mask / pointmap
-```
-
-因此当前验证的问题是：**SAM3 原生 video memory 是否能让我们的 lightweight
-decoder 输出更稳定的 prompt object mask**，而不是“纯 SAM3 是否能分割成功”。
+SAM3 使用 image / detector intermediate feature，不是 video tracker memory。
 
 ### Pointmap Decoder
 
@@ -229,31 +207,7 @@ StreamVGGT aggregator layers [4, 11, 17, 23]
   -> pred_pointmap + pred_point_conf
 ```
 
-`stream_dpt` 会加载原 StreamVGGT `point_head` 权重。
-
-当前默认配置是：
-
-```yaml
-model.point_conditioning: none
-```
-
-也就是说，pointmap 几何默认不吃 `object_query`，避免 SAM3 memory / mask
-分支把几何头带偏。这个设置下：
-
-```text
-fused tokens
-  -> point decoder
-  -> pred_pointmap
-```
-
-如果显式设置：
-
-```yaml
-model.point_conditioning: object_query
-```
-
-则会把 `fused_tokens + object_query` 投影到 StreamVGGT token 维度后，作为 residual
-condition 加到 DPT patch tokens 上：
+`stream_dpt` 会加载原 StreamVGGT `point_head` 权重。融合方式不是替换 StreamVGGT token，而是把 `fused_tokens + object_query` 投影到 StreamVGGT token 维度后，作为 residual condition 加到 DPT patch tokens 上：
 
 ```text
 condition = Linear(interp(fused_tokens + object_query))
@@ -262,40 +216,33 @@ stream_patch_tokens = stream_patch_tokens + scale * condition
 
 其中 `scale` 是可学习参数，初始化为 `0.1`。
 
-### Object Query Conditioning
+### Object Query Memory
 
-当前已经移除了早期自定义 GRU object-query memory。`object_query` 仍然保留，
-但它只是 decoder 的当前帧条件向量，不再跨帧递归更新。
+当前还有一个轻量 object query memory，它不是 SAM3 原生 tracker memory。
 
-每帧的 query 由当前帧 fused tokens 和一个 mask source 直接得到：
+初始化：
 
 ```text
-mask source + current fused tokens
+reference_mask + fused tokens
   -> masked pooling
-  -> current object_query
-  -> lightweight decoder
+  -> object_query
 ```
 
-mask source 由配置控制：
-
-```yaml
-history.update_source: sam3 | gt | pred | gt_or_pred
-```
-
-当前默认是：
-
-```yaml
-history.update_source: sam3
-```
-
-含义如下：
+逐帧更新：
 
 ```text
-sam3: 使用 SAM3 video memory tracked mask，在当前 fused tokens 上 pooling。
-gt: 使用 GT instance mask，作为 teacher-forced 对照组。
-pred: 先用 reference query 粗解一次，再用当前预测 mask pooling 后重解码。
-gt_or_pred: 当前帧 GT 存在则用 GT，否则退回 pred。
+update_mask + fused tokens
+  -> candidate object query
+  -> GRUCell(object_query, candidate)
 ```
+
+更新 mask 来源由配置控制：
+
+```yaml
+history.update_source: gt | pred | gt_or_pred
+```
+
+`gt` 是训练阶段 oracle / teacher forcing，`pred` 更接近推理时设置。
 
 ## 6. Loss 设计
 
@@ -439,8 +386,8 @@ Pred prompt object point cloud
 
 ```text
 1. prompt 的文本部分仍是类别名；reference_mask 来自训练 GT，不是 SAM3 交互 prompt。
-2. SAM3 video tracker memory 已接入为 object-query 条件分支，但还没有替换 fusion 使用的 SAM3 image feature。
-3. 早期自定义 GRU object-query memory 已移除；当前 object query 由 SAM3 / GT / pred mask 直接在当前帧 fused tokens 上 pooling 得到。
+2. SAM3 没有使用 video tracker memory。
+3. object query memory 是当前代码自定义实现，不是 SAM3 原生 memory。
 4. hard pred-mask point supervision 容易受 mask 错选区域影响。
 5. stream_dpt 当前只是 residual token conditioning，mask / occupancy 还没有进入 DPT 解码过程。
 6. 当前输出的是 visible object pointmap，还没有 canonical / amodal object memory。
