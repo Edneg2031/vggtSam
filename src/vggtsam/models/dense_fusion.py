@@ -183,6 +183,7 @@ class DenseFusionOutput:
     prompt_score: torch.Tensor
     instance_embedding: torch.Tensor
     aux_logits: torch.Tensor | None = None
+    dense_mask_logits: torch.Tensor | None = None
 
 
 class DenseSAMVGGTModel(nn.Module):

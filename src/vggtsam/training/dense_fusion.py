@@ -1105,6 +1105,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
         fused_sam_mask_losses: List[torch.Tensor] = []
         fused_sam_dice_losses: List[torch.Tensor] = []
         pred_ious: List[float] = []
+        dense_ious: List[float] = []
         fused_sam_ious: List[float] = []
         sam3_direct_ious: List[float] = []
         sam3_fused_ious: List[float] = []
@@ -1146,6 +1147,14 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 ),
                 stream_patch_start_idx=stream_patch_start_idx,
                 point_mask_condition=point_mask_condition,
+            )
+            output.dense_mask_logits = output.mask_logits
+            dense_ious.append(
+                binary_iou_tensor(
+                    output.dense_mask_logits[0].detach().sigmoid()
+                    > config.visualize_threshold,
+                    target["prompt_mask"],
+                )
             )
             if sam3_direct_masks_device is not None:
                 output.sam3_direct_mask = sam3_direct_masks_device[frame_idx]
@@ -1347,6 +1356,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "fused_sam_mask_loss": mean_metric(fused_sam_mask_losses),
             "fused_sam_dice_loss": mean_metric(fused_sam_dice_losses),
             "pred_iou": mean_float(pred_ious),
+            "dense_iou": mean_float(dense_ious),
             "fused_sam_iou": mean_float(fused_sam_ious),
             "sam3_direct_iou": mean_float(sam3_direct_ious),
             "sam3_full_flow_iou": mean_float(sam3_fused_ious),
@@ -1393,7 +1403,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 "stream_point={streamvggt_point_loss:.4f} "
                 "chamfer={chamfer_loss:.4f} reproj={reprojection_loss:.4f} "
                 "legacy_fused={fused_sam_mask_loss:.4f}/{fused_sam_dice_loss:.4f} "
-                "pred_iou={pred_iou:.4f} legacy_iou={fused_sam_iou:.4f} "
+                "pred_iou={pred_iou:.4f} dense_iou={dense_iou:.4f} "
+                "legacy_iou={fused_sam_iou:.4f} "
                 "sam3_full_iou={sam3_full_flow_iou:.4f} "
                 "sam3_direct_iou={sam3_direct_iou:.4f} "
                 "text={text_loss:.4f} match={match_loss:.4f} "
@@ -2124,7 +2135,12 @@ def save_dense_visualization(
     primary = primary_mask_source.strip().lower()
     full_flow_sources = {"sam3_full", "sam3_fused", "sam3_full_flow"}
     legacy_fused_sources = {"fused_sam", "sam_decoder"}
+    dense_sources = {"dense", "mask_head", "baseline"}
     hidden_legacy_fused_sources = legacy_fused_sources | full_flow_sources
+    show_primary_pred = primary not in full_flow_sources
+    show_dense_head = primary not in dense_sources and any(
+        getattr(output, "dense_mask_logits", None) is not None for output in outputs
+    )
     show_legacy_fused_sam = primary not in hidden_legacy_fused_sources and any(
         getattr(output, "fused_sam_mask_logits", None) is not None
         for output in outputs
@@ -2137,9 +2153,11 @@ def save_dense_visualization(
         getattr(output, "sam3_fused_mask", None) is not None
         for output in outputs
     )
-    show_score = primary in {"dense", "mask_head", "baseline"}
+    show_score = primary in dense_sources
     columns = (
-        3
+        2
+        + int(show_primary_pred)
+        + int(show_dense_head)
         + int(show_sam3_fused)
         + int(show_sam3_direct)
         + int(show_legacy_fused_sam)
@@ -2167,7 +2185,11 @@ def save_dense_visualization(
         pred_heading = "Pred (SAM3 original)"
     else:
         pred_heading = "Pred mask"
-    headings = ["RGB", "GT prompt", pred_heading]
+    headings = ["RGB", "GT prompt"]
+    if show_primary_pred:
+        headings.append(pred_heading)
+    if show_dense_head:
+        headings.append("Dense head")
     if show_sam3_fused:
         headings.append("SAM3 full fused")
     if show_sam3_direct:
@@ -2182,12 +2204,20 @@ def save_dense_visualization(
     for frame_idx, output in enumerate(outputs):
         image = load_rgb(sequence.image_paths[frame_idx], batch["prompt_mask"].shape[1:])
         gt = batch["prompt_mask"][frame_idx].detach().cpu().numpy()
-        pred = output.mask_logits[0].sigmoid().detach().float().cpu().numpy()
         panels = [
             image,
             overlay_mask(image, gt, (230, 57, 70), threshold=0.5),
-            overlay_mask(image, pred, (69, 123, 157), threshold=threshold),
         ]
+        if show_primary_pred:
+            pred = output.mask_logits[0].sigmoid().detach().float().cpu().numpy()
+            panels.append(overlay_mask(image, pred, (69, 123, 157), threshold=threshold))
+        dense_mask_logits = getattr(output, "dense_mask_logits", None)
+        if show_dense_head:
+            if dense_mask_logits is None:
+                panels.append(image)
+            else:
+                dense = dense_mask_logits[0].sigmoid().detach().float().cpu().numpy()
+                panels.append(overlay_mask(image, dense, (69, 123, 157), threshold=threshold))
         sam3_fused_mask = getattr(output, "sam3_fused_mask", None)
         if show_sam3_fused:
             if sam3_fused_mask is None:
@@ -2492,6 +2522,7 @@ def write_metrics_header(path: Path) -> None:
         "fused_sam_mask_loss",
         "fused_sam_dice_loss",
         "pred_iou",
+        "dense_iou",
         "fused_sam_iou",
         "sam3_direct_iou",
         "sam3_full_flow_iou",
