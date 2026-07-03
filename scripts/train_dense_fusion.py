@@ -10,6 +10,7 @@ import yaml
 
 from vggtsam.training.dense_fusion import (
     DenseFusionTrainConfig,
+    export_streamvggt_baseline,
     train_dense_fusion,
 )
 
@@ -105,6 +106,11 @@ def main() -> None:
     parser.add_argument("--no-overfit", action="store_true")
     parser.add_argument("--window-index", type=int, default=None)
     parser.add_argument("--instance-id", type=int, default=None)
+    parser.add_argument(
+        "--export-streamvggt-baseline",
+        action="store_true",
+        help="Run StreamVGGT once and export its pointmap with the selected GT mask.",
+    )
     args = parser.parse_args()
 
     raw = load_config(args.config)
@@ -208,7 +214,11 @@ def main() -> None:
         if args.prompt.strip().lower() != "object":
             raw["objects"]["target_object_labels"] = [args.prompt]
 
-    train_dense_fusion(build_train_config(raw))
+    config = build_train_config(raw)
+    if args.export_streamvggt_baseline:
+        export_streamvggt_baseline(config)
+    else:
+        train_dense_fusion(config)
 
 
 def load_config(path: Path) -> dict:

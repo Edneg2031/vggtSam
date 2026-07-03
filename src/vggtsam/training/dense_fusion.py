@@ -298,6 +298,137 @@ def batch_to_device(
     return {key: value.to(device) for key, value in batch.items()}
 
 
+@torch.no_grad()
+def export_streamvggt_baseline(config: DenseFusionTrainConfig) -> None:
+    """Run frozen StreamVGGT once and export its pointmap under the selected GT mask."""
+    rng = random.Random(config.seed)
+    torch.manual_seed(config.seed)
+    object_config = ObjectSamplingConfig(
+        min_pixels=config.min_pixels,
+        max_area_ratio=config.max_area_ratio,
+        min_visible_frames=config.min_visible_frames,
+        max_objects_per_frame=config.max_objects_per_frame,
+        ignore_instance_id=config.ignore_instance_id,
+        semantic_ignore_label=config.semantic_ignore_label,
+    )
+    dataset = ScanNetPPObjectSequenceDataset(
+        config.manifest,
+        scene_id=config.scene_id,
+        sequence_length=config.sequence_length,
+        frame_stride=config.frame_stride,
+        frame_indices=config.frame_indices,
+        object_config=object_config,
+    )
+
+    if config.overfit:
+        sequence, prompt_selection, resolved_window_index = select_overfit_sequence(
+            dataset,
+            config=config,
+            rng=rng,
+        )
+        if config.overfit_window_index != resolved_window_index:
+            print(
+                "streamvggt baseline window adjusted "
+                f"requested={config.overfit_window_index} "
+                f"resolved={resolved_window_index}"
+            )
+    else:
+        sequence = dataset.sample(rng)
+        prompt_selection = select_training_prompt(sequence, config=config, rng=rng)
+        if prompt_selection is None:
+            raise RuntimeError("Could not select a prompt for StreamVGGT baseline export.")
+
+    if sequence.pointmaps is None:
+        raise RuntimeError(
+            "StreamVGGT baseline export requires processed GT pointmaps. "
+            "Re-run scripts/prepare_scannetpp_2d.py with --save-pointmaps."
+        )
+
+    batch = build_dense_batch(
+        sequence,
+        prompt_selection,
+        config=config,
+        device="cpu",
+    )
+    if batch is None:
+        raise RuntimeError(
+            "Selected StreamVGGT baseline target produced no prompt_mask. "
+            "Try a different --window-index / --instance-id."
+        )
+
+    print(
+        "streamvggt baseline target "
+        f"scene={sequence.scene_id} "
+        f"frames={sequence.frame_indices} "
+        f"instance={prompt_selection.sampled_instance_id} "
+        f"label='{prompt_selection.sampled_label}' "
+        f"target_mode={config.target_mode}"
+    )
+
+    streamvggt_model = load_streamvggt_latent_model(
+        repo_path=config.streamvggt_repo,
+        checkpoint_path=config.streamvggt_checkpoint,
+        device=config.geometry_device,
+        strict=True,
+    )
+    streamvggt_model.requires_grad_(False)
+    geometry = StreamVGGTLatentAdapter(
+        streamvggt_model,
+        device=config.geometry_device,
+        token_grid=config.feature_grid,
+        context_grid=config.context_grid,
+        layer_index=config.streamvggt_layer_index,
+        dpt_layer_indices=config.streamvggt_dpt_layer_indices,
+        image_mode=config.streamvggt_image_mode,
+    )
+    geo_out = geometry.extract_from_paths(
+        sequence.image_paths,
+        return_pointmap=True,
+        streaming_cache=config.geometry_streaming_cache,
+    )
+    stream_points = detach_to_cpu(geo_out.geometry.aux.get("pointmap_dense"))
+    if stream_points is None:
+        stream_points = detach_to_cpu(geo_out.pointmap_grid)
+    if stream_points is None:
+        raise RuntimeError("StreamVGGT did not return a pointmap for baseline export.")
+    stream_points = resize_dense_bhwc_tensor(stream_points, config.output_size)
+
+    output_dir = config.output_dir / "streamvggt_baseline"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rgb = load_sequence_rgb(sequence.image_paths, batch["prompt_mask"].shape[1:])
+    gt_mask = batch["prompt_mask"].detach().cpu()
+    gt_points = batch["pointmap"].detach().cpu()
+    gt_valid = batch["point_valid"].detach().cpu() & gt_mask
+    stream_loss = dense_point_loss(stream_points, gt_points, gt_valid)
+
+    write_pointcloud_ply(
+        output_dir / "gt_object.ply",
+        gt_points,
+        rgb,
+        gt_mask,
+        max_points=config.max_visual_points,
+    )
+    write_pointcloud_ply(
+        output_dir / "streamvggt_object_gtmask.ply",
+        stream_points,
+        rgb,
+        gt_mask,
+        max_points=config.max_visual_points,
+    )
+    write_streamvggt_baseline_visualization(
+        output_dir / "streamvggt_baseline.png",
+        sequence=sequence,
+        batch=batch,
+        prompt=prompt_selection.prompt,
+    )
+    print(
+        "streamvggt baseline exported "
+        f"dir={output_dir} "
+        f"stream_point_loss={float(stream_loss.detach().cpu()):.6f} "
+        f"gt_mask_pixels={int(gt_mask.sum().item())}"
+    )
+
+
 def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
     rng = random.Random(config.seed)
     torch.manual_seed(config.seed)
@@ -498,6 +629,9 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             stream_dpt_tokens_all = overfit_feature_cache.get("stream_dpt_tokens")
             stream_images_all = overfit_feature_cache.get("stream_images")
             stream_patch_start_idx = overfit_feature_cache.get("stream_patch_start_idx")
+            stream_baseline_pointmaps = overfit_feature_cache.get(
+                "stream_baseline_pointmaps"
+            )
             sam3_direct_masks = overfit_feature_cache.get("sam3_direct_masks")
             sam3_direct_aux = overfit_feature_cache.get("sam3_direct_aux", {})
             text_embedding = overfit_feature_cache["text_embedding"].to(config.device)
@@ -514,7 +648,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 )
                 geo_out = geometry.extract_from_paths(
                     sequence.image_paths,
-                    return_pointmap=False,
+                    return_pointmap=config.point_decoder == "stream_dpt",
                     streaming_cache=config.geometry_streaming_cache,
                 )
                 text_embedding = pool_language_features(sam_out.text_out)
@@ -536,6 +670,11 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                         geo_out.geometry.aux.get("stream_images")
                     )
                     stream_patch_start_idx = geo_out.geometry.aux.get("patch_start_idx")
+                    stream_baseline_pointmaps = detach_to_cpu(
+                        geo_out.geometry.aux.get("pointmap_dense")
+                    )
+                    if stream_baseline_pointmaps is None:
+                        stream_baseline_pointmaps = detach_to_cpu(geo_out.pointmap_grid)
                     if (
                         stream_dpt_tokens_all is None
                         or stream_images_all is None
@@ -547,10 +686,20 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                             "model.point_decoder='stream_dpt'."
                         )
                     stream_patch_start_idx = int(stream_patch_start_idx)
+                    if stream_baseline_pointmaps is None:
+                        raise RuntimeError(
+                            "StreamVGGT adapter did not return pointmap_grid for "
+                            "the direct StreamVGGT pointmap comparison."
+                        )
+                    stream_baseline_pointmaps = resize_dense_bhwc_tensor(
+                        stream_baseline_pointmaps,
+                        config.output_size,
+                    )
                 else:
                     stream_dpt_tokens_all = None
                     stream_images_all = None
                     stream_patch_start_idx = None
+                    stream_baseline_pointmaps = None
 
             batch = build_dense_batch(
                 sequence,
@@ -584,6 +733,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                     "stream_dpt_tokens": stream_dpt_tokens_all,
                     "stream_images": stream_images_all,
                     "stream_patch_start_idx": stream_patch_start_idx,
+                    "stream_baseline_pointmaps": stream_baseline_pointmaps,
                     "sam3_direct_masks": sam3_direct_masks,
                     "sam3_direct_aux": sam3_direct_aux,
                     "text_embedding": text_embedding.detach().cpu(),
@@ -685,6 +835,11 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             if sam3_direct_masks is not None
             else None
         )
+        stream_baseline_pointmaps_device = (
+            stream_baseline_pointmaps.to(config.device).float()
+            if stream_baseline_pointmaps is not None
+            else None
+        )
 
         fused_frame_tokens: List[torch.Tensor] = []
         for frame_idx in range(num_frames):
@@ -710,6 +865,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
         mask_losses: List[torch.Tensor] = []
         dice_losses: List[torch.Tensor] = []
         point_losses: List[torch.Tensor] = []
+        stream_baseline_point_losses: List[torch.Tensor] = []
         chamfer_losses: List[torch.Tensor] = []
         reprojection_losses: List[torch.Tensor] = []
         fused_sam_mask_losses: List[torch.Tensor] = []
@@ -754,6 +910,10 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 sam3_direct_ious.append(
                     binary_iou_tensor(output.sam3_direct_mask, target["prompt_mask"])
                 )
+            if stream_baseline_pointmaps_device is not None:
+                output.streamvggt_pointmap = stream_baseline_pointmaps_device[
+                    frame_idx : frame_idx + 1
+                ]
             zero = output.mask_logits.sum() * 0.0
             fused_sam_mask_loss = zero
             fused_sam_dice_loss = zero
@@ -804,6 +964,13 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 target["pointmap"],
                 point_valid,
             )
+            stream_baseline_point_loss = zero
+            if output.streamvggt_pointmap is not None:
+                stream_baseline_point_loss = dense_point_loss(
+                    output.streamvggt_pointmap[0],
+                    target["pointmap"],
+                    target["point_valid"] & target["prompt_mask"],
+                )
             chamfer_loss = dense_chamfer_loss(
                 output.pointmap[0],
                 target["pointmap"],
@@ -863,6 +1030,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             mask_losses.append(mask_loss)
             dice_losses.append(dice_loss)
             point_losses.append(point_loss)
+            stream_baseline_point_losses.append(stream_baseline_point_loss)
             chamfer_losses.append(chamfer_loss)
             reprojection_losses.append(reprojection_loss)
             fused_sam_mask_losses.append(fused_sam_mask_loss)
@@ -905,6 +1073,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "mask_loss": mean_metric(mask_losses),
             "dice_loss": mean_metric(dice_losses),
             "point_loss": mean_metric(point_losses),
+            "streamvggt_point_loss": mean_metric(stream_baseline_point_losses),
             "chamfer_loss": mean_metric(chamfer_losses),
             "reprojection_loss": mean_metric(reprojection_losses),
             "fused_sam_mask_loss": mean_metric(fused_sam_mask_losses),
@@ -940,6 +1109,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             print(
                 "step={step} loss={loss:.4f} mask={mask_loss:.4f} "
                 "dice={dice_loss:.4f} point={point_loss:.4f} "
+                "stream_point={streamvggt_point_loss:.4f} "
                 "chamfer={chamfer_loss:.4f} reproj={reprojection_loss:.4f} "
                 "fused_sam={fused_sam_mask_loss:.4f}/{fused_sam_dice_loss:.4f} "
                 "sam3_direct_iou={sam3_direct_iou:.4f} "
@@ -1190,6 +1360,19 @@ def resize_pointmap(
     resized = weighted / weights.clamp_min(1e-6)
     resized_valid = weights[0, 0] > 0.5
     return resized[0].permute(1, 2, 0).numpy().astype(np.float32), resized_valid.numpy()
+
+
+def resize_dense_bhwc_tensor(
+    values: torch.Tensor,
+    output_size: tuple[int, int],
+) -> torch.Tensor:
+    if values.ndim != 4:
+        raise ValueError(f"Expected dense tensor [B, H, W, C], got {tuple(values.shape)}")
+    if tuple(values.shape[1:3]) == tuple(output_size):
+        return values.detach().float().cpu()
+    x = values.detach().float().permute(0, 3, 1, 2)
+    x = F.interpolate(x, size=output_size, mode="bilinear", align_corners=False)
+    return x.permute(0, 2, 3, 1).contiguous().cpu()
 
 
 def dense_mask_bce_loss(
@@ -1659,16 +1842,7 @@ def export_dense_pointclouds(
     max_points: int,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    rgb = torch.stack(
-        [
-            torch.from_numpy(
-                np.asarray(load_rgb(path, batch["prompt_mask"].shape[1:])).copy()
-            ).float()
-            / 255.0
-            for path in sequence.image_paths
-        ],
-        dim=0,
-    )
+    rgb = load_sequence_rgb(sequence.image_paths, batch["prompt_mask"].shape[1:])
     gt_mask = batch["prompt_mask"].detach().cpu()
     gt_points = batch["pointmap"].detach().cpu()
     pred_masks = torch.stack(
@@ -1693,6 +1867,35 @@ def export_dense_pointclouds(
         pred_masks,
         max_points=max_points,
     )
+    write_pointcloud_ply(
+        output_dir / f"step_{step:06d}_pred_object_gtmask.ply",
+        pred_points,
+        rgb,
+        gt_mask,
+        max_points=max_points,
+    )
+    stream_pointmaps = [
+        getattr(output, "streamvggt_pointmap", None) for output in outputs
+    ]
+    if all(pointmap is not None for pointmap in stream_pointmaps):
+        stream_points = torch.cat(
+            [pointmap.detach().float().cpu() for pointmap in stream_pointmaps],
+            dim=0,
+        )
+        write_pointcloud_ply(
+            output_dir / f"step_{step:06d}_streamvggt_object_gtmask.ply",
+            stream_points,
+            rgb,
+            gt_mask,
+            max_points=max_points,
+        )
+        write_pointcloud_ply(
+            output_dir / f"step_{step:06d}_streamvggt_object_predmask.ply",
+            stream_points,
+            rgb,
+            pred_masks,
+            max_points=max_points,
+        )
     sam3_direct_masks = [
         getattr(output, "sam3_direct_mask", None) for output in outputs
     ]
@@ -1726,6 +1929,60 @@ def export_dense_pointclouds(
             fused_sam_masks,
             max_points=max_points,
         )
+
+
+def write_streamvggt_baseline_visualization(
+    path: Path,
+    *,
+    sequence: ObjectSequence,
+    batch: Dict[str, torch.Tensor],
+    prompt: str,
+) -> None:
+    frames = len(sequence.image_paths)
+    panel_w = 320
+    panel_h = int(round(panel_w * batch["prompt_mask"].shape[1] / batch["prompt_mask"].shape[2]))
+    title_h = 26
+    margin = 6
+    columns = 2
+    canvas = Image.new(
+        "RGB",
+        (columns * panel_w + (columns + 1) * margin, title_h + frames * (panel_h + margin) + margin),
+        color=(20, 20, 20),
+    )
+    draw = ImageDraw.Draw(canvas)
+    draw.text((margin, 5), f"StreamVGGT baseline prompt='{prompt}'", fill=(240, 240, 240))
+    headings = ["RGB", "GT mask"]
+    for col, heading in enumerate(headings):
+        draw.text((margin + col * (panel_w + margin), title_h - 14), heading, fill=(220, 220, 220))
+
+    for frame_idx in range(frames):
+        image = load_rgb(sequence.image_paths[frame_idx], batch["prompt_mask"].shape[1:])
+        gt = batch["prompt_mask"][frame_idx].detach().cpu().numpy()
+        panels = [
+            image,
+            overlay_mask(image, gt, (230, 57, 70), threshold=0.5),
+        ]
+        row_y = title_h + margin + frame_idx * (panel_h + margin)
+        for col, panel in enumerate(panels):
+            panel = panel.resize((panel_w, panel_h), Image.BILINEAR)
+            canvas.paste(panel, (margin + col * (panel_w + margin), row_y))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path)
+
+
+def load_sequence_rgb(
+    image_paths: Sequence[Path],
+    output_hw: Sequence[int],
+) -> torch.Tensor:
+    return torch.stack(
+        [
+            torch.from_numpy(np.asarray(load_rgb(path, output_hw)).copy()).float()
+            / 255.0
+            for path in image_paths
+        ],
+        dim=0,
+    )
 
 
 def load_rgb(path: Path, output_hw: Sequence[int]) -> Image.Image:
@@ -1818,6 +2075,7 @@ def write_metrics_header(path: Path) -> None:
         "mask_loss",
         "dice_loss",
         "point_loss",
+        "streamvggt_point_loss",
         "chamfer_loss",
         "reprojection_loss",
         "fused_sam_mask_loss",

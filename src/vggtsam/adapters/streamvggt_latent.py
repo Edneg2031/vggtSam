@@ -108,7 +108,9 @@ class StreamVGGTLatentAdapter:
             camera_tokens = pose_enc_list[-1].float()
 
         pointmap_grid = None
+        pointmap_dense = None
         confidence_grid = None
+        confidence_dense = None
         raw_output = None
         if return_pointmap and getattr(self.model, "point_head", None) is not None:
             with torch.cuda.amp.autocast(enabled=False):
@@ -117,9 +119,11 @@ class StreamVGGTLatentAdapter:
                     images=batch_images,
                     patch_start_idx=patch_start_idx,
                 )
-            pointmap_grid = resize_dense_map(ensure_thwc(pts3d[0]).float(), self.token_grid)
+            pointmap_dense = ensure_thwc(pts3d[0]).float()
+            confidence_dense = ensure_thwc(pts3d_conf[0]).float()
+            pointmap_grid = resize_dense_map(pointmap_dense, self.token_grid)
             confidence_grid = resize_dense_map(
-                ensure_thwc(pts3d_conf[0]).float(),
+                confidence_dense,
                 self.token_grid,
             )
 
@@ -142,6 +146,8 @@ class StreamVGGTLatentAdapter:
                 "stream_dpt_tokens": dpt_tokens,
                 "stream_images": images,
                 "patch_start_idx": patch_start_idx,
+                "pointmap_dense": pointmap_dense,
+                "confidence_dense": confidence_dense,
             },
         )
         return StreamVGGTLatentOutput(
@@ -171,7 +177,9 @@ class StreamVGGTLatentAdapter:
         dense_chunks = []
         dpt_layer_chunks = [[] for _ in self.dpt_layer_indices]
         pointmap_chunks = []
+        pointmap_dense_chunks = []
         confidence_chunks = []
+        confidence_dense_chunks = []
         patch_start_idx = None
         patch_shape = patch_grid_from_images(
             images[:1],
@@ -208,12 +216,16 @@ class StreamVGGTLatentAdapter:
                         images=batch_frame,
                         patch_start_idx=patch_start_idx,
                     )
+                pointmap_dense = ensure_thwc(pts3d[0]).float()
+                confidence_dense = ensure_thwc(pts3d_conf[0]).float()
+                pointmap_dense_chunks.append(pointmap_dense)
+                confidence_dense_chunks.append(confidence_dense)
                 pointmap_chunks.append(
-                    resize_dense_map(ensure_thwc(pts3d[0]).float(), self.token_grid)
+                    resize_dense_map(pointmap_dense, self.token_grid)
                 )
                 confidence_chunks.append(
                     resize_dense_map(
-                        ensure_thwc(pts3d_conf[0]).float(),
+                        confidence_dense,
                         self.token_grid,
                     )
                 )
@@ -222,7 +234,9 @@ class StreamVGGTLatentAdapter:
         dense_tokens = torch.cat(dense_chunks, dim=1)
         dpt_tokens = [torch.cat(chunks, dim=1) for chunks in dpt_layer_chunks]
         pointmap_grid = torch.cat(pointmap_chunks, dim=0) if pointmap_chunks else None
+        pointmap_dense = torch.cat(pointmap_dense_chunks, dim=0) if pointmap_dense_chunks else None
         confidence_grid = torch.cat(confidence_chunks, dim=0) if confidence_chunks else None
+        confidence_dense = torch.cat(confidence_dense_chunks, dim=0) if confidence_dense_chunks else None
         geometry = GeometryTokens(
             tokens=context_tokens.reshape(1, -1, context_tokens.shape[-1]),
             camera_tokens=None,
@@ -242,6 +256,8 @@ class StreamVGGTLatentAdapter:
                 "stream_dpt_tokens": dpt_tokens,
                 "stream_images": images,
                 "patch_start_idx": patch_start_idx,
+                "pointmap_dense": pointmap_dense,
+                "confidence_dense": confidence_dense,
                 "streaming_cache": True,
             },
         )
