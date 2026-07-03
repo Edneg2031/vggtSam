@@ -169,14 +169,15 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --stream-dpt-use-pretrained \
   --fusion-type camera_guided \
   --primary-mask-source fused_sam \
+  --compare-sam3-direct \
   --history-update-source gt \
   --fused-sam-feature-mode residual \
   --fused-sam-prompt-source none \
-  --fused-sam-mask-weight 1 \
-  --fused-sam-dice-weight 1 \
   --train-scope sam_adapter \
-  --mask-weight 0 \
-  --dice-weight 0 \
+  --mask-weight 1 \
+  --dice-weight 1 \
+  --fused-sam-mask-weight 0 \
+  --fused-sam-dice-weight 0 \
   --point-weight 0 \
   --text-weight 0 \
   --aux-cls-weight 0 \
@@ -187,5 +188,6 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --device cuda:3 \
   --geometry-device cuda:1 \
   --sam3-device cuda:2 \
+  --sam3-direct-device cuda:3 \
   --visualize-every 10 \
-  --output-dir outputs/camera_guided_primary_sam_inst37
+  --output-dir outputs/fused_sam_vs_original_sam_inst37
