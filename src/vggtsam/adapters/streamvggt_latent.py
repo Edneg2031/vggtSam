@@ -176,11 +176,17 @@ class StreamVGGTLatentAdapter:
         context_chunks = []
         dense_chunks = []
         dpt_layer_chunks = [[] for _ in self.dpt_layer_indices]
+        camera_chunks = []
         pointmap_chunks = []
         pointmap_dense_chunks = []
         confidence_chunks = []
         confidence_dense_chunks = []
         patch_start_idx = None
+        past_key_values_camera = (
+            [None] * self.model.camera_head.trunk_depth
+            if getattr(self.model, "camera_head", None) is not None
+            else None
+        )
         patch_shape = patch_grid_from_images(
             images[:1],
             patch_size=self.model.aggregator.patch_size,
@@ -209,6 +215,15 @@ class StreamVGGTLatentAdapter:
             context_chunks.append(resize_token_map(spatial_tokens, self.context_grid))
             dense_chunks.append(resize_token_map(spatial_tokens, self.token_grid))
 
+            if getattr(self.model, "camera_head", None) is not None:
+                with torch.cuda.amp.autocast(enabled=False):
+                    pose_enc_list, past_key_values_camera = self.model.camera_head(
+                        aggregated_tokens_list,
+                        past_key_values_camera=past_key_values_camera,
+                        use_cache=True,
+                    )
+                camera_chunks.append(pose_enc_list[-1].float())
+
             if return_pointmap and getattr(self.model, "point_head", None) is not None:
                 with torch.cuda.amp.autocast(enabled=False):
                     pts3d, pts3d_conf = self.model.point_head(
@@ -233,13 +248,14 @@ class StreamVGGTLatentAdapter:
         context_tokens = torch.cat(context_chunks, dim=1)
         dense_tokens = torch.cat(dense_chunks, dim=1)
         dpt_tokens = [torch.cat(chunks, dim=1) for chunks in dpt_layer_chunks]
+        camera_tokens = torch.cat(camera_chunks, dim=1) if camera_chunks else None
         pointmap_grid = torch.cat(pointmap_chunks, dim=0) if pointmap_chunks else None
         pointmap_dense = torch.cat(pointmap_dense_chunks, dim=0) if pointmap_dense_chunks else None
         confidence_grid = torch.cat(confidence_chunks, dim=0) if confidence_chunks else None
         confidence_dense = torch.cat(confidence_dense_chunks, dim=0) if confidence_dense_chunks else None
         geometry = GeometryTokens(
             tokens=context_tokens.reshape(1, -1, context_tokens.shape[-1]),
-            camera_tokens=None,
+            camera_tokens=camera_tokens,
             pointmap=(
                 pointmap_grid.reshape(1, -1, pointmap_grid.shape[-1])
                 if pointmap_grid is not None

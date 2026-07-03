@@ -96,6 +96,7 @@ class DenseFusionTrainConfig:
     dropout: float
     point_decoder: str
     point_mask_condition: str
+    fusion_type: str
     stream_dpt_use_pretrained: bool
     stream_dpt_freeze: bool
     mask_weight: float
@@ -311,12 +312,22 @@ def configure_trainable_parameters(
         for param in model.parameters():
             param.requires_grad_(False)
         trainable_names = []
+        trainable_prefixes = (
+            "fused_sam_",
+            "proj_sam",
+            "proj_geometry",
+            "proj_camera",
+            "context_norm",
+            "cross_attention",
+            "fusion_norm",
+            "camera_guided_fusion",
+        )
         for name, param in model.named_parameters():
-            if name.startswith("fused_sam_"):
+            if name.startswith(trainable_prefixes):
                 param.requires_grad_(True)
                 trainable_names.append(name)
         if not trainable_names:
-            raise RuntimeError("No fused_sam_* parameters were found to train.")
+            raise RuntimeError("No SAM/fusion adapter parameters were found to train.")
         params = [param for param in model.parameters() if param.requires_grad]
     else:
         raise ValueError(
@@ -912,6 +923,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 point_mask_condition=config.point_mask_condition,
                 stream_dpt_freeze=config.stream_dpt_freeze,
                 enable_fused_sam_decoder=use_fused_sam,
+                fusion_type=config.fusion_type,
             ).to(config.device)
             if config.point_decoder == "stream_dpt" and stream_point_head_state is not None:
                 load_result = model.load_stream_point_decoder_state_dict(
@@ -940,6 +952,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 f"output_size={config.output_size} "
                 f"point_decoder={config.point_decoder} "
                 f"point_mask_condition={config.point_mask_condition} "
+                f"fusion_type={config.fusion_type} "
                 f"fused_sam_feature_mode={config.fused_sam_feature_mode} "
                 f"train_scope={config.train_scope}"
             )
@@ -1230,6 +1243,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "num_match_pixels": int(selected_match_pixels),
             "point_valid_source": config.point_valid_source,
             "point_mask_condition": config.point_mask_condition,
+            "fusion_type": config.fusion_type,
+            "use_camera_tokens": int(config.use_camera_tokens),
             "train_scope": config.train_scope,
             "history_update_source": config.history_update_source,
             "fused_sam_prompt_source": config.fused_sam_prompt_source,
@@ -2241,6 +2256,8 @@ def write_metrics_header(path: Path) -> None:
         "num_match_pixels",
         "point_valid_source",
         "point_mask_condition",
+        "fusion_type",
+        "use_camera_tokens",
         "train_scope",
         "history_update_source",
         "fused_sam_prompt_source",

@@ -12,6 +12,164 @@ import torch.nn.functional as F
 from .tokens import GeometryTokens, SemanticTokens
 
 
+class CameraGuidedTokenFusion(nn.Module):
+    """Camera-guided geometry-to-visual fusion.
+
+    This keeps the visual token shape unchanged: SAM3 tokens remain the query
+    stream, while StreamVGGT spatial and camera tokens provide a learned
+    geometry residual.
+    """
+
+    def __init__(
+        self,
+        *,
+        visual_dim: int,
+        spatial_dim: int,
+        camera_dim: int | None,
+        attention_dim: int,
+        num_heads: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.visual_dim = int(visual_dim)
+        self.spatial_dim = int(spatial_dim)
+        self.camera_dim = int(camera_dim) if camera_dim is not None else None
+        self.attention_dim = int(attention_dim)
+
+        self.visual_norm = nn.LayerNorm(self.visual_dim)
+        self.spatial_norm = nn.LayerNorm(self.spatial_dim)
+        self.query_proj = nn.Linear(self.visual_dim, self.attention_dim)
+        self.key_proj = nn.Linear(self.spatial_dim, self.attention_dim)
+        self.value_proj = nn.Linear(self.spatial_dim, self.attention_dim)
+        self.camera_proj = (
+            nn.Linear(self.camera_dim, self.attention_dim)
+            if self.camera_dim is not None
+            else None
+        )
+        self.null_camera = nn.Parameter(torch.zeros(1, 1, self.attention_dim))
+
+        self.geom_mlp = nn.Sequential(
+            nn.Linear(self.spatial_dim + self.attention_dim, self.attention_dim),
+            nn.GELU(),
+            nn.Linear(self.attention_dim, self.attention_dim),
+            nn.LayerNorm(self.attention_dim),
+        )
+        self.token_weight_proj = nn.Linear(self.spatial_dim, self.attention_dim)
+        self.token_weight_attn = nn.MultiheadAttention(
+            embed_dim=self.attention_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.token_weight_mlp = nn.Sequential(
+            nn.Linear(self.attention_dim, max(1, self.attention_dim // 4)),
+            nn.GELU(),
+            nn.Linear(max(1, self.attention_dim // 4), 1),
+        )
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=self.attention_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.out_proj = nn.Linear(self.attention_dim, self.visual_dim)
+        self.camera_gate = nn.Linear(self.attention_dim, self.visual_dim)
+        self.out_norm = nn.LayerNorm(self.visual_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.residual_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(
+        self,
+        *,
+        visual_tokens: torch.Tensor,
+        spatial_tokens: torch.Tensor,
+        camera_tokens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        visual_tokens = ensure_batched(visual_tokens)
+        spatial_tokens = ensure_batched(spatial_tokens)
+        if spatial_tokens.shape[0] == 1 and visual_tokens.shape[0] > 1:
+            spatial_tokens = spatial_tokens.expand(visual_tokens.shape[0], -1, -1)
+        if spatial_tokens.shape[0] != visual_tokens.shape[0]:
+            raise ValueError(
+                "Camera-guided fusion batch mismatch: "
+                f"visual={visual_tokens.shape[0]} spatial={spatial_tokens.shape[0]}"
+            )
+
+        visual_norm = self.visual_norm(visual_tokens)
+        spatial_norm = self.spatial_norm(spatial_tokens)
+        query = self.query_proj(visual_norm)
+        key = self.key_proj(spatial_norm)
+        value = self.value_proj(spatial_norm)
+
+        camera = self._project_camera(
+            camera_tokens,
+            batch_size=visual_tokens.shape[0],
+            device=visual_tokens.device,
+            dtype=visual_tokens.dtype,
+        )
+        camera_summary = camera.mean(dim=1, keepdim=True)
+        camera_for_spatial = camera_summary.expand(-1, spatial_norm.shape[1], -1)
+        geom_bias = self.geom_mlp(
+            torch.cat([spatial_norm, camera_for_spatial], dim=-1)
+        ).to(dtype=key.dtype)
+        key = key + geom_bias
+        value = value + geom_bias
+
+        token_input = self.token_weight_proj(spatial_norm)
+        token_context, _ = self.token_weight_attn(
+            token_input,
+            token_input,
+            token_input,
+            need_weights=False,
+        )
+        token_weight = torch.sigmoid(self.token_weight_mlp(token_input + token_context))
+        value = value * token_weight
+
+        key = torch.cat([camera, key], dim=1)
+        value = torch.cat([camera, value], dim=1)
+        fused, _ = self.cross_attention(
+            query=query,
+            key=key,
+            value=value,
+            need_weights=False,
+        )
+        fused = self.out_proj(fused)
+        gate = torch.sigmoid(self.camera_gate(camera_summary.squeeze(1)))
+        fused = self.dropout(fused * gate[:, None])
+        return self.out_norm(visual_tokens + self.residual_scale * fused)
+
+    def _project_camera(
+        self,
+        camera_tokens: torch.Tensor | None,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if camera_tokens is None:
+            return self.null_camera.to(device=device, dtype=dtype).expand(
+                batch_size,
+                -1,
+                -1,
+            )
+        camera_tokens = ensure_batched(camera_tokens).to(device=device, dtype=dtype)
+        if camera_tokens.shape[0] == 1 and batch_size > 1:
+            camera_tokens = camera_tokens.expand(batch_size, -1, -1)
+        if camera_tokens.shape[0] != batch_size:
+            raise ValueError(
+                "Camera token batch mismatch: "
+                f"camera={camera_tokens.shape[0]} visual={batch_size}"
+            )
+        if self.camera_proj is None:
+            if camera_tokens.shape[-1] != self.attention_dim:
+                raise ValueError(
+                    "Camera tokens were provided but camera_dim=None and token width "
+                    f"{camera_tokens.shape[-1]} != attention_dim={self.attention_dim}."
+                )
+            return camera_tokens
+        return self.camera_proj(camera_tokens)
+
+
 @dataclass
 class DenseFusionOutput:
     fused_tokens: torch.Tensor
@@ -48,6 +206,7 @@ class DenseSAMVGGTModel(nn.Module):
         point_mask_condition: str = "none",
         stream_dpt_freeze: bool = False,
         enable_fused_sam_decoder: bool = False,
+        fusion_type: str = "simple_cross_attn",
     ) -> None:
         super().__init__()
         self.feature_grid = tuple(int(v) for v in feature_grid)
@@ -57,10 +216,16 @@ class DenseSAMVGGTModel(nn.Module):
         self.enable_fused_sam_decoder = bool(enable_fused_sam_decoder)
         self.point_decoder = point_decoder.strip().lower()
         self.point_mask_condition = point_mask_condition.strip().lower()
+        self.fusion_type = fusion_type.strip().lower()
         if self.point_decoder not in {"simple", "stream_dpt"}:
             raise ValueError(
                 "point_decoder must be 'simple' or 'stream_dpt', "
                 f"got {point_decoder!r}"
+            )
+        if self.fusion_type not in {"simple_cross_attn", "camera_guided"}:
+            raise ValueError(
+                "fusion_type must be 'simple_cross_attn' or 'camera_guided', "
+                f"got {fusion_type!r}"
             )
         if self.point_mask_condition not in {"none", "gt_soft"}:
             raise ValueError(
@@ -81,6 +246,18 @@ class DenseSAMVGGTModel(nn.Module):
             batch_first=True,
         )
         self.fusion_norm = nn.LayerNorm(d_fuse)
+        self.camera_guided_fusion = (
+            CameraGuidedTokenFusion(
+                visual_dim=d_fuse,
+                spatial_dim=geometry_dim,
+                camera_dim=camera_dim,
+                attention_dim=d_fuse,
+                num_heads=num_heads,
+                dropout=dropout,
+            )
+            if self.fusion_type == "camera_guided"
+            else None
+        )
 
         self.decoder = nn.Sequential(
             nn.Conv2d(d_fuse, d_fuse, kernel_size=3, padding=1),
@@ -447,13 +624,20 @@ class DenseSAMVGGTModel(nn.Module):
     ) -> torch.Tensor:
         sam_tokens = self._ensure_batched(sam_tokens)
         geometry_tokens = self._ensure_batched(geometry_tokens)
+        query = self.proj_sam(sam_tokens)
+        if self.fusion_type == "camera_guided":
+            assert self.camera_guided_fusion is not None
+            return self.camera_guided_fusion(
+                visual_tokens=query,
+                spatial_tokens=geometry_tokens,
+                camera_tokens=camera_tokens,
+            )
         context = [self.proj_geometry(geometry_tokens)]
         if camera_tokens is not None:
             if self.proj_camera is None:
                 raise ValueError("camera_tokens were provided but camera_dim is None")
             context.append(self.proj_camera(self._ensure_batched(camera_tokens)))
         context_tokens = self.context_norm(torch.cat(context, dim=1))
-        query = self.proj_sam(sam_tokens)
         fused, _ = self.cross_attention(
             query=query,
             key=context_tokens,
@@ -770,3 +954,13 @@ def resize_bhw(values: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
     x = values[:, None]
     x = F.interpolate(x, size=size, mode="bilinear", align_corners=False)
     return x[:, 0].contiguous()
+
+
+def ensure_batched(tokens: torch.Tensor) -> torch.Tensor:
+    if tokens.ndim == 2:
+        return tokens.unsqueeze(0)
+    if tokens.ndim != 3:
+        raise ValueError(
+            f"Expected token tensor [B, N, C] or [N, C], got {tuple(tokens.shape)}"
+        )
+    return tokens

@@ -75,7 +75,7 @@ geometry:
   # StreamVGGT DPT point decoder uses these original aggregator layers.
   dpt_layer_indices: [4, 11, 17, 23]
   image_mode: crop
-  use_camera_tokens: false
+  use_camera_tokens: true
 
 model:
   # Dense output/loss grid. Set to [350, 518] or larger if memory allows.
@@ -83,6 +83,9 @@ model:
   d_fuse: 256
   num_heads: 8
   embedding_dim: 256
+  # simple_cross_attn: old one-stage SAM-query / geometry-key-value fusion.
+  # camera_guided: SpaceMind-style camera-guided geometry residual into SAM tokens.
+  fusion_type: camera_guided
   # Auxiliary closed-set semantic classifier. Must be larger than processed
   # semantic class ids; the open-vocabulary path uses text alignment.
   num_classes: 1024
@@ -138,7 +141,7 @@ training:
   iterations: 200
   lr: 0.0003
   # all: train the full dense fusion model.
-  # sam_adapter: freeze the model and train only fused_sam_* adapter parameters.
+  # sam_adapter: freeze the model and train only SAM/fusion adapter parameters.
   train_scope: all
   seed: 0
   # Overfit repeats one window and one target instance. This is the first sanity
