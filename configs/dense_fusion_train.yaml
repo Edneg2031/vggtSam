@@ -51,9 +51,12 @@ sam3:
   prompt: object
   prompt_mode: random_instance
   resolution: 1008
-  feature_source: detector_fpn2
+  # tracker_fpn2 is aligned with SAM3/SAM2 tracker mask decoding. The old
+  # detector_fpn2 source is useful for open-vocabulary detector-token probes,
+  # but is not the right default for 3AM-style SAM-flow fusion.
+  feature_source: tracker_fpn2
   text_conditioning: concat
-  enable_inst_interactivity: false
+  enable_inst_interactivity: true
   # Direct SAM3 video tracker mask provider. This bypasses fused-token SAM decoding
   # and is only used when history.update_source or loss.point_valid_source is sam3_direct.
   # compare_direct only runs original SAM3 for visualization/IoU comparison.

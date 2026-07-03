@@ -292,6 +292,20 @@ def uses_sam3_direct_masks(config: DenseFusionTrainConfig) -> bool:
     )
 
 
+def sam3_feature_requires_inst_interactivity(source: str) -> bool:
+    source = source.strip().lower()
+    return source in {
+        "tracker_fpn0",
+        "tracker_fpn1",
+        "tracker_fpn2",
+        "sam2_fpn0",
+        "sam2_fpn1",
+        "sam2_fpn2",
+        "tracker_vision_features",
+        "sam2_vision_features",
+    }
+
+
 def configure_trainable_parameters(
     model: DenseSAMVGGTModel,
     *,
@@ -589,6 +603,9 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
     use_fused_sam = uses_fused_sam_decoder(config)
     use_fused_sam_residual = uses_fused_sam_residual_features(config)
     use_sam3_direct = uses_sam3_direct_masks(config)
+    needs_tracker_backbone = sam3_feature_requires_inst_interactivity(
+        config.sam3_feature_source
+    )
     object_config = ObjectSamplingConfig(
         min_pixels=config.min_pixels,
         max_area_ratio=config.max_area_ratio,
@@ -611,7 +628,9 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
         checkpoint_path=config.sam3_checkpoint,
         device=config.sam3_device,
         enable_inst_interactivity=(
-            config.sam3_enable_inst_interactivity or use_fused_sam
+            config.sam3_enable_inst_interactivity
+            or use_fused_sam
+            or needs_tracker_backbone
         ),
     )
     sam3_model.requires_grad_(False)
@@ -981,6 +1000,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 "initialized DenseSAMVGGTModel "
                 f"sam_dim={sam_dim} geometry_dim={geometry_dim} "
                 f"text_dim={int(text_embedding.shape[-1])} camera_dim={camera_dim} "
+                f"sam_feature_source={config.sam3_feature_source} "
                 f"output_size={config.output_size} "
                 f"point_decoder={config.point_decoder} "
                 f"point_mask_condition={config.point_mask_condition} "

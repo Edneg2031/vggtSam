@@ -182,6 +182,7 @@ class SAM3IntermediateAdapter:
 
 
 def select_sam3_spatial_feature(backbone_out: Dict[str, Any], *, source: str) -> Any:
+    source = source.strip().lower()
     if source in {"detector_fpn2", "sam3_fpn2"}:
         return backbone_out["backbone_fpn"][-1]
     if source in {"detector_fpn1", "sam3_fpn1"}:
@@ -190,14 +191,29 @@ def select_sam3_spatial_feature(backbone_out: Dict[str, Any], *, source: str) ->
         return backbone_out["backbone_fpn"][-3]
     if source == "vision_features":
         return backbone_out["vision_features"]
-    if source in {"tracker_fpn2", "sam2_fpn2"}:
+    if source in {
+        "tracker_fpn0",
+        "tracker_fpn1",
+        "tracker_fpn2",
+        "sam2_fpn0",
+        "sam2_fpn1",
+        "sam2_fpn2",
+        "tracker_vision_features",
+        "sam2_vision_features",
+    }:
         sam2 = backbone_out.get("sam2_backbone_out")
         if sam2 is None:
             raise KeyError(
                 "SAM3 backbone_out does not contain sam2_backbone_out. "
-                "Build the image model with enable_inst_interactivity=True or use detector_fpn2."
+                "Build the image model with enable_inst_interactivity=True."
             )
-        return sam2["backbone_fpn"][-1]
+        if source in {"tracker_fpn2", "sam2_fpn2"}:
+            return sam2["backbone_fpn"][-1]
+        if source in {"tracker_fpn1", "sam2_fpn1"}:
+            return sam2["backbone_fpn"][-2]
+        if source in {"tracker_fpn0", "sam2_fpn0"}:
+            return sam2["backbone_fpn"][-3]
+        return sam2["vision_features"]
     raise KeyError(f"Unknown SAM3 feature source: {source}")
 
 
