@@ -88,6 +88,16 @@ def main() -> None:
         choices=["simple_cross_attn", "camera_guided"],
         default=None,
     )
+    parser.add_argument(
+        "--primary-mask-source",
+        choices=["dense", "fused_sam", "sam3_direct"],
+        default=None,
+        help=(
+            "dense uses the lightweight mask_head; fused_sam routes the main "
+            "prediction through SAM3 prompt/mask decoder; sam3_direct uses the "
+            "original SAM3 video tracker mask provider."
+        ),
+    )
     camera_tokens = parser.add_mutually_exclusive_group()
     camera_tokens.add_argument("--use-camera-tokens", action="store_true")
     camera_tokens.add_argument("--no-use-camera-tokens", action="store_true")
@@ -222,6 +232,8 @@ def main() -> None:
         raw["model"]["point_mask_condition"] = args.point_mask_condition
     if args.fusion_type is not None:
         raw["model"]["fusion_type"] = args.fusion_type
+    if args.primary_mask_source is not None:
+        raw["model"]["primary_mask_source"] = args.primary_mask_source
     if args.use_camera_tokens:
         raw["geometry"]["use_camera_tokens"] = True
     if args.no_use_camera_tokens:
@@ -340,6 +352,7 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         point_decoder=str(model.get("point_decoder", "simple")),
         point_mask_condition=str(model.get("point_mask_condition", "none")),
         fusion_type=str(model.get("fusion_type", "simple_cross_attn")),
+        primary_mask_source=str(model.get("primary_mask_source", "dense")),
         stream_dpt_use_pretrained=bool(
             model.get("stream_dpt_use_pretrained", True)
         ),

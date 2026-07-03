@@ -97,6 +97,7 @@ class DenseFusionTrainConfig:
     point_decoder: str
     point_mask_condition: str
     fusion_type: str
+    primary_mask_source: str
     stream_dpt_use_pretrained: bool
     stream_dpt_freeze: bool
     mask_weight: float
@@ -263,6 +264,7 @@ def detach_to_cpu(value):
 def uses_fused_sam_decoder(config: DenseFusionTrainConfig) -> bool:
     return (
         config.history_update_source.strip().lower() in {"fused_sam", "sam_decoder"}
+        or config.primary_mask_source.strip().lower() in {"fused_sam", "sam_decoder"}
         or config.fused_sam_mask_weight > 0.0
         or config.fused_sam_dice_weight > 0.0
     )
@@ -284,6 +286,7 @@ def uses_sam3_direct_masks(config: DenseFusionTrainConfig) -> bool:
     return (
         config.history_update_source.strip().lower() in direct_sources
         or config.point_valid_source.strip().lower() in direct_sources
+        or config.primary_mask_source.strip().lower() in direct_sources
     )
 
 
@@ -304,10 +307,23 @@ def configure_trainable_parameters(
                 "Set history.update_source='fused_sam' or give fused_sam losses "
                 "positive weights."
             )
-        if config.fused_sam_mask_weight <= 0.0 and config.fused_sam_dice_weight <= 0.0:
+        primary_uses_fused_sam = config.primary_mask_source.strip().lower() in {
+            "fused_sam",
+            "sam_decoder",
+        }
+        has_primary_sam_loss = primary_uses_fused_sam and (
+            config.mask_weight > 0.0 or config.dice_weight > 0.0
+        )
+        if (
+            config.fused_sam_mask_weight <= 0.0
+            and config.fused_sam_dice_weight <= 0.0
+            and not has_primary_sam_loss
+        ):
             raise RuntimeError(
                 "training.train_scope='sam_adapter' needs a trainable fused SAM "
-                "loss. Set --fused-sam-mask-weight and/or --fused-sam-dice-weight."
+                "loss. Set --fused-sam-mask-weight/--fused-sam-dice-weight, "
+                "or use --primary-mask-source fused_sam with positive "
+                "--mask-weight/--dice-weight."
             )
         for param in model.parameters():
             param.requires_grad_(False)
@@ -967,6 +983,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 f"point_decoder={config.point_decoder} "
                 f"point_mask_condition={config.point_mask_condition} "
                 f"fusion_type={config.fusion_type} "
+                f"primary_mask_source={config.primary_mask_source} "
                 f"fused_sam_feature_mode={config.fused_sam_feature_mode} "
                 f"train_scope={config.train_scope}"
             )
@@ -1109,6 +1126,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                     target["prompt_mask"],
                     target["mask_supervision"],
                 )
+            apply_primary_mask_source(output, config.primary_mask_source)
             outputs.append(output)
 
             mask_loss = dense_mask_bce_loss(
@@ -1258,6 +1276,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "point_valid_source": config.point_valid_source,
             "point_mask_condition": config.point_mask_condition,
             "fusion_type": config.fusion_type,
+            "primary_mask_source": config.primary_mask_source,
             "use_camera_tokens": int(config.use_camera_tokens),
             "train_scope": config.train_scope,
             "history_update_source": config.history_update_source,
@@ -1626,6 +1645,40 @@ def select_point_mask_condition(
         "model.point_mask_condition must be 'none' or 'gt_soft', "
         f"got {source!r}"
     )
+
+
+def apply_primary_mask_source(output: Any, source: str) -> None:
+    """Route the main predicted mask through the selected mask provider."""
+    source = source.strip().lower()
+    if source in {"dense", "mask_head", "baseline"}:
+        return
+    if source in {"fused_sam", "sam_decoder"}:
+        fused_sam_logits = getattr(output, "fused_sam_mask_logits", None)
+        if fused_sam_logits is None:
+            raise RuntimeError(
+                "model.primary_mask_source='fused_sam' requires fused_sam_mask_logits. "
+                "Enable the fused SAM decoder path."
+            )
+        output.mask_logits = fused_sam_logits
+        return
+    if source in {"sam3_direct", "sam3", "sam_video", "sam3_video"}:
+        sam3_mask = getattr(output, "sam3_direct_mask", None)
+        if sam3_mask is None:
+            raise RuntimeError(
+                "model.primary_mask_source='sam3_direct' requires sam3_direct_mask. "
+                "Enable the SAM3 video tracker path."
+            )
+        output.mask_logits = mask_to_logits(sam3_mask).unsqueeze(0)
+        return
+    raise ValueError(
+        "model.primary_mask_source must be 'dense', 'fused_sam', or 'sam3_direct', "
+        f"got {source!r}"
+    )
+
+
+def mask_to_logits(mask: torch.Tensor, *, eps: float = 1e-4) -> torch.Tensor:
+    prob = mask.float().clamp(float(eps), 1.0 - float(eps))
+    return torch.logit(prob)
 
 
 def dense_point_loss(
@@ -2271,6 +2324,7 @@ def write_metrics_header(path: Path) -> None:
         "point_valid_source",
         "point_mask_condition",
         "fusion_type",
+        "primary_mask_source",
         "use_camera_tokens",
         "train_scope",
         "history_update_source",

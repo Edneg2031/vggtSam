@@ -160,14 +160,16 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --output-dir outputs/fused_sam_adapter_inst37
 
   测试
-  PYTHONPATH=src python scripts/train_dense_fusion.py \
+PYTHONPATH=src python scripts/train_dense_fusion.py \
   --config configs/dense_fusion_train.yaml \
   --scene-id 00a231a370 \
   --instance-id 37 \
   --frame-indices 91 133 162 163 228 263 273 \
-  --point-decoder simple \
+  --point-decoder stream_dpt \
+  --stream-dpt-use-pretrained \
   --fusion-type camera_guided \
-  --use-camera-tokens \
+  --primary-mask-source fused_sam \
+  --history-update-source gt \
   --fused-sam-feature-mode residual \
   --fused-sam-prompt-source none \
   --fused-sam-mask-weight 1 \
@@ -186,4 +188,4 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --geometry-device cuda:1 \
   --sam3-device cuda:2 \
   --visualize-every 10 \
-  --output-dir outputs/camera_guided_sam_adapter_inst37
+  --output-dir outputs/camera_guided_primary_sam_inst37
