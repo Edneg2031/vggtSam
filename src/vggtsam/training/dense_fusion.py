@@ -16,6 +16,7 @@ from PIL import Image, ImageDraw
 
 from vggtsam.adapters.sam3_intermediate import (
     SAM3IntermediateAdapter,
+    ensure_bchw_tensor,
     load_sam3_image_model,
     pool_language_features,
 )
@@ -115,6 +116,7 @@ class DenseFusionTrainConfig:
     history_update_source: str
     history_pred_threshold: float
     fused_sam_prompt_source: str
+    fused_sam_feature_mode: str
     fused_sam_mask_weight: float
     fused_sam_dice_weight: float
     device: str
@@ -193,12 +195,20 @@ def extract_sam3_sequence(
     *,
     prompt: str,
     chunk_size: int,
+    sam_tracker_for_features: Any | None = None,
 ):
     chunk_size = int(chunk_size)
     if chunk_size <= 0 or chunk_size >= len(image_paths):
-        return sam3.extract_from_paths(image_paths, prompt=prompt)
+        out = sam3.extract_from_paths(image_paths, prompt=prompt)
+        if sam_tracker_for_features is not None:
+            out.sam_tracker_features = extract_sam3_tracker_decoder_features(
+                out.backbone_out,
+                sam_tracker_for_features,
+            )
+        return out
 
     token_chunks = []
+    feature_chunks: Dict[str, List[torch.Tensor]] = {}
     text_out = None
     spatial_shape = None
     aux = None
@@ -208,6 +218,13 @@ def extract_sam3_sequence(
             prompt=prompt,
         )
         token_chunks.append(out.semantic.tokens.detach().cpu())
+        if sam_tracker_for_features is not None:
+            chunk_features = extract_sam3_tracker_decoder_features(
+                out.backbone_out,
+                sam_tracker_for_features,
+            )
+            for key, value in chunk_features.items():
+                feature_chunks.setdefault(key, []).append(value)
         if text_out is None:
             text_out = detach_to_cpu(out.text_out)
             spatial_shape = out.semantic.spatial_shape
@@ -223,6 +240,10 @@ def extract_sam3_sequence(
             aux=aux or {},
         ),
         text_out=text_out or {},
+        sam_tracker_features={
+            key: torch.cat(values, dim=0)
+            for key, values in feature_chunks.items()
+        } if feature_chunks else None,
     )
 
 
@@ -243,6 +264,12 @@ def uses_fused_sam_decoder(config: DenseFusionTrainConfig) -> bool:
         config.history_update_source.strip().lower() in {"fused_sam", "sam_decoder"}
         or config.fused_sam_mask_weight > 0.0
         or config.fused_sam_dice_weight > 0.0
+    )
+
+
+def uses_fused_sam_residual_features(config: DenseFusionTrainConfig) -> bool:
+    return uses_fused_sam_decoder(config) and (
+        config.fused_sam_feature_mode.strip().lower() == "residual"
     )
 
 
@@ -300,6 +327,46 @@ def configure_trainable_parameters(
     num_params = sum(param.numel() for param in params)
     print(f"train_scope={scope} trainable_parameters={num_params}")
     return params
+
+
+@torch.no_grad()
+def extract_sam3_tracker_decoder_features(
+    backbone_out: Dict[str, Any],
+    sam_tracker,
+) -> Dict[str, torch.Tensor]:
+    """Build the original SAM3 tracker decoder features for residual injection."""
+    sam2 = backbone_out.get("sam2_backbone_out")
+    if sam2 is None:
+        raise RuntimeError(
+            "SAM3 backbone_out does not contain sam2_backbone_out. "
+            "Build SAM3 with enable_inst_interactivity=True."
+        )
+    fpn = sam2.get("backbone_fpn")
+    if fpn is None or len(fpn) < 3:
+        raise RuntimeError("SAM3 sam2_backbone_out is missing 3 FPN levels.")
+    decoder = sam_tracker.sam_mask_decoder
+    high_s0 = decoder.conv_s0(ensure_bchw_tensor(fpn[0]))
+    high_s1 = decoder.conv_s1(ensure_bchw_tensor(fpn[1]))
+    image_embed = ensure_bchw_tensor(fpn[2])
+    return {
+        "image_embed": image_embed.detach().float().cpu(),
+        "high_s1": high_s1.detach().float().cpu(),
+        "high_s0": high_s0.detach().float().cpu(),
+    }
+
+
+def slice_sam3_tracker_features(
+    features: Dict[str, torch.Tensor] | None,
+    *,
+    frame_idx: int,
+    device: str,
+) -> Dict[str, torch.Tensor] | None:
+    if features is None:
+        return None
+    return {
+        key: value[frame_idx : frame_idx + 1].float().to(device)
+        for key, value in features.items()
+    }
 
 
 def slice_stream_dpt_tokens(
@@ -477,6 +544,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
     rng = random.Random(config.seed)
     torch.manual_seed(config.seed)
     use_fused_sam = uses_fused_sam_decoder(config)
+    use_fused_sam_residual = uses_fused_sam_residual_features(config)
     use_sam3_direct = uses_sam3_direct_masks(config)
     object_config = ObjectSamplingConfig(
         min_pixels=config.min_pixels,
@@ -676,11 +744,13 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             stream_baseline_pointmaps = overfit_feature_cache.get(
                 "stream_baseline_pointmaps"
             )
+            sam_tracker_features = overfit_feature_cache.get("sam_tracker_features")
             sam3_direct_masks = overfit_feature_cache.get("sam3_direct_masks")
             sam3_direct_aux = overfit_feature_cache.get("sam3_direct_aux", {})
             text_embedding = overfit_feature_cache["text_embedding"].to(config.device)
             batch = batch_to_device(overfit_feature_cache["batch"], config.device)
         else:
+            sam_tracker_features = None
             sam3_direct_masks = None
             sam3_direct_aux: Dict[str, Any] = {}
             with torch.no_grad():
@@ -689,6 +759,9 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                     sequence.image_paths,
                     prompt=prompt_selection.prompt,
                     chunk_size=config.sam3_frame_chunk_size,
+                    sam_tracker_for_features=(
+                        sam_tracker_model if use_fused_sam_residual else None
+                    ),
                 )
                 geo_out = geometry.extract_from_paths(
                     sequence.image_paths,
@@ -699,6 +772,16 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 if text_embedding is None:
                     raise RuntimeError("SAM3 did not return language_features for text alignment.")
                 text_embedding = text_embedding.to(config.device).float()
+                if use_fused_sam_residual:
+                    sam_tracker_features = getattr(
+                        sam_out,
+                        "sam_tracker_features",
+                        None,
+                    )
+                    if sam_tracker_features is None:
+                        raise RuntimeError(
+                            "fused_sam.feature_mode='residual' requires SAM tracker features."
+                        )
                 sam_tokens_all = sam_out.semantic.tokens.detach().cpu()
                 geometry_tokens_all = geo_out.geometry.tokens.detach().cpu()
                 geometry_camera_tokens = (
@@ -778,6 +861,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                     "stream_images": stream_images_all,
                     "stream_patch_start_idx": stream_patch_start_idx,
                     "stream_baseline_pointmaps": stream_baseline_pointmaps,
+                    "sam_tracker_features": sam_tracker_features,
                     "sam3_direct_masks": sam3_direct_masks,
                     "sam3_direct_aux": sam3_direct_aux,
                     "text_embedding": text_embedding.detach().cpu(),
@@ -856,6 +940,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 f"output_size={config.output_size} "
                 f"point_decoder={config.point_decoder} "
                 f"point_mask_condition={config.point_mask_condition} "
+                f"fused_sam_feature_mode={config.fused_sam_feature_mode} "
                 f"train_scope={config.train_scope}"
             )
 
@@ -980,6 +1065,12 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                     sam_tracker=sam_tracker_model,
                     mask_prompt=fused_sam_prompt,
                     object_query=object_query,
+                    sam_features=slice_sam3_tracker_features(
+                        sam_tracker_features,
+                        frame_idx=frame_idx,
+                        device=config.device,
+                    ),
+                    feature_mode=config.fused_sam_feature_mode,
                 )
                 fused_sam_mask_loss = dense_mask_bce_loss(
                     output.fused_sam_mask_logits[0],
@@ -1142,6 +1233,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "train_scope": config.train_scope,
             "history_update_source": config.history_update_source,
             "fused_sam_prompt_source": config.fused_sam_prompt_source,
+            "fused_sam_feature_mode": config.fused_sam_feature_mode,
             "sam3_direct_selected_obj_id": (
                 "" if not sam3_direct_aux else sam3_direct_aux.get("selected_obj_id", "")
             ),
@@ -2152,6 +2244,7 @@ def write_metrics_header(path: Path) -> None:
         "train_scope",
         "history_update_source",
         "fused_sam_prompt_source",
+        "fused_sam_feature_mode",
         "sam3_direct_selected_obj_id",
         "sam3_direct_prompt_frame_idx",
         "prompt",

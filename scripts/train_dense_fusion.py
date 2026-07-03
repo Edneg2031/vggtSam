@@ -42,6 +42,15 @@ def main() -> None:
     )
     parser.add_argument("--fused-sam-mask-weight", type=float, default=None)
     parser.add_argument("--fused-sam-dice-weight", type=float, default=None)
+    parser.add_argument(
+        "--fused-sam-feature-mode",
+        choices=["replace", "residual"],
+        default=None,
+        help=(
+            "replace feeds adapter-generated SAM features to the decoder; residual "
+            "adds adapter output to original SAM3 tracker features."
+        ),
+    )
     parser.add_argument("--sam3-direct-device", default=None)
     sam3_direct_box = parser.add_mutually_exclusive_group()
     sam3_direct_box.add_argument("--sam3-direct-box", action="store_true")
@@ -147,6 +156,8 @@ def main() -> None:
         raw.setdefault("fused_sam", {})["mask_weight"] = args.fused_sam_mask_weight
     if args.fused_sam_dice_weight is not None:
         raw.setdefault("fused_sam", {})["dice_weight"] = args.fused_sam_dice_weight
+    if args.fused_sam_feature_mode is not None:
+        raw.setdefault("fused_sam", {})["feature_mode"] = args.fused_sam_feature_mode
     if args.sam3_direct_device is not None:
         raw["sam3"]["direct_device"] = args.sam3_direct_device
     if args.sam3_direct_box:
@@ -336,6 +347,7 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         history_update_source=str(history.get("update_source", "gt")),
         history_pred_threshold=float(history.get("pred_threshold", 0.5)),
         fused_sam_prompt_source=str(history.get("fused_sam_prompt_source", "pred")),
+        fused_sam_feature_mode=str(fused_sam.get("feature_mode", "replace")),
         fused_sam_mask_weight=float(fused_sam.get("mask_weight", 0.0)),
         fused_sam_dice_weight=float(fused_sam.get("dice_weight", 0.0)),
         device=training["device"],

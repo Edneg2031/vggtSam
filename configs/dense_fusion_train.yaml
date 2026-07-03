@@ -127,6 +127,9 @@ history:
   fused_sam_prompt_source: pred
 
 fused_sam:
+  # replace: adapter output replaces SAM image/high-res features.
+  # residual: original SAM3 tracker features + adapter(fused tokens) residual.
+  feature_mode: replace
   mask_weight: 0.0
   dice_weight: 0.0
 

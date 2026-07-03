@@ -160,11 +160,13 @@ class DenseSAMVGGTModel(nn.Module):
                 nn.Conv2d(d_fuse, d_fuse // 8, kernel_size=1),
             )
             self.fused_sam_object_proj = nn.Linear(d_fuse, d_fuse)
+            self.fused_sam_residual_scale = nn.Parameter(torch.tensor(0.1))
         else:
             self.fused_sam_image_proj = None
             self.fused_sam_high_s1 = None
             self.fused_sam_high_s0 = None
             self.fused_sam_object_proj = None
+            self.fused_sam_residual_scale = None
         self.prompt_logit_scale = nn.Parameter(torch.tensor(10.0))
         self.instance_logit_scale = nn.Parameter(torch.tensor(10.0))
 
@@ -496,6 +498,8 @@ class DenseSAMVGGTModel(nn.Module):
         sam_tracker,
         mask_prompt: torch.Tensor | None,
         object_query: torch.Tensor | None = None,
+        sam_features: dict[str, torch.Tensor] | None = None,
+        feature_mode: str = "replace",
     ) -> torch.Tensor:
         """Run SAM3's prompt encoder + mask decoder on adapted fused tokens."""
         if not self.enable_fused_sam_decoder:
@@ -504,7 +508,14 @@ class DenseSAMVGGTModel(nn.Module):
         assert self.fused_sam_high_s1 is not None
         assert self.fused_sam_high_s0 is not None
         assert self.fused_sam_object_proj is not None
+        assert self.fused_sam_residual_scale is not None
 
+        feature_mode = feature_mode.strip().lower()
+        if feature_mode not in {"replace", "residual"}:
+            raise ValueError(
+                "feature_mode must be 'replace' or 'residual', "
+                f"got {feature_mode!r}"
+            )
         fused_tokens = self._ensure_batched(fused_tokens)
         feature = self.tokens_to_feature_grid(fused_tokens)
         object_query = self._prepare_object_query(
@@ -516,13 +527,41 @@ class DenseSAMVGGTModel(nn.Module):
             feature = feature + self.fused_sam_object_proj(object_query)[
                 :, :, None, None
             ]
-        image_embed = self.fused_sam_image_proj(feature)
-        high_s1 = self.fused_sam_high_s1(
+        residual_image = self.fused_sam_image_proj(feature)
+        residual_s1 = self.fused_sam_high_s1(
             F.interpolate(feature, size=(144, 144), mode="bilinear", align_corners=False)
         )
-        high_s0 = self.fused_sam_high_s0(
+        residual_s0 = self.fused_sam_high_s0(
             F.interpolate(feature, size=(288, 288), mode="bilinear", align_corners=False)
         )
+        if feature_mode == "replace":
+            image_embed = residual_image
+            high_s1 = residual_s1
+            high_s0 = residual_s0
+        else:
+            if sam_features is None:
+                raise ValueError(
+                    "feature_mode='residual' requires original SAM3 tracker features."
+                )
+            image_embed = self._sam_feature(
+                sam_features,
+                key="image_embed",
+                reference=residual_image,
+            )
+            high_s1 = self._sam_feature(
+                sam_features,
+                key="high_s1",
+                reference=residual_s1,
+            )
+            high_s0 = self._sam_feature(
+                sam_features,
+                key="high_s0",
+                reference=residual_s0,
+            )
+            scale = self.fused_sam_residual_scale
+            image_embed = image_embed + scale * residual_image
+            high_s1 = high_s1 + scale * residual_s1
+            high_s0 = high_s0 + scale * residual_s0
 
         if mask_prompt is not None:
             if mask_prompt.ndim == 2:
@@ -574,6 +613,45 @@ class DenseSAMVGGTModel(nn.Module):
                 align_corners=False,
             )
         return mask_logits[:, 0].contiguous()
+
+    @staticmethod
+    def _sam_feature(
+        sam_features: dict[str, torch.Tensor],
+        *,
+        key: str,
+        reference: torch.Tensor,
+    ) -> torch.Tensor:
+        if key not in sam_features:
+            raise KeyError(f"sam_features is missing {key!r}")
+        value = sam_features[key]
+        if value.ndim == 3:
+            value = value[None]
+        if value.ndim != 4:
+            raise ValueError(
+                f"sam_features[{key!r}] must have shape [B, C, H, W], "
+                f"got {tuple(value.shape)}"
+            )
+        value = value.to(device=reference.device, dtype=reference.dtype)
+        if value.shape[0] == 1 and reference.shape[0] > 1:
+            value = value.expand(reference.shape[0], -1, -1, -1)
+        if value.shape[0] != reference.shape[0]:
+            raise ValueError(
+                f"sam_features[{key!r}] batch {value.shape[0]} does not match "
+                f"reference batch {reference.shape[0]}"
+            )
+        if value.shape[1] != reference.shape[1]:
+            raise ValueError(
+                f"sam_features[{key!r}] channels {value.shape[1]} do not match "
+                f"adapter channels {reference.shape[1]}"
+            )
+        if value.shape[-2:] != reference.shape[-2:]:
+            value = F.interpolate(
+                value,
+                size=reference.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        return value
 
     def pool_object_query(
         self,
