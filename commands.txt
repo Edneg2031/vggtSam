@@ -126,3 +126,5 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --sam3-direct-device cuda:3 \
   --visualize-every 10 \
   --output-dir outputs/dense_fusion_streamdpt_sam3direct_inst73
+
+  # record gt gt
