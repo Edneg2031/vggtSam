@@ -32,7 +32,14 @@ def main() -> None:
     parser.add_argument("--no-history", action="store_true")
     parser.add_argument(
         "--history-update-source",
-        choices=["gt", "pred", "gt_or_pred", "fused_sam", "sam3_direct"],
+        choices=[
+            "gt",
+            "pred",
+            "gt_or_pred",
+            "fused_sam",
+            "sam3_direct",
+            "sam3_full_proxy",
+        ],
         default=None,
     )
     parser.add_argument(
@@ -59,6 +66,11 @@ def main() -> None:
     sam3_full_flow.add_argument("--sam3-full-flow", action="store_true")
     sam3_full_flow.add_argument("--no-sam3-full-flow", action="store_true")
     parser.add_argument("--sam3-full-residual-scale", type=float, default=None)
+    sam3_full_proxy = parser.add_mutually_exclusive_group()
+    sam3_full_proxy.add_argument("--sam3-full-trainable-proxy", action="store_true")
+    sam3_full_proxy.add_argument("--no-sam3-full-trainable-proxy", action="store_true")
+    parser.add_argument("--sam3-full-proxy-mask-weight", type=float, default=None)
+    parser.add_argument("--sam3-full-proxy-dice-weight", type=float, default=None)
     sam3_direct_box = parser.add_mutually_exclusive_group()
     sam3_direct_box.add_argument("--sam3-direct-box", action="store_true")
     sam3_direct_box.add_argument("--no-sam3-direct-box", action="store_true")
@@ -97,13 +109,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--primary-mask-source",
-        choices=["dense", "fused_sam", "sam3_direct", "sam3_full"],
+        choices=["dense", "fused_sam", "sam3_direct", "sam3_full", "sam3_full_proxy"],
         default=None,
         help=(
             "dense uses the lightweight mask_head; fused_sam routes the main "
             "prediction through SAM3 prompt/mask decoder; sam3_direct uses the "
             "original SAM3 video tracker mask provider; sam3_full uses the "
-            "SAM3 full-flow tracker after injecting fused residuals."
+            "SAM3 full-flow tracker after injecting fused residuals; "
+            "sam3_full_proxy uses the trainable SAM3 decoder proxy."
         ),
     )
     camera_tokens = parser.add_mutually_exclusive_group()
@@ -196,6 +209,14 @@ def main() -> None:
         raw["sam3"]["full_flow"] = False
     if args.sam3_full_residual_scale is not None:
         raw["sam3"]["full_residual_scale"] = args.sam3_full_residual_scale
+    if args.sam3_full_trainable_proxy:
+        raw["sam3"]["full_trainable_proxy"] = True
+    if args.no_sam3_full_trainable_proxy:
+        raw["sam3"]["full_trainable_proxy"] = False
+    if args.sam3_full_proxy_mask_weight is not None:
+        raw["sam3"]["full_proxy_mask_weight"] = args.sam3_full_proxy_mask_weight
+    if args.sam3_full_proxy_dice_weight is not None:
+        raw["sam3"]["full_proxy_dice_weight"] = args.sam3_full_proxy_dice_weight
     if args.sam3_direct_box:
         raw["sam3"]["direct_prompt_with_box"] = True
     if args.no_sam3_direct_box:
@@ -352,6 +373,9 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         sam3_compare_direct=bool(sam3.get("compare_direct", False)),
         sam3_full_flow=bool(sam3.get("full_flow", False)),
         sam3_full_residual_scale=float(sam3.get("full_residual_scale", 1.0)),
+        sam3_full_trainable_proxy=bool(sam3.get("full_trainable_proxy", False)),
+        sam3_full_proxy_mask_weight=float(sam3.get("full_proxy_mask_weight", 0.0)),
+        sam3_full_proxy_dice_weight=float(sam3.get("full_proxy_dice_weight", 0.0)),
         streamvggt_repo=Path(geometry["repo"]),
         streamvggt_checkpoint=Path(geometry["checkpoint"]),
         geometry_device=str(geometry.get("device") or training["device"]),

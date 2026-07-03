@@ -81,6 +81,9 @@ class DenseFusionTrainConfig:
     sam3_compare_direct: bool
     sam3_full_flow: bool
     sam3_full_residual_scale: float
+    sam3_full_trainable_proxy: bool
+    sam3_full_proxy_mask_weight: float
+    sam3_full_proxy_dice_weight: float
     streamvggt_repo: Path
     streamvggt_checkpoint: Path
     geometry_device: str
@@ -266,10 +269,27 @@ def detach_to_cpu(value):
 
 def uses_fused_sam_decoder(config: DenseFusionTrainConfig) -> bool:
     return (
+        uses_legacy_fused_sam_decoder(config)
+        or uses_sam3_full_proxy(config)
+    )
+
+
+def uses_legacy_fused_sam_decoder(config: DenseFusionTrainConfig) -> bool:
+    return (
         config.history_update_source.strip().lower() in {"fused_sam", "sam_decoder"}
-        or config.primary_mask_source.strip().lower() in {"fused_sam", "sam_decoder"}
+        or config.primary_mask_source.strip().lower()
+        in {"fused_sam", "sam_decoder"}
         or config.fused_sam_mask_weight > 0.0
         or config.fused_sam_dice_weight > 0.0
+    )
+
+
+def uses_sam3_full_proxy(config: DenseFusionTrainConfig) -> bool:
+    return (
+        config.sam3_full_trainable_proxy
+        or config.sam3_full_proxy_mask_weight > 0.0
+        or config.sam3_full_proxy_dice_weight > 0.0
+        or config.primary_mask_source.strip().lower() == "sam3_full_proxy"
     )
 
 
@@ -330,6 +350,7 @@ def configure_trainable_parameters(
         primary_uses_fused_sam = config.primary_mask_source.strip().lower() in {
             "fused_sam",
             "sam_decoder",
+            "sam3_full_proxy",
         }
         has_primary_sam_loss = primary_uses_fused_sam and (
             config.mask_weight > 0.0 or config.dice_weight > 0.0
@@ -337,11 +358,14 @@ def configure_trainable_parameters(
         if (
             config.fused_sam_mask_weight <= 0.0
             and config.fused_sam_dice_weight <= 0.0
+            and config.sam3_full_proxy_mask_weight <= 0.0
+            and config.sam3_full_proxy_dice_weight <= 0.0
             and not has_primary_sam_loss
         ):
             raise RuntimeError(
                 "training.train_scope='sam_adapter' needs a trainable fused SAM "
                 "loss. Set --fused-sam-mask-weight/--fused-sam-dice-weight, "
+                "set --sam3-full-proxy-mask-weight/--sam3-full-proxy-dice-weight, "
                 "or use --primary-mask-source fused_sam with positive "
                 "--mask-weight/--dice-weight."
             )
@@ -604,6 +628,8 @@ def export_streamvggt_baseline(config: DenseFusionTrainConfig) -> None:
 def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
     rng = random.Random(config.seed)
     torch.manual_seed(config.seed)
+    use_sam3_full_proxy = uses_sam3_full_proxy(config)
+    use_legacy_fused_sam = uses_legacy_fused_sam_decoder(config)
     use_fused_sam = uses_fused_sam_decoder(config)
     use_fused_sam_residual = uses_fused_sam_residual_features(config)
     use_sam3_direct = uses_sam3_direct_masks(config)
@@ -1011,6 +1037,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 f"fusion_type={config.fusion_type} "
                 f"primary_mask_source={config.primary_mask_source} "
                 f"fused_sam_feature_mode={config.fused_sam_feature_mode} "
+                f"sam3_full_trainable_proxy={config.sam3_full_trainable_proxy} "
                 f"train_scope={config.train_scope}"
             )
 
@@ -1104,9 +1131,12 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
         reprojection_losses: List[torch.Tensor] = []
         fused_sam_mask_losses: List[torch.Tensor] = []
         fused_sam_dice_losses: List[torch.Tensor] = []
+        sam3_full_proxy_mask_losses: List[torch.Tensor] = []
+        sam3_full_proxy_dice_losses: List[torch.Tensor] = []
         pred_ious: List[float] = []
         dense_ious: List[float] = []
         fused_sam_ious: List[float] = []
+        sam3_full_proxy_ious: List[float] = []
         sam3_direct_ious: List[float] = []
         sam3_fused_ious: List[float] = []
         text_losses: List[torch.Tensor] = []
@@ -1173,7 +1203,49 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             zero = output.mask_logits.sum() * 0.0
             fused_sam_mask_loss = zero
             fused_sam_dice_loss = zero
-            if use_fused_sam:
+            sam3_full_proxy_mask_loss = zero
+            sam3_full_proxy_dice_loss = zero
+            if use_sam3_full_proxy:
+                if sam_tracker_model is None:
+                    raise RuntimeError(
+                        "sam3.full_trainable_proxy requires SAM3 instance "
+                        "interactivity and tracker decoder features."
+                    )
+                proxy_prompt = select_fused_sam_prompt_mask(
+                    output=output,
+                    target=target,
+                    source=config.fused_sam_prompt_source,
+                )
+                output.sam3_full_proxy_mask_logits = model.decode_fused_sam_mask(
+                    fused_tokens=fused_frame_tokens[frame_idx],
+                    sam_tracker=sam_tracker_model,
+                    mask_prompt=proxy_prompt,
+                    object_query=object_query,
+                    sam_features=slice_sam3_tracker_features(
+                        sam_tracker_features,
+                        frame_idx=frame_idx,
+                        device=config.device,
+                    ),
+                    feature_mode=config.fused_sam_feature_mode,
+                )
+                sam3_full_proxy_mask_loss = dense_mask_bce_loss(
+                    output.sam3_full_proxy_mask_logits[0],
+                    target["prompt_mask"],
+                    target["mask_supervision"],
+                )
+                sam3_full_proxy_dice_loss = dense_dice_loss(
+                    output.sam3_full_proxy_mask_logits[0],
+                    target["prompt_mask"],
+                    target["mask_supervision"],
+                )
+                sam3_full_proxy_ious.append(
+                    binary_iou_tensor(
+                        output.sam3_full_proxy_mask_logits[0].detach().sigmoid()
+                        > config.visualize_threshold,
+                        target["prompt_mask"],
+                    )
+                )
+            if use_legacy_fused_sam:
                 if sam_tracker_model is None:
                     raise RuntimeError("Fused SAM decoder requested but SAM tracker model is missing.")
                 fused_sam_prompt = select_fused_sam_prompt_mask(
@@ -1299,6 +1371,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 + config.reprojection_weight * reprojection_loss
                 + config.fused_sam_mask_weight * fused_sam_mask_loss
                 + config.fused_sam_dice_weight * fused_sam_dice_loss
+                + config.sam3_full_proxy_mask_weight * sam3_full_proxy_mask_loss
+                + config.sam3_full_proxy_dice_weight * sam3_full_proxy_dice_loss
                 + config.text_weight * text_loss
                 + config.aux_cls_weight * aux_loss
                 + config.match_weight * match_loss
@@ -1312,6 +1386,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             reprojection_losses.append(reprojection_loss)
             fused_sam_mask_losses.append(fused_sam_mask_loss)
             fused_sam_dice_losses.append(fused_sam_dice_loss)
+            sam3_full_proxy_mask_losses.append(sam3_full_proxy_mask_loss)
+            sam3_full_proxy_dice_losses.append(sam3_full_proxy_dice_loss)
             text_losses.append(text_loss)
             aux_losses.append(aux_loss)
             match_losses.append(match_loss)
@@ -1355,9 +1431,12 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "reprojection_loss": mean_metric(reprojection_losses),
             "fused_sam_mask_loss": mean_metric(fused_sam_mask_losses),
             "fused_sam_dice_loss": mean_metric(fused_sam_dice_losses),
+            "sam3_full_proxy_mask_loss": mean_metric(sam3_full_proxy_mask_losses),
+            "sam3_full_proxy_dice_loss": mean_metric(sam3_full_proxy_dice_losses),
             "pred_iou": mean_float(pred_ious),
             "dense_iou": mean_float(dense_ious),
             "fused_sam_iou": mean_float(fused_sam_ious),
+            "sam3_full_proxy_iou": mean_float(sam3_full_proxy_ious),
             "sam3_direct_iou": mean_float(sam3_direct_ious),
             "sam3_full_flow_iou": mean_float(sam3_fused_ious),
             "text_loss": mean_metric(text_losses),
@@ -1379,6 +1458,13 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "fused_sam_feature_mode": config.fused_sam_feature_mode,
             "sam3_full_flow": int(config.sam3_full_flow),
             "sam3_full_residual_scale": float(config.sam3_full_residual_scale),
+            "sam3_full_trainable_proxy": int(config.sam3_full_trainable_proxy),
+            "sam3_full_proxy_mask_weight": float(
+                config.sam3_full_proxy_mask_weight
+            ),
+            "sam3_full_proxy_dice_weight": float(
+                config.sam3_full_proxy_dice_weight
+            ),
             "sam3_full_selected_obj_id": (
                 "" if not sam3_fused_aux else sam3_fused_aux.get("selected_obj_id", "")
             ),
@@ -1403,8 +1489,10 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 "stream_point={streamvggt_point_loss:.4f} "
                 "chamfer={chamfer_loss:.4f} reproj={reprojection_loss:.4f} "
                 "legacy_fused={fused_sam_mask_loss:.4f}/{fused_sam_dice_loss:.4f} "
+                "sam3_proxy={sam3_full_proxy_mask_loss:.4f}/{sam3_full_proxy_dice_loss:.4f} "
                 "pred_iou={pred_iou:.4f} dense_iou={dense_iou:.4f} "
                 "legacy_iou={fused_sam_iou:.4f} "
+                "sam3_proxy_iou={sam3_full_proxy_iou:.4f} "
                 "sam3_full_iou={sam3_full_flow_iou:.4f} "
                 "sam3_direct_iou={sam3_direct_iou:.4f} "
                 "text={text_loss:.4f} match={match_loss:.4f} "
@@ -1792,9 +1880,18 @@ def apply_primary_mask_source(output: Any, source: str) -> None:
             )
         output.mask_logits = mask_to_logits(sam3_mask).unsqueeze(0)
         return
+    if source in {"sam3_full_proxy", "sam3_proxy"}:
+        proxy_logits = getattr(output, "sam3_full_proxy_mask_logits", None)
+        if proxy_logits is None:
+            raise RuntimeError(
+                "model.primary_mask_source='sam3_full_proxy' requires "
+                "sam3_full_proxy_mask_logits. Enable sam3.full_trainable_proxy."
+            )
+        output.mask_logits = proxy_logits
+        return
     raise ValueError(
         "model.primary_mask_source must be 'dense', 'fused_sam', "
-        "'sam3_direct', or 'sam3_full', "
+        "'sam3_direct', 'sam3_full', or 'sam3_full_proxy', "
         f"got {source!r}"
     )
 
@@ -2062,6 +2159,14 @@ def select_history_update_mask(
                 "Enable the fused SAM decoder path."
             )
         return fused_sam_logits[0].detach().sigmoid() > float(pred_threshold)
+    if source in {"sam3_full_proxy", "sam3_proxy"}:
+        proxy_logits = getattr(output, "sam3_full_proxy_mask_logits", None)
+        if proxy_logits is None:
+            raise RuntimeError(
+                "history.update_source='sam3_full_proxy' requires "
+                "sam3_full_proxy_mask_logits. Enable sam3.full_trainable_proxy."
+            )
+        return proxy_logits[0].detach().sigmoid() > float(pred_threshold)
     if source in {"sam3_direct", "sam3", "sam_video", "sam3_video"}:
         sam3_mask = getattr(output, "sam3_direct_mask", None)
         if sam3_mask is None:
@@ -2077,7 +2182,7 @@ def select_history_update_mask(
         return output.mask_logits[0].detach().sigmoid() > float(pred_threshold)
     raise ValueError(
         "history.update_source must be 'gt', 'pred', 'gt_or_pred', 'fused_sam', "
-        "or 'sam3_direct', "
+        "'sam3_direct', or 'sam3_full_proxy', "
         f"got {source!r}"
     )
 
@@ -2145,6 +2250,10 @@ def save_dense_visualization(
         getattr(output, "fused_sam_mask_logits", None) is not None
         for output in outputs
     )
+    show_sam3_full_proxy = primary != "sam3_full_proxy" and any(
+        getattr(output, "sam3_full_proxy_mask_logits", None) is not None
+        for output in outputs
+    )
     show_sam3_direct = any(
         getattr(output, "sam3_direct_mask", None) is not None
         for output in outputs
@@ -2159,6 +2268,7 @@ def save_dense_visualization(
         + int(show_primary_pred)
         + int(show_dense_head)
         + int(show_sam3_fused)
+        + int(show_sam3_full_proxy)
         + int(show_sam3_direct)
         + int(show_legacy_fused_sam)
         + int(show_score)
@@ -2179,6 +2289,8 @@ def save_dense_visualization(
     )
     if primary in legacy_fused_sources:
         pred_heading = "Pred (legacy fused SAM)"
+    elif primary == "sam3_full_proxy":
+        pred_heading = "Pred (SAM3 trainable proxy)"
     elif primary in full_flow_sources:
         pred_heading = "Pred (SAM3 full flow)"
     elif primary in {"sam3_direct", "sam3", "sam_video", "sam3_video"}:
@@ -2192,6 +2304,8 @@ def save_dense_visualization(
         headings.append("Dense head")
     if show_sam3_fused:
         headings.append("SAM3 full fused")
+    if show_sam3_full_proxy:
+        headings.append("SAM3 trainable proxy")
     if show_sam3_direct:
         headings.append("SAM3 original")
     if show_legacy_fused_sam:
@@ -2225,6 +2339,20 @@ def save_dense_visualization(
             else:
                 fused_full = sam3_fused_mask.detach().float().cpu().numpy()
                 panels.append(overlay_mask(image, fused_full, (42, 157, 143), threshold=0.5))
+        sam3_full_proxy_logits = getattr(output, "sam3_full_proxy_mask_logits", None)
+        if show_sam3_full_proxy:
+            if sam3_full_proxy_logits is None:
+                panels.append(image)
+            else:
+                proxy = (
+                    sam3_full_proxy_logits[0]
+                    .sigmoid()
+                    .detach()
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
+                panels.append(overlay_mask(image, proxy, (131, 56, 236), threshold=threshold))
         sam3_direct_mask = getattr(output, "sam3_direct_mask", None)
         if show_sam3_direct:
             if sam3_direct_mask is None:
@@ -2521,9 +2649,12 @@ def write_metrics_header(path: Path) -> None:
         "reprojection_loss",
         "fused_sam_mask_loss",
         "fused_sam_dice_loss",
+        "sam3_full_proxy_mask_loss",
+        "sam3_full_proxy_dice_loss",
         "pred_iou",
         "dense_iou",
         "fused_sam_iou",
+        "sam3_full_proxy_iou",
         "sam3_direct_iou",
         "sam3_full_flow_iou",
         "text_loss",
@@ -2545,6 +2676,9 @@ def write_metrics_header(path: Path) -> None:
         "fused_sam_feature_mode",
         "sam3_full_flow",
         "sam3_full_residual_scale",
+        "sam3_full_trainable_proxy",
+        "sam3_full_proxy_mask_weight",
+        "sam3_full_proxy_dice_weight",
         "sam3_full_selected_obj_id",
         "sam3_direct_selected_obj_id",
         "sam3_direct_prompt_frame_idx",
