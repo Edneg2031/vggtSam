@@ -1392,8 +1392,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 "dice={dice_loss:.4f} point={point_loss:.4f} "
                 "stream_point={streamvggt_point_loss:.4f} "
                 "chamfer={chamfer_loss:.4f} reproj={reprojection_loss:.4f} "
-                "fused_sam={fused_sam_mask_loss:.4f}/{fused_sam_dice_loss:.4f} "
-                "pred_iou={pred_iou:.4f} fused_iou={fused_sam_iou:.4f} "
+                "legacy_fused={fused_sam_mask_loss:.4f}/{fused_sam_dice_loss:.4f} "
+                "pred_iou={pred_iou:.4f} legacy_iou={fused_sam_iou:.4f} "
                 "sam3_full_iou={sam3_full_flow_iou:.4f} "
                 "sam3_direct_iou={sam3_direct_iou:.4f} "
                 "text={text_loss:.4f} match={match_loss:.4f} "
@@ -2122,7 +2122,10 @@ def save_dense_visualization(
     title_h = 26
     margin = 6
     primary = primary_mask_source.strip().lower()
-    show_fused_sam = primary not in {"fused_sam", "sam_decoder"} and any(
+    full_flow_sources = {"sam3_full", "sam3_fused", "sam3_full_flow"}
+    legacy_fused_sources = {"fused_sam", "sam_decoder"}
+    hidden_legacy_fused_sources = legacy_fused_sources | full_flow_sources
+    show_legacy_fused_sam = primary not in hidden_legacy_fused_sources and any(
         getattr(output, "fused_sam_mask_logits", None) is not None
         for output in outputs
     )
@@ -2139,7 +2142,7 @@ def save_dense_visualization(
         3
         + int(show_sam3_fused)
         + int(show_sam3_direct)
-        + int(show_fused_sam)
+        + int(show_legacy_fused_sam)
         + int(show_score)
     )
     canvas = Image.new(
@@ -2156,18 +2159,21 @@ def save_dense_visualization(
         ),
         fill=(240, 240, 240),
     )
-    pred_heading = (
-        "Pred (fused SAM)"
-        if primary in {"fused_sam", "sam_decoder"}
-        else "Pred mask"
-    )
+    if primary in legacy_fused_sources:
+        pred_heading = "Pred (legacy fused SAM)"
+    elif primary in full_flow_sources:
+        pred_heading = "Pred (SAM3 full flow)"
+    elif primary in {"sam3_direct", "sam3", "sam_video", "sam3_video"}:
+        pred_heading = "Pred (SAM3 original)"
+    else:
+        pred_heading = "Pred mask"
     headings = ["RGB", "GT prompt", pred_heading]
     if show_sam3_fused:
         headings.append("SAM3 full fused")
     if show_sam3_direct:
         headings.append("SAM3 original")
-    if show_fused_sam:
-        headings.append("Fused SAM")
+    if show_legacy_fused_sam:
+        headings.append("Legacy fused SAM")
     if show_score:
         headings.append("Pred score")
     for col, heading in enumerate(headings):
@@ -2197,7 +2203,7 @@ def save_dense_visualization(
                 direct = sam3_direct_mask.detach().float().cpu().numpy()
                 panels.append(overlay_mask(image, direct, (255, 183, 3), threshold=0.5))
         fused_sam_logits = getattr(output, "fused_sam_mask_logits", None)
-        if show_fused_sam:
+        if show_legacy_fused_sam:
             if fused_sam_logits is None:
                 panels.append(image)
             else:

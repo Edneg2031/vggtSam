@@ -7,6 +7,8 @@ case is validation and visualization, not training loss.
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import os
 import shutil
 import tempfile
@@ -37,6 +39,7 @@ def load_sam3_video_predictor(
     checkpoint_path: str | Path,
     device: str,
     async_loading_frames: bool = False,
+    quiet: bool = True,
 ):
     repo = maybe_add_repo_to_path(repo_path)
     if repo_path is not None:
@@ -53,23 +56,24 @@ def load_sam3_video_predictor(
     if not str(device).startswith("cuda"):
         raise RuntimeError("SAM3 video predictor requires a CUDA device.")
 
-    try:
-        from sam3.model_builder import build_sam3_video_predictor
-    except ModuleNotFoundError as exc:
-        if exc.name == "sam3":
-            raise RuntimeError(
-                "Could not import `sam3`. Run `git submodule update --init --recursive` "
-                "or pass `--sam3-repo` to a SAM3 repo."
-            ) from exc
-        raise
+    with quiet_sam3_output(quiet):
+        try:
+            from sam3.model_builder import build_sam3_video_predictor
+        except ModuleNotFoundError as exc:
+            if exc.name == "sam3":
+                raise RuntimeError(
+                    "Could not import `sam3`. Run `git submodule update --init --recursive` "
+                    "or pass `--sam3-repo` to a SAM3 repo."
+                ) from exc
+            raise
 
-    gpu_id = parse_cuda_device_index(device)
-    return build_sam3_video_predictor(
-        checkpoint_path=str(checkpoint_path),
-        gpus_to_use=[gpu_id],
-        compile=False,
-        async_loading_frames=async_loading_frames,
-    )
+        gpu_id = parse_cuda_device_index(device)
+        return build_sam3_video_predictor(
+            checkpoint_path=str(checkpoint_path),
+            gpus_to_use=[gpu_id],
+            compile=False,
+            async_loading_frames=async_loading_frames,
+        )
 
 
 class SAM3VideoTrackerAdapter:
@@ -98,6 +102,7 @@ class SAM3VideoTrackerAdapter:
         reference_mask: torch.Tensor | np.ndarray | None = None,
         tracker_fpn_residuals: Optional[Sequence[torch.Tensor]] = None,
         tracker_fpn_residual_scale: float = 1.0,
+        quiet: bool = True,
     ) -> SAM3TrackOutput:
         if not image_paths:
             raise ValueError("At least one image path is required for SAM3 tracking.")
@@ -111,49 +116,50 @@ class SAM3VideoTrackerAdapter:
         with tempfile.TemporaryDirectory(prefix="sam3_track_") as tmp:
             tmp_dir = Path(tmp)
             materialize_video_dir(image_paths, tmp_dir)
-            session = self.predictor.start_session(resource_path=str(tmp_dir))
-            session_id = session["session_id"] if isinstance(session, dict) else session
-            try:
-                residual_enabled = tracker_fpn_residuals is not None
-                if residual_enabled:
-                    set_vggtsam_tracker_fpn_residuals(
-                        self.predictor,
-                        session_id=session_id,
-                        residuals=tracker_fpn_residuals,
-                        scale=tracker_fpn_residual_scale,
+            with quiet_sam3_output(quiet):
+                session = self.predictor.start_session(resource_path=str(tmp_dir))
+                session_id = session["session_id"] if isinstance(session, dict) else session
+                try:
+                    residual_enabled = tracker_fpn_residuals is not None
+                    if residual_enabled:
+                        set_vggtsam_tracker_fpn_residuals(
+                            self.predictor,
+                            session_id=session_id,
+                            residuals=tracker_fpn_residuals,
+                            scale=tracker_fpn_residual_scale,
+                        )
+                    prompt_box = None
+                    reference_mask_out = normalize_reference_mask(
+                        reference_mask,
+                        output_size=output_size,
                     )
-                prompt_box = None
-                reference_mask_out = normalize_reference_mask(
-                    reference_mask,
-                    output_size=output_size,
-                )
-                if self.prompt_with_box and reference_mask_out is not None:
-                    prompt_box = mask_to_normalized_box(
-                        reference_mask_out,
-                        image_path=Path(image_paths[prompt_frame_idx]),
-                    )
+                    if self.prompt_with_box and reference_mask_out is not None:
+                        prompt_box = mask_to_normalized_box(
+                            reference_mask_out,
+                            image_path=Path(image_paths[prompt_frame_idx]),
+                        )
 
-                add_kwargs: Dict[str, Any] = {
-                    "session_id": session_id,
-                    "frame_idx": prompt_frame_idx,
-                    "text": prompt,
-                    "output_prob_thresh": self.output_prob_thresh,
-                }
-                if prompt_box is not None:
-                    add_kwargs["bounding_boxes"] = [prompt_box]
-                    add_kwargs["bounding_box_labels"] = [1]
-                prompted = self.predictor.add_prompt(**add_kwargs)
-                propagated = list(
-                    self.predictor.propagate_in_video(
-                        session_id=session_id,
-                        propagation_direction="both",
-                        start_frame_idx=prompt_frame_idx,
-                        max_frame_num_to_track=len(image_paths),
-                        output_prob_thresh=self.output_prob_thresh,
+                    add_kwargs: Dict[str, Any] = {
+                        "session_id": session_id,
+                        "frame_idx": prompt_frame_idx,
+                        "text": prompt,
+                        "output_prob_thresh": self.output_prob_thresh,
+                    }
+                    if prompt_box is not None:
+                        add_kwargs["bounding_boxes"] = [prompt_box]
+                        add_kwargs["bounding_box_labels"] = [1]
+                    prompted = self.predictor.add_prompt(**add_kwargs)
+                    propagated = list(
+                        self.predictor.propagate_in_video(
+                            session_id=session_id,
+                            propagation_direction="both",
+                            start_frame_idx=prompt_frame_idx,
+                            max_frame_num_to_track=len(image_paths),
+                            output_prob_thresh=self.output_prob_thresh,
+                        )
                     )
-                )
-            finally:
-                self.predictor.close_session(session_id)
+                finally:
+                    self.predictor.close_session(session_id)
 
         frame_objects = collect_frame_objects(
             [prompted, *propagated],
@@ -190,6 +196,40 @@ class SAM3VideoTrackerAdapter:
                 },
             },
         )
+
+
+@contextlib.contextmanager
+def quiet_sam3_output(enabled: bool = True):
+    if not enabled:
+        yield
+        return
+
+    previous_levels: Dict[str, int] = {}
+    set_sam3_loggers(logging.WARNING, previous_levels)
+    with open(os.devnull, "w", encoding="utf8") as devnull:
+        with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+            try:
+                yield
+            finally:
+                restore_loggers(previous_levels)
+
+
+def set_sam3_loggers(level: int, previous_levels: Dict[str, int]) -> None:
+    names = {"", "sam3"}
+    names.update(
+        name
+        for name in logging.Logger.manager.loggerDict.keys()
+        if str(name).startswith("sam3")
+    )
+    for name in names:
+        logger = logging.getLogger(name)
+        previous_levels.setdefault(name, logger.level)
+        logger.setLevel(level)
+
+
+def restore_loggers(previous_levels: Dict[str, int]) -> None:
+    for name, level in previous_levels.items():
+        logging.getLogger(name).setLevel(level)
 
 
 def set_vggtsam_tracker_fpn_residuals(
