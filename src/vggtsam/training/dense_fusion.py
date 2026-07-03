@@ -1718,8 +1718,17 @@ def select_point_supervision_mask(
                 "to sam3_direct so the SAM3 video tracker is enabled."
             )
         return point_valid & sam3_mask.detach().bool()
+    if source in {"sam3_full", "sam3_fused", "sam3_full_flow"}:
+        sam3_mask = getattr(output, "sam3_fused_mask", None)
+        if sam3_mask is None:
+            raise RuntimeError(
+                "loss.point_valid_source='sam3_full' requires sam3_fused_mask. "
+                "Enable --sam3-full-flow."
+            )
+        return point_valid & sam3_mask.detach().bool()
     raise ValueError(
-        "loss.point_valid_source must be 'gt', 'pred', or 'sam3_direct', "
+        "loss.point_valid_source must be 'gt', 'pred', 'sam3_direct', "
+        "or 'sam3_full', "
         f"got {source!r}"
     )
 

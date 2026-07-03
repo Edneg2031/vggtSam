@@ -37,7 +37,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--fused-sam-prompt-source",
-        choices=["none", "pred", "gt", "gt_or_pred"],
+        choices=["none", "pred", "gt", "gt_or_pred", "sam3_direct"],
         default=None,
     )
     parser.add_argument("--fused-sam-mask-weight", type=float, default=None)
@@ -127,7 +127,7 @@ def main() -> None:
     parser.add_argument("--point-weight", type=float, default=None)
     parser.add_argument(
         "--point-valid-source",
-        choices=["gt", "pred", "sam3_direct"],
+        choices=["gt", "pred", "sam3_direct", "sam3_full"],
         default=None,
     )
     parser.add_argument("--point-valid-threshold", type=float, default=None)
