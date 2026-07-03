@@ -798,6 +798,58 @@ class DenseSAMVGGTModel(nn.Module):
             )
         return mask_logits[:, 0].contiguous()
 
+    def build_sam3_tracker_fpn_residuals(
+        self,
+        *,
+        fused_tokens: torch.Tensor,
+        object_query: torch.Tensor | None = None,
+    ) -> list[torch.Tensor]:
+        """Project fused tokens into SAM3 tracker FPN residuals.
+
+        Returned levels are [fpn0, fpn1, fpn2]. Injecting these into SAM3's
+        tracker backbone lets the original video memory and propagation path run
+        on the 3D-aware features.
+        """
+        if not self.enable_fused_sam_decoder:
+            raise RuntimeError("Fused SAM adapter layers are disabled for this model.")
+        assert self.fused_sam_image_proj is not None
+        assert self.fused_sam_high_s1 is not None
+        assert self.fused_sam_high_s0 is not None
+        assert self.fused_sam_object_proj is not None
+        assert self.fused_sam_residual_scale is not None
+
+        fused_tokens = self._ensure_batched(fused_tokens)
+        feature = self.tokens_to_feature_grid(fused_tokens)
+        object_query = self._prepare_object_query(
+            object_query,
+            batch_size=feature.shape[0],
+            device=feature.device,
+        )
+        if object_query is not None:
+            feature = feature + self.fused_sam_object_proj(object_query)[
+                :, :, None, None
+            ]
+
+        scale = self.fused_sam_residual_scale
+        residual_fpn2 = scale * self.fused_sam_image_proj(feature)
+        residual_fpn1 = scale * self.fused_sam_high_s1(
+            F.interpolate(
+                feature,
+                size=(144, 144),
+                mode="bilinear",
+                align_corners=False,
+            )
+        )
+        residual_fpn0 = scale * self.fused_sam_high_s0(
+            F.interpolate(
+                feature,
+                size=(288, 288),
+                mode="bilinear",
+                align_corners=False,
+            )
+        )
+        return [residual_fpn0, residual_fpn1, residual_fpn2]
+
     @staticmethod
     def _sam_feature(
         sam_features: dict[str, torch.Tensor],

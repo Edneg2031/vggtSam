@@ -140,7 +140,7 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --point-decoder stream_dpt \
   --stream-dpt-use-pretrained \
   --history-update-source gt \
-  --fused-sam-prompt-source none \
+  --fused-sam-prompt-source sam3_direct \
   --fused-sam-mask-weight 1 \
   --fused-sam-dice-weight 1 \
   --train-scope sam_adapter \
@@ -172,7 +172,7 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --compare-sam3-direct \
   --history-update-source gt \
   --fused-sam-feature-mode residual \
-  --fused-sam-prompt-source none \
+  --fused-sam-prompt-source sam3_direct \
   --train-scope sam_adapter \
   --mask-weight 1 \
   --dice-weight 1 \
@@ -209,7 +209,7 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --compare-sam3-direct \
   --history-update-source gt \
   --fused-sam-feature-mode residual \
-  --fused-sam-prompt-source none \
+  --fused-sam-prompt-source sam3_direct \
   --train-scope sam_adapter \
   --mask-weight 1 \
   --dice-weight 1 \
@@ -227,4 +227,77 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --sam3-device cuda:2 \
   --sam3-direct-device cuda:3 \
   --visualize-every 10 \
-  --output-dir outputs/tracker_fpn2_fused_sam_vs_original_inst37
+  --output-dir outputs/tracker_fpn2_sam3memory_fuseddecode_vs_original_inst37
+
+
+### 完整 SAM3 flow hook 验证：先检查 hook 不破坏原版流程
+# scale=0 时，SAM3 full fused 应该基本等同于 SAM3 original。
+PYTHONPATH=src python scripts/train_dense_fusion.py \
+  --config configs/dense_fusion_train.yaml \
+  --scene-id 00a231a370 \
+  --instance-id 37 \
+  --frame-indices 91 133 162 163 228 263 273 \
+  --point-decoder stream_dpt \
+  --stream-dpt-use-pretrained \
+  --fusion-type camera_guided \
+  --sam3-full-flow \
+  --sam3-full-residual-scale 0 \
+  --primary-mask-source sam3_full \
+  --compare-sam3-direct \
+  --history-update-source gt \
+  --fused-sam-feature-mode residual \
+  --fused-sam-prompt-source sam3_direct \
+  --train-scope sam_adapter \
+  --mask-weight 0 \
+  --dice-weight 0 \
+  --fused-sam-mask-weight 1 \
+  --fused-sam-dice-weight 1 \
+  --point-weight 0 \
+  --text-weight 0 \
+  --aux-cls-weight 0 \
+  --match-weight 0 \
+  --chamfer-weight 0 \
+  --reprojection-weight 0 \
+  --iterations 100 \
+  --device cuda:3 \
+  --geometry-device cuda:1 \
+  --sam3-device cuda:2 \
+  --sam3-direct-device cuda:3 \
+  --visualize-every 10 \
+  --output-dir outputs/sam3_full_flow_hook_scale0_inst37
+
+
+### 完整 SAM3 flow hook 验证：3D residual 注入 SAM3 tracker FPN 后走原生 memory/propagation
+PYTHONPATH=src python scripts/train_dense_fusion.py \
+  --config configs/dense_fusion_train.yaml \
+  --scene-id 00a231a370 \
+  --instance-id 37 \
+  --frame-indices 91 133 162 163 228 263 273 \
+  --point-decoder stream_dpt \
+  --stream-dpt-use-pretrained \
+  --fusion-type camera_guided \
+  --sam3-full-flow \
+  --sam3-full-residual-scale 1 \
+  --primary-mask-source sam3_full \
+  --compare-sam3-direct \
+  --history-update-source gt \
+  --fused-sam-feature-mode residual \
+  --fused-sam-prompt-source sam3_direct \
+  --train-scope sam_adapter \
+  --mask-weight 0 \
+  --dice-weight 0 \
+  --fused-sam-mask-weight 1 \
+  --fused-sam-dice-weight 1 \
+  --point-weight 0 \
+  --text-weight 0 \
+  --aux-cls-weight 0 \
+  --match-weight 0 \
+  --chamfer-weight 0 \
+  --reprojection-weight 0 \
+  --iterations 700 \
+  --device cuda:3 \
+  --geometry-device cuda:1 \
+  --sam3-device cuda:2 \
+  --sam3-direct-device cuda:3 \
+  --visualize-every 10 \
+  --output-dir outputs/sam3_full_flow_hook_scale1_inst37

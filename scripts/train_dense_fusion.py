@@ -55,6 +55,10 @@ def main() -> None:
     sam3_compare_direct = parser.add_mutually_exclusive_group()
     sam3_compare_direct.add_argument("--compare-sam3-direct", action="store_true")
     sam3_compare_direct.add_argument("--no-compare-sam3-direct", action="store_true")
+    sam3_full_flow = parser.add_mutually_exclusive_group()
+    sam3_full_flow.add_argument("--sam3-full-flow", action="store_true")
+    sam3_full_flow.add_argument("--no-sam3-full-flow", action="store_true")
+    parser.add_argument("--sam3-full-residual-scale", type=float, default=None)
     sam3_direct_box = parser.add_mutually_exclusive_group()
     sam3_direct_box.add_argument("--sam3-direct-box", action="store_true")
     sam3_direct_box.add_argument("--no-sam3-direct-box", action="store_true")
@@ -93,12 +97,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--primary-mask-source",
-        choices=["dense", "fused_sam", "sam3_direct"],
+        choices=["dense", "fused_sam", "sam3_direct", "sam3_full"],
         default=None,
         help=(
             "dense uses the lightweight mask_head; fused_sam routes the main "
             "prediction through SAM3 prompt/mask decoder; sam3_direct uses the "
-            "original SAM3 video tracker mask provider."
+            "original SAM3 video tracker mask provider; sam3_full uses the "
+            "SAM3 full-flow tracker after injecting fused residuals."
         ),
     )
     camera_tokens = parser.add_mutually_exclusive_group()
@@ -185,6 +190,12 @@ def main() -> None:
         raw["sam3"]["compare_direct"] = True
     if args.no_compare_sam3_direct:
         raw["sam3"]["compare_direct"] = False
+    if args.sam3_full_flow:
+        raw["sam3"]["full_flow"] = True
+    if args.no_sam3_full_flow:
+        raw["sam3"]["full_flow"] = False
+    if args.sam3_full_residual_scale is not None:
+        raw["sam3"]["full_residual_scale"] = args.sam3_full_residual_scale
     if args.sam3_direct_box:
         raw["sam3"]["direct_prompt_with_box"] = True
     if args.no_sam3_direct_box:
@@ -339,6 +350,8 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
             sam3.get("direct_async_loading_frames", False)
         ),
         sam3_compare_direct=bool(sam3.get("compare_direct", False)),
+        sam3_full_flow=bool(sam3.get("full_flow", False)),
+        sam3_full_residual_scale=float(sam3.get("full_residual_scale", 1.0)),
         streamvggt_repo=Path(geometry["repo"]),
         streamvggt_checkpoint=Path(geometry["checkpoint"]),
         geometry_device=str(geometry.get("device") or training["device"]),

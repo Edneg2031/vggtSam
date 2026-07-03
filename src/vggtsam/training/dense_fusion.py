@@ -79,6 +79,8 @@ class DenseFusionTrainConfig:
     sam3_direct_output_prob_thresh: float
     sam3_direct_async_loading_frames: bool
     sam3_compare_direct: bool
+    sam3_full_flow: bool
+    sam3_full_residual_scale: float
     streamvggt_repo: Path
     streamvggt_checkpoint: Path
     geometry_device: str
@@ -288,7 +290,9 @@ def uses_sam3_direct_masks(config: DenseFusionTrainConfig) -> bool:
         config.history_update_source.strip().lower() in direct_sources
         or config.point_valid_source.strip().lower() in direct_sources
         or config.primary_mask_source.strip().lower() in direct_sources
+        or config.fused_sam_prompt_source.strip().lower() in direct_sources
         or config.sam3_compare_direct
+        or config.sam3_full_flow
     )
 
 
@@ -1061,6 +1065,35 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             fused_frame_tokens[reference_frame_idx],
             batch["reference_mask"],
         )
+        sam3_fused_masks = None
+        sam3_fused_aux: Dict[str, Any] = {}
+        if config.sam3_full_flow:
+            fused_tokens_for_tracker = torch.cat(
+                [tokens.detach() for tokens in fused_frame_tokens],
+                dim=0,
+            )
+            tracker_residuals = model.build_sam3_tracker_fpn_residuals(
+                fused_tokens=fused_tokens_for_tracker,
+                object_query=object_query.detach(),
+            )
+            sam3_fused_track = get_sam3_direct_tracker().track_from_paths(
+                sequence.image_paths,
+                prompt=prompt_selection.prompt,
+                output_size=config.output_size,
+                prompt_frame_idx=reference_frame_idx,
+                reference_mask=batch["reference_mask"].detach().cpu(),
+                tracker_fpn_residuals=[
+                    residual.detach().cpu() for residual in tracker_residuals
+                ],
+                tracker_fpn_residual_scale=config.sam3_full_residual_scale,
+            )
+            sam3_fused_masks = sam3_fused_track.masks.detach().cpu()
+            sam3_fused_aux = {
+                **sam3_fused_track.aux,
+                "selected_obj_id": sam3_fused_track.selected_obj_id,
+                "prompt_frame_idx": sam3_fused_track.prompt_frame_idx,
+                "prompt_box_xywh": sam3_fused_track.prompt_box_xywh,
+            }
 
         frame_losses: List[torch.Tensor] = []
         mask_losses: List[torch.Tensor] = []
@@ -1071,7 +1104,10 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
         reprojection_losses: List[torch.Tensor] = []
         fused_sam_mask_losses: List[torch.Tensor] = []
         fused_sam_dice_losses: List[torch.Tensor] = []
+        pred_ious: List[float] = []
+        fused_sam_ious: List[float] = []
         sam3_direct_ious: List[float] = []
+        sam3_fused_ious: List[float] = []
         text_losses: List[torch.Tensor] = []
         aux_losses: List[torch.Tensor] = []
         match_losses: List[torch.Tensor] = []
@@ -1081,6 +1117,11 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
         selected_point_pixels = 0
         gt_point_pixels = int(
             (batch["prompt_mask"] & batch["point_valid"]).sum().item()
+        )
+        sam3_fused_masks_device = (
+            sam3_fused_masks.to(config.device).bool()
+            if sam3_fused_masks is not None
+            else None
         )
 
         for frame_idx in range(num_frames):
@@ -1110,6 +1151,11 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 output.sam3_direct_mask = sam3_direct_masks_device[frame_idx]
                 sam3_direct_ious.append(
                     binary_iou_tensor(output.sam3_direct_mask, target["prompt_mask"])
+                )
+            if sam3_fused_masks_device is not None:
+                output.sam3_fused_mask = sam3_fused_masks_device[frame_idx]
+                sam3_fused_ious.append(
+                    binary_iou_tensor(output.sam3_fused_mask, target["prompt_mask"])
                 )
             if stream_baseline_pointmaps_device is not None:
                 output.streamvggt_pointmap = stream_baseline_pointmaps_device[
@@ -1148,7 +1194,21 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                     target["prompt_mask"],
                     target["mask_supervision"],
                 )
+                fused_sam_ious.append(
+                    binary_iou_tensor(
+                        output.fused_sam_mask_logits[0].detach().sigmoid()
+                        > config.visualize_threshold,
+                        target["prompt_mask"],
+                    )
+                )
             apply_primary_mask_source(output, config.primary_mask_source)
+            pred_ious.append(
+                binary_iou_tensor(
+                    output.mask_logits[0].detach().sigmoid()
+                    > config.visualize_threshold,
+                    target["prompt_mask"],
+                )
+            )
             outputs.append(output)
 
             mask_loss = dense_mask_bce_loss(
@@ -1286,7 +1346,10 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "reprojection_loss": mean_metric(reprojection_losses),
             "fused_sam_mask_loss": mean_metric(fused_sam_mask_losses),
             "fused_sam_dice_loss": mean_metric(fused_sam_dice_losses),
+            "pred_iou": mean_float(pred_ious),
+            "fused_sam_iou": mean_float(fused_sam_ious),
             "sam3_direct_iou": mean_float(sam3_direct_ious),
+            "sam3_full_flow_iou": mean_float(sam3_fused_ious),
             "text_loss": mean_metric(text_losses),
             "aux_cls_loss": mean_metric(aux_losses),
             "match_loss": mean_metric(match_losses),
@@ -1304,6 +1367,11 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "history_update_source": config.history_update_source,
             "fused_sam_prompt_source": config.fused_sam_prompt_source,
             "fused_sam_feature_mode": config.fused_sam_feature_mode,
+            "sam3_full_flow": int(config.sam3_full_flow),
+            "sam3_full_residual_scale": float(config.sam3_full_residual_scale),
+            "sam3_full_selected_obj_id": (
+                "" if not sam3_fused_aux else sam3_fused_aux.get("selected_obj_id", "")
+            ),
             "sam3_direct_selected_obj_id": (
                 "" if not sam3_direct_aux else sam3_direct_aux.get("selected_obj_id", "")
             ),
@@ -1325,6 +1393,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 "stream_point={streamvggt_point_loss:.4f} "
                 "chamfer={chamfer_loss:.4f} reproj={reprojection_loss:.4f} "
                 "fused_sam={fused_sam_mask_loss:.4f}/{fused_sam_dice_loss:.4f} "
+                "pred_iou={pred_iou:.4f} fused_iou={fused_sam_iou:.4f} "
+                "sam3_full_iou={sam3_full_flow_iou:.4f} "
                 "sam3_direct_iou={sam3_direct_iou:.4f} "
                 "text={text_loss:.4f} match={match_loss:.4f} "
                 "prompt_pixels={num_prompt_pixels} "
@@ -1693,8 +1763,18 @@ def apply_primary_mask_source(output: Any, source: str) -> None:
             )
         output.mask_logits = mask_to_logits(sam3_mask).unsqueeze(0)
         return
+    if source in {"sam3_full", "sam3_fused", "sam3_full_flow"}:
+        sam3_mask = getattr(output, "sam3_fused_mask", None)
+        if sam3_mask is None:
+            raise RuntimeError(
+                "model.primary_mask_source='sam3_full' requires sam3_fused_mask. "
+                "Enable --sam3-full-flow."
+            )
+        output.mask_logits = mask_to_logits(sam3_mask).unsqueeze(0)
+        return
     raise ValueError(
-        "model.primary_mask_source must be 'dense', 'fused_sam', or 'sam3_direct', "
+        "model.primary_mask_source must be 'dense', 'fused_sam', "
+        "'sam3_direct', or 'sam3_full', "
         f"got {source!r}"
     )
 
@@ -2000,8 +2080,18 @@ def select_fused_sam_prompt_mask(
         if gt.any():
             return gt.float()
         return output.mask_logits.detach()
+    if source in {"sam3_direct", "sam3", "sam_video", "sam3_video"}:
+        sam3_mask = getattr(output, "sam3_direct_mask", None)
+        if sam3_mask is None:
+            raise RuntimeError(
+                "history.fused_sam_prompt_source='sam3_direct' requires "
+                "sam3_direct_mask. Enable sam3.compare_direct or use a SAM3 "
+                "direct source."
+            )
+        return sam3_mask.detach().float()
     raise ValueError(
-        "history.fused_sam_prompt_source must be 'none', 'pred', 'gt', or 'gt_or_pred', "
+        "history.fused_sam_prompt_source must be 'none', 'pred', 'gt', "
+        "'gt_or_pred', or 'sam3_direct', "
         f"got {source!r}"
     )
 
@@ -2031,8 +2121,18 @@ def save_dense_visualization(
         getattr(output, "sam3_direct_mask", None) is not None
         for output in outputs
     )
+    show_sam3_fused = any(
+        getattr(output, "sam3_fused_mask", None) is not None
+        for output in outputs
+    )
     show_score = primary in {"dense", "mask_head", "baseline"}
-    columns = 3 + int(show_sam3_direct) + int(show_fused_sam) + int(show_score)
+    columns = (
+        3
+        + int(show_sam3_fused)
+        + int(show_sam3_direct)
+        + int(show_fused_sam)
+        + int(show_score)
+    )
     canvas = Image.new(
         "RGB",
         (columns * panel_w + (columns + 1) * margin, title_h + frames * (panel_h + margin) + margin),
@@ -2053,6 +2153,8 @@ def save_dense_visualization(
         else "Pred mask"
     )
     headings = ["RGB", "GT prompt", pred_heading]
+    if show_sam3_fused:
+        headings.append("SAM3 full fused")
     if show_sam3_direct:
         headings.append("SAM3 original")
     if show_fused_sam:
@@ -2071,6 +2173,13 @@ def save_dense_visualization(
             overlay_mask(image, gt, (230, 57, 70), threshold=0.5),
             overlay_mask(image, pred, (69, 123, 157), threshold=threshold),
         ]
+        sam3_fused_mask = getattr(output, "sam3_fused_mask", None)
+        if show_sam3_fused:
+            if sam3_fused_mask is None:
+                panels.append(image)
+            else:
+                fused_full = sam3_fused_mask.detach().float().cpu().numpy()
+                panels.append(overlay_mask(image, fused_full, (42, 157, 143), threshold=0.5))
         sam3_direct_mask = getattr(output, "sam3_direct_mask", None)
         if show_sam3_direct:
             if sam3_direct_mask is None:
@@ -2181,6 +2290,21 @@ def export_dense_pointclouds(
             pred_points,
             rgb,
             direct_masks,
+            max_points=max_points,
+        )
+    sam3_fused_masks = [
+        getattr(output, "sam3_fused_mask", None) for output in outputs
+    ]
+    if all(mask is not None for mask in sam3_fused_masks):
+        fused_full_masks = torch.stack(
+            [mask.detach().bool().cpu() for mask in sam3_fused_masks],
+            dim=0,
+        )
+        write_pointcloud_ply(
+            output_dir / f"step_{step:06d}_pred_object_sam3_full_fused.ply",
+            pred_points,
+            rgb,
+            fused_full_masks,
             max_points=max_points,
         )
     fused_sam_logits = [
@@ -2352,7 +2476,10 @@ def write_metrics_header(path: Path) -> None:
         "reprojection_loss",
         "fused_sam_mask_loss",
         "fused_sam_dice_loss",
+        "pred_iou",
+        "fused_sam_iou",
         "sam3_direct_iou",
+        "sam3_full_flow_iou",
         "text_loss",
         "aux_cls_loss",
         "match_loss",
@@ -2370,6 +2497,9 @@ def write_metrics_header(path: Path) -> None:
         "history_update_source",
         "fused_sam_prompt_source",
         "fused_sam_feature_mode",
+        "sam3_full_flow",
+        "sam3_full_residual_scale",
+        "sam3_full_selected_obj_id",
         "sam3_direct_selected_obj_id",
         "sam3_direct_prompt_frame_idx",
         "prompt",

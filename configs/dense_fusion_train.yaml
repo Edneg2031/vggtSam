@@ -61,6 +61,10 @@ sam3:
   # and is only used when history.update_source or loss.point_valid_source is sam3_direct.
   # compare_direct only runs original SAM3 for visualization/IoU comparison.
   compare_direct: true
+  # Full SAM3-flow hook: inject fused SAM/VGGT residuals into SAM3 tracker FPN,
+  # then let SAM3 run its own memory propagation and mask decoding.
+  full_flow: false
+  full_residual_scale: 1.0
   direct_device:
   direct_prompt_with_box: true
   direct_output_prob_thresh: 0.5
@@ -136,12 +140,15 @@ history:
   # sam3_direct uses SAM3's original video tracker mask as the update mask.
   update_source: gt
   pred_threshold: 0.5
-  fused_sam_prompt_source: none
+  # sam3_direct uses the original SAM3 video tracker memory mask as the prompt
+  # to the fused SAM decoder. This is the current 3AM-style bridge: SAM3 keeps
+  # target memory, while fused SAM/VGGT features participate in final decoding.
+  fused_sam_prompt_source: sam3_direct
 
 fused_sam:
   # replace: adapter output replaces SAM image/high-res features.
   # residual: original SAM3 tracker features + adapter(fused tokens) residual.
-  feature_mode: replace
+  feature_mode: residual
   mask_weight: 0.0
   dice_weight: 0.0
 

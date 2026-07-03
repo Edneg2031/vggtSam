@@ -85,6 +85,7 @@ class SAM3VideoTrackerAdapter:
         self.predictor = predictor
         self.output_prob_thresh = float(output_prob_thresh)
         self.prompt_with_box = bool(prompt_with_box)
+        install_vggtsam_sam3_feature_hooks(self.predictor)
 
     @torch.no_grad()
     def track_from_paths(
@@ -95,6 +96,8 @@ class SAM3VideoTrackerAdapter:
         output_size: tuple[int, int],
         prompt_frame_idx: int = 0,
         reference_mask: torch.Tensor | np.ndarray | None = None,
+        tracker_fpn_residuals: Optional[Sequence[torch.Tensor]] = None,
+        tracker_fpn_residual_scale: float = 1.0,
     ) -> SAM3TrackOutput:
         if not image_paths:
             raise ValueError("At least one image path is required for SAM3 tracking.")
@@ -111,6 +114,14 @@ class SAM3VideoTrackerAdapter:
             session = self.predictor.start_session(resource_path=str(tmp_dir))
             session_id = session["session_id"] if isinstance(session, dict) else session
             try:
+                residual_enabled = tracker_fpn_residuals is not None
+                if residual_enabled:
+                    set_vggtsam_tracker_fpn_residuals(
+                        self.predictor,
+                        session_id=session_id,
+                        residuals=tracker_fpn_residuals,
+                        scale=tracker_fpn_residual_scale,
+                    )
                 prompt_box = None
                 reference_mask_out = normalize_reference_mask(
                     reference_mask,
@@ -167,12 +178,163 @@ class SAM3VideoTrackerAdapter:
             aux={
                 "prompt": prompt,
                 "num_frames": len(image_paths),
+                "vggtsam_tracker_fpn_residuals": bool(
+                    tracker_fpn_residuals is not None
+                ),
+                "vggtsam_tracker_fpn_residual_scale": float(
+                    tracker_fpn_residual_scale
+                ),
                 "frame_object_counts": {
                     int(frame_idx): len(objects)
                     for frame_idx, objects in frame_objects.items()
                 },
             },
         )
+
+
+def set_vggtsam_tracker_fpn_residuals(
+    predictor,
+    *,
+    session_id: str,
+    residuals: Sequence[torch.Tensor],
+    scale: float,
+) -> None:
+    """Attach per-frame FPN residuals to SAM3's local inference feature cache."""
+    if not hasattr(predictor, "_get_session"):
+        raise RuntimeError("SAM3 predictor does not expose _get_session for local hooks.")
+    session = predictor._get_session(session_id)
+    inference_state = session["state"]
+    feature_cache = inference_state.setdefault("feature_cache", {})
+    feature_cache["vggtsam_tracker_fpn_residuals"] = [
+        residual.detach().cpu() if torch.is_tensor(residual) else residual
+        for residual in residuals
+    ]
+    feature_cache["vggtsam_tracker_fpn_residual_scale"] = float(scale)
+
+
+def install_vggtsam_sam3_feature_hooks(predictor) -> None:
+    """Patch local SAM3 source objects so VGGT residuals enter full video flow."""
+    model = getattr(predictor, "model", None)
+    if model is None or getattr(model, "_vggtsam_feature_hooks_installed", False):
+        return
+
+    original_reset_state = model.reset_state
+
+    def reset_state_with_vggtsam_cache(inference_state, *args, **kwargs):
+        cache = inference_state.get("feature_cache", {})
+        keep = {
+            key: value
+            for key, value in cache.items()
+            if str(key).startswith("vggtsam_")
+        }
+        result = original_reset_state(inference_state, *args, **kwargs)
+        inference_state.setdefault("feature_cache", {}).update(keep)
+        return result
+
+    original_run_backbone = model.run_backbone_and_detection
+
+    def run_backbone_with_vggtsam_residuals(*args, **kwargs):
+        frame_idx = kwargs.get("frame_idx", args[0] if len(args) > 0 else None)
+        feature_cache = kwargs.get(
+            "feature_cache",
+            args[4] if len(args) > 4 else None,
+        )
+        result = original_run_backbone(*args, **kwargs)
+        if frame_idx is not None and feature_cache is not None:
+            apply_vggtsam_tracker_fpn_residuals(
+                feature_cache,
+                frame_idx=int(frame_idx),
+            )
+        return result
+
+    model.reset_state = reset_state_with_vggtsam_cache
+    model.run_backbone_and_detection = run_backbone_with_vggtsam_residuals
+    model._vggtsam_feature_hooks_installed = True
+
+
+def apply_vggtsam_tracker_fpn_residuals(
+    feature_cache: Dict,
+    *,
+    frame_idx: int,
+) -> None:
+    """Inject cached residuals into SAM3 tracker FPNs after SAM3 builds them."""
+    residuals = feature_cache.get("vggtsam_tracker_fpn_residuals")
+    if residuals is None:
+        return
+    cached = feature_cache.get(int(frame_idx))
+    if cached is None:
+        return
+    _, backbone_cache = cached
+    scale = float(feature_cache.get("vggtsam_tracker_fpn_residual_scale", 1.0))
+    for key in ("tracker_backbone_out", "sam2_backbone_out", "interactive"):
+        backbone_out = backbone_cache.get(key)
+        if backbone_out is None:
+            continue
+        fpn = backbone_out.get("backbone_fpn")
+        if fpn is None:
+            continue
+        for level in range(len(fpn)):
+            residual = select_vggtsam_fpn_residual(residuals, level, frame_idx)
+            if residual is None:
+                continue
+            feature = fpn[level]
+            if hasattr(feature, "tensors"):
+                feature.tensors = add_vggtsam_residual(
+                    feature.tensors,
+                    residual,
+                    scale,
+                )
+            else:
+                fpn[level] = add_vggtsam_residual(feature, residual, scale)
+        last = fpn[-1]
+        backbone_out["vision_features"] = (
+            last.tensors if hasattr(last, "tensors") else last
+        )
+
+
+def select_vggtsam_fpn_residual(
+    residuals: Any,
+    level: int,
+    frame_idx: int,
+) -> Optional[torch.Tensor]:
+    if isinstance(residuals, dict):
+        residual = residuals.get(level)
+        if residual is None:
+            residual = residuals.get(str(level))
+        if residual is None:
+            residual = residuals.get(f"fpn{level}")
+    else:
+        residual = residuals[level] if level < len(residuals) else None
+    if residual is None:
+        return None
+    if residual.ndim == 4 and residual.shape[0] > frame_idx:
+        residual = residual[frame_idx : frame_idx + 1]
+    elif residual.ndim == 3:
+        residual = residual.unsqueeze(0)
+    return residual
+
+
+def add_vggtsam_residual(
+    feature: torch.Tensor,
+    residual: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    residual = residual.to(device=feature.device, dtype=feature.dtype)
+    if residual.shape[-2:] != feature.shape[-2:]:
+        residual = F.interpolate(
+            residual,
+            size=feature.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+    if residual.shape[0] == 1 and feature.shape[0] > 1:
+        residual = residual.expand(feature.shape[0], -1, -1, -1)
+    if residual.shape[:2] != feature.shape[:2]:
+        raise RuntimeError(
+            "vggtsam tracker FPN residual shape mismatch: "
+            f"feature={tuple(feature.shape)} residual={tuple(residual.shape)}"
+        )
+    return feature + float(scale) * residual
 
 
 def parse_cuda_device_index(device: str) -> int:
