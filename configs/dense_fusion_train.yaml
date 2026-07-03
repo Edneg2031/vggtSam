@@ -56,6 +56,8 @@ sam3:
   enable_inst_interactivity: false
   # Direct SAM3 video tracker mask provider. This bypasses fused-token SAM decoding
   # and is only used when history.update_source or loss.point_valid_source is sam3_direct.
+  # compare_direct only runs original SAM3 for visualization/IoU comparison.
+  compare_direct: true
   direct_device:
   direct_prompt_with_box: true
   direct_output_prob_thresh: 0.5

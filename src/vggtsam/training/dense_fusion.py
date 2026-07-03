@@ -78,6 +78,7 @@ class DenseFusionTrainConfig:
     sam3_direct_prompt_with_box: bool
     sam3_direct_output_prob_thresh: float
     sam3_direct_async_loading_frames: bool
+    sam3_compare_direct: bool
     streamvggt_repo: Path
     streamvggt_checkpoint: Path
     geometry_device: str
@@ -287,6 +288,7 @@ def uses_sam3_direct_masks(config: DenseFusionTrainConfig) -> bool:
         config.history_update_source.strip().lower() in direct_sources
         or config.point_valid_source.strip().lower() in direct_sources
         or config.primary_mask_source.strip().lower() in direct_sources
+        or config.sam3_compare_direct
     )
 
 
@@ -1320,6 +1322,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 prompt=prompt_selection.prompt,
                 step=step,
                 threshold=config.visualize_threshold,
+                primary_mask_source=config.primary_mask_source,
             )
             export_dense_pointclouds(
                 config.output_dir / "pointclouds",
@@ -1992,13 +1995,15 @@ def save_dense_visualization(
     prompt: str,
     step: int,
     threshold: float,
+    primary_mask_source: str,
 ) -> None:
     frames = len(sequence.image_paths)
     panel_w = 320
     panel_h = int(round(panel_w * batch["prompt_mask"].shape[1] / batch["prompt_mask"].shape[2]))
     title_h = 26
     margin = 6
-    show_fused_sam = any(
+    primary = primary_mask_source.strip().lower()
+    show_fused_sam = primary not in {"fused_sam", "sam_decoder"} and any(
         getattr(output, "fused_sam_mask_logits", None) is not None
         for output in outputs
     )
@@ -2006,20 +2011,34 @@ def save_dense_visualization(
         getattr(output, "sam3_direct_mask", None) is not None
         for output in outputs
     )
-    columns = 4 + int(show_sam3_direct) + int(show_fused_sam)
+    show_score = primary in {"dense", "mask_head", "baseline"}
+    columns = 3 + int(show_sam3_direct) + int(show_fused_sam) + int(show_score)
     canvas = Image.new(
         "RGB",
         (columns * panel_w + (columns + 1) * margin, title_h + frames * (panel_h + margin) + margin),
         color=(20, 20, 20),
     )
     draw = ImageDraw.Draw(canvas)
-    draw.text((margin, 5), f"step={step} prompt='{prompt}' threshold={threshold:.2f}", fill=(240, 240, 240))
-    headings = ["RGB", "GT prompt", "Pred mask"]
+    draw.text(
+        (margin, 5),
+        (
+            f"step={step} prompt='{prompt}' threshold={threshold:.2f} "
+            f"pred_source={primary_mask_source}"
+        ),
+        fill=(240, 240, 240),
+    )
+    pred_heading = (
+        "Pred (fused SAM)"
+        if primary in {"fused_sam", "sam_decoder"}
+        else "Pred mask"
+    )
+    headings = ["RGB", "GT prompt", pred_heading]
     if show_sam3_direct:
-        headings.append("SAM3 direct")
+        headings.append("SAM3 original")
     if show_fused_sam:
         headings.append("Fused SAM")
-    headings.append("Pred score")
+    if show_score:
+        headings.append("Pred score")
     for col, heading in enumerate(headings):
         draw.text((margin + col * (panel_w + margin), title_h - 14), heading, fill=(220, 220, 220))
 
@@ -2027,7 +2046,6 @@ def save_dense_visualization(
         image = load_rgb(sequence.image_paths[frame_idx], batch["prompt_mask"].shape[1:])
         gt = batch["prompt_mask"][frame_idx].detach().cpu().numpy()
         pred = output.mask_logits[0].sigmoid().detach().float().cpu().numpy()
-        score = output.prompt_score[0].sigmoid().detach().float().cpu().numpy()
         panels = [
             image,
             overlay_mask(image, gt, (230, 57, 70), threshold=0.5),
@@ -2047,7 +2065,9 @@ def save_dense_visualization(
             else:
                 fused_sam = fused_sam_logits[0].sigmoid().detach().float().cpu().numpy()
                 panels.append(overlay_mask(image, fused_sam, (42, 157, 143), threshold=threshold))
-        panels.append(heatmap_overlay(image, score))
+        if show_score:
+            score = output.prompt_score[0].sigmoid().detach().float().cpu().numpy()
+            panels.append(heatmap_overlay(image, score))
         row_y = title_h + margin + frame_idx * (panel_h + margin)
         for col, panel in enumerate(panels):
             panel = panel.resize((panel_w, panel_h), Image.BILINEAR)

@@ -52,6 +52,9 @@ def main() -> None:
         ),
     )
     parser.add_argument("--sam3-direct-device", default=None)
+    sam3_compare_direct = parser.add_mutually_exclusive_group()
+    sam3_compare_direct.add_argument("--compare-sam3-direct", action="store_true")
+    sam3_compare_direct.add_argument("--no-compare-sam3-direct", action="store_true")
     sam3_direct_box = parser.add_mutually_exclusive_group()
     sam3_direct_box.add_argument("--sam3-direct-box", action="store_true")
     sam3_direct_box.add_argument("--no-sam3-direct-box", action="store_true")
@@ -178,6 +181,10 @@ def main() -> None:
         raw.setdefault("fused_sam", {})["feature_mode"] = args.fused_sam_feature_mode
     if args.sam3_direct_device is not None:
         raw["sam3"]["direct_device"] = args.sam3_direct_device
+    if args.compare_sam3_direct:
+        raw["sam3"]["compare_direct"] = True
+    if args.no_compare_sam3_direct:
+        raw["sam3"]["compare_direct"] = False
     if args.sam3_direct_box:
         raw["sam3"]["direct_prompt_with_box"] = True
     if args.no_sam3_direct_box:
@@ -331,6 +338,7 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         sam3_direct_async_loading_frames=bool(
             sam3.get("direct_async_loading_frames", False)
         ),
+        sam3_compare_direct=bool(sam3.get("compare_direct", False)),
         streamvggt_repo=Path(geometry["repo"]),
         streamvggt_checkpoint=Path(geometry["checkpoint"]),
         geometry_device=str(geometry.get("device") or training["device"]),
