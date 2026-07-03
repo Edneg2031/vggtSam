@@ -90,6 +90,9 @@ model:
   # simple: old shallow Conv point head.
   # stream_dpt: StreamVGGT DPT point decoder, conditioned by fused/object tokens.
   point_decoder: stream_dpt
+  # none: old StreamDPT adapter.
+  # gt_soft: inject GT instance mask as a soft spatial residual into DPT patch tokens.
+  point_mask_condition: none
   stream_dpt_use_pretrained: true
   stream_dpt_freeze: false
 

@@ -44,6 +44,7 @@ class DenseSAMVGGTModel(nn.Module):
         num_classes: int | None = None,
         dropout: float = 0.0,
         point_decoder: str = "simple",
+        point_mask_condition: str = "none",
         stream_dpt_freeze: bool = False,
         enable_fused_sam_decoder: bool = False,
     ) -> None:
@@ -54,10 +55,16 @@ class DenseSAMVGGTModel(nn.Module):
         self.embedding_dim = int(embedding_dim)
         self.enable_fused_sam_decoder = bool(enable_fused_sam_decoder)
         self.point_decoder = point_decoder.strip().lower()
+        self.point_mask_condition = point_mask_condition.strip().lower()
         if self.point_decoder not in {"simple", "stream_dpt"}:
             raise ValueError(
                 "point_decoder must be 'simple' or 'stream_dpt', "
                 f"got {point_decoder!r}"
+            )
+        if self.point_mask_condition not in {"none", "gt_soft"}:
+            raise ValueError(
+                "point_mask_condition must be 'none' or 'gt_soft', "
+                f"got {point_mask_condition!r}"
             )
 
         self.proj_sam = nn.Linear(sam_dim, d_fuse)
@@ -93,6 +100,9 @@ class DenseSAMVGGTModel(nn.Module):
             self.stream_condition_proj = None
             self.stream_condition_norm = None
             self.stream_condition_scale = None
+            self.stream_mask_condition_proj = None
+            self.stream_mask_condition_norm = None
+            self.stream_mask_condition_scale = None
         else:
             from streamvggt.heads.dpt_head import DPTHead
 
@@ -107,6 +117,9 @@ class DenseSAMVGGTModel(nn.Module):
             self.stream_condition_proj = nn.Linear(d_fuse, geometry_dim)
             self.stream_condition_norm = nn.LayerNorm(geometry_dim)
             self.stream_condition_scale = nn.Parameter(torch.tensor(0.1))
+            self.stream_mask_condition_proj = nn.Linear(1, geometry_dim)
+            self.stream_mask_condition_norm = nn.LayerNorm(geometry_dim)
+            self.stream_mask_condition_scale = nn.Parameter(torch.tensor(0.01))
             if stream_dpt_freeze:
                 for param in self.stream_point_decoder.parameters():
                     param.requires_grad = False
@@ -163,6 +176,7 @@ class DenseSAMVGGTModel(nn.Module):
         stream_tokens: Sequence[torch.Tensor] | None = None,
         stream_images: torch.Tensor | None = None,
         stream_patch_start_idx: int | None = None,
+        point_mask_condition: torch.Tensor | None = None,
     ) -> DenseFusionOutput:
         fused_tokens = self.fuse_tokens(
             sam_tokens=sam_tokens,
@@ -176,6 +190,7 @@ class DenseSAMVGGTModel(nn.Module):
             stream_tokens=stream_tokens,
             stream_images=stream_images,
             stream_patch_start_idx=stream_patch_start_idx,
+            point_mask_condition=point_mask_condition,
         )
 
     def decode(
@@ -187,6 +202,7 @@ class DenseSAMVGGTModel(nn.Module):
         stream_tokens: Sequence[torch.Tensor] | None = None,
         stream_images: torch.Tensor | None = None,
         stream_patch_start_idx: int | None = None,
+        point_mask_condition: torch.Tensor | None = None,
     ) -> DenseFusionOutput:
         dense = self.tokens_to_dense(fused_tokens)
         object_query = self._prepare_object_query(
@@ -208,6 +224,7 @@ class DenseSAMVGGTModel(nn.Module):
                 stream_tokens=stream_tokens,
                 stream_images=stream_images,
                 stream_patch_start_idx=stream_patch_start_idx,
+                point_mask_condition=point_mask_condition,
             )
         semantic_embedding = self.semantic_head(dense)
         instance_embedding_chw = F.normalize(self.instance_head(dense), dim=1)
@@ -249,6 +266,7 @@ class DenseSAMVGGTModel(nn.Module):
         stream_tokens: Sequence[torch.Tensor] | None,
         stream_images: torch.Tensor | None,
         stream_patch_start_idx: int | None,
+        point_mask_condition: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if (
             stream_tokens is None
@@ -266,6 +284,7 @@ class DenseSAMVGGTModel(nn.Module):
             object_query=object_query,
             stream_images=stream_images,
             patch_start_idx=int(stream_patch_start_idx),
+            point_mask_condition=point_mask_condition,
         )
         points, confidence = self.stream_point_decoder(
             list(conditioned_tokens),
@@ -288,10 +307,14 @@ class DenseSAMVGGTModel(nn.Module):
         object_query: torch.Tensor | None,
         stream_images: torch.Tensor,
         patch_start_idx: int,
+        point_mask_condition: torch.Tensor | None,
     ) -> list[torch.Tensor]:
         assert self.stream_condition_proj is not None
         assert self.stream_condition_norm is not None
         assert self.stream_condition_scale is not None
+        assert self.stream_mask_condition_proj is not None
+        assert self.stream_mask_condition_norm is not None
+        assert self.stream_mask_condition_scale is not None
         fused_tokens = self._ensure_batched(fused_tokens)
         object_query = self._prepare_object_query(
             object_query,
@@ -305,7 +328,15 @@ class DenseSAMVGGTModel(nn.Module):
         patch_size = int(self.stream_point_decoder.patch_size)
         patch_shape = (int(image_h // patch_size), int(image_w // patch_size))
         condition = self.fused_tokens_to_patch_condition(fused_tokens, patch_shape)
-        scale = self.stream_condition_scale
+        fused_scale = self.stream_condition_scale
+        mask_condition = self.mask_to_patch_condition(
+            point_mask_condition,
+            patch_shape=patch_shape,
+            batch_size=fused_tokens.shape[0],
+            device=fused_tokens.device,
+            dtype=fused_tokens.dtype,
+        )
+        mask_scale = self.stream_mask_condition_scale
 
         conditioned = []
         for tokens in stream_tokens:
@@ -317,9 +348,10 @@ class DenseSAMVGGTModel(nn.Module):
                     f"{patch_tokens.shape[2]} vs {condition.shape[1]}"
             )
             updated = tokens.clone()
-            updated[:, :, patch_start_idx:, :] = (
-                patch_tokens + scale * condition[:, None]
-            )
+            residual = fused_scale * condition[:, None]
+            if mask_condition is not None:
+                residual = residual + mask_scale * mask_condition[:, None]
+            updated[:, :, patch_start_idx:, :] = patch_tokens + residual
             conditioned.append(updated)
         return conditioned
 
@@ -346,6 +378,49 @@ class DenseSAMVGGTModel(nn.Module):
         condition = dense.flatten(2).transpose(1, 2)
         condition = self.stream_condition_proj(condition)
         return self.stream_condition_norm(condition)
+
+    def mask_to_patch_condition(
+        self,
+        mask: torch.Tensor | None,
+        *,
+        patch_shape: tuple[int, int],
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        if self.point_mask_condition == "none":
+            return None
+        if mask is None:
+            raise ValueError(
+                f"point_mask_condition={self.point_mask_condition!r} requires a mask."
+            )
+        if mask.ndim == 2:
+            mask = mask[None, None]
+        elif mask.ndim == 3:
+            mask = mask[:, None]
+        elif mask.ndim != 4:
+            raise ValueError(
+                "point_mask_condition mask must have shape [H, W], [B, H, W], "
+                f"or [B, 1, H, W], got {tuple(mask.shape)}"
+            )
+        mask = mask.to(device=device, dtype=dtype)
+        if mask.shape[0] == 1 and batch_size > 1:
+            mask = mask.expand(batch_size, -1, -1, -1)
+        if mask.shape[0] != batch_size:
+            raise ValueError(
+                f"Mask batch size {mask.shape[0]} does not match {batch_size}."
+            )
+        mask = F.interpolate(
+            mask,
+            size=patch_shape,
+            mode="bilinear",
+            align_corners=False,
+        )
+        condition = mask.flatten(2).transpose(1, 2)
+        assert self.stream_mask_condition_proj is not None
+        assert self.stream_mask_condition_norm is not None
+        condition = self.stream_mask_condition_proj(condition)
+        return self.stream_mask_condition_norm(condition)
 
     def load_stream_point_decoder_state_dict(
         self,
@@ -416,6 +491,7 @@ class DenseSAMVGGTModel(nn.Module):
         fused_tokens: torch.Tensor,
         sam_tracker,
         mask_prompt: torch.Tensor | None,
+        object_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run SAM3's prompt encoder + mask decoder on adapted fused tokens."""
         if not self.enable_fused_sam_decoder:
@@ -426,6 +502,13 @@ class DenseSAMVGGTModel(nn.Module):
 
         fused_tokens = self._ensure_batched(fused_tokens)
         feature = self.tokens_to_feature_grid(fused_tokens)
+        object_query = self._prepare_object_query(
+            object_query,
+            batch_size=feature.shape[0],
+            device=feature.device,
+        )
+        if object_query is not None:
+            feature = feature + self.object_query_proj(object_query)[:, :, None, None]
         image_embed = self.fused_sam_image_proj(feature)
         high_s1 = self.fused_sam_high_s1(
             F.interpolate(feature, size=(144, 144), mode="bilinear", align_corners=False)

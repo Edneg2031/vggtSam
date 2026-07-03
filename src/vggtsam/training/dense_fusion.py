@@ -94,6 +94,7 @@ class DenseFusionTrainConfig:
     num_classes: int
     dropout: float
     point_decoder: str
+    point_mask_condition: str
     stream_dpt_use_pretrained: bool
     stream_dpt_freeze: bool
     mask_weight: float
@@ -630,6 +631,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 num_classes=config.num_classes,
                 dropout=config.dropout,
                 point_decoder=config.point_decoder,
+                point_mask_condition=config.point_mask_condition,
                 stream_dpt_freeze=config.stream_dpt_freeze,
                 enable_fused_sam_decoder=use_fused_sam,
             ).to(config.device)
@@ -653,7 +655,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 f"sam_dim={sam_dim} geometry_dim={geometry_dim} "
                 f"text_dim={int(text_embedding.shape[-1])} camera_dim={camera_dim} "
                 f"output_size={config.output_size} "
-                f"point_decoder={config.point_decoder}"
+                f"point_decoder={config.point_decoder} "
+                f"point_mask_condition={config.point_mask_condition}"
             )
 
         assert model is not None and optimizer is not None
@@ -724,6 +727,11 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
         )
 
         for frame_idx in range(num_frames):
+            target = frame_target(batch, frame_idx)
+            point_mask_condition = select_point_mask_condition(
+                target=target,
+                source=config.point_mask_condition,
+            )
             output = model.decode(
                 fused_tokens=fused_frame_tokens[frame_idx],
                 text_embedding=text_embedding,
@@ -739,8 +747,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                     device=config.device,
                 ),
                 stream_patch_start_idx=stream_patch_start_idx,
+                point_mask_condition=point_mask_condition,
             )
-            target = frame_target(batch, frame_idx)
             if sam3_direct_masks_device is not None:
                 output.sam3_direct_mask = sam3_direct_masks_device[frame_idx]
                 sam3_direct_ious.append(
@@ -761,6 +769,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                     fused_tokens=fused_frame_tokens[frame_idx],
                     sam_tracker=sam_tracker_model,
                     mask_prompt=fused_sam_prompt,
+                    object_query=object_query,
                 )
                 fused_sam_mask_loss = dense_mask_bce_loss(
                     output.fused_sam_mask_logits[0],
@@ -910,6 +919,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "num_gt_point_pixels": gt_point_pixels,
             "num_match_pixels": int(selected_match_pixels),
             "point_valid_source": config.point_valid_source,
+            "point_mask_condition": config.point_mask_condition,
             "history_update_source": config.history_update_source,
             "fused_sam_prompt_source": config.fused_sam_prompt_source,
             "sam3_direct_selected_obj_id": (
@@ -1242,6 +1252,22 @@ def select_point_supervision_mask(
         return point_valid & sam3_mask.detach().bool()
     raise ValueError(
         "loss.point_valid_source must be 'gt', 'pred', or 'sam3_direct', "
+        f"got {source!r}"
+    )
+
+
+def select_point_mask_condition(
+    *,
+    target: Dict[str, torch.Tensor],
+    source: str,
+) -> torch.Tensor | None:
+    source = source.strip().lower()
+    if source in {"none", "no", "disabled"}:
+        return None
+    if source in {"gt_soft", "gt", "target", "teacher"}:
+        return target["prompt_mask"].float()
+    raise ValueError(
+        "model.point_mask_condition must be 'none' or 'gt_soft', "
         f"got {source!r}"
     )
 
@@ -1806,6 +1832,7 @@ def write_metrics_header(path: Path) -> None:
         "num_gt_point_pixels",
         "num_match_pixels",
         "point_valid_source",
+        "point_mask_condition",
         "history_update_source",
         "fused_sam_prompt_source",
         "sam3_direct_selected_obj_id",

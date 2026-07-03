@@ -68,6 +68,11 @@ def main() -> None:
         choices=["simple", "stream_dpt"],
         default=None,
     )
+    parser.add_argument(
+        "--point-mask-condition",
+        choices=["none", "gt_soft"],
+        default=None,
+    )
     stream_dpt_pretrained = parser.add_mutually_exclusive_group()
     stream_dpt_pretrained.add_argument(
         "--stream-dpt-use-pretrained",
@@ -177,6 +182,8 @@ def main() -> None:
         raw["model"]["output_size"] = list(args.output_size)
     if args.point_decoder is not None:
         raw["model"]["point_decoder"] = args.point_decoder
+    if args.point_mask_condition is not None:
+        raw["model"]["point_mask_condition"] = args.point_mask_condition
     if args.stream_dpt_use_pretrained:
         raw["model"]["stream_dpt_use_pretrained"] = True
     if args.no_stream_dpt_use_pretrained:
@@ -285,6 +292,7 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         num_classes=int(model["num_classes"]),
         dropout=float(model.get("dropout", 0.0)),
         point_decoder=str(model.get("point_decoder", "simple")),
+        point_mask_condition=str(model.get("point_mask_condition", "none")),
         stream_dpt_use_pretrained=bool(
             model.get("stream_dpt_use_pretrained", True)
         ),
