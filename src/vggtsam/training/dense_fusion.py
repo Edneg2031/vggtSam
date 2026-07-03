@@ -356,9 +356,23 @@ def extract_sam3_tracker_decoder_features(
     if fpn is None or len(fpn) < 3:
         raise RuntimeError("SAM3 sam2_backbone_out is missing 3 FPN levels.")
     decoder = sam_tracker.sam_mask_decoder
-    high_s0 = decoder.conv_s0(ensure_bchw_tensor(fpn[0]))
-    high_s1 = decoder.conv_s1(ensure_bchw_tensor(fpn[1]))
-    image_embed = ensure_bchw_tensor(fpn[2])
+    decoder_param = next(decoder.parameters())
+    decoder_device = decoder_param.device
+    decoder_dtype = decoder_param.dtype
+    high_s0_input = ensure_bchw_tensor(fpn[0]).to(
+        device=decoder_device,
+        dtype=decoder_dtype,
+    )
+    high_s1_input = ensure_bchw_tensor(fpn[1]).to(
+        device=decoder_device,
+        dtype=decoder_dtype,
+    )
+    image_embed = ensure_bchw_tensor(fpn[2]).to(
+        device=decoder_device,
+        dtype=decoder_dtype,
+    )
+    high_s0 = decoder.conv_s0(high_s0_input)
+    high_s1 = decoder.conv_s1(high_s1_input)
     return {
         "image_embed": image_embed.detach().float().cpu(),
         "high_s1": high_s1.detach().float().cpu(),
