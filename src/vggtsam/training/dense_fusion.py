@@ -120,6 +120,7 @@ class DenseFusionTrainConfig:
     device: str
     iterations: int
     lr: float
+    train_scope: str
     seed: int
     log_every: int
     save_every: int
@@ -256,6 +257,49 @@ def uses_sam3_direct_masks(config: DenseFusionTrainConfig) -> bool:
         config.history_update_source.strip().lower() in direct_sources
         or config.point_valid_source.strip().lower() in direct_sources
     )
+
+
+def configure_trainable_parameters(
+    model: DenseSAMVGGTModel,
+    *,
+    config: DenseFusionTrainConfig,
+    use_fused_sam: bool,
+) -> List[torch.nn.Parameter]:
+    """Select which parameters should be optimized for the requested ablation."""
+    scope = config.train_scope.strip().lower()
+    if scope == "all":
+        params = [param for param in model.parameters() if param.requires_grad]
+    elif scope == "sam_adapter":
+        if not use_fused_sam:
+            raise RuntimeError(
+                "training.train_scope='sam_adapter' requires the fused SAM decoder. "
+                "Set history.update_source='fused_sam' or give fused_sam losses "
+                "positive weights."
+            )
+        if config.fused_sam_mask_weight <= 0.0 and config.fused_sam_dice_weight <= 0.0:
+            raise RuntimeError(
+                "training.train_scope='sam_adapter' needs a trainable fused SAM "
+                "loss. Set --fused-sam-mask-weight and/or --fused-sam-dice-weight."
+            )
+        for param in model.parameters():
+            param.requires_grad_(False)
+        trainable_names = []
+        for name, param in model.named_parameters():
+            if name.startswith("fused_sam_"):
+                param.requires_grad_(True)
+                trainable_names.append(name)
+        if not trainable_names:
+            raise RuntimeError("No fused_sam_* parameters were found to train.")
+        params = [param for param in model.parameters() if param.requires_grad]
+    else:
+        raise ValueError(
+            "training.train_scope must be 'all' or 'sam_adapter', "
+            f"got {config.train_scope!r}"
+        )
+
+    num_params = sum(param.numel() for param in params)
+    print(f"train_scope={scope} trainable_parameters={num_params}")
+    return params
 
 
 def slice_stream_dpt_tokens(
@@ -799,14 +843,20 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                     "loaded StreamVGGT point_head into stream_dpt decoder "
                     f"missing={len(missing_keys)} unexpected={len(unexpected_keys)}"
                 )
-            optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
+            trainable_params = configure_trainable_parameters(
+                model,
+                config=config,
+                use_fused_sam=use_fused_sam,
+            )
+            optimizer = torch.optim.AdamW(trainable_params, lr=config.lr)
             print(
                 "initialized DenseSAMVGGTModel "
                 f"sam_dim={sam_dim} geometry_dim={geometry_dim} "
                 f"text_dim={int(text_embedding.shape[-1])} camera_dim={camera_dim} "
                 f"output_size={config.output_size} "
                 f"point_decoder={config.point_decoder} "
-                f"point_mask_condition={config.point_mask_condition}"
+                f"point_mask_condition={config.point_mask_condition} "
+                f"train_scope={config.train_scope}"
             )
 
         assert model is not None and optimizer is not None
@@ -1089,6 +1139,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "num_match_pixels": int(selected_match_pixels),
             "point_valid_source": config.point_valid_source,
             "point_mask_condition": config.point_mask_condition,
+            "train_scope": config.train_scope,
             "history_update_source": config.history_update_source,
             "fused_sam_prompt_source": config.fused_sam_prompt_source,
             "sam3_direct_selected_obj_id": (
@@ -1138,6 +1189,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 step=step,
                 threshold=config.visualize_threshold,
                 max_points=config.max_visual_points,
+                gt_once=config.overfit,
             )
 
         if step % config.save_every == 0:
@@ -1840,6 +1892,7 @@ def export_dense_pointclouds(
     step: int,
     threshold: float,
     max_points: int,
+    gt_once: bool = False,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     rgb = load_sequence_rgb(sequence.image_paths, batch["prompt_mask"].shape[1:])
@@ -1853,8 +1906,13 @@ def export_dense_pointclouds(
         [output.pointmap[0].detach().float().cpu() for output in outputs],
         dim=0,
     )
+    gt_path = (
+        output_dir / "gt_object.ply"
+        if gt_once
+        else output_dir / f"step_{step:06d}_gt_object.ply"
+    )
     write_pointcloud_ply(
-        output_dir / f"step_{step:06d}_gt_object.ply",
+        gt_path,
         gt_points,
         rgb,
         gt_mask,
@@ -2091,6 +2149,7 @@ def write_metrics_header(path: Path) -> None:
         "num_match_pixels",
         "point_valid_source",
         "point_mask_condition",
+        "train_scope",
         "history_update_source",
         "fused_sam_prompt_source",
         "sam3_direct_selected_obj_id",

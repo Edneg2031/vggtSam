@@ -134,6 +134,9 @@ training:
   device: cuda
   iterations: 200
   lr: 0.0003
+  # all: train the full dense fusion model.
+  # sam_adapter: freeze the model and train only fused_sam_* adapter parameters.
+  train_scope: all
   seed: 0
   # Overfit repeats one window and one target instance. This is the first sanity
   # test for instance tracking; turn it off for random-window training.

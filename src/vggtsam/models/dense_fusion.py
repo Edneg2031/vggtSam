@@ -159,10 +159,12 @@ class DenseSAMVGGTModel(nn.Module):
                 nn.GELU(),
                 nn.Conv2d(d_fuse, d_fuse // 8, kernel_size=1),
             )
+            self.fused_sam_object_proj = nn.Linear(d_fuse, d_fuse)
         else:
             self.fused_sam_image_proj = None
             self.fused_sam_high_s1 = None
             self.fused_sam_high_s0 = None
+            self.fused_sam_object_proj = None
         self.prompt_logit_scale = nn.Parameter(torch.tensor(10.0))
         self.instance_logit_scale = nn.Parameter(torch.tensor(10.0))
 
@@ -501,6 +503,7 @@ class DenseSAMVGGTModel(nn.Module):
         assert self.fused_sam_image_proj is not None
         assert self.fused_sam_high_s1 is not None
         assert self.fused_sam_high_s0 is not None
+        assert self.fused_sam_object_proj is not None
 
         fused_tokens = self._ensure_batched(fused_tokens)
         feature = self.tokens_to_feature_grid(fused_tokens)
@@ -510,7 +513,9 @@ class DenseSAMVGGTModel(nn.Module):
             device=feature.device,
         )
         if object_query is not None:
-            feature = feature + self.object_query_proj(object_query)[:, :, None, None]
+            feature = feature + self.fused_sam_object_proj(object_query)[
+                :, :, None, None
+            ]
         image_embed = self.fused_sam_image_proj(feature)
         high_s1 = self.fused_sam_high_s1(
             F.interpolate(feature, size=(144, 144), mode="bilinear", align_corners=False)

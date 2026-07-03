@@ -101,6 +101,15 @@ def main() -> None:
     parser.add_argument("--text-weight", type=float, default=None)
     parser.add_argument("--aux-cls-weight", type=float, default=None)
     parser.add_argument("--match-weight", type=float, default=None)
+    parser.add_argument(
+        "--train-scope",
+        choices=["all", "sam_adapter"],
+        default=None,
+        help=(
+            "all trains the dense fusion baseline; sam_adapter freezes the model "
+            "and trains only fused_sam_* adapter parameters."
+        ),
+    )
     parser.add_argument("--target-mode", choices=["class", "instance"], default=None)
     parser.add_argument("--overfit", action="store_true")
     parser.add_argument("--no-overfit", action="store_true")
@@ -176,6 +185,8 @@ def main() -> None:
         raw["loss"]["aux_cls_weight"] = args.aux_cls_weight
     if args.match_weight is not None:
         raw["loss"]["match_weight"] = args.match_weight
+    if args.train_scope is not None:
+        raw["training"]["train_scope"] = args.train_scope
     if args.scene_id is not None:
         raw["dataset"]["scene_id"] = args.scene_id
     if args.sequence_length is not None:
@@ -330,6 +341,7 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         device=training["device"],
         iterations=int(training["iterations"]),
         lr=float(training["lr"]),
+        train_scope=str(training.get("train_scope", "all")),
         seed=int(training["seed"]),
         log_every=int(training["log_every"]),
         save_every=int(training["save_every"]),
