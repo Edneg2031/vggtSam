@@ -538,13 +538,16 @@ def run_sam3_source_tracker_flow(
         raise RuntimeError("sam3_source reference mask is empty.")
 
     was_training = bool(sam_tracker.training)
+    had_teacher_force = hasattr(sam_tracker, "teacher_force_obj_scores_for_mem")
     old_teacher_force = getattr(sam_tracker, "teacher_force_obj_scores_for_mem", None)
+    had_mem_dropout = hasattr(sam_tracker, "prob_to_dropout_spatial_mem")
     old_mem_dropout = getattr(sam_tracker, "prob_to_dropout_spatial_mem", None)
     sam_tracker.train()
-    if old_teacher_force is not None:
-        sam_tracker.teacher_force_obj_scores_for_mem = False
-    if old_mem_dropout is not None:
-        sam_tracker.prob_to_dropout_spatial_mem = 0.0
+    # SAM3 inference checkpoints may not carry every training-time attribute.
+    # `track_step` checks these only when `self.training=True`, so define stable
+    # no-op defaults while we run the differentiable source path.
+    sam_tracker.teacher_force_obj_scores_for_mem = False
+    sam_tracker.prob_to_dropout_spatial_mem = 0.0
 
     output_dict = {"cond_frame_outputs": {}, "non_cond_frame_outputs": {}}
     frame_outputs: Dict[int, Dict[str, torch.Tensor]] = {}
@@ -591,10 +594,14 @@ def run_sam3_source_tracker_flow(
                 output_dict["non_cond_frame_outputs"][frame_idx] = current_out
             frame_outputs[frame_idx] = current_out
     finally:
-        if old_teacher_force is not None:
+        if had_teacher_force:
             sam_tracker.teacher_force_obj_scores_for_mem = old_teacher_force
-        if old_mem_dropout is not None:
+        else:
+            delattr(sam_tracker, "teacher_force_obj_scores_for_mem")
+        if had_mem_dropout:
             sam_tracker.prob_to_dropout_spatial_mem = old_mem_dropout
+        else:
+            delattr(sam_tracker, "prob_to_dropout_spatial_mem")
         sam_tracker.train(was_training)
 
     logits = []
