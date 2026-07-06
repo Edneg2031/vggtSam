@@ -23,6 +23,7 @@ def main() -> None:
         default=Path("configs/dense_fusion_train.yaml"),
     )
     parser.add_argument("--iterations", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--sam3-device", default=None)
     parser.add_argument("--geometry-device", default=None)
@@ -197,6 +198,8 @@ def main() -> None:
     raw = load_config(args.config)
     if args.iterations is not None:
         raw["training"]["iterations"] = args.iterations
+    if args.lr is not None:
+        raw["training"]["lr"] = args.lr
     if args.device is not None:
         raw["training"]["device"] = args.device
     if args.sam3_device is not None:

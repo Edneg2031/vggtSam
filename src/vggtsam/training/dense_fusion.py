@@ -1344,6 +1344,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 f"point_decoder={config.point_decoder} "
                 f"point_mask_condition={config.point_mask_condition} "
                 f"fusion_type={config.fusion_type} "
+                f"geometry_ablation={config.geometry_ablation} "
                 f"primary_mask_source={config.primary_mask_source} "
                 f"fused_sam_feature_mode={config.fused_sam_feature_mode} "
                 f"sam3_full_trainable_proxy={config.sam3_full_trainable_proxy} "

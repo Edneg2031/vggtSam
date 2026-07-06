@@ -167,55 +167,19 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --output-dir outputs/sam3_source_full_flow_inst37
 
 
-A source-flow 无 residual 检查source dirct差异
+
+无3d
 PYTHONPATH=src python scripts/train_dense_fusion.py \
   --config configs/dense_fusion_train.yaml \
   --scene-id 00a231a370 \
   --instance-id 37 \
-  --frame-indices 91 133 162 163 228 263 273 \
-  --output-size 256 384 \
-  --point-decoder simple \
-  --fusion-type camera_guided \
-  --geometry-ablation none \
-  --sam3-source-flow \
-  --sam3-full-residual-scale 0 \
-  --primary-mask-source sam3_source \
-  --compare-sam3-direct \
-  --no-history \
-  --fused-sam-prompt-source none \
-  --train-scope sam_adapter \
-  --mask-weight 1 \
-  --dice-weight 1 \
-  --sam3-source-mask-weight 0 \
-  --sam3-source-dice-weight 0 \
-  --point-weight 0 \
-  --text-weight 0 \
-  --aux-cls-weight 0 \
-  --match-weight 0 \
-  --chamfer-weight 0 \
-  --reprojection-weight 0 \
-  --iterations 50 \
-  --device cuda:3 \
-  --geometry-device cuda:1 \
-  --sam3-device cuda:2 \
-  --sam3-direct-device cuda:3 \
-  --visualize-every 10 \
-  --output-dir outputs/abl_source_residual0_inst37
-
-
-
-  B 训练adapter 但是不输入3d信息
-  PYTHONPATH=src python scripts/train_dense_fusion.py \
-  --config configs/dense_fusion_train.yaml \
-  --scene-id 00a231a370 \
-  --instance-id 37 \
-  --frame-indices 91 133 162 163 228 263 273 \
+  --frame-indices 133 162 520 566 477 \
   --output-size 256 384 \
   --point-decoder simple \
   --fusion-type camera_guided \
   --geometry-ablation zero \
   --sam3-source-flow \
-  --sam3-full-residual-scale 1 \
+  --sam3-full-residual-scale 10 \
   --primary-mask-source sam3_source \
   --compare-sam3-direct \
   --no-history \
@@ -231,28 +195,30 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --match-weight 0 \
   --chamfer-weight 0 \
   --reprojection-weight 0 \
-  --iterations 700 \
+  --lr 0.001 \
+  --iterations 500 \
   --device cuda:3 \
   --geometry-device cuda:1 \
   --sam3-device cuda:2 \
   --sam3-direct-device cuda:3 \
   --visualize-every 10 \
-  --output-dir outputs/abl_source_samonly_adapter_inst37
+  --output-dir outputs/abl_source_samonly_scale10_lr1e3_inst37
 
 
-  C 训练adapter，输入3D信息
+
+有3d
   PYTHONPATH=src python scripts/train_dense_fusion.py \
   --config configs/dense_fusion_train.yaml \
   --scene-id 00a231a370 \
   --instance-id 37 \
-  --frame-indices 91 133 162 163 228 263 273 \
+  --frame-indices 133 162 520 566 477 \
   --output-size 256 384 \
   --point-decoder simple \
   --fusion-type camera_guided \
   --geometry-ablation none \
   --use-camera-tokens \
   --sam3-source-flow \
-  --sam3-full-residual-scale 1 \
+  --sam3-full-residual-scale 10 \
   --primary-mask-source sam3_source \
   --compare-sam3-direct \
   --no-history \
@@ -268,10 +234,11 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --match-weight 0 \
   --chamfer-weight 0 \
   --reprojection-weight 0 \
-  --iterations 700 \
+  --lr 0.001 \
+  --iterations 500 \
   --device cuda:3 \
   --geometry-device cuda:1 \
   --sam3-device cuda:2 \
   --sam3-direct-device cuda:3 \
   --visualize-every 10 \
-  --output-dir outputs/abl_source_3d_adapter_inst37
+  --output-dir outputs/abl_source_3d_scale10_lr1e3_inst37
