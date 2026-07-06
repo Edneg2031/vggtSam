@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import random
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -548,6 +549,7 @@ def run_sam3_source_tracker_flow(
     # no-op defaults while we run the differentiable source path.
     sam_tracker.teacher_force_obj_scores_for_mem = False
     sam_tracker.prob_to_dropout_spatial_mem = 0.0
+    move_sam3_non_buffer_rope_caches(sam_tracker, tracker_device)
 
     output_dict = {"cond_frame_outputs": {}, "non_cond_frame_outputs": {}}
     frame_outputs: Dict[int, Dict[str, torch.Tensor]] = {}
@@ -556,43 +558,49 @@ def run_sam3_source_tracker_flow(
         + list(range(int(reference_frame_idx) + 1, num_frames))
         + list(range(int(reference_frame_idx) - 1, -1, -1))
     )
+    cuda_context = (
+        torch.cuda.device(tracker_device)
+        if tracker_device.type == "cuda"
+        else nullcontext()
+    )
     try:
-        for frame_idx in order:
-            current_vision_feats, current_vision_pos_embeds, feat_sizes = (
-                build_sam3_source_frame_features(
-                    sam_tracker_features,
-                    tracker_residuals=tracker_residuals,
-                    frame_idx=frame_idx,
-                    residual_scale=float(residual_scale),
+        with cuda_context:
+            for frame_idx in order:
+                current_vision_feats, current_vision_pos_embeds, feat_sizes = (
+                    build_sam3_source_frame_features(
+                        sam_tracker_features,
+                        tracker_residuals=tracker_residuals,
+                        frame_idx=frame_idx,
+                        residual_scale=float(residual_scale),
+                        device=tracker_device,
+                        dtype=feature_dtype,
+                    )
+                )
+                image = sam_input_images[frame_idx : frame_idx + 1].to(
                     device=tracker_device,
                     dtype=feature_dtype,
                 )
-            )
-            image = sam_input_images[frame_idx : frame_idx + 1].to(
-                device=tracker_device,
-                dtype=feature_dtype,
-            )
-            is_reference = frame_idx == int(reference_frame_idx)
-            current_out = sam_tracker.track_step(
-                frame_idx=frame_idx,
-                is_init_cond_frame=is_reference,
-                current_vision_feats=current_vision_feats,
-                current_vision_pos_embeds=current_vision_pos_embeds,
-                feat_sizes=feat_sizes,
-                image=image,
-                point_inputs=prompt if is_reference else None,
-                mask_inputs=None,
-                output_dict=output_dict,
-                num_frames=num_frames,
-                track_in_reverse=frame_idx < int(reference_frame_idx),
-                run_mem_encoder=True,
-                use_prev_mem_frame=True,
-            )
-            if is_reference:
-                output_dict["cond_frame_outputs"][frame_idx] = current_out
-            else:
-                output_dict["non_cond_frame_outputs"][frame_idx] = current_out
-            frame_outputs[frame_idx] = current_out
+                is_reference = frame_idx == int(reference_frame_idx)
+                current_out = sam_tracker.track_step(
+                    frame_idx=frame_idx,
+                    is_init_cond_frame=is_reference,
+                    current_vision_feats=current_vision_feats,
+                    current_vision_pos_embeds=current_vision_pos_embeds,
+                    feat_sizes=feat_sizes,
+                    image=image,
+                    point_inputs=prompt if is_reference else None,
+                    mask_inputs=None,
+                    output_dict=output_dict,
+                    num_frames=num_frames,
+                    track_in_reverse=frame_idx < int(reference_frame_idx),
+                    run_mem_encoder=True,
+                    use_prev_mem_frame=True,
+                )
+                if is_reference:
+                    output_dict["cond_frame_outputs"][frame_idx] = current_out
+                else:
+                    output_dict["non_cond_frame_outputs"][frame_idx] = current_out
+                frame_outputs[frame_idx] = current_out
     finally:
         if had_teacher_force:
             sam_tracker.teacher_force_obj_scores_for_mem = old_teacher_force
@@ -618,6 +626,15 @@ def run_sam3_source_tracker_flow(
             )
         logits.append(mask_logits[:, 0])
     return torch.cat(logits, dim=0).contiguous()
+
+
+def move_sam3_non_buffer_rope_caches(module: torch.nn.Module, device: torch.device) -> None:
+    """Move SAM3 RoPE tensors that are plain attributes, not registered buffers."""
+    for child in module.modules():
+        for attr in ("freqs_cis", "freqs_cis_real", "freqs_cis_imag"):
+            value = getattr(child, attr, None)
+            if torch.is_tensor(value) and value.device != device:
+                setattr(child, attr, value.to(device))
 
 
 def build_sam3_source_frame_features(
