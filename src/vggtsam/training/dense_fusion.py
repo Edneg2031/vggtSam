@@ -98,6 +98,7 @@ class DenseFusionTrainConfig:
     streamvggt_dpt_layer_indices: List[int]
     streamvggt_image_mode: str
     use_camera_tokens: bool
+    geometry_ablation: str
     output_size: tuple[int, int]
     d_fuse: int
     num_heads: int
@@ -488,6 +489,24 @@ def slice_sam3_tracker_features(
         key: value[frame_idx : frame_idx + 1].float().to(device)
         for key, value in features.items()
     }
+
+
+def apply_geometry_ablation(
+    tokens: torch.Tensor | None,
+    *,
+    mode: str,
+) -> torch.Tensor | None:
+    mode = mode.strip().lower()
+    if tokens is None:
+        return None
+    if mode in {"none", "off", "disabled"}:
+        return tokens
+    if mode in {"zero", "zeros", "no_geometry", "sam_only"}:
+        return torch.zeros_like(tokens)
+    raise ValueError(
+        "geometry.ablation must be 'none' or 'zero', "
+        f"got {mode!r}"
+    )
 
 
 def run_sam3_source_tracker_flow(
@@ -1222,7 +1241,17 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                     "selected_obj_id": sam3_track.selected_obj_id,
                     "prompt_frame_idx": sam3_track.prompt_frame_idx,
                     "prompt_box_xywh": sam3_track.prompt_box_xywh,
+                    "frame_objects": sam3_track.frame_objects,
                 }
+                sam3_direct_aux["frame_diagnostics"] = build_sam3_tracking_diagnostics(
+                    frame_objects=sam3_track.frame_objects,
+                    selected_obj_id=sam3_track.selected_obj_id,
+                    target_masks=batch["prompt_mask"].detach().cpu(),
+                )
+                write_sam3_tracking_diagnostics(
+                    config.output_dir / "sam3_direct_instance_diagnostics.csv",
+                    sam3_direct_aux["frame_diagnostics"],
+                )
             if config.overfit and batch is not None:
                 overfit_feature_cache = {
                     "sam_tokens": sam_tokens_all,
@@ -1376,15 +1405,23 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
 
         fused_frame_tokens: List[torch.Tensor] = []
         for frame_idx in range(num_frames):
+            geometry_tokens_for_fusion = apply_geometry_ablation(
+                geometry_frame_tokens[frame_idx],
+                mode=config.geometry_ablation,
+            )
+            camera_tokens_for_fusion = apply_geometry_ablation(
+                slice_camera_tokens(
+                    camera_tokens,
+                    frame_idx=frame_idx,
+                    num_frames=num_frames,
+                ),
+                mode=config.geometry_ablation,
+            )
             fused_frame_tokens.append(
                 model.fuse_tokens(
                     sam_tokens=sam_frame_tokens[frame_idx],
-                    geometry_tokens=geometry_frame_tokens[frame_idx],
-                    camera_tokens=slice_camera_tokens(
-                        camera_tokens,
-                        frame_idx=frame_idx,
-                        num_frames=num_frames,
-                    ),
+                    geometry_tokens=geometry_tokens_for_fusion,
+                    camera_tokens=camera_tokens_for_fusion,
                 )
             )
 
@@ -1446,7 +1483,17 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 "selected_obj_id": sam3_fused_track.selected_obj_id,
                 "prompt_frame_idx": sam3_fused_track.prompt_frame_idx,
                 "prompt_box_xywh": sam3_fused_track.prompt_box_xywh,
+                "frame_objects": sam3_fused_track.frame_objects,
             }
+            sam3_fused_aux["frame_diagnostics"] = build_sam3_tracking_diagnostics(
+                frame_objects=sam3_fused_track.frame_objects,
+                selected_obj_id=sam3_fused_track.selected_obj_id,
+                target_masks=batch["prompt_mask"].detach().cpu(),
+            )
+            write_sam3_tracking_diagnostics(
+                config.output_dir / "sam3_full_fused_instance_diagnostics.csv",
+                sam3_fused_aux["frame_diagnostics"],
+            )
 
         frame_losses: List[torch.Tensor] = []
         mask_losses: List[torch.Tensor] = []
@@ -1466,6 +1513,10 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
         fused_sam_ious: List[float] = []
         sam3_full_proxy_ious: List[float] = []
         sam3_source_ious: List[float] = []
+        sam3_source_best_ious: List[float] = []
+        sam3_source_best_thresholds: List[float] = []
+        sam3_source_pos_probs: List[float] = []
+        sam3_source_neg_probs: List[float] = []
         sam3_direct_ious: List[float] = []
         sam3_fused_ious: List[float] = []
         text_losses: List[torch.Tensor] = []
@@ -1579,6 +1630,23 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                         target["prompt_mask"],
                     )
                 )
+                source_prob = output.sam3_source_mask_logits[0].detach().sigmoid()
+                best_iou, best_threshold = best_threshold_iou(
+                    source_prob,
+                    target["prompt_mask"],
+                )
+                sam3_source_best_ious.append(best_iou)
+                sam3_source_best_thresholds.append(best_threshold)
+                positive = target["prompt_mask"].bool()
+                negative = target["mask_supervision"].bool() & ~positive
+                if positive.any():
+                    sam3_source_pos_probs.append(
+                        float(source_prob[positive].mean().detach().cpu())
+                    )
+                if negative.any():
+                    sam3_source_neg_probs.append(
+                        float(source_prob[negative].mean().detach().cpu())
+                    )
             if use_sam3_full_proxy:
                 if sam_tracker_model is None:
                     raise RuntimeError(
@@ -1848,6 +1916,10 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "fused_sam_iou": mean_float(fused_sam_ious),
             "sam3_full_proxy_iou": mean_float(sam3_full_proxy_ious),
             "sam3_source_iou": mean_float(sam3_source_ious),
+            "sam3_source_best_iou": mean_float(sam3_source_best_ious),
+            "sam3_source_best_threshold": mean_float(sam3_source_best_thresholds),
+            "sam3_source_pos_prob": mean_float(sam3_source_pos_probs),
+            "sam3_source_neg_prob": mean_float(sam3_source_neg_probs),
             "sam3_direct_iou": mean_float(sam3_direct_ious),
             "sam3_full_flow_iou": mean_float(sam3_fused_ious),
             "text_loss": mean_metric(text_losses),
@@ -1861,6 +1933,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "point_valid_source": config.point_valid_source,
             "point_mask_condition": config.point_mask_condition,
             "fusion_type": config.fusion_type,
+            "geometry_ablation": config.geometry_ablation,
             "primary_mask_source": config.primary_mask_source,
             "use_camera_tokens": int(config.use_camera_tokens),
             "train_scope": config.train_scope,
@@ -1879,6 +1952,10 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "sam3_source_flow": int(config.sam3_source_flow),
             "sam3_source_mask_weight": float(config.sam3_source_mask_weight),
             "sam3_source_dice_weight": float(config.sam3_source_dice_weight),
+            "fused_sam_residual_scale": model_scalar_parameter(
+                model,
+                "fused_sam_residual_scale",
+            ),
             "sam3_full_selected_obj_id": (
                 "" if not sam3_fused_aux else sam3_fused_aux.get("selected_obj_id", "")
             ),
@@ -1909,6 +1986,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 "legacy_iou={fused_sam_iou:.4f} "
                 "sam3_proxy_iou={sam3_full_proxy_iou:.4f} "
                 "sam3_source_iou={sam3_source_iou:.4f} "
+                "sam3_source_best={sam3_source_best_iou:.4f}@{sam3_source_best_threshold:.2f} "
+                "sam3_source_prob={sam3_source_pos_prob:.3f}/{sam3_source_neg_prob:.3f} "
                 "sam3_full_iou={sam3_full_flow_iou:.4f} "
                 "sam3_direct_iou={sam3_direct_iou:.4f} "
                 "text={text_loss:.4f} match={match_loss:.4f} "
@@ -1929,6 +2008,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 step=step,
                 threshold=config.visualize_threshold,
                 primary_mask_source=config.primary_mask_source,
+                sam3_direct_aux=sam3_direct_aux,
+                sam3_fused_aux=sam3_fused_aux,
             )
             export_dense_pointclouds(
                 config.output_dir / "pointclouds",
@@ -2674,6 +2755,8 @@ def save_dense_visualization(
     step: int,
     threshold: float,
     primary_mask_source: str,
+    sam3_direct_aux: Dict[str, Any] | None = None,
+    sam3_fused_aux: Dict[str, Any] | None = None,
 ) -> None:
     frames = len(sequence.image_paths)
     panel_w = 320
@@ -2768,6 +2851,12 @@ def save_dense_visualization(
     for col, heading in enumerate(headings):
         draw.text((margin + col * (panel_w + margin), title_h - 14), heading, fill=(220, 220, 220))
 
+    direct_diag = diagnostics_by_frame(
+        (sam3_direct_aux or {}).get("frame_diagnostics", [])
+    )
+    fused_diag = diagnostics_by_frame(
+        (sam3_fused_aux or {}).get("frame_diagnostics", [])
+    )
     for frame_idx, output in enumerate(outputs):
         image = load_rgb(sequence.image_paths[frame_idx], batch["prompt_mask"].shape[1:])
         gt = batch["prompt_mask"][frame_idx].detach().cpu().numpy()
@@ -2775,27 +2864,41 @@ def save_dense_visualization(
             image,
             overlay_mask(image, gt, (230, 57, 70), threshold=0.5),
         ]
+        labels = [
+            f"frame={frame_idx}",
+            f"GT inst={target_instance_id} px={int(np.asarray(gt).sum())}",
+        ]
         if show_primary_pred:
             pred = output.mask_logits[0].sigmoid().detach().float().cpu().numpy()
             panels.append(overlay_mask(image, pred, (69, 123, 157), threshold=threshold))
+            labels.append(
+                f"IoU={binary_iou_array(pred > threshold, gt > 0.5):.3f}"
+            )
         dense_mask_logits = getattr(output, "dense_mask_logits", None)
         if show_dense_head:
             if dense_mask_logits is None:
                 panels.append(image)
+                labels.append("disabled")
             else:
                 dense = dense_mask_logits[0].sigmoid().detach().float().cpu().numpy()
                 panels.append(overlay_mask(image, dense, (69, 123, 157), threshold=threshold))
+                labels.append(
+                    f"IoU={binary_iou_array(dense > threshold, gt > 0.5):.3f}"
+                )
         sam3_fused_mask = getattr(output, "sam3_fused_mask", None)
         if show_sam3_fused:
             if sam3_fused_mask is None:
                 panels.append(image)
+                labels.append("disabled")
             else:
                 fused_full = sam3_fused_mask.detach().float().cpu().numpy()
                 panels.append(overlay_mask(image, fused_full, (42, 157, 143), threshold=0.5))
+                labels.append(format_tracking_diagnostic(fused_diag.get(frame_idx)))
         sam3_full_proxy_logits = getattr(output, "sam3_full_proxy_mask_logits", None)
         if show_sam3_full_proxy:
             if sam3_full_proxy_logits is None:
                 panels.append(image)
+                labels.append("disabled")
             else:
                 proxy = (
                     sam3_full_proxy_logits[0]
@@ -2806,10 +2909,14 @@ def save_dense_visualization(
                     .numpy()
                 )
                 panels.append(overlay_mask(image, proxy, (131, 56, 236), threshold=threshold))
+                labels.append(
+                    f"IoU={binary_iou_array(proxy > threshold, gt > 0.5):.3f}"
+                )
         sam3_source_logits = getattr(output, "sam3_source_mask_logits", None)
         if show_sam3_source:
             if sam3_source_logits is None:
                 panels.append(image)
+                labels.append("disabled")
             else:
                 source_mask = (
                     sam3_source_logits[0]
@@ -2822,25 +2929,37 @@ def save_dense_visualization(
                 panels.append(
                     overlay_mask(image, source_mask, (93, 63, 211), threshold=threshold)
                 )
+                labels.append(
+                    f"IoU={binary_iou_array(source_mask > threshold, gt > 0.5):.3f}"
+                )
         sam3_direct_mask = getattr(output, "sam3_direct_mask", None)
         if show_sam3_direct:
             if sam3_direct_mask is None:
                 panels.append(image)
+                labels.append("disabled")
             else:
                 direct = sam3_direct_mask.detach().float().cpu().numpy()
                 panels.append(overlay_mask(image, direct, (255, 183, 3), threshold=0.5))
+                labels.append(format_tracking_diagnostic(direct_diag.get(frame_idx)))
         fused_sam_logits = getattr(output, "fused_sam_mask_logits", None)
         if show_legacy_fused_sam:
             if fused_sam_logits is None:
                 panels.append(image)
+                labels.append("disabled")
             else:
                 fused_sam = fused_sam_logits[0].sigmoid().detach().float().cpu().numpy()
                 panels.append(overlay_mask(image, fused_sam, (42, 157, 143), threshold=threshold))
+                labels.append(
+                    f"IoU={binary_iou_array(fused_sam > threshold, gt > 0.5):.3f}"
+                )
         if show_score:
             score = output.prompt_score[0].sigmoid().detach().float().cpu().numpy()
             panels.append(heatmap_overlay(image, score))
+            labels.append("score")
         row_y = title_h + margin + frame_idx * (panel_h + margin)
         for col, panel in enumerate(panels):
+            if col < len(labels):
+                panel = annotate_panel(panel, labels[col])
             panel = panel.resize((panel_w, panel_h), Image.BILINEAR)
             canvas.paste(panel, (margin + col * (panel_w + margin), row_y))
 
@@ -3071,6 +3190,59 @@ def heatmap_overlay(image: Image.Image, heatmap: np.ndarray) -> Image.Image:
     return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8))
 
 
+def annotate_panel(image: Image.Image, text: str) -> Image.Image:
+    if not text:
+        return image
+    out = image.copy()
+    draw = ImageDraw.Draw(out)
+    x0, y0 = 4, 4
+    bbox = draw.textbbox((x0, y0), text)
+    pad = 3
+    draw.rectangle(
+        (bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad),
+        fill=(0, 0, 0),
+    )
+    draw.text((x0, y0), text, fill=(255, 255, 255))
+    return out
+
+
+def binary_iou_array(pred: np.ndarray, target: np.ndarray) -> float:
+    pred_bool = np.asarray(pred).astype(bool)
+    target_bool = np.asarray(target).astype(bool)
+    union = np.logical_or(pred_bool, target_bool).sum()
+    if union == 0:
+        return 1.0
+    return float(np.logical_and(pred_bool, target_bool).sum() / union)
+
+
+def diagnostics_by_frame(
+    diagnostics: Sequence[Dict[str, Any]] | None,
+) -> Dict[int, Dict[str, Any]]:
+    if not diagnostics:
+        return {}
+    return {int(row["frame_idx"]): row for row in diagnostics}
+
+
+def format_tracking_diagnostic(row: Dict[str, Any] | None) -> str:
+    if not row:
+        return ""
+    status = []
+    if int(row.get("lost", 0)):
+        status.append("LOST")
+    if int(row.get("id_switch_risk", 0)):
+        status.append("SWITCH")
+    if int(row.get("false_positive", 0)):
+        status.append("FP")
+    suffix = "" if not status else " " + ",".join(status)
+    return (
+        f"id={row.get('selected_obj_id', '')} "
+        f"IoU={float(row.get('selected_iou', 0.0)):.3f} "
+        f"best={row.get('best_obj_id', '')}:"
+        f"{float(row.get('best_iou', 0.0)):.3f}"
+        f"{suffix}"
+    )
+
+
 def write_pointcloud_ply(
     path: Path,
     points: torch.Tensor,
@@ -3116,6 +3288,52 @@ def mean_float(values: Sequence[float]) -> float:
     return float(sum(float(value) for value in values) / len(values))
 
 
+def best_threshold_iou(
+    probability: torch.Tensor,
+    target: torch.Tensor,
+    thresholds: Sequence[float] = (
+        0.05,
+        0.1,
+        0.15,
+        0.2,
+        0.25,
+        0.3,
+        0.35,
+        0.4,
+        0.45,
+        0.5,
+        0.55,
+        0.6,
+        0.65,
+        0.7,
+        0.75,
+        0.8,
+        0.85,
+        0.9,
+        0.95,
+    ),
+) -> tuple[float, float]:
+    prob = probability.detach()
+    target_bool = target.detach().bool()
+    best_iou = -1.0
+    best_threshold = 0.5
+    for threshold in thresholds:
+        iou = binary_iou_tensor(prob > float(threshold), target_bool)
+        if iou > best_iou:
+            best_iou = iou
+            best_threshold = float(threshold)
+    return float(best_iou), float(best_threshold)
+
+
+def model_scalar_parameter(model: torch.nn.Module, name: str) -> float:
+    value = getattr(model, name, None)
+    if value is None:
+        return 0.0
+    if isinstance(value, torch.Tensor):
+        return float(value.detach().float().mean().cpu())
+    return float(value)
+
+
 def binary_iou_tensor(pred: torch.Tensor, target: torch.Tensor) -> float:
     pred = pred.detach().bool()
     target = target.detach().bool()
@@ -3123,6 +3341,97 @@ def binary_iou_tensor(pred: torch.Tensor, target: torch.Tensor) -> float:
     if union == 0:
         return 1.0
     return float((pred & target).sum().item() / union)
+
+
+def build_sam3_tracking_diagnostics(
+    *,
+    frame_objects: Dict[int, Dict[int, torch.Tensor]],
+    selected_obj_id: int | None,
+    target_masks: torch.Tensor,
+    switch_margin: float = 0.1,
+    lost_iou: float = 0.1,
+    false_positive_pixels: int = 128,
+) -> List[Dict[str, Any]]:
+    diagnostics: List[Dict[str, Any]] = []
+    targets = target_masks.detach().cpu().bool()
+    selected_key = int(selected_obj_id) if selected_obj_id is not None else None
+    for frame_idx in range(int(targets.shape[0])):
+        target = targets[frame_idx]
+        objects = frame_objects.get(frame_idx, {})
+        empty = torch.zeros_like(target)
+        selected_mask = (
+            objects.get(selected_key, empty) if selected_key is not None else empty
+        )
+        selected_mask = selected_mask.detach().cpu().bool()
+        selected_iou = binary_iou_tensor(selected_mask, target)
+        selected_pixels = int(selected_mask.sum().item())
+        gt_visible = bool(target.any().item())
+        best_obj_id = None
+        best_iou = 1.0 if not gt_visible and not objects else 0.0
+        best_pixels = 0
+        for obj_id, mask in objects.items():
+            mask_bool = mask.detach().cpu().bool()
+            iou = binary_iou_tensor(mask_bool, target)
+            if best_obj_id is None or iou > best_iou:
+                best_obj_id = int(obj_id)
+                best_iou = float(iou)
+                best_pixels = int(mask_bool.sum().item())
+        id_switch = (
+            gt_visible
+            and selected_key is not None
+            and best_obj_id is not None
+            and int(best_obj_id) != int(selected_key)
+            and best_iou > selected_iou + float(switch_margin)
+        )
+        diagnostics.append(
+            {
+                "frame_idx": frame_idx,
+                "gt_visible": int(gt_visible),
+                "gt_pixels": int(target.sum().item()),
+                "selected_obj_id": "" if selected_key is None else selected_key,
+                "selected_iou": float(selected_iou),
+                "selected_pixels": selected_pixels,
+                "best_obj_id": "" if best_obj_id is None else int(best_obj_id),
+                "best_iou": float(best_iou),
+                "best_pixels": best_pixels,
+                "num_sam3_objects": int(len(objects)),
+                "id_switch_risk": int(id_switch),
+                "lost": int(gt_visible and selected_iou < float(lost_iou)),
+                "false_positive": int(
+                    (not gt_visible) and selected_pixels > int(false_positive_pixels)
+                ),
+            }
+        )
+    return diagnostics
+
+
+def write_sam3_tracking_diagnostics(
+    path: Path,
+    diagnostics: Sequence[Dict[str, Any]],
+) -> None:
+    if not diagnostics:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "frame_idx",
+        "gt_visible",
+        "gt_pixels",
+        "selected_obj_id",
+        "selected_iou",
+        "selected_pixels",
+        "best_obj_id",
+        "best_iou",
+        "best_pixels",
+        "num_sam3_objects",
+        "id_switch_risk",
+        "lost",
+        "false_positive",
+    ]
+    with path.open("w", newline="", encoding="utf8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in diagnostics:
+            writer.writerow({name: row.get(name, "") for name in fieldnames})
 
 
 def write_metrics_header(path: Path) -> None:
@@ -3147,6 +3456,10 @@ def write_metrics_header(path: Path) -> None:
         "fused_sam_iou",
         "sam3_full_proxy_iou",
         "sam3_source_iou",
+        "sam3_source_best_iou",
+        "sam3_source_best_threshold",
+        "sam3_source_pos_prob",
+        "sam3_source_neg_prob",
         "sam3_direct_iou",
         "sam3_full_flow_iou",
         "text_loss",
@@ -3160,6 +3473,7 @@ def write_metrics_header(path: Path) -> None:
         "point_valid_source",
         "point_mask_condition",
         "fusion_type",
+        "geometry_ablation",
         "primary_mask_source",
         "use_camera_tokens",
         "train_scope",
@@ -3174,6 +3488,7 @@ def write_metrics_header(path: Path) -> None:
         "sam3_source_flow",
         "sam3_source_mask_weight",
         "sam3_source_dice_weight",
+        "fused_sam_residual_scale",
         "sam3_full_selected_obj_id",
         "sam3_direct_selected_obj_id",
         "sam3_direct_prompt_frame_idx",

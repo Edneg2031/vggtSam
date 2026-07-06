@@ -30,6 +30,7 @@ class SAM3TrackOutput:
     selected_obj_id: Optional[int]
     prompt_frame_idx: int
     prompt_box_xywh: Optional[tuple[float, float, float, float]]
+    frame_objects: Dict[int, Dict[int, torch.Tensor]] = field(default_factory=dict)
     aux: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -181,6 +182,7 @@ class SAM3VideoTrackerAdapter:
             selected_obj_id=selected_obj_id,
             prompt_frame_idx=prompt_frame_idx,
             prompt_box_xywh=tuple(prompt_box) if prompt_box is not None else None,
+            frame_objects=frame_objects,
             aux={
                 "prompt": prompt,
                 "num_frames": len(image_paths),

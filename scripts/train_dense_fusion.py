@@ -114,6 +114,15 @@ def main() -> None:
         default=None,
     )
     parser.add_argument(
+        "--geometry-ablation",
+        choices=["none", "zero"],
+        default=None,
+        help=(
+            "none uses StreamVGGT geometry/camera context; zero keeps the same "
+            "fusion/adapter graph but zeros geometry/camera tokens for ablation."
+        ),
+    )
+    parser.add_argument(
         "--primary-mask-source",
         choices=[
             "dense",
@@ -294,6 +303,8 @@ def main() -> None:
         raw["model"]["point_mask_condition"] = args.point_mask_condition
     if args.fusion_type is not None:
         raw["model"]["fusion_type"] = args.fusion_type
+    if args.geometry_ablation is not None:
+        raw["geometry"]["ablation"] = args.geometry_ablation
     if args.primary_mask_source is not None:
         raw["model"]["primary_mask_source"] = args.primary_mask_source
     if args.use_camera_tokens:
@@ -414,6 +425,7 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         ],
         streamvggt_image_mode=str(geometry["image_mode"]),
         use_camera_tokens=bool(geometry.get("use_camera_tokens", False)),
+        geometry_ablation=str(geometry.get("ablation", "none")),
         output_size=tuple(int(v) for v in model["output_size"]),
         d_fuse=int(model["d_fuse"]),
         num_heads=int(model["num_heads"]),
