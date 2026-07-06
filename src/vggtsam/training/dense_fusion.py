@@ -1925,6 +1925,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 batch=batch,
                 outputs=outputs,
                 prompt=prompt_selection.prompt,
+                target_instance_id=int(prompt_selection.sampled_instance_id),
                 step=step,
                 threshold=config.visualize_threshold,
                 primary_mask_source=config.primary_mask_source,
@@ -2669,6 +2670,7 @@ def save_dense_visualization(
     batch: Dict[str, torch.Tensor],
     outputs: Sequence[Any],
     prompt: str,
+    target_instance_id: int | None,
     step: int,
     threshold: float,
     primary_mask_source: str,
@@ -2730,7 +2732,7 @@ def save_dense_visualization(
         (margin, 5),
         (
             f"step={step} prompt='{prompt}' threshold={threshold:.2f} "
-            f"pred_source={primary_mask_source}"
+            f"instance_id={target_instance_id} pred_source={primary_mask_source}"
         ),
         fill=(240, 240, 240),
     )
