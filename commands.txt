@@ -461,3 +461,44 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --sam3-direct-device cuda:3 \
   --visualize-every 10 \
   --output-dir outputs/sam3_full_proxy_scale01_inst37
+
+
+### 消融 4：可反传 SAM3 source full-flow（不走 predictor，不走 proxy）
+# Pred 显示 sam3_source：fused token -> residual adapter -> SAM3 tracker track_step/memory/mask decoder。
+# SAM3 权重冻结，只训练 fusion/SAM adapter；sam3_direct_iou 是原版 SAM3 上限参考。
+PYTHONPATH=src python scripts/train_dense_fusion.py \
+  --config configs/dense_fusion_train.yaml \
+  --scene-id 00a231a370 \
+  --instance-id 37 \
+  --frame-indices 91 133 162 163 228 263 273 \
+  --point-decoder stream_dpt \
+  --stream-dpt-use-pretrained \
+  --fusion-type camera_guided \
+  --sam3-source-flow \
+  --sam3-source-mask-weight 0 \
+  --sam3-source-dice-weight 0 \
+  --sam3-full-residual-scale 1 \
+  --primary-mask-source sam3_source \
+  --compare-sam3-direct \
+  --no-history \
+  --history-update-source gt \
+  --fused-sam-feature-mode residual \
+  --fused-sam-prompt-source none \
+  --train-scope sam_adapter \
+  --mask-weight 1 \
+  --dice-weight 1 \
+  --fused-sam-mask-weight 0 \
+  --fused-sam-dice-weight 0 \
+  --point-weight 0 \
+  --text-weight 0 \
+  --aux-cls-weight 0 \
+  --match-weight 0 \
+  --chamfer-weight 0 \
+  --reprojection-weight 0 \
+  --iterations 700 \
+  --device cuda:3 \
+  --geometry-device cuda:1 \
+  --sam3-device cuda:2 \
+  --sam3-direct-device cuda:3 \
+  --visualize-every 10 \
+  --output-dir outputs/sam3_source_full_flow_inst37

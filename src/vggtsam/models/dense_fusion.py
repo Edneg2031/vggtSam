@@ -176,6 +176,7 @@ class DenseFusionOutput:
     mask_logits: torch.Tensor | None
     fused_sam_mask_logits: torch.Tensor | None
     sam3_full_proxy_mask_logits: torch.Tensor | None
+    sam3_source_mask_logits: torch.Tensor | None
     sam3_direct_mask: torch.Tensor | None
     pointmap: torch.Tensor | None
     streamvggt_pointmap: torch.Tensor | None
@@ -469,6 +470,7 @@ class DenseSAMVGGTModel(nn.Module):
             mask_logits=mask_logits,
             fused_sam_mask_logits=None,
             sam3_full_proxy_mask_logits=None,
+            sam3_source_mask_logits=None,
             sam3_direct_mask=None,
             pointmap=pointmap,
             streamvggt_pointmap=None,

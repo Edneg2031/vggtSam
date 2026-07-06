@@ -72,6 +72,12 @@ sam3:
   full_trainable_proxy: false
   full_proxy_mask_weight: 0.0
   full_proxy_dice_weight: 0.0
+  # Trainable source-flow path: bypass the inference-only predictor and call
+  # SAM3 tracker source `track_step` directly. This keeps SAM3 frozen but lets
+  # mask loss backpropagate into the fused residual adapter.
+  source_flow: false
+  source_mask_weight: 0.0
+  source_dice_weight: 0.0
   direct_device:
   direct_prompt_with_box: true
   direct_output_prob_thresh: 0.5
@@ -106,6 +112,7 @@ model:
   # fused_sam: use SAM3 prompt/mask decoder output as the main Pred mask.
   # sam3_direct: use original SAM3 video tracker masks as the main Pred mask.
   # sam3_full_proxy: use the trainable frozen-SAM3 decoder proxy as Pred.
+  # sam3_source: use the trainable SAM3 source-flow tracker logits as Pred.
   primary_mask_source: fused_sam
   # Auxiliary closed-set semantic classifier. Must be larger than processed
   # semantic class ids; the open-vocabulary path uses text alignment.
@@ -127,6 +134,7 @@ loss:
   # gt: point loss only on GT object mask.
   # pred: point loss only where the current predicted mask is above threshold.
   # sam3_direct: point loss only on SAM3 video-tracker mask.
+  # sam3_source: point loss only on trainable SAM3 source-flow mask.
   point_valid_source: gt
   point_valid_threshold: 0.5
   chamfer_weight: 0.1
