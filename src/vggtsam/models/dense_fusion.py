@@ -173,16 +173,16 @@ class CameraGuidedTokenFusion(nn.Module):
 @dataclass
 class DenseFusionOutput:
     fused_tokens: torch.Tensor
-    mask_logits: torch.Tensor
+    mask_logits: torch.Tensor | None
     fused_sam_mask_logits: torch.Tensor | None
     sam3_full_proxy_mask_logits: torch.Tensor | None
     sam3_direct_mask: torch.Tensor | None
-    pointmap: torch.Tensor
+    pointmap: torch.Tensor | None
     streamvggt_pointmap: torch.Tensor | None
     point_conf: torch.Tensor | None
-    semantic_embedding: torch.Tensor
-    prompt_score: torch.Tensor
-    instance_embedding: torch.Tensor
+    semantic_embedding: torch.Tensor | None
+    prompt_score: torch.Tensor | None
+    instance_embedding: torch.Tensor | None
     aux_logits: torch.Tensor | None = None
     dense_mask_logits: torch.Tensor | None = None
 
@@ -387,20 +387,42 @@ class DenseSAMVGGTModel(nn.Module):
         stream_images: torch.Tensor | None = None,
         stream_patch_start_idx: int | None = None,
         point_mask_condition: torch.Tensor | None = None,
+        decode_mask: bool = True,
+        decode_point: bool = True,
+        decode_semantic: bool = True,
+        decode_instance: bool = True,
+        decode_aux: bool = True,
     ) -> DenseFusionOutput:
-        dense = self.tokens_to_dense(fused_tokens)
+        fused_tokens = self._ensure_batched(fused_tokens)
+        needs_dense = (
+            decode_mask
+            or decode_semantic
+            or decode_instance
+            or decode_aux
+            or (decode_point and self.point_decoder == "simple")
+        )
+        dense = self.tokens_to_dense(fused_tokens) if needs_dense else None
         object_query = self._prepare_object_query(
             object_query,
-            batch_size=dense.shape[0],
-            device=dense.device,
+            batch_size=fused_tokens.shape[0],
+            device=fused_tokens.device,
         )
-        if object_query is not None:
+        if dense is not None and object_query is not None:
             dense = dense + self.object_query_proj(object_query)[:, :, None, None]
-        mask_logits = self.mask_head(dense).squeeze(1)
-        if self.point_decoder == "simple":
+        mask_logits = None
+        if decode_mask:
+            if dense is None:
+                raise RuntimeError("decode_mask=True requires dense features.")
+            mask_logits = self.mask_head(dense).squeeze(1)
+        pointmap = None
+        point_conf = None
+        if not decode_point:
+            pass
+        elif self.point_decoder == "simple":
+            if dense is None:
+                raise RuntimeError("decode_point=True requires dense features.")
             assert self.point_head is not None
             pointmap = self.point_head(dense).permute(0, 2, 3, 1).contiguous()
-            point_conf = None
         else:
             pointmap, point_conf = self.decode_stream_pointmap(
                 fused_tokens=fused_tokens,
@@ -410,9 +432,22 @@ class DenseSAMVGGTModel(nn.Module):
                 stream_patch_start_idx=stream_patch_start_idx,
                 point_mask_condition=point_mask_condition,
             )
-        semantic_embedding = self.semantic_head(dense)
-        instance_embedding_chw = F.normalize(self.instance_head(dense), dim=1)
-        if object_query is not None:
+        semantic_embedding = None
+        prompt_score = None
+        if decode_semantic:
+            if dense is None:
+                raise RuntimeError("decode_semantic=True requires dense features.")
+            semantic_embedding = self.semantic_head(dense)
+            prompt_score = self.compute_prompt_score(
+                semantic_embedding,
+                text_embedding,
+            )
+        instance_embedding_chw = None
+        if decode_instance:
+            if dense is None:
+                raise RuntimeError("decode_instance=True requires dense features.")
+            instance_embedding_chw = F.normalize(self.instance_head(dense), dim=1)
+        if mask_logits is not None and object_query is not None and instance_embedding_chw is not None:
             object_embedding = F.normalize(
                 self.object_query_to_embedding(object_query),
                 dim=-1,
@@ -424,11 +459,11 @@ class DenseSAMVGGTModel(nn.Module):
             )
             scale = self.instance_logit_scale.clamp(1.0, 100.0)
             mask_logits = mask_logits + instance_score * scale
-        prompt_score = self.compute_prompt_score(
-            semantic_embedding,
-            text_embedding,
+        aux_logits = (
+            self.aux_head(dense)
+            if decode_aux and self.aux_head is not None and dense is not None
+            else None
         )
-        aux_logits = self.aux_head(dense) if self.aux_head is not None else None
         return DenseFusionOutput(
             fused_tokens=fused_tokens,
             mask_logits=mask_logits,
@@ -438,9 +473,17 @@ class DenseSAMVGGTModel(nn.Module):
             pointmap=pointmap,
             streamvggt_pointmap=None,
             point_conf=point_conf,
-            semantic_embedding=semantic_embedding.permute(0, 2, 3, 1).contiguous(),
+            semantic_embedding=(
+                semantic_embedding.permute(0, 2, 3, 1).contiguous()
+                if semantic_embedding is not None
+                else None
+            ),
             prompt_score=prompt_score,
-            instance_embedding=instance_embedding_chw.permute(0, 2, 3, 1).contiguous(),
+            instance_embedding=(
+                instance_embedding_chw.permute(0, 2, 3, 1).contiguous()
+                if instance_embedding_chw is not None
+                else None
+            ),
             aux_logits=aux_logits,
         )
 

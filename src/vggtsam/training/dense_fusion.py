@@ -633,6 +633,11 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
     use_fused_sam = uses_fused_sam_decoder(config)
     use_fused_sam_residual = uses_fused_sam_residual_features(config)
     use_sam3_direct = uses_sam3_direct_masks(config)
+    need_point_outputs = (
+        config.point_weight > 0.0
+        or config.chamfer_weight > 0.0
+        or config.reprojection_weight > 0.0
+    )
     needs_tracker_backbone = sam3_feature_requires_inst_interactivity(
         config.sam3_feature_source
     )
@@ -857,7 +862,9 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 )
                 geo_out = geometry.extract_from_paths(
                     sequence.image_paths,
-                    return_pointmap=config.point_decoder == "stream_dpt",
+                    return_pointmap=(
+                        config.point_decoder == "stream_dpt" and need_point_outputs
+                    ),
                     streaming_cache=config.geometry_streaming_cache,
                 )
                 text_embedding = pool_language_features(sam_out.text_out)
@@ -881,7 +888,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                     if geo_out.geometry.camera_tokens is not None
                     else None
                 )
-                if config.point_decoder == "stream_dpt":
+                if config.point_decoder == "stream_dpt" and need_point_outputs:
                     stream_dpt_tokens_all = detach_to_cpu(
                         geo_out.geometry.aux.get("stream_dpt_tokens")
                     )
@@ -1067,9 +1074,30 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             if sam3_direct_masks is not None
             else None
         )
+        primary_source = config.primary_mask_source.strip().lower()
+        prompt_source = config.fused_sam_prompt_source.strip().lower()
+        prompt_needs_pre_primary_pred = prompt_source in {
+            "pred",
+            "prediction",
+            "gt_or_pred",
+            "teacher_or_pred",
+        }
+        need_dense_mask_decode = primary_source in {
+            "dense",
+            "mask_head",
+            "baseline",
+        } or prompt_needs_pre_primary_pred
+        need_point_decode = (
+            config.point_weight > 0.0
+            or config.chamfer_weight > 0.0
+            or config.reprojection_weight > 0.0
+        )
+        need_semantic_decode = config.text_weight > 0.0
+        need_aux_decode = config.aux_cls_weight > 0.0
+        need_instance_decode = need_dense_mask_decode or config.match_weight > 0.0
         stream_baseline_pointmaps_device = (
             stream_baseline_pointmaps.to(config.device).float()
-            if stream_baseline_pointmaps is not None
+            if need_point_decode and stream_baseline_pointmaps is not None
             else None
         )
 
@@ -1157,35 +1185,57 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
 
         for frame_idx in range(num_frames):
             target = frame_target(batch, frame_idx)
-            point_mask_condition = select_point_mask_condition(
-                target=target,
-                source=config.point_mask_condition,
+            point_mask_condition = (
+                select_point_mask_condition(
+                    target=target,
+                    source=config.point_mask_condition,
+                )
+                if need_point_decode
+                else None
+            )
+            stream_tokens_for_decode = (
+                slice_stream_dpt_tokens(
+                    stream_dpt_tokens_all,
+                    frame_idx=frame_idx,
+                    device=config.device,
+                )
+                if need_point_decode
+                else None
+            )
+            stream_images_for_decode = (
+                slice_stream_images(
+                    stream_images_all,
+                    frame_idx=frame_idx,
+                    device=config.device,
+                )
+                if need_point_decode
+                else None
             )
             output = model.decode(
                 fused_tokens=fused_frame_tokens[frame_idx],
                 text_embedding=text_embedding,
                 object_query=object_query,
-                stream_tokens=slice_stream_dpt_tokens(
-                    stream_dpt_tokens_all,
-                    frame_idx=frame_idx,
-                    device=config.device,
+                stream_tokens=stream_tokens_for_decode,
+                stream_images=stream_images_for_decode,
+                stream_patch_start_idx=(
+                    stream_patch_start_idx if need_point_decode else None
                 ),
-                stream_images=slice_stream_images(
-                    stream_images_all,
-                    frame_idx=frame_idx,
-                    device=config.device,
-                ),
-                stream_patch_start_idx=stream_patch_start_idx,
                 point_mask_condition=point_mask_condition,
+                decode_mask=need_dense_mask_decode,
+                decode_point=need_point_decode,
+                decode_semantic=need_semantic_decode,
+                decode_instance=need_instance_decode,
+                decode_aux=need_aux_decode,
             )
-            output.dense_mask_logits = output.mask_logits
-            dense_ious.append(
-                binary_iou_tensor(
-                    output.dense_mask_logits[0].detach().sigmoid()
-                    > config.visualize_threshold,
-                    target["prompt_mask"],
+            if output.mask_logits is not None:
+                output.dense_mask_logits = output.mask_logits
+                dense_ious.append(
+                    binary_iou_tensor(
+                        output.dense_mask_logits[0].detach().sigmoid()
+                        > config.visualize_threshold,
+                        target["prompt_mask"],
+                    )
                 )
-            )
             if sam3_direct_masks_device is not None:
                 output.sam3_direct_mask = sam3_direct_masks_device[frame_idx]
                 sam3_direct_ious.append(
@@ -1200,7 +1250,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 output.streamvggt_pointmap = stream_baseline_pointmaps_device[
                     frame_idx : frame_idx + 1
                 ]
-            zero = output.mask_logits.sum() * 0.0
+            zero = fused_frame_tokens[frame_idx].sum() * 0.0
             fused_sam_mask_loss = zero
             fused_sam_dice_loss = zero
             sam3_full_proxy_mask_loss = zero
@@ -1292,54 +1342,82 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             )
             outputs.append(output)
 
-            mask_loss = dense_mask_bce_loss(
-                output.mask_logits[0],
-                target["prompt_mask"],
-                target["mask_supervision"],
-            )
-            dice_loss = dense_dice_loss(
-                output.mask_logits[0],
-                target["prompt_mask"],
-                target["mask_supervision"],
-            )
-            point_valid = select_point_supervision_mask(
-                output=output,
-                target=target,
-                source=config.point_valid_source,
-                pred_threshold=config.point_valid_threshold,
-            )
-            point_loss = dense_point_loss(
-                output.pointmap[0],
-                target["pointmap"],
-                point_valid,
-            )
+            mask_loss = zero
+            dice_loss = zero
+            if config.mask_weight > 0.0:
+                mask_loss = dense_mask_bce_loss(
+                    output.mask_logits[0],
+                    target["prompt_mask"],
+                    target["mask_supervision"],
+                )
+            if config.dice_weight > 0.0:
+                dice_loss = dense_dice_loss(
+                    output.mask_logits[0],
+                    target["prompt_mask"],
+                    target["mask_supervision"],
+                )
+            point_valid = None
+            point_loss = zero
+            if config.point_weight > 0.0:
+                if output.pointmap is None:
+                    raise RuntimeError("point_weight > 0 requires decoded pointmap.")
+                point_valid = select_point_supervision_mask(
+                    output=output,
+                    target=target,
+                    source=config.point_valid_source,
+                    pred_threshold=config.point_valid_threshold,
+                )
+                point_loss = dense_point_loss(
+                    output.pointmap[0],
+                    target["pointmap"],
+                    point_valid,
+                )
             stream_baseline_point_loss = zero
-            if output.streamvggt_pointmap is not None:
+            if config.point_weight > 0.0 and output.streamvggt_pointmap is not None:
                 stream_baseline_point_loss = dense_point_loss(
                     output.streamvggt_pointmap[0],
                     target["pointmap"],
                     target["point_valid"] & target["prompt_mask"],
                 )
-            chamfer_loss = dense_chamfer_loss(
-                output.pointmap[0],
-                target["pointmap"],
-                point_valid,
-                max_points=config.max_chamfer_points,
-            )
-            reprojection_loss = dense_reprojection_mask_loss(
-                output.pointmap[0],
-                output.mask_logits[0],
-                target["prompt_mask"],
-                target.get("intrinsics"),
-                target.get("world_to_camera"),
-            )
-            text_loss = dense_mask_bce_loss(
-                output.prompt_score[0],
-                target["prompt_mask"],
-                target["mask_supervision"],
-            )
+            chamfer_loss = zero
+            if config.chamfer_weight > 0.0:
+                if output.pointmap is None:
+                    raise RuntimeError("chamfer_weight > 0 requires decoded pointmap.")
+                if point_valid is None:
+                    point_valid = select_point_supervision_mask(
+                        output=output,
+                        target=target,
+                        source=config.point_valid_source,
+                        pred_threshold=config.point_valid_threshold,
+                    )
+                chamfer_loss = dense_chamfer_loss(
+                    output.pointmap[0],
+                    target["pointmap"],
+                    point_valid,
+                    max_points=config.max_chamfer_points,
+                )
+            reprojection_loss = zero
+            if config.reprojection_weight > 0.0:
+                if output.pointmap is None:
+                    raise RuntimeError("reprojection_weight > 0 requires decoded pointmap.")
+                reprojection_loss = dense_reprojection_mask_loss(
+                    output.pointmap[0],
+                    output.mask_logits[0],
+                    target["prompt_mask"],
+                    target.get("intrinsics"),
+                    target.get("world_to_camera"),
+                )
+            text_loss = zero
+            if config.text_weight > 0.0:
+                if output.prompt_score is None:
+                    raise RuntimeError("text_weight > 0 requires prompt_score.")
+                text_loss = dense_mask_bce_loss(
+                    output.prompt_score[0],
+                    target["prompt_mask"],
+                    target["mask_supervision"],
+                )
             aux_loss = zero
-            if output.aux_logits is not None:
+            if config.aux_cls_weight > 0.0 and output.aux_logits is not None:
                 aux_valid = target["semantic_valid"]
                 if aux_valid.any():
                     aux_loss = F.cross_entropy(
@@ -1349,7 +1427,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
 
             match_loss = zero
             match_pixels = 0
-            if history_buffer:
+            if config.match_weight > 0.0 and output.instance_embedding is not None and history_buffer:
                 history = history_buffer[rng.randrange(len(history_buffer))]
                 match_loss, match_pixels = dense_instance_match_loss(
                     current_embeddings=output.instance_embedding[0],
@@ -1392,14 +1470,16 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             aux_losses.append(aux_loss)
             match_losses.append(match_loss)
             selected_match_pixels += match_pixels
-            selected_point_pixels += int(point_valid.sum().detach().cpu().item())
-            history_buffer.append(
-                {
-                    "embeddings": output.instance_embedding[0].detach(),
-                    "instance": target["instance"].detach(),
-                    "valid": target["instance_valid"].detach(),
-                }
-            )
+            if point_valid is not None:
+                selected_point_pixels += int(point_valid.sum().detach().cpu().item())
+            if config.match_weight > 0.0 and output.instance_embedding is not None:
+                history_buffer.append(
+                    {
+                        "embeddings": output.instance_embedding[0].detach(),
+                        "instance": target["instance"].detach(),
+                        "valid": target["instance_valid"].detach(),
+                    }
+                )
             if config.history_enabled:
                 update_mask = select_history_update_mask(
                     output=output,
@@ -2243,9 +2323,7 @@ def save_dense_visualization(
     dense_sources = {"dense", "mask_head", "baseline"}
     hidden_legacy_fused_sources = legacy_fused_sources | full_flow_sources
     show_primary_pred = primary not in full_flow_sources
-    show_dense_head = primary not in dense_sources and any(
-        getattr(output, "dense_mask_logits", None) is not None for output in outputs
-    )
+    show_dense_head = False
     show_legacy_fused_sam = primary not in hidden_legacy_fused_sources and any(
         getattr(output, "fused_sam_mask_logits", None) is not None
         for output in outputs
@@ -2261,8 +2339,10 @@ def save_dense_visualization(
     show_sam3_fused = any(
         getattr(output, "sam3_fused_mask", None) is not None
         for output in outputs
+    ) and not show_sam3_direct
+    show_score = primary in dense_sources and any(
+        getattr(output, "prompt_score", None) is not None for output in outputs
     )
-    show_score = primary in dense_sources
     columns = (
         2
         + int(show_primary_pred)
@@ -2394,6 +2474,8 @@ def export_dense_pointclouds(
     rgb = load_sequence_rgb(sequence.image_paths, batch["prompt_mask"].shape[1:])
     gt_mask = batch["prompt_mask"].detach().cpu()
     gt_points = batch["pointmap"].detach().cpu()
+    if any(getattr(output, "pointmap", None) is None for output in outputs):
+        return
     pred_masks = torch.stack(
         [output.mask_logits[0].sigmoid().detach().float().cpu() > threshold for output in outputs],
         dim=0,
