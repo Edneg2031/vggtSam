@@ -78,6 +78,7 @@ def main() -> None:
     sam3_source_flow.add_argument("--no-sam3-source-flow", action="store_true")
     parser.add_argument("--sam3-source-mask-weight", type=float, default=None)
     parser.add_argument("--sam3-source-dice-weight", type=float, default=None)
+    parser.add_argument("--sam3-source-objectness-weight", type=float, default=None)
     sam3_direct_box = parser.add_mutually_exclusive_group()
     sam3_direct_box.add_argument("--sam3-direct-box", action="store_true")
     sam3_direct_box.add_argument("--no-sam3-direct-box", action="store_true")
@@ -252,6 +253,10 @@ def main() -> None:
         raw["sam3"]["source_mask_weight"] = args.sam3_source_mask_weight
     if args.sam3_source_dice_weight is not None:
         raw["sam3"]["source_dice_weight"] = args.sam3_source_dice_weight
+    if args.sam3_source_objectness_weight is not None:
+        raw["sam3"][
+            "source_objectness_weight"
+        ] = args.sam3_source_objectness_weight
     if args.sam3_direct_box:
         raw["sam3"]["direct_prompt_with_box"] = True
     if args.no_sam3_direct_box:
@@ -416,6 +421,9 @@ def build_train_config(raw: dict) -> DenseFusionTrainConfig:
         sam3_source_flow=bool(sam3.get("source_flow", False)),
         sam3_source_mask_weight=float(sam3.get("source_mask_weight", 0.0)),
         sam3_source_dice_weight=float(sam3.get("source_dice_weight", 0.0)),
+        sam3_source_objectness_weight=float(
+            sam3.get("source_objectness_weight", 0.0)
+        ),
         streamvggt_repo=Path(geometry["repo"]),
         streamvggt_checkpoint=Path(geometry["checkpoint"]),
         geometry_device=str(geometry.get("device") or training["device"]),

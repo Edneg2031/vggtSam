@@ -78,6 +78,9 @@ sam3:
   source_flow: false
   source_mask_weight: 0.0
   source_dice_weight: 0.0
+  # Explicitly supervise SAM3's object-present gate in source_flow:
+  # GT visible frame -> object_score_logits > 0; invisible frame -> < 0.
+  source_objectness_weight: 0.0
   direct_device:
   direct_prompt_with_box: true
   direct_output_prob_thresh: 0.5

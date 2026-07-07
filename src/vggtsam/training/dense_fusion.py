@@ -88,6 +88,7 @@ class DenseFusionTrainConfig:
     sam3_source_flow: bool
     sam3_source_mask_weight: float
     sam3_source_dice_weight: float
+    sam3_source_objectness_weight: float
     streamvggt_repo: Path
     streamvggt_checkpoint: Path
     geometry_device: str
@@ -305,6 +306,7 @@ def uses_sam3_source_flow(config: DenseFusionTrainConfig) -> bool:
         config.sam3_source_flow
         or config.sam3_source_mask_weight > 0.0
         or config.sam3_source_dice_weight > 0.0
+        or config.sam3_source_objectness_weight > 0.0
         or config.primary_mask_source.strip().lower() in source_names
         or config.history_update_source.strip().lower() in source_names
         or config.point_valid_source.strip().lower() in source_names
@@ -384,6 +386,7 @@ def configure_trainable_parameters(
             and config.sam3_full_proxy_dice_weight <= 0.0
             and config.sam3_source_mask_weight <= 0.0
             and config.sam3_source_dice_weight <= 0.0
+            and config.sam3_source_objectness_weight <= 0.0
             and not has_primary_sam_loss
         ):
             raise RuntimeError(
@@ -650,14 +653,14 @@ def run_sam3_source_tracker_flow(
         object_score = frame_out.get("object_score_logits")
         if object_score is None:
             object_score = mask_logits.new_zeros(1)
-        object_scores.append(object_score.float().reshape(-1)[0].detach().cpu())
+        object_scores.append(object_score.float().reshape(-1)[0])
         iou_score = frame_out.get("iou_score")
         if iou_score is None:
             iou_score = mask_logits.new_zeros(1)
         iou_scores.append(iou_score.float().reshape(-1)[0].detach().cpu())
     aux = {
         "object_score_logits": torch.stack(object_scores),
-        "object_present": torch.stack(object_scores) > 0,
+        "object_present": torch.stack(object_scores).detach() > 0,
         "iou_scores": torch.stack(iou_scores),
     }
     return torch.cat(logits, dim=0).contiguous(), aux
@@ -1526,6 +1529,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
         sam3_full_proxy_dice_losses: List[torch.Tensor] = []
         sam3_source_mask_losses: List[torch.Tensor] = []
         sam3_source_dice_losses: List[torch.Tensor] = []
+        sam3_source_objectness_losses: List[torch.Tensor] = []
         pred_ious: List[float] = []
         dense_ious: List[float] = []
         fused_sam_ious: List[float] = []
@@ -1627,6 +1631,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             sam3_full_proxy_dice_loss = zero
             sam3_source_mask_loss = zero
             sam3_source_dice_loss = zero
+            sam3_source_objectness_loss = zero
             if sam3_source_logits is not None:
                 output.sam3_source_mask_logits = sam3_source_logits[
                     frame_idx : frame_idx + 1
@@ -1664,6 +1669,20 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 if negative.any():
                     sam3_source_neg_probs.append(
                         float(source_prob[negative].mean().detach().cpu())
+                    )
+                object_score_logits = sam3_source_aux.get("object_score_logits")
+                if (
+                    object_score_logits is not None
+                    and object_score_logits.numel() > frame_idx
+                ):
+                    object_score_logit = object_score_logits.reshape(-1)[frame_idx]
+                    visible_label = target["prompt_mask"].bool().any().to(
+                        device=object_score_logit.device,
+                        dtype=object_score_logit.dtype,
+                    )
+                    sam3_source_objectness_loss = F.binary_cross_entropy_with_logits(
+                        object_score_logit.reshape(1),
+                        visible_label.reshape(1),
                     )
             if use_sam3_full_proxy:
                 if sam_tracker_model is None:
@@ -1863,6 +1882,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 + config.sam3_full_proxy_dice_weight * sam3_full_proxy_dice_loss
                 + config.sam3_source_mask_weight * sam3_source_mask_loss
                 + config.sam3_source_dice_weight * sam3_source_dice_loss
+                + config.sam3_source_objectness_weight
+                * sam3_source_objectness_loss
                 + config.text_weight * text_loss
                 + config.aux_cls_weight * aux_loss
                 + config.match_weight * match_loss
@@ -1880,6 +1901,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             sam3_full_proxy_dice_losses.append(sam3_full_proxy_dice_loss)
             sam3_source_mask_losses.append(sam3_source_mask_loss)
             sam3_source_dice_losses.append(sam3_source_dice_loss)
+            sam3_source_objectness_losses.append(sam3_source_objectness_loss)
             text_losses.append(text_loss)
             aux_losses.append(aux_loss)
             match_losses.append(match_loss)
@@ -1929,6 +1951,9 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "sam3_full_proxy_dice_loss": mean_metric(sam3_full_proxy_dice_losses),
             "sam3_source_mask_loss": mean_metric(sam3_source_mask_losses),
             "sam3_source_dice_loss": mean_metric(sam3_source_dice_losses),
+            "sam3_source_objectness_loss": mean_metric(
+                sam3_source_objectness_losses
+            ),
             "pred_iou": mean_float(pred_ious),
             "dense_iou": mean_float(dense_ious),
             "fused_sam_iou": mean_float(fused_sam_ious),
@@ -1990,6 +2015,9 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "sam3_source_flow": int(config.sam3_source_flow),
             "sam3_source_mask_weight": float(config.sam3_source_mask_weight),
             "sam3_source_dice_weight": float(config.sam3_source_dice_weight),
+            "sam3_source_objectness_weight": float(
+                config.sam3_source_objectness_weight
+            ),
             "fused_sam_residual_scale": model_scalar_parameter(
                 model,
                 "fused_sam_residual_scale",
@@ -2027,6 +2055,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 "legacy_fused={fused_sam_mask_loss:.4f}/{fused_sam_dice_loss:.4f} "
                 "sam3_proxy={sam3_full_proxy_mask_loss:.4f}/{sam3_full_proxy_dice_loss:.4f} "
                 "sam3_source={sam3_source_mask_loss:.4f}/{sam3_source_dice_loss:.4f} "
+                "objness={sam3_source_objectness_loss:.4f} "
                 "pred_iou={pred_iou:.4f} dense_iou={dense_iou:.4f} "
                 "legacy_iou={fused_sam_iou:.4f} "
                 "sam3_proxy_iou={sam3_full_proxy_iou:.4f} "
@@ -3578,6 +3607,7 @@ def write_metrics_header(path: Path) -> None:
         "sam3_full_proxy_dice_loss",
         "sam3_source_mask_loss",
         "sam3_source_dice_loss",
+        "sam3_source_objectness_loss",
         "pred_iou",
         "dense_iou",
         "fused_sam_iou",
@@ -3618,6 +3648,7 @@ def write_metrics_header(path: Path) -> None:
         "sam3_source_flow",
         "sam3_source_mask_weight",
         "sam3_source_dice_weight",
+        "sam3_source_objectness_weight",
         "fused_sam_residual_scale",
         "sam3_full_selected_obj_id",
         "sam3_direct_selected_obj_id",

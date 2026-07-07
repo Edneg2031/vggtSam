@@ -242,3 +242,85 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --sam3-direct-device cuda:3 \
   --visualize-every 10 \
   --output-dir outputs/abl_source_3d_scale10_lr1e3_inst37
+
+
+
+### objectness gate loss 消融：无 3D
+# 目标：显式训练 SAM3 source-flow 的 object_score_logits。
+# 观察 sam3_source_present_frames / sam3_source_obj / sam3_source_objectness_loss。
+PYTHONPATH=src python scripts/train_dense_fusion.py \
+  --config configs/dense_fusion_train.yaml \
+  --scene-id 00a231a370 \
+  --instance-id 37 \
+  --frame-indices 133 162 520 566 477 \
+  --output-size 256 384 \
+  --point-decoder simple \
+  --fusion-type camera_guided \
+  --geometry-ablation zero \
+  --sam3-source-flow \
+  --sam3-full-residual-scale 10 \
+  --primary-mask-source sam3_source \
+  --compare-sam3-direct \
+  --no-history \
+  --fused-sam-prompt-source none \
+  --train-scope sam_adapter \
+  --mask-weight 1 \
+  --dice-weight 1 \
+  --sam3-source-objectness-weight 1 \
+  --sam3-source-mask-weight 0 \
+  --sam3-source-dice-weight 0 \
+  --point-weight 0 \
+  --text-weight 0 \
+  --aux-cls-weight 0 \
+  --match-weight 0 \
+  --chamfer-weight 0 \
+  --reprojection-weight 0 \
+  --lr 0.001 \
+  --iterations 500 \
+  --device cuda:3 \
+  --geometry-device cuda:1 \
+  --sam3-device cuda:2 \
+  --sam3-direct-device cuda:3 \
+  --visualize-every 10 \
+  --output-dir outputs/abl_objness_samonly_scale10_lr1e3_inst37
+
+
+
+### objectness gate loss 消融：有 3D
+# 如果 3D 有效，应比 zero 更早/更稳地把 GT 可见帧的 object_score_logits 推过 0。
+PYTHONPATH=src python scripts/train_dense_fusion.py \
+  --config configs/dense_fusion_train.yaml \
+  --scene-id 00a231a370 \
+  --instance-id 37 \
+  --frame-indices 133 162 520 566 477 \
+  --output-size 256 384 \
+  --point-decoder simple \
+  --fusion-type camera_guided \
+  --geometry-ablation none \
+  --use-camera-tokens \
+  --sam3-source-flow \
+  --sam3-full-residual-scale 10 \
+  --primary-mask-source sam3_source \
+  --compare-sam3-direct \
+  --no-history \
+  --fused-sam-prompt-source none \
+  --train-scope sam_adapter \
+  --mask-weight 1 \
+  --dice-weight 1 \
+  --sam3-source-objectness-weight 1 \
+  --sam3-source-mask-weight 0 \
+  --sam3-source-dice-weight 0 \
+  --point-weight 0 \
+  --text-weight 0 \
+  --aux-cls-weight 0 \
+  --match-weight 0 \
+  --chamfer-weight 0 \
+  --reprojection-weight 0 \
+  --lr 0.001 \
+  --iterations 500 \
+  --device cuda:3 \
+  --geometry-device cuda:1 \
+  --sam3-device cuda:2 \
+  --sam3-direct-device cuda:3 \
+  --visualize-every 10 \
+  --output-dir outputs/abl_objness_3d_scale10_lr1e3_inst37
