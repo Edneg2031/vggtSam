@@ -520,7 +520,7 @@ def run_sam3_source_tracker_flow(
     output_size: tuple[int, int],
     residual_scale: float,
     device: str,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Run differentiable SAM3 tracker source flow with fused FPN residuals.
 
     This bypasses the SAM3 predictor API, which is inference-only, and calls the
@@ -632,10 +632,13 @@ def run_sam3_source_tracker_flow(
         sam_tracker.train(was_training)
 
     logits = []
+    object_scores = []
+    iou_scores = []
     for frame_idx in range(num_frames):
         if frame_idx not in frame_outputs:
             raise RuntimeError(f"sam3_source did not produce frame {frame_idx}.")
-        mask_logits = frame_outputs[frame_idx]["pred_masks_high_res"].float()
+        frame_out = frame_outputs[frame_idx]
+        mask_logits = frame_out["pred_masks_high_res"].float()
         if tuple(mask_logits.shape[-2:]) != tuple(output_size):
             mask_logits = F.interpolate(
                 mask_logits,
@@ -644,7 +647,20 @@ def run_sam3_source_tracker_flow(
                 align_corners=False,
             )
         logits.append(mask_logits[:, 0])
-    return torch.cat(logits, dim=0).contiguous()
+        object_score = frame_out.get("object_score_logits")
+        if object_score is None:
+            object_score = mask_logits.new_zeros(1)
+        object_scores.append(object_score.float().reshape(-1)[0].detach().cpu())
+        iou_score = frame_out.get("iou_score")
+        if iou_score is None:
+            iou_score = mask_logits.new_zeros(1)
+        iou_scores.append(iou_score.float().reshape(-1)[0].detach().cpu())
+    aux = {
+        "object_score_logits": torch.stack(object_scores),
+        "object_present": torch.stack(object_scores) > 0,
+        "iou_scores": torch.stack(iou_scores),
+    }
+    return torch.cat(logits, dim=0).contiguous(), aux
 
 
 def move_sam3_non_buffer_rope_caches(module: torch.nn.Module, device: torch.device) -> None:
@@ -1432,6 +1448,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             batch["reference_mask"],
         )
         sam3_source_logits = None
+        sam3_source_aux: Dict[str, torch.Tensor] = {}
         if use_sam3_source:
             if sam_tracker_model is None:
                 raise RuntimeError(
@@ -1441,7 +1458,7 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 fused_tokens=torch.cat(fused_frame_tokens, dim=0),
                 object_query=object_query,
             )
-            sam3_source_logits = run_sam3_source_tracker_flow(
+            sam3_source_logits, sam3_source_aux = run_sam3_source_tracker_flow(
                 sam_tracker=sam_tracker_model,
                 sam_tracker_features=sam_tracker_features,
                 sam_input_images=(
@@ -1921,6 +1938,26 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "sam3_source_best_threshold": mean_float(sam3_source_best_thresholds),
             "sam3_source_pos_prob": mean_float(sam3_source_pos_probs),
             "sam3_source_neg_prob": mean_float(sam3_source_neg_probs),
+            "sam3_source_present_frames": int(
+                sam3_source_aux.get(
+                    "object_present",
+                    torch.zeros(0, dtype=torch.bool),
+                )
+                .detach()
+                .cpu()
+                .sum()
+                .item()
+            ),
+            "sam3_source_min_object_score": source_aux_stat(
+                sam3_source_aux,
+                "object_score_logits",
+                "min",
+            ),
+            "sam3_source_mean_object_score": source_aux_stat(
+                sam3_source_aux,
+                "object_score_logits",
+                "mean",
+            ),
             "sam3_direct_iou": mean_float(sam3_direct_ious),
             "sam3_full_flow_iou": mean_float(sam3_fused_ious),
             "text_loss": mean_metric(text_losses),
@@ -1973,6 +2010,13 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
             "reference_frame_idx": reference_frame_idx,
         }
         append_metric(metrics_path, row)
+        if use_sam3_source:
+            write_sam3_source_object_scores(
+                config.output_dir / "sam3_source_object_scores.csv",
+                step=step,
+                batch=batch,
+                aux=sam3_source_aux,
+            )
 
         if step % config.log_every == 0 or completed_steps == 1:
             print(
@@ -1989,6 +2033,8 @@ def train_dense_fusion(config: DenseFusionTrainConfig) -> None:
                 "sam3_source_iou={sam3_source_iou:.4f} "
                 "sam3_source_best={sam3_source_best_iou:.4f}@{sam3_source_best_threshold:.2f} "
                 "sam3_source_prob={sam3_source_pos_prob:.3f}/{sam3_source_neg_prob:.3f} "
+                "sam3_source_present={sam3_source_present_frames} "
+                "sam3_source_obj={sam3_source_min_object_score:.3f}/{sam3_source_mean_object_score:.3f} "
                 "sam3_full_iou={sam3_full_flow_iou:.4f} "
                 "sam3_direct_iou={sam3_direct_iou:.4f} "
                 "text={text_loss:.4f} match={match_loss:.4f} "
@@ -3289,6 +3335,20 @@ def mean_float(values: Sequence[float]) -> float:
     return float(sum(float(value) for value in values) / len(values))
 
 
+def source_aux_stat(aux: Dict[str, torch.Tensor], key: str, reduce: str) -> float:
+    value = aux.get(key)
+    if value is None or value.numel() == 0:
+        return 0.0
+    value = value.detach().float().cpu()
+    if reduce == "min":
+        return float(value.min())
+    if reduce == "max":
+        return float(value.max())
+    if reduce == "mean":
+        return float(value.mean())
+    raise ValueError(f"Unknown reduction: {reduce}")
+
+
 def best_threshold_iou(
     probability: torch.Tensor,
     target: torch.Tensor,
@@ -3435,6 +3495,72 @@ def write_sam3_tracking_diagnostics(
             writer.writerow({name: row.get(name, "") for name in fieldnames})
 
 
+def write_sam3_source_object_scores(
+    path: Path,
+    *,
+    step: int,
+    batch: Dict[str, Any],
+    aux: Dict[str, torch.Tensor],
+) -> None:
+    object_scores = aux.get("object_score_logits")
+    if object_scores is None or object_scores.numel() == 0:
+        return
+
+    object_scores = object_scores.detach().float().cpu().reshape(-1)
+    present = aux.get("object_present")
+    if present is None:
+        present = object_scores > 0
+    present = present.detach().cpu().bool().reshape(-1)
+    iou_scores = aux.get("iou_scores")
+    if iou_scores is None or iou_scores.numel() == 0:
+        iou_scores = torch.zeros_like(object_scores)
+    else:
+        iou_scores = iou_scores.detach().float().cpu().reshape(-1)
+
+    masks = batch["prompt_mask"].detach().cpu().bool()
+    gt_pixels = masks.flatten(1).sum(dim=1)
+    gt_visible = gt_pixels > 0
+    reference_frame = int(batch["reference_frame_idx"].detach().cpu().item())
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if step == 1 and path.exists():
+        path.unlink()
+    new_file = not path.exists()
+    fieldnames = [
+        "step",
+        "frame_idx",
+        "reference_frame_idx",
+        "gt_visible",
+        "gt_pixels",
+        "object_score_logit",
+        "object_present",
+        "sam3_iou_score",
+    ]
+    with path.open("a", newline="", encoding="utf8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        if new_file:
+            writer.writeheader()
+        num_rows = min(
+            int(object_scores.numel()),
+            int(present.numel()),
+            int(iou_scores.numel()),
+            int(gt_pixels.numel()),
+        )
+        for frame_idx in range(num_rows):
+            writer.writerow(
+                {
+                    "step": int(step),
+                    "frame_idx": int(frame_idx),
+                    "reference_frame_idx": reference_frame,
+                    "gt_visible": int(gt_visible[frame_idx].item()),
+                    "gt_pixels": int(gt_pixels[frame_idx].item()),
+                    "object_score_logit": float(object_scores[frame_idx].item()),
+                    "object_present": int(present[frame_idx].item()),
+                    "sam3_iou_score": float(iou_scores[frame_idx].item()),
+                }
+            )
+
+
 def write_metrics_header(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
@@ -3461,6 +3587,9 @@ def write_metrics_header(path: Path) -> None:
         "sam3_source_best_threshold",
         "sam3_source_pos_prob",
         "sam3_source_neg_prob",
+        "sam3_source_present_frames",
+        "sam3_source_min_object_score",
+        "sam3_source_mean_object_score",
         "sam3_direct_iou",
         "sam3_full_flow_iou",
         "text_loss",

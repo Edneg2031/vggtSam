@@ -1,0 +1,170 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2600" height="3300" viewBox="0 0 2600 3300">
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .title { font: 700 58px -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #0f172a; }
+      .subtitle { font: 34px -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #475569; }
+      .box-title { font: 700 32px -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #0f172a; }
+      .box-text { font: 26px -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #334155; }
+      .small { font: 24px -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #334155; }
+      .tag { font: 700 22px -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: white; }
+      .input { fill: #e0f2fe; stroke: #0284c7; stroke-width: 4; }
+      .frozen { fill: #e8eef7; stroke: #4b6b9b; stroke-width: 4; }
+      .train { fill: #fff1d6; stroke: #b7791f; stroke-width: 4; }
+      .flow { fill: #ecfdf5; stroke: #059669; stroke-width: 4; }
+      .loss { fill: #ffe4e6; stroke: #be123c; stroke-width: 4; }
+      .arrow { fill: none; stroke: #334155; stroke-width: 4; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrowhead); }
+      .thin-arrow { fill: none; stroke: #64748b; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrowhead-gray); }
+      .label-bg { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 2; }
+    </style>
+    <marker id="arrowhead" markerWidth="14" markerHeight="10" refX="12" refY="5" orient="auto">
+      <polygon points="0 0, 14 5, 0 10" fill="#334155"/>
+    </marker>
+    <marker id="arrowhead-gray" markerWidth="14" markerHeight="10" refX="12" refY="5" orient="auto">
+      <polygon points="0 0, 14 5, 0 10" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="2600" height="3300"/>
+
+  <text class="title" x="120" y="95">当前训练结构图：SAM3 / StreamVGGT 3D-aware Tracker Adapter</text>
+  <text class="subtitle" x="120" y="155">目标：训练 adapter，让 3D 信息通过 SAM3 原 tracker full flow 改善跨视角实例 mask 追踪</text>
+
+  <!-- Input -->
+  <rect class="input" x="610" y="230" width="1380" height="180" rx="24"/>
+  <text class="box-title" x="650" y="285">训练数据</text>
+  <text class="box-text" x="650" y="330">RGB 序列 [T,3,H,W] ｜ GT instance mask [T,256,384]</text>
+  <text class="box-text" x="650" y="366">GT pointmap / camera 可选，用于点云分支或诊断</text>
+
+  <!-- Frozen branches -->
+  <rect class="frozen" x="150" y="520" width="980" height="180" rx="24"/>
+  <text class="box-title" x="190" y="580">Frozen SAM3 tracker / image backbone</text>
+  <text class="box-text" x="190" y="626">enable_inst_interactivity=True</text>
+  <text class="box-text" x="190" y="662">输入 resize 到 1008×1008</text>
+  <rect x="1010" y="540" width="88" height="38" rx="12" fill="#4b6b9b"/>
+  <text class="tag" x="1025" y="566">Frozen</text>
+
+  <rect class="frozen" x="1380" y="520" width="980" height="180" rx="24"/>
+  <text class="box-title" x="1420" y="580">Frozen StreamVGGT</text>
+  <text class="box-text" x="1420" y="626">streaming_cache=True</text>
+  <text class="box-text" x="1420" y="662">使用 aggregator + camera_head</text>
+  <rect x="2240" y="540" width="88" height="38" rx="12" fill="#4b6b9b"/>
+  <text class="tag" x="2255" y="566">Frozen</text>
+
+  <!-- SAM branch details -->
+  <rect class="frozen" x="150" y="800" width="980" height="190" rx="24"/>
+  <text class="box-title" x="190" y="860">SAM3 特征层：tracker_fpn2</text>
+  <text class="box-text" x="190" y="906">来源：sam2_backbone_out["backbone_fpn"][-1]</text>
+  <text class="box-text" x="190" y="942">形状：[T,256,72,72]</text>
+
+  <rect class="frozen" x="150" y="1040" width="980" height="170" rx="24"/>
+  <text class="box-title" x="190" y="1100">Text conditioning</text>
+  <text class="box-text" x="190" y="1146">prompt → language feature [1,256]</text>
+  <text class="box-text" x="190" y="1182">与 tracker_fpn2 token concat</text>
+
+  <rect class="frozen" x="150" y="1260" width="980" height="200" rx="24"/>
+  <text class="box-title" x="190" y="1320">SAM tokens</text>
+  <text class="box-text" x="190" y="1366">per frame：[1,72×72,512] = [1,5184,512]</text>
+  <text class="box-text" x="190" y="1402">sequence：[1,T×5184,512]</text>
+
+  <!-- VGGT branch details -->
+  <rect class="frozen" x="1380" y="800" width="980" height="190" rx="24"/>
+  <text class="box-title" x="1420" y="860">StreamVGGT aggregator 最后一层</text>
+  <text class="box-text" x="1420" y="906">layer_index = -1</text>
+  <text class="box-text" x="1420" y="942">原 patch token dim = 2048</text>
+
+  <rect class="frozen" x="1380" y="1040" width="980" height="190" rx="24"/>
+  <text class="box-title" x="1420" y="1100">Geometry tokens</text>
+  <text class="box-text" x="1420" y="1146">resize 到 context_grid = 12×12</text>
+  <text class="box-text" x="1420" y="1182">per frame：[1,144,2048]</text>
+
+  <rect class="frozen" x="1380" y="1280" width="980" height="160" rx="24"/>
+  <text class="box-title" x="1420" y="1340">Camera tokens</text>
+  <text class="box-text" x="1420" y="1386">camera_head 最后一层 pose encoding：[1,1,9]</text>
+
+  <!-- Fusion -->
+  <rect class="train" x="610" y="1580" width="1380" height="260" rx="24"/>
+  <text class="box-title" x="650" y="1640">Camera-guided Fusion</text>
+  <text class="box-text" x="650" y="1686">SAM token 线性投影为 query：[1,5184,256]</text>
+  <text class="box-text" x="650" y="1722">VGGT geometry/camera 投影为 key/value：[1,145,256]</text>
+  <text class="box-text" x="650" y="1758">Multi-head cross attention + camera gate + residual norm</text>
+  <rect x="1840" y="1600" width="112" height="38" rx="12" fill="#b7791f"/>
+  <text class="tag" x="1855" y="1626">Trainable</text>
+
+  <rect class="train" x="610" y="1940" width="1380" height="160" rx="24"/>
+  <text class="box-title" x="650" y="2000">Fused tokens</text>
+  <text class="box-text" x="650" y="2046">per frame：[1,5184,256]，仍保持 72×72 SAM token grid</text>
+
+  <!-- Object query and adapter -->
+  <rect class="input" x="150" y="2220" width="820" height="170" rx="24"/>
+  <text class="box-title" x="190" y="2280">Reference GT mask</text>
+  <text class="box-text" x="190" y="2326">reference frame 的实例 mask / box prompt</text>
+
+  <rect class="train" x="1060" y="2210" width="900" height="190" rx="24"/>
+  <text class="box-title" x="1100" y="2270">Object query</text>
+  <text class="box-text" x="1100" y="2316">在 fused token 72×72 grid 上 masked average pooling</text>
+  <text class="box-text" x="1100" y="2352">形状：[1,256]</text>
+
+  <rect class="train" x="610" y="2510" width="1380" height="220" rx="24"/>
+  <text class="box-title" x="650" y="2570">SAM3 FPN residual adapter</text>
+  <text class="box-text" x="650" y="2616">fused tokens + object query → 三层 residual</text>
+  <text class="box-text" x="650" y="2652">训练 adapter；SAM3 和 StreamVGGT 主体冻结</text>
+  <rect x="1840" y="2530" width="112" height="38" rx="12" fill="#b7791f"/>
+  <text class="tag" x="1855" y="2556">Trainable</text>
+
+  <rect class="train" x="610" y="2810" width="1380" height="200" rx="24"/>
+  <text class="box-title" x="650" y="2870">输出 3D-aware FPN residuals</text>
+  <text class="box-text" x="650" y="2916">residual_fpn0 [T,32,288,288] ｜ residual_fpn1 [T,64,144,144]</text>
+  <text class="box-text" x="650" y="2952">residual_fpn2 [T,256,72,72]</text>
+
+  <!-- Final flow and loss -->
+  <rect class="flow" x="260" y="3100" width="900" height="160" rx="24"/>
+  <text class="box-title" x="300" y="3158">SAM3 原 tracker full flow</text>
+  <text class="box-text" x="300" y="3204">原始 fpn0/fpn1/fpn2 + residual，走 memory / object gate / mask decoder</text>
+
+  <rect class="flow" x="1260" y="3100" width="520" height="160" rx="24"/>
+  <text class="box-title" x="1300" y="3158">Pred mask logits</text>
+  <text class="box-text" x="1300" y="3204">[T,256,384]</text>
+
+  <rect class="loss" x="1880" y="3100" width="560" height="160" rx="24"/>
+  <text class="box-title" x="1920" y="3158">监督</text>
+  <text class="box-text" x="1920" y="3204">GT instance mask：BCE loss + Dice loss</text>
+
+  <!-- Edges -->
+  <path class="arrow" d="M 1050 410 L 1050 465 L 640 465 L 640 520"/>
+  <path class="arrow" d="M 1550 410 L 1550 465 L 1870 465 L 1870 520"/>
+  <path class="arrow" d="M 640 700 L 640 800"/>
+  <path class="arrow" d="M 640 990 L 640 1040"/>
+  <path class="arrow" d="M 640 1210 L 640 1260"/>
+  <path class="arrow" d="M 1870 700 L 1870 800"/>
+  <path class="arrow" d="M 1870 990 L 1870 1040"/>
+  <path class="arrow" d="M 1870 990 L 1870 1280"/>
+  <path class="arrow" d="M 640 1460 L 640 1520 L 1020 1520 L 1020 1580"/>
+  <path class="arrow" d="M 1870 1230 L 1870 1520 L 1580 1520 L 1580 1580"/>
+  <path class="arrow" d="M 1870 1440 L 1870 1520 L 1580 1520"/>
+  <path class="arrow" d="M 1300 1840 L 1300 1940"/>
+  <path class="arrow" d="M 1300 2100 L 1300 2210"/>
+  <path class="arrow" d="M 970 2305 L 1060 2305"/>
+  <path class="arrow" d="M 1300 2100 L 1300 2510"/>
+  <path class="arrow" d="M 1510 2400 L 1510 2510"/>
+  <path class="arrow" d="M 1300 2730 L 1300 2810"/>
+  <path class="arrow" d="M 1300 3010 L 710 3010 L 710 3100"/>
+  <path class="arrow" d="M 1160 3180 L 1260 3180"/>
+  <path class="arrow" d="M 1780 3180 L 1880 3180"/>
+  <path class="thin-arrow" d="M 640 700 L 520 700 L 520 3060 L 610 3060 L 610 3100"/>
+  <rect class="label-bg" x="395" y="2940" width="250" height="44" rx="10"/>
+  <text class="small" x="415" y="2971">原始 tracker FPN</text>
+  <path class="thin-arrow" d="M 560 2390 L 560 3050 L 650 3050 L 650 3100"/>
+  <rect class="label-bg" x="395" y="2445" width="150" height="44" rx="10"/>
+  <text class="small" x="415" y="2476">ref prompt</text>
+
+  <!-- Legend -->
+  <rect class="frozen" x="120" y="3265" width="42" height="30" rx="8"/>
+  <text class="small" x="178" y="3290">Frozen backbone</text>
+  <rect class="train" x="560" y="3265" width="42" height="30" rx="8"/>
+  <text class="small" x="618" y="3290">Trainable adapter</text>
+  <rect class="flow" x="1030" y="3265" width="42" height="30" rx="8"/>
+  <text class="small" x="1088" y="3290">SAM3 full flow</text>
+  <rect class="loss" x="1500" y="3265" width="42" height="30" rx="8"/>
+  <text class="small" x="1558" y="3290">Loss</text>
+</svg>
