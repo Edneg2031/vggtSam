@@ -565,10 +565,23 @@ def run_sam3_source_tracker_flow(
     old_teacher_force = getattr(sam_tracker, "teacher_force_obj_scores_for_mem", None)
     had_mem_dropout = hasattr(sam_tracker, "prob_to_dropout_spatial_mem")
     old_mem_dropout = getattr(sam_tracker, "prob_to_dropout_spatial_mem", None)
-    sam_tracker.train()
-    # SAM3 inference checkpoints may not carry every training-time attribute.
-    # `track_step` checks these only when `self.training=True`, so define stable
-    # no-op defaults while we run the differentiable source path.
+    had_offload = hasattr(sam_tracker, "offload_output_to_cpu_for_eval")
+    old_offload = getattr(sam_tracker, "offload_output_to_cpu_for_eval", None)
+    had_trim = hasattr(sam_tracker, "trim_past_non_cond_mem_for_eval")
+    old_trim = getattr(sam_tracker, "trim_past_non_cond_mem_for_eval", None)
+    # Run SAM3's source tracker in eval semantics, matching the video predictor,
+    # but without torch.no_grad/inference_mode so gradients still reach the
+    # fused residual adapter. Eval mode also keeps object_score_logits in
+    # current_out, which is required for the explicit objectness loss.
+    sam_tracker.eval()
+    # Keep all tensors on-device for differentiable loss computation.
+    if had_offload:
+        sam_tracker.offload_output_to_cpu_for_eval = False
+    if had_trim:
+        sam_tracker.trim_past_non_cond_mem_for_eval = False
+    # Some checkpoints may not carry training-only attributes. They are unused
+    # in eval mode, but stable defaults make source-flow robust if a downstream
+    # SAM3 variant checks them unconditionally.
     sam_tracker.teacher_force_obj_scores_for_mem = False
     sam_tracker.prob_to_dropout_spatial_mem = 0.0
     move_sam3_non_buffer_rope_caches(sam_tracker, tracker_device)
@@ -632,6 +645,10 @@ def run_sam3_source_tracker_flow(
             sam_tracker.prob_to_dropout_spatial_mem = old_mem_dropout
         else:
             delattr(sam_tracker, "prob_to_dropout_spatial_mem")
+        if had_offload:
+            sam_tracker.offload_output_to_cpu_for_eval = old_offload
+        if had_trim:
+            sam_tracker.trim_past_non_cond_mem_for_eval = old_trim
         sam_tracker.train(was_training)
 
     logits = []
@@ -653,7 +670,9 @@ def run_sam3_source_tracker_flow(
         object_score = frame_out.get("object_score_logits")
         if object_score is None:
             object_score = mask_logits.new_zeros(1)
-        object_scores.append(object_score.float().reshape(-1)[0])
+        object_scores.append(
+            object_score.float().reshape(-1)[0].to(device=mask_logits.device)
+        )
         iou_score = frame_out.get("iou_score")
         if iou_score is None:
             iou_score = mask_logits.new_zeros(1)
