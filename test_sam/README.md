@@ -61,3 +61,18 @@ StreamVGGT aggregator feature(s) ────┘              │
 论文依据：[3AM](https://arxiv.org/html/2601.08831) 使用多层 3D foundation-model 特征，经逐层 cross-attention 与卷积细化后并入 SAM2 特征，再完整经过 memory attention 和 mask decoder；[Multimodal SAM Adapter](https://arxiv.org/html/2509.10408) 还提供了 concat 与 cross-attention injector 这两类有价值的对照。当前 `multilevel_cross_attention` 保留 3AM 主线，但有意去掉 point/ray positional encoding 与 camera token，以隔离“隐式 3D feature fusion”本身。
 
 `dataset.frame_indices` 的书写顺序就是送入 SAM3/StreamVGGT 的流式顺序，代码不会自动排序。做真实时序实验时应按采集顺序填写；故意构造跳视角序列时也要明确该顺序代表的传播过程。
+
+## 一键运行
+
+```bash
+bash test_sam/run_all_ablations.sh
+```
+
+默认每组运行 700 step。快速检查全部链路可使用：
+
+```bash
+ITERATIONS=2 OUTPUT_ROOT=outputs/test_sam_ablation_smoke \
+  bash test_sam/run_all_ablations.sh
+```
+
+所有实验顺序执行，日志保存在各实验目录的 `run.log`，最终汇总写入 `ablation_summary.csv`。

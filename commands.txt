@@ -366,3 +366,10 @@ PYTHONPATH=src:. python -m test_sam.train_fusion_ablation \
 #
 # 第二阶段：在最佳融合器后加 --train-tracker，训练范围扩展到
 # fusion + SAM3 memory_attention + sam_mask_decoder（更接近 3AM）。
+
+# 一键顺序运行上面全部 8 组并生成 ablation_summary.csv。
+bash test_sam/run_all_ablations.sh
+
+# 全部方法各跑 2 step 的快速链路检查。
+ITERATIONS=2 OUTPUT_ROOT=outputs/test_sam_ablation_smoke \
+  bash test_sam/run_all_ablations.sh
