@@ -1,0 +1,65 @@
+# Focused cross-view mask consistency experiment. No pointmap decoder and no
+# camera-token fusion are constructed in this pipeline.
+
+dataset:
+  manifest: data/processed/scannetpp_pinhole_2d/manifest.json
+  scene_id: 00a231a370
+  frame_indices: [133, 162, 520, 566, 477]
+  sequence_length: 5
+  frame_stride: 1
+  window_index: 0
+  instance_id: 37
+  min_pixels: 128
+  max_area_ratio: 0.25
+  min_visible_frames: 2
+  excluded_labels: [object, unknown, wall, floor, ceiling]
+
+sam3:
+  repo: externals/sam3
+  checkpoint: /home/bod/86Nas/95_data_bak/FoundationModels/sam3/sam3.pt
+  feature_device: cuda:2
+  tracker_device: cuda:3
+  direct_device: cuda:0
+  resolution: 1008
+  frame_chunk_size: 1
+  # 3AM uses mask prompts for ScanNet++; only the reference frame receives GT.
+  reference_prompt_mode: mask
+  compare_direct: true
+
+streamvggt:
+  repo: externals/streamvggt
+  checkpoint: /home/bod/86Nas/95_data_bak/FoundationModels/StreamVGGT/checkpoints.pth
+  device: cuda:1
+  streaming_cache: true
+  image_mode: crop
+  context_grid: [12, 12]
+  layer_indices: [4, 11, 17, 23]
+
+fusion:
+  # sam_only | add | concat_conv | film | cross_attention |
+  # gated_cross_attention | multilevel_cross_attention
+  method: multilevel_cross_attention
+  hidden_channels: 256
+  num_heads: 8
+  dropout: 0.0
+  residual_scale: 1.0
+  # 3AM keeps shallow SAM features unchanged and injects the merged feature
+  # before memory attention, corresponding to tracker FPN2 here.
+  inject_levels: [fpn2]
+  zero_geometry: false
+
+training:
+  iterations: 700
+  lr: 0.0003
+  seed: 0
+  amp: true
+  train_tracker: false
+  focal_weight: 20.0
+  dice_weight: 1.0
+  presence_weight: 1.0
+  gradient_clip: 1.0
+  log_every: 10
+  visualize_every: 20
+  save_every: 100
+  output_size: [256, 384]
+  output_dir: outputs/test_sam_multilevel

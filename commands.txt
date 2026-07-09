@@ -1,10 +1,4 @@
 
-  PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
-  --config configs/scannetpp_pinhole_2d.yaml \
-  --scene-ids 00a231a370 \
-  --max-frames 600 \
-  --frame-step 1
-
 
 
 ### 消融 1：只看可训练 proxy 本身能不能拟合 mask
@@ -324,3 +318,51 @@ PYTHONPATH=src python scripts/train_dense_fusion.py \
   --sam3-direct-device cuda:3 \
   --visualize-every 10 \
   --output-dir outputs/abl_objness_3d_scale10_lr1e3_inst37
+
+
+### test_sam：只验证 StreamVGGT 几何特征能否增强 SAM3 跨视角实例一致性
+# 不构建 pointmap head，不使用 camera token。
+# 先做 CPU/Python 结构检查（服务器环境）。
+PYTHONPATH=src:. python test_sam/test_fusion_shapes.py
+
+# 先跑 2 step，确认服务器上的 SAM3 source-flow 与特征 shape。
+PYTHONPATH=src:. python -m test_sam.train_fusion_ablation \
+  --config test_sam/config.yaml \
+  --fusion-method cross_attention \
+  --iterations 2 \
+  --no-compare-direct \
+  --output-dir outputs/test_sam_smoke
+
+# 1. 同容量 SAM-only adapter 基线。
+PYTHONPATH=src:. python -m test_sam.train_fusion_ablation \
+  --config test_sam/config.yaml \
+  --fusion-method sam_only \
+  --output-dir outputs/test_sam_01_sam_only
+
+# 2. Cross-attention 同构零几何对照。
+PYTHONPATH=src:. python -m test_sam.train_fusion_ablation \
+  --config test_sam/config.yaml \
+  --fusion-method cross_attention \
+  --zero-geometry \
+  --output-dir outputs/test_sam_02_cross_zero
+
+# 3. 单层 StreamVGGT cross-attention。
+PYTHONPATH=src:. python -m test_sam.train_fusion_ablation \
+  --config test_sam/config.yaml \
+  --fusion-method cross_attention \
+  --output-dir outputs/test_sam_03_cross_3d
+
+# 4. 最接近 3AM 的多层逐级 cross-attention + SAM 卷积融合。
+PYTHONPATH=src:. python -m test_sam.train_fusion_ablation \
+  --config test_sam/config.yaml \
+  --fusion-method multilevel_cross_attention \
+  --output-dir outputs/test_sam_04_multilevel_3d
+
+# 其余融合器只需替换：
+# --fusion-method add
+# --fusion-method concat_conv
+# --fusion-method film
+# --fusion-method gated_cross_attention
+#
+# 第二阶段：在最佳融合器后加 --train-tracker，训练范围扩展到
+# fusion + SAM3 memory_attention + sam_mask_decoder（更接近 3AM）。

@@ -523,13 +523,15 @@ def run_sam3_source_tracker_flow(
     output_size: tuple[int, int],
     residual_scale: float,
     device: str,
+    reference_prompt_mode: str = "box_points",
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Run differentiable SAM3 tracker source flow with fused FPN residuals.
 
     This bypasses the SAM3 predictor API, which is inference-only, and calls the
-    underlying tracker `track_step` directly. SAM3 weights remain frozen; the
-    returned logits keep gradients to `tracker_residuals`, and therefore to the
-    fused-token adapter that produced them.
+    underlying tracker `track_step` directly. The returned logits keep gradients
+    to `tracker_residuals`, and therefore to the fused-token adapter that
+    produced them. Callers may keep SAM3 frozen or selectively train tracker
+    submodules.
     """
     if sam_tracker_features is None:
         raise RuntimeError("sam3_source requires cached SAM3 tracker FPN features.")
@@ -551,14 +553,46 @@ def run_sam3_source_tracker_flow(
 
     tracker_device = torch.device(device)
     feature_dtype = tracker_residuals[-1].dtype
-    prompt = make_sam3_box_point_prompt(
-        reference_mask,
-        image_size=int(getattr(sam_tracker, "image_size", 1008)),
-        device=tracker_device,
-        dtype=feature_dtype,
-    )
-    if prompt is None:
-        raise RuntimeError("sam3_source reference mask is empty.")
+    reference_prompt_mode = reference_prompt_mode.strip().lower()
+    if reference_prompt_mode not in {"box_points", "mask"}:
+        raise ValueError(
+            "reference_prompt_mode must be 'box_points' or 'mask', "
+            f"got {reference_prompt_mode!r}"
+        )
+    prompt = None
+    reference_mask_input = None
+    if reference_prompt_mode == "box_points":
+        prompt = make_sam3_box_point_prompt(
+            reference_mask,
+            image_size=int(getattr(sam_tracker, "image_size", 1008)),
+            device=tracker_device,
+            dtype=feature_dtype,
+        )
+        if prompt is None:
+            raise RuntimeError("sam3_source reference mask is empty.")
+    else:
+        reference_mask_input = reference_mask.detach().to(
+            device=tracker_device,
+            dtype=feature_dtype,
+        )
+        if reference_mask_input.ndim == 2:
+            reference_mask_input = reference_mask_input[None, None]
+        elif reference_mask_input.ndim == 3:
+            reference_mask_input = reference_mask_input[:, None]
+        if reference_mask_input.ndim != 4:
+            raise ValueError(
+                "reference_mask must become [B,1,H,W], got "
+                f"{tuple(reference_mask_input.shape)}"
+            )
+        if not bool(reference_mask_input.any()):
+            raise RuntimeError("sam3_source reference mask is empty.")
+        image_size = int(getattr(sam_tracker, "image_size", 1008))
+        if tuple(reference_mask_input.shape[-2:]) != (image_size, image_size):
+            reference_mask_input = F.interpolate(
+                reference_mask_input.float(),
+                size=(image_size, image_size),
+                mode="nearest",
+            ).to(dtype=feature_dtype)
 
     was_training = bool(sam_tracker.training)
     had_teacher_force = hasattr(sam_tracker, "teacher_force_obj_scores_for_mem")
@@ -624,7 +658,7 @@ def run_sam3_source_tracker_flow(
                     feat_sizes=feat_sizes,
                     image=image,
                     point_inputs=prompt if is_reference else None,
-                    mask_inputs=None,
+                    mask_inputs=reference_mask_input if is_reference else None,
                     output_dict=output_dict,
                     num_frames=num_frames,
                     track_in_reverse=frame_idx < int(reference_frame_idx),
