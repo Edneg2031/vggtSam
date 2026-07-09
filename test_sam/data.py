@@ -44,7 +44,7 @@ def load_mask_tracking_sequence(
     excluded_labels: Iterable[str],
     seed: int,
 ) -> MaskTrackingSequence:
-    manifest_path = Path(manifest_path)
+    manifest_path = Path(manifest_path).expanduser().resolve()
     with manifest_path.open("r", encoding="utf8") as handle:
         manifest = json.load(handle)
 
@@ -174,10 +174,22 @@ def resolve_manifest_path(value: str | Path, manifest_path: Path) -> Path:
     path = Path(value).expanduser()
     if path.is_absolute():
         return path
-    return (manifest_path.parent / path).resolve()
+
+    # Preprocessing manifests may store either repository-relative paths such
+    # as data/processed/... or paths relative to the manifest directory.
+    candidates = [
+        (Path.cwd() / path).resolve(),
+        (manifest_path.parent / path).resolve(),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    attempted = "\n".join(f"  - {candidate}" for candidate in candidates)
+    raise FileNotFoundError(
+        f"Could not resolve manifest path {str(value)!r}. Tried:\n{attempted}"
+    )
 
 
 def read_mask(path: Path) -> np.ndarray:
     with Image.open(path) as image:
         return np.asarray(image).copy()
-
