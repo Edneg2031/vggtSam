@@ -195,6 +195,7 @@ def run_experiment(config: ExperimentConfig) -> None:
     )
 
     target_masks = target_masks.to(config.tracker_device)
+    visible = visible.to(config.tracker_device)
     sam_input_images = sam_input_images.to(config.tracker_device)
     sam_fpn2 = sam_fpn2.to(config.tracker_device)
     if geometry_levels is not None:
