@@ -81,8 +81,10 @@ class ExperimentConfig:
     num_heads: int
     dropout: float
     residual_scale: float
+    residual_init_std: float
     inject_levels: tuple[str, ...]
     zero_geometry: bool
+    shuffle_geometry: bool
     iterations: int
     lr: float
     seed: int
@@ -181,6 +183,7 @@ def run_experiment(config: ExperimentConfig) -> None:
         num_heads=config.num_heads,
         dropout=config.dropout,
         inject_levels=config.inject_levels,
+        residual_init_std=config.residual_init_std,
     ).to(config.tracker_device)
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     sam_tracker.requires_grad_(False)
@@ -189,7 +192,9 @@ def run_experiment(config: ExperimentConfig) -> None:
     optimizer = torch.optim.AdamW(trainable, lr=config.lr)
     print(
         f"fusion={config.fusion_method} zero_geometry={config.zero_geometry} "
+        f"shuffle_geometry={config.shuffle_geometry} "
         f"inject_levels={config.inject_levels} "
+        f"residual_init_std={config.residual_init_std:g} "
         f"train_tracker={config.train_tracker} "
         f"trainable_parameters={sum(parameter.numel() for parameter in trainable)}"
     )
@@ -209,6 +214,7 @@ def run_experiment(config: ExperimentConfig) -> None:
         training_step = step > 0
         train_loss_value = 0.0
         gradient_norm = 0.0
+        residual_gradient_norm = 0.0
         if training_step:
             model.train()
             optimizer.zero_grad(set_to_none=True)
@@ -242,7 +248,13 @@ def run_experiment(config: ExperimentConfig) -> None:
                     + config.dice_weight * train_dice
                     + config.presence_weight * train_presence
                 )
+            if step == 1:
+                for residual in train_residuals:
+                    if residual.requires_grad:
+                        residual.retain_grad()
             train_loss.backward()
+            if step == 1:
+                residual_gradient_norm = retained_gradient_norm(train_residuals)
             if config.gradient_clip > 0:
                 norm = torch.nn.utils.clip_grad_norm_(
                     trainable,
@@ -256,7 +268,11 @@ def run_experiment(config: ExperimentConfig) -> None:
             ):
                 raise RuntimeError(
                     "Fusion adapter received no usable gradient at step 1. "
-                    f"gradient_norm={gradient_norm}. Aborting the ablation suite."
+                    f"parameter_gradient_norm={gradient_norm}, "
+                    f"residual_gradient_norm={residual_gradient_norm}, "
+                    f"train_logits_requires_grad={train_logits.requires_grad}. "
+                    "If residual_gradient_norm is zero, the gradient is blocked "
+                    "inside the SAM3 source flow; otherwise inspect the residual head."
                 )
             optimizer.step()
             train_loss_value = float(train_loss.detach().float().cpu())
@@ -327,6 +343,7 @@ def run_experiment(config: ExperimentConfig) -> None:
                 "object_score_mean": float(object_scores.mean().detach().cpu()),
                 "residual_rms": residual_rms(residuals),
                 "gradient_norm": gradient_norm,
+                "residual_gradient_norm": residual_gradient_norm,
             }
             append_metrics(metrics_path, row)
 
@@ -341,7 +358,8 @@ def run_experiment(config: ExperimentConfig) -> None:
                 f"cross_recall={row['cross_view_recall']:.4f} "
                 f"present={present_count}/{len(sequence.frame_indices)} "
                 f"residual_rms={row['residual_rms']:.6f} "
-                f"grad_norm={gradient_norm:.6f}"
+                f"grad_norm={gradient_norm:.6f} "
+                f"residual_grad={residual_gradient_norm:.6f}"
             )
         if step % config.visualize_every == 0 or step == config.iterations:
             save_visualization(
@@ -354,6 +372,7 @@ def run_experiment(config: ExperimentConfig) -> None:
                 output_size=config.output_size,
                 fusion_method=config.fusion_method,
                 zero_geometry=config.zero_geometry,
+                shuffle_geometry=config.shuffle_geometry,
             )
             write_frame_metrics(
                 config.output_dir / "frame_metrics.csv",
@@ -472,6 +491,15 @@ def extract_geometry_features(
         output_grid=config.context_grid,
         zero_geometry=config.zero_geometry,
     )
+    if config.shuffle_geometry:
+        if levels[0].shape[0] < 2:
+            raise ValueError("Geometry shuffling requires at least two frames.")
+        permutation = torch.roll(
+            torch.arange(levels[0].shape[0]),
+            shifts=1,
+        )
+        levels = [level.index_select(0, permutation) for level in levels]
+        print(f"StreamVGGT frame permutation={permutation.tolist()}")
     if config.fusion_method != "multilevel_cross_attention":
         levels = [levels[-1]]
     levels = [level.detach().cpu() for level in levels]
@@ -646,6 +674,19 @@ def total_gradient_norm(parameters: list[torch.nn.Parameter]) -> float:
     return float(torch.stack(squared).sum().sqrt().cpu())
 
 
+def retained_gradient_norm(
+    tensors: list[torch.Tensor],
+) -> float:
+    squared = [
+        tensor.grad.detach().float().square().sum()
+        for tensor in tensors
+        if tensor.grad is not None
+    ]
+    if not squared:
+        return 0.0
+    return float(torch.stack(squared).sum().sqrt().cpu())
+
+
 def save_visualization(
     path: Path,
     *,
@@ -657,6 +698,7 @@ def save_visualization(
     output_size: tuple[int, int],
     fusion_method: str,
     zero_geometry: bool,
+    shuffle_geometry: bool,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     target = target_masks.detach().cpu().numpy().astype(bool)
@@ -668,7 +710,14 @@ def save_visualization(
     )
     scores = object_scores.detach().float().cpu().tolist()
     rows = []
-    geometry_label = "no StreamVGGT" if fusion_method == "sam_only" else "StreamVGGT zeroed" if zero_geometry else "StreamVGGT on"
+    if fusion_method == "sam_only":
+        geometry_label = "no StreamVGGT"
+    elif zero_geometry:
+        geometry_label = "StreamVGGT zeroed"
+    elif shuffle_geometry:
+        geometry_label = "StreamVGGT frame-shuffled"
+    else:
+        geometry_label = "StreamVGGT aligned"
     for index, image_path in enumerate(sequence.image_paths):
         with Image.open(image_path) as source:
             rgb = source.convert("RGB").resize(
@@ -918,6 +967,7 @@ METRIC_FIELDS = [
     "object_score_mean",
     "residual_rms",
     "gradient_norm",
+    "residual_gradient_norm",
 ]
 
 
@@ -1047,6 +1097,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--geometry-device")
     parser.add_argument("--direct-device")
     parser.add_argument("--zero-geometry", action="store_true")
+    parser.add_argument("--shuffle-geometry", action="store_true")
     parser.add_argument("--train-tracker", action="store_true")
     parser.add_argument("--no-compare-direct", action="store_true")
     return parser.parse_args()
@@ -1077,6 +1128,8 @@ def apply_cli_overrides(raw: dict[str, Any], args: argparse.Namespace) -> None:
             raw.setdefault(section, {})[key] = value
     if args.zero_geometry:
         raw.setdefault("fusion", {})["zero_geometry"] = True
+    if args.shuffle_geometry:
+        raw.setdefault("fusion", {})["shuffle_geometry"] = True
     if args.train_tracker:
         raw.setdefault("training", {})["train_tracker"] = True
     if args.no_compare_direct:
@@ -1130,10 +1183,12 @@ def build_config(raw: dict[str, Any]) -> ExperimentConfig:
         num_heads=int(fusion.get("num_heads", 8)),
         dropout=float(fusion.get("dropout", 0.0)),
         residual_scale=float(fusion.get("residual_scale", 1.0)),
+        residual_init_std=float(fusion.get("residual_init_std", 1e-4)),
         inject_levels=tuple(
             str(value) for value in fusion.get("inject_levels", ["fpn2"])
         ),
         zero_geometry=bool(fusion.get("zero_geometry", False)),
+        shuffle_geometry=bool(fusion.get("shuffle_geometry", False)),
         iterations=int(training.get("iterations", 700)),
         lr=float(training.get("lr", 3e-4)),
         seed=int(training.get("seed", 0)),

@@ -29,6 +29,10 @@ StreamVGGT aggregator feature(s) ────┘              │
 
 `--zero-geometry` 会保留同一个融合器和参数量，但把 StreamVGGT 特征清零，是判断提升是否真正来自 3D 信息的关键对照。
 
+`--shuffle-geometry` 会把 StreamVGGT 特征沿帧维循环错位，保留特征分布但破坏 RGB/geometry 对应关系。`cross_attention` 只有同时优于 zero 和 shuffled 两组，才能说明提升与正确的跨视角 3D 对应有关。
+
+residual 输出层默认使用标准差 `1e-4` 的小初始化。精确零初始化会与 SAM3 的 hard object gate 形成零梯度死点；小初始化仍使 step 0 接近原始 SAM3，同时允许 adapter 收到第一步梯度。日志中的 `grad_norm` 和 `residual_grad` 分别检查参数梯度与 SAM3 返回到 residual 的梯度。
+
 是否使用 StreamVGGT 的判断很直接：`sam_only` 完全跳过 StreamVGGT；`cross_attention --zero-geometry` 会加载 StreamVGGT 但把特征置零，用来控制融合器结构和参数量；其余 `add/concat_conv/film/cross_attention/gated_cross_attention/multilevel_cross_attention` 都会使用 StreamVGGT aggregator token。
 
 默认只向 FPN2 注入 residual：这是进入 SAM3 memory attention 的深层特征；FPN0/FPN1 保持原样，为 mask decoder 保留高分辨率边界信息，也与 3AM “不修改浅层 Hiera feature”的设计一致。`fusion.inject_levels` 可用于额外的注入层消融。
@@ -40,9 +44,9 @@ StreamVGGT aggregator feature(s) ────┘              │
 1. `sam_only`：确认 SAM3 source-flow 与数据监督本身能训练。
 2. `cross_attention --zero-geometry`：控制融合器容量，但不提供 3D 信息。
 3. `cross_attention`：只改变 geometry 输入，和第 2 组直接比较。
-4. `multilevel_cross_attention`：检验 3AM 式多层几何融合是否优于单层。
-5. `concat_conv`、`add`：判断复杂 attention 是否真的必要。
-6. `gated_cross_attention`、`film`：分别检查选择性注入和无空间几何调制。
+4. `cross_attention --shuffle-geometry`：保留 StreamVGGT 特征，但破坏逐帧对应。
+5. `multilevel_cross_attention`：前三组成立后，再检验 3AM 式多层融合。
+6. `concat_conv/add/gated_cross_attention/film`：最后比较融合结构。
 
 ## 训练目标
 
@@ -72,7 +76,13 @@ StreamVGGT aggregator feature(s) ────┘              │
 bash test_sam/run_all_ablations.sh
 ```
 
-默认每组运行 700 step。快速检查全部链路可使用：
+默认只运行四个核心实验：`sam_only`、zero geometry、aligned geometry 和 shuffled geometry。运行完整融合方法集合使用：
+
+```bash
+FULL_ABLATIONS=1 bash test_sam/run_all_ablations.sh
+```
+
+默认每组运行 700 step。快速检查核心链路可使用：
 
 ```bash
 ITERATIONS=2 OUTPUT_ROOT=outputs/test_sam_ablation_smoke \

@@ -43,10 +43,14 @@ fusion:
   num_heads: 8
   dropout: 0.0
   residual_scale: 1.0
+  # Exact zero initialization can be trapped by SAM3's hard object gate.
+  # This remains a tiny residual while allowing a first-step gradient.
+  residual_init_std: 0.0001
   # 3AM keeps shallow SAM features unchanged and injects the merged feature
   # before memory attention, corresponding to tracker FPN2 here.
   inject_levels: [fpn2]
   zero_geometry: false
+  shuffle_geometry: false
 
 training:
   iterations: 700

@@ -4,6 +4,7 @@ set -euo pipefail
 CONFIG="${CONFIG:-test_sam/config.yaml}"
 ITERATIONS="${ITERATIONS:-700}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/test_sam_ablation}"
+FULL_ABLATIONS="${FULL_ABLATIONS:-0}"
 
 export PYTHONPATH="src:.:${PYTHONPATH:-}"
 mkdir -p "${OUTPUT_ROOT}"
@@ -49,17 +50,24 @@ run_ablation \
   --no-compare-direct
 
 run_ablation \
-  "04_multilevel_cross_attention" \
-  "multilevel_cross_attention" \
+  "04_cross_attention_shuffled_geometry" \
+  "cross_attention" \
+  --shuffle-geometry \
   --no-compare-direct
 
-run_ablation "05_add" "add" --no-compare-direct
-run_ablation "06_concat_conv" "concat_conv" --no-compare-direct
-run_ablation \
-  "07_gated_cross_attention" \
-  "gated_cross_attention" \
-  --no-compare-direct
-run_ablation "08_film" "film" --no-compare-direct
+if [[ "${FULL_ABLATIONS}" == "1" ]]; then
+  run_ablation \
+    "05_multilevel_cross_attention" \
+    "multilevel_cross_attention" \
+    --no-compare-direct
+  run_ablation "06_add" "add" --no-compare-direct
+  run_ablation "07_concat_conv" "concat_conv" --no-compare-direct
+  run_ablation \
+    "08_gated_cross_attention" \
+    "gated_cross_attention" \
+    --no-compare-direct
+  run_ablation "09_film" "film" --no-compare-direct
+fi
 
 python -m test_sam.summarize_ablations \
   "${OUTPUT_ROOT}" \

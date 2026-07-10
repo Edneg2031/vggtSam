@@ -1,8 +1,8 @@
 """Ablatable StreamVGGT-to-SAM3 feature mergers.
 
 Every merger returns residuals for SAM3 tracker FPN0/FPN1/FPN2. The original
-SAM3 features remain the main branch, so all methods start from the same
-pretrained tracker behavior.
+SAM3 features remain the main branch. A tiny residual initialization keeps all
+methods near the same pretrained tracker behavior without creating a dead gate.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ class SAM3GeometryFusion(nn.Module):
         num_heads: int = 8,
         dropout: float = 0.0,
         inject_levels: Sequence[str] = ("fpn2",),
+        residual_init_std: float = 1e-4,
     ) -> None:
         super().__init__()
         method = method.strip().lower()
@@ -47,6 +48,9 @@ class SAM3GeometryFusion(nn.Module):
         self.sam_channels = int(sam_channels)
         self.geometry_channels = int(geometry_channels)
         self.hidden_channels = int(hidden_channels)
+        self.residual_init_std = float(residual_init_std)
+        if self.residual_init_std < 0:
+            raise ValueError("residual_init_std must be non-negative.")
         self.inject_levels = {
             str(level).strip().lower() for level in inject_levels
         }
@@ -128,7 +132,7 @@ class SAM3GeometryFusion(nn.Module):
         self.fpn2_head = residual_head(self.hidden_channels, 256)
         self.fpn1_head = residual_head(self.hidden_channels, 64)
         self.fpn0_head = residual_head(self.hidden_channels, 32)
-        self._zero_initialize_residual_outputs()
+        self._initialize_residual_outputs()
         self._freeze_unused_branches()
 
     def forward(
@@ -312,10 +316,13 @@ class SAM3GeometryFusion(nn.Module):
                 )
         return levels
 
-    def _zero_initialize_residual_outputs(self) -> None:
+    def _initialize_residual_outputs(self) -> None:
         for head in (self.fpn0_head, self.fpn1_head, self.fpn2_head):
             output = head[-1]
-            nn.init.zeros_(output.weight)
+            if self.residual_init_std == 0:
+                nn.init.zeros_(output.weight)
+            else:
+                nn.init.normal_(output.weight, mean=0.0, std=self.residual_init_std)
             nn.init.zeros_(output.bias)
 
     def _freeze_unused_branches(self) -> None:
