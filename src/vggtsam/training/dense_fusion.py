@@ -524,6 +524,7 @@ def run_sam3_source_tracker_flow(
     residual_scale: float,
     device: str,
     reference_prompt_mode: str = "box_points",
+    training_target_masks: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Run differentiable SAM3 tracker source flow with fused FPN residuals.
 
@@ -550,6 +551,18 @@ def run_sam3_source_tracker_flow(
             f"reference_frame_idx={reference_frame_idx} is out of range for "
             f"{num_frames} frames."
         )
+    teacher_forced_training = training_target_masks is not None
+    if teacher_forced_training:
+        if training_target_masks.ndim != 3:
+            raise ValueError(
+                "training_target_masks must be [T,H,W], got "
+                f"{tuple(training_target_masks.shape)}"
+            )
+        if int(training_target_masks.shape[0]) != num_frames:
+            raise ValueError(
+                "training_target_masks frame count does not match source flow: "
+                f"{training_target_masks.shape[0]} vs {num_frames}"
+            )
 
     tracker_device = torch.device(device)
     feature_dtype = tracker_residuals[-1].dtype
@@ -603,11 +616,28 @@ def run_sam3_source_tracker_flow(
     old_offload = getattr(sam_tracker, "offload_output_to_cpu_for_eval", None)
     had_trim = hasattr(sam_tracker, "trim_past_non_cond_mem_for_eval")
     old_trim = getattr(sam_tracker, "trim_past_non_cond_mem_for_eval", None)
-    # Run SAM3's source tracker in eval semantics, matching the video predictor,
-    # but without torch.no_grad/inference_mode so gradients still reach the
-    # fused residual adapter. Eval mode also keeps object_score_logits in
-    # current_out, which is required for the explicit objectness loss.
-    sam_tracker.eval()
+    had_forward_override = "_forward_sam_heads" in sam_tracker.__dict__
+    old_forward_override = sam_tracker.__dict__.get("_forward_sam_heads")
+    original_forward_sam_heads = sam_tracker._forward_sam_heads
+    current_training_gt = None
+    captured_object_score = None
+
+    def teacher_forced_sam_heads(*args, **kwargs):
+        nonlocal captured_object_score
+        kwargs["gt_masks"] = current_training_gt
+        outputs = original_forward_sam_heads(*args, **kwargs)
+        captured_object_score = outputs[-1]
+        return outputs
+
+    # Evaluation uses the predictor's hard object-presence gate. During
+    # supervised training, GT visibility selects the mask branch so positive
+    # frames retain a differentiable mask loss; object_score_logits are still
+    # captured separately for the presence loss.
+    if teacher_forced_training:
+        sam_tracker.train()
+        sam_tracker._forward_sam_heads = teacher_forced_sam_heads
+    else:
+        sam_tracker.eval()
     # Keep all tensors on-device for differentiable loss computation.
     if had_offload:
         sam_tracker.offload_output_to_cpu_for_eval = False
@@ -616,7 +646,7 @@ def run_sam3_source_tracker_flow(
     # Some checkpoints may not carry training-only attributes. They are unused
     # in eval mode, but stable defaults make source-flow robust if a downstream
     # SAM3 variant checks them unconditionally.
-    sam_tracker.teacher_force_obj_scores_for_mem = False
+    sam_tracker.teacher_force_obj_scores_for_mem = teacher_forced_training
     sam_tracker.prob_to_dropout_spatial_mem = 0.0
     move_sam3_non_buffer_rope_caches(sam_tracker, tracker_device)
 
@@ -635,6 +665,21 @@ def run_sam3_source_tracker_flow(
     try:
         with cuda_context:
             for frame_idx in order:
+                if teacher_forced_training:
+                    image_size = int(getattr(sam_tracker, "image_size", 1008))
+                    current_training_gt = training_target_masks[
+                        frame_idx : frame_idx + 1
+                    ].detach().to(device=tracker_device, dtype=feature_dtype)[:, None]
+                    if tuple(current_training_gt.shape[-2:]) != (
+                        image_size,
+                        image_size,
+                    ):
+                        current_training_gt = F.interpolate(
+                            current_training_gt.float(),
+                            size=(image_size, image_size),
+                            mode="nearest",
+                        ).to(dtype=feature_dtype)
+                    captured_object_score = None
                 current_vision_feats, current_vision_pos_embeds, feat_sizes = (
                     build_sam3_source_frame_features(
                         sam_tracker_features,
@@ -665,6 +710,19 @@ def run_sam3_source_tracker_flow(
                     run_mem_encoder=True,
                     use_prev_mem_frame=True,
                 )
+                if (
+                    teacher_forced_training
+                    and "object_score_logits" not in current_out
+                ):
+                    if is_reference and reference_mask_input is not None:
+                        current_out["object_score_logits"] = image.new_full((1, 1), 10.0)
+                    elif captured_object_score is not None:
+                        current_out["object_score_logits"] = captured_object_score
+                    else:
+                        raise RuntimeError(
+                            "Teacher-forced SAM3 source flow did not expose "
+                            "object_score_logits."
+                        )
                 if is_reference:
                     output_dict["cond_frame_outputs"][frame_idx] = current_out
                 else:
@@ -683,6 +741,11 @@ def run_sam3_source_tracker_flow(
             sam_tracker.offload_output_to_cpu_for_eval = old_offload
         if had_trim:
             sam_tracker.trim_past_non_cond_mem_for_eval = old_trim
+        if teacher_forced_training:
+            if had_forward_override:
+                sam_tracker._forward_sam_heads = old_forward_override
+            else:
+                delattr(sam_tracker, "_forward_sam_heads")
         sam_tracker.train(was_training)
 
     logits = []

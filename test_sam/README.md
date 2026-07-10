@@ -29,6 +29,8 @@ StreamVGGT aggregator feature(s) ────┘              │
 
 `--zero-geometry` 会保留同一个融合器和参数量，但把 StreamVGGT 特征清零，是判断提升是否真正来自 3D 信息的关键对照。
 
+是否使用 StreamVGGT 的判断很直接：`sam_only` 完全跳过 StreamVGGT；`cross_attention --zero-geometry` 会加载 StreamVGGT 但把特征置零，用来控制融合器结构和参数量；其余 `add/concat_conv/film/cross_attention/gated_cross_attention/multilevel_cross_attention` 都会使用 StreamVGGT aggregator token。
+
 默认只向 FPN2 注入 residual：这是进入 SAM3 memory attention 的深层特征；FPN0/FPN1 保持原样，为 mask decoder 保留高分辨率边界信息，也与 3AM “不修改浅层 Hiera feature”的设计一致。`fusion.inject_levels` 可用于额外的注入层消融。
 
 可视化中的 `Original SAM3` 使用原版 predictor API（reference GT box + 类别文本），用于直观参考；严格的同构对照是 `sam_only` 和 `cross_attention --zero-geometry`，因为它们与 3D 实验使用完全相同的 source-flow、mask prompt 和损失。
@@ -50,12 +52,14 @@ StreamVGGT aggregator feature(s) ────┘              │
 - presence：逐帧监督目标是否可见，对应 3AM/SAM 的 occlusion/object-score 训练。
 - 默认只训练 fusion adapter；`--train-tracker` 额外训练 SAM3 memory attention 和 mask decoder，接近 3AM 的训练范围。
 
+训练 forward 使用 GT visibility 选择 SAM3 的可导 mask 分支，避免源码的硬 object gate 把漏检帧 mask 固定为 `-1024` 后截断梯度。CSV、日志和可视化中的跨视角指标来自独立的无 GT 推理 forward，不使用 teacher forcing。
+
 ## 输出
 
 - `training_history.csv`：loss、正样本 IoU、Tracking Recall、消失帧误检率、residual RMS。
 - `training_curves.png`：loss、跨视角指标和误检率曲线。
 - `frame_metrics.csv`：每帧 fused/original SAM3 IoU 与 object score。
-- `visualizations/`：RGB、GT、Original SAM3、Fused SAM3 四列对比。
+- `visualizations/`：RGB、GT、Original SAM3、Fused/source SAM3 四列对比；每列会标注 frame、ref/cross/absent、mask 像素数、IoU、object score，并画出 mask 边界框。如果某一列显示 `empty`，表示该路径在该帧没有输出 mask。
 - `checkpoints/`：融合器参数；启用 `--train-tracker` 时同时保存对应 SAM3 子模块。
 
 论文依据：[3AM](https://arxiv.org/html/2601.08831) 使用多层 3D foundation-model 特征，经逐层 cross-attention 与卷积细化后并入 SAM2 特征，再完整经过 memory attention 和 mask decoder；[Multimodal SAM Adapter](https://arxiv.org/html/2509.10408) 还提供了 concat 与 cross-attention injector 这两类有价值的对照。当前 `multilevel_cross_attention` 保留 3AM 主线，但有意去掉 point/ray positional encoding 与 camera token，以隔离“隐式 3D feature fusion”本身。

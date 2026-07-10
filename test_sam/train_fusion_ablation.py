@@ -207,12 +207,73 @@ def run_experiment(config: ExperimentConfig) -> None:
     initialize_metrics_csv(metrics_path)
     for step in range(0, config.iterations + 1):
         training_step = step > 0
-        model.train(training_step)
-        optimizer.zero_grad(set_to_none=True)
+        train_loss_value = 0.0
+        gradient_norm = 0.0
+        if training_step:
+            model.train()
+            optimizer.zero_grad(set_to_none=True)
+            with autocast_context(config):
+                train_residuals = model(sam_fpn2, geometry_levels)
+                train_logits, train_aux = run_sam3_source_tracker_flow(
+                    sam_tracker=sam_tracker,
+                    sam_tracker_features=sam_features,
+                    sam_input_images=sam_input_images,
+                    tracker_residuals=train_residuals,
+                    reference_mask=target_masks[sequence.reference_frame_idx],
+                    reference_frame_idx=sequence.reference_frame_idx,
+                    output_size=config.output_size,
+                    residual_scale=config.residual_scale,
+                    device=config.tracker_device,
+                    reference_prompt_mode=config.reference_prompt_mode,
+                    training_target_masks=target_masks,
+                )
+                train_focal = sigmoid_focal_loss(
+                    train_logits,
+                    target_masks.float(),
+                )
+                train_dice = dice_loss(train_logits, target_masks.float())
+                train_object_scores = train_aux["object_score_logits"].reshape(-1)
+                train_presence = F.binary_cross_entropy_with_logits(
+                    train_object_scores,
+                    visible.to(dtype=train_object_scores.dtype),
+                )
+                train_loss = (
+                    config.focal_weight * train_focal
+                    + config.dice_weight * train_dice
+                    + config.presence_weight * train_presence
+                )
+            train_loss.backward()
+            if config.gradient_clip > 0:
+                norm = torch.nn.utils.clip_grad_norm_(
+                    trainable,
+                    config.gradient_clip,
+                )
+                gradient_norm = float(norm.detach().float().cpu())
+            else:
+                gradient_norm = total_gradient_norm(trainable)
+            if step == 1 and (
+                not np.isfinite(gradient_norm) or gradient_norm <= 1e-12
+            ):
+                raise RuntimeError(
+                    "Fusion adapter received no usable gradient at step 1. "
+                    f"gradient_norm={gradient_norm}. Aborting the ablation suite."
+                )
+            optimizer.step()
+            train_loss_value = float(train_loss.detach().float().cpu())
 
-        amp_context = autocast_context(config)
-        grad_context = torch.enable_grad() if training_step else torch.no_grad()
-        with grad_context, amp_context:
+        should_evaluate = (
+            step == 0
+            or step == 1
+            or step == config.iterations
+            or step % config.log_every == 0
+            or step % config.visualize_every == 0
+            or (training_step and step % config.save_every == 0)
+        )
+        if not should_evaluate:
+            continue
+
+        model.eval()
+        with torch.no_grad(), autocast_context(config):
             residuals = model(sam_fpn2, geometry_levels)
             logits, source_aux = run_sam3_source_tracker_flow(
                 sam_tracker=sam_tracker,
@@ -238,14 +299,6 @@ def run_experiment(config: ExperimentConfig) -> None:
                 + config.dice_weight * dice
                 + config.presence_weight * presence
             )
-
-        if training_step:
-            loss.backward()
-            if config.gradient_clip > 0:
-                torch.nn.utils.clip_grad_norm_(trainable, config.gradient_clip)
-            optimizer.step()
-
-        with torch.no_grad():
             current_metrics = tracking_metrics(
                 logits,
                 target_masks.float(),
@@ -256,6 +309,11 @@ def run_experiment(config: ExperimentConfig) -> None:
             row = {
                 "step": step,
                 "loss": float(loss.detach().cpu()),
+                "train_loss": (
+                    train_loss_value
+                    if training_step
+                    else float(loss.detach().cpu())
+                ),
                 "focal": float(focal.detach().cpu()),
                 "dice": float(dice.detach().cpu()),
                 "presence": float(presence.detach().cpu()),
@@ -268,19 +326,22 @@ def run_experiment(config: ExperimentConfig) -> None:
                 "present_frames": present_count,
                 "object_score_mean": float(object_scores.mean().detach().cpu()),
                 "residual_rms": residual_rms(residuals),
+                "gradient_norm": gradient_norm,
             }
             append_metrics(metrics_path, row)
 
         if step % config.log_every == 0 or step == 1:
             print(
-                f"step={step} loss={row['loss']:.4f} "
+                f"step={step} eval_loss={row['loss']:.4f} "
+                f"train_loss={row['train_loss']:.4f} "
                 f"focal={row['focal']:.4f} dice={row['dice']:.4f} "
                 f"presence={row['presence']:.4f} "
                 f"iou={row['mean_iou']:.4f} pos_iou={row['positive_iou']:.4f} "
                 f"cross_iou={row['cross_view_iou']:.4f} "
                 f"cross_recall={row['cross_view_recall']:.4f} "
                 f"present={present_count}/{len(sequence.frame_indices)} "
-                f"residual_rms={row['residual_rms']:.6f}"
+                f"residual_rms={row['residual_rms']:.6f} "
+                f"grad_norm={gradient_norm:.6f}"
             )
         if step % config.visualize_every == 0 or step == config.iterations:
             save_visualization(
@@ -291,6 +352,8 @@ def run_experiment(config: ExperimentConfig) -> None:
                 direct_masks=direct_masks,
                 object_scores=object_scores,
                 output_size=config.output_size,
+                fusion_method=config.fusion_method,
+                zero_geometry=config.zero_geometry,
             )
             write_frame_metrics(
                 config.output_dir / "frame_metrics.csv",
@@ -572,6 +635,17 @@ def residual_rms(residuals: list[torch.Tensor]) -> float:
     return float(values.square().mean().sqrt().detach().cpu())
 
 
+def total_gradient_norm(parameters: list[torch.nn.Parameter]) -> float:
+    squared = [
+        parameter.grad.detach().float().square().sum()
+        for parameter in parameters
+        if parameter.grad is not None
+    ]
+    if not squared:
+        return 0.0
+    return float(torch.stack(squared).sum().sqrt().cpu())
+
+
 def save_visualization(
     path: Path,
     *,
@@ -581,6 +655,8 @@ def save_visualization(
     direct_masks: torch.Tensor | None,
     object_scores: torch.Tensor,
     output_size: tuple[int, int],
+    fusion_method: str,
+    zero_geometry: bool,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     target = target_masks.detach().cpu().numpy().astype(bool)
@@ -592,34 +668,79 @@ def save_visualization(
     )
     scores = object_scores.detach().float().cpu().tolist()
     rows = []
+    geometry_label = "no StreamVGGT" if fusion_method == "sam_only" else "StreamVGGT zeroed" if zero_geometry else "StreamVGGT on"
     for index, image_path in enumerate(sequence.image_paths):
         with Image.open(image_path) as source:
             rgb = source.convert("RGB").resize(
                 (output_size[1], output_size[0]),
                 Image.Resampling.BILINEAR,
             )
-        gt_panel = overlay_mask(rgb, target[index], (0, 210, 0))
-        pred_panel = overlay_mask(rgb, pred[index], (235, 50, 50))
+        frame_state = frame_status(
+            index=index,
+            reference_frame_idx=sequence.reference_frame_idx,
+            gt_visible=bool(target[index].any()),
+        )
+        gt_pixels = int(target[index].sum())
+        pred_pixels = int(pred[index].sum())
+        direct_pixels = int(direct[index].sum()) if direct is not None else 0
+        frame_iou = mask_iou(pred[index], target[index])
+        direct_iou = mask_iou(direct[index], target[index]) if direct is not None else None
+
+        gt_panel = mark_mask(
+            overlay_mask(rgb, target[index], (0, 210, 0)),
+            target[index],
+            (0, 255, 80),
+            "GT",
+        )
+        pred_panel = mark_mask(
+            overlay_mask(rgb, pred[index], (235, 50, 50)),
+            pred[index],
+            (255, 80, 80),
+            "PRED",
+        )
         direct_panel = (
-            overlay_mask(rgb, direct[index], (30, 110, 255))
+            mark_mask(
+                overlay_mask(rgb, direct[index], (30, 110, 255)),
+                direct[index],
+                (80, 170, 255),
+                "SAM3",
+            )
             if direct is not None
             else rgb.copy()
         )
-        frame_iou = mask_iou(pred[index], target[index])
+        direct_text = (
+            f"Original SAM3\nIoU={direct_iou:.3f} pix={direct_pixels}"
+            if direct_iou is not None
+            else "Original SAM3\nnot run"
+        )
         panels = [
-            annotate(rgb, f"RGB frame={sequence.frame_indices[index]}"),
-            annotate(gt_panel, "GT instance"),
             annotate(
-                direct_panel,
-                "Original SAM3" if direct is not None else "Original SAM3 disabled",
+                rgb,
+                f"RGB frame={sequence.frame_indices[index]} idx={index} {frame_state}\n"
+                f"{fusion_method} | {geometry_label} | target={sequence.label}",
             ),
+            annotate(gt_panel, f"GT instance={sequence.instance_id}\npix={gt_pixels}"),
+            annotate(direct_panel, direct_text),
             annotate(
                 pred_panel,
-                f"Fused SAM3 IoU={frame_iou:.3f} score={scores[index]:.2f}",
+                f"Fused/source SAM3\nIoU={frame_iou:.3f} pix={pred_pixels} score={scores[index]:.2f}",
             ),
         ]
         rows.append(concatenate_horizontal(panels))
     concatenate_vertical(rows).save(path, quality=92)
+
+
+def frame_status(
+    *,
+    index: int,
+    reference_frame_idx: int,
+    gt_visible: bool,
+) -> str:
+    if index == reference_frame_idx:
+        return "ref"
+    if gt_visible:
+        return "cross-visible"
+    return "absent"
 
 
 def write_frame_metrics(
@@ -690,11 +811,63 @@ def overlay_mask(
     return Image.fromarray(base)
 
 
+def mark_mask(
+    image: Image.Image,
+    mask: np.ndarray,
+    color: tuple[int, int, int],
+    label: str,
+) -> Image.Image:
+    output = image.copy()
+    draw = ImageDraw.Draw(output)
+    bbox = mask_bbox(mask)
+    if bbox is None:
+        draw.rectangle((6, 32, 90, 52), fill=(0, 0, 0))
+        draw.text((10, 36), f"{label}: empty", fill=color)
+        return output
+    x0, y0, x1, y1 = bbox
+    draw.rectangle((x0, y0, x1, y1), outline=color, width=3)
+    text_y = max(30, y0 - 18)
+    draw.rectangle((x0, text_y, min(output.width - 1, x0 + 118), text_y + 17), fill=(0, 0, 0))
+    draw.text((x0 + 4, text_y + 3), f"{label}: {int(mask.sum())}", fill=color)
+    return draw_mask_boundary(output, mask, color)
+
+
+def mask_bbox(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def draw_mask_boundary(
+    image: Image.Image,
+    mask: np.ndarray,
+    color: tuple[int, int, int],
+) -> Image.Image:
+    pixels = np.asarray(image).copy()
+    if not mask.any():
+        return Image.fromarray(pixels)
+    padded = np.pad(mask.astype(bool), 1, mode="constant", constant_values=False)
+    center = padded[1:-1, 1:-1]
+    interior = (
+        padded[:-2, 1:-1]
+        & padded[2:, 1:-1]
+        & padded[1:-1, :-2]
+        & padded[1:-1, 2:]
+    )
+    boundary = center & ~interior
+    pixels[boundary] = np.asarray(color, dtype=np.uint8)
+    return Image.fromarray(pixels)
+
+
 def annotate(image: Image.Image, text: str) -> Image.Image:
     output = image.copy()
     draw = ImageDraw.Draw(output)
-    draw.rectangle((0, 0, output.width, 24), fill=(0, 0, 0))
-    draw.text((6, 5), text, fill=(255, 255, 255))
+    lines = text.splitlines() or [text]
+    bar_height = 20 * len(lines) + 6
+    draw.rectangle((0, 0, output.width, bar_height), fill=(0, 0, 0))
+    for line_index, line in enumerate(lines):
+        draw.text((6, 5 + 18 * line_index), line, fill=(255, 255, 255))
     return output
 
 
@@ -731,6 +904,7 @@ def autocast_context(config: ExperimentConfig):
 METRIC_FIELDS = [
     "step",
     "loss",
+    "train_loss",
     "focal",
     "dice",
     "presence",
@@ -743,6 +917,7 @@ METRIC_FIELDS = [
     "present_frames",
     "object_score_mean",
     "residual_rms",
+    "gradient_norm",
 ]
 
 
@@ -768,7 +943,12 @@ def plot_training_history(csv_path: Path, output_path: Path) -> None:
         return
     steps = [int(row["step"]) for row in rows]
     figure, axes = plt.subplots(1, 3, figsize=(14, 4))
-    axes[0].plot(steps, [float(row["loss"]) for row in rows], label="total")
+    axes[0].plot(steps, [float(row["loss"]) for row in rows], label="eval total")
+    axes[0].plot(
+        steps,
+        [float(row["train_loss"]) for row in rows],
+        label="train total",
+    )
     axes[0].plot(steps, [float(row["focal"]) for row in rows], label="focal")
     axes[0].plot(steps, [float(row["dice"]) for row in rows], label="dice")
     axes[0].plot(steps, [float(row["presence"]) for row in rows], label="presence")
