@@ -25,6 +25,46 @@ FUSION_METHODS = (
 )
 
 
+class ConstantPromptFusion(nn.Module):
+    """Learn a fixed spatial prompt while retaining the frozen SAM3 image feature."""
+
+    def __init__(
+        self,
+        *,
+        sam_channels: int = 256,
+        hidden_channels: int = 256,
+        residual_init_std: float = 1e-4,
+    ) -> None:
+        super().__init__()
+        self.sam_proj = nn.Sequential(
+            nn.Conv2d(sam_channels, hidden_channels, kernel_size=1),
+            nn.GroupNorm(8, hidden_channels),
+            nn.GELU(),
+        )
+        self.prompt = nn.Parameter(torch.zeros(1, hidden_channels, 1, 1))
+        self.refine = ConvRefine(hidden_channels * 2, hidden_channels)
+        self.fpn2_head = residual_head(hidden_channels, 256)
+        output = self.fpn2_head[-1]
+        nn.init.normal_(output.weight, mean=0.0, std=float(residual_init_std))
+        nn.init.zeros_(output.bias)
+
+    def forward(self, sam_fpn2: torch.Tensor) -> list[torch.Tensor]:
+        if sam_fpn2.ndim != 4 or sam_fpn2.shape[1:] != (256, 72, 72):
+            raise ValueError(
+                "ConstantPromptFusion expects SAM FPN2 [T,256,72,72], "
+                f"got {tuple(sam_fpn2.shape)}"
+            )
+        sam = self.sam_proj(sam_fpn2)
+        prompt = self.prompt.expand(sam.shape[0], -1, sam.shape[2], sam.shape[3])
+        fused = self.refine(torch.cat([sam, prompt], dim=1))
+        fpn2 = self.fpn2_head(fused)
+        return [
+            fpn2.new_zeros(fpn2.shape[0], 32, 288, 288),
+            fpn2.new_zeros(fpn2.shape[0], 64, 144, 144),
+            fpn2,
+        ]
+
+
 class SAM3GeometryFusion(nn.Module):
     """Fuse SAM3 FPN2 with StreamVGGT latent geometry and emit FPN residuals."""
 

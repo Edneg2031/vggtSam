@@ -751,6 +751,8 @@ def run_sam3_source_tracker_flow(
     logits = []
     object_scores = []
     iou_scores = []
+    object_ptrs = []
+    spatial_memories = []
     for frame_idx in range(num_frames):
         if frame_idx not in frame_outputs:
             raise RuntimeError(f"sam3_source did not produce frame {frame_idx}.")
@@ -774,10 +776,24 @@ def run_sam3_source_tracker_flow(
         if iou_score is None:
             iou_score = mask_logits.new_zeros(1)
         iou_scores.append(iou_score.float().reshape(-1)[0].detach().cpu())
+        object_ptr = frame_out.get("obj_ptr")
+        if object_ptr is not None:
+            object_ptrs.append(object_ptr.float())
+        spatial_memory = frame_out.get("maskmem_features")
+        if spatial_memory is not None:
+            spatial_memories.append(spatial_memory.float())
     aux = {
         "object_score_logits": torch.stack(object_scores),
         "object_present": torch.stack(object_scores).detach() > 0,
         "iou_scores": torch.stack(iou_scores),
+        "object_ptrs": (
+            torch.cat(object_ptrs, dim=0) if len(object_ptrs) == num_frames else None
+        ),
+        "spatial_memories": (
+            torch.cat(spatial_memories, dim=0)
+            if len(spatial_memories) == num_frames
+            else None
+        ),
     }
     return torch.cat(logits, dim=0).contiguous(), aux
 

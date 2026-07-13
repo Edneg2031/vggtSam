@@ -2,6 +2,28 @@
 
 这个目录只验证一个问题：StreamVGGT 的隐式几何特征能否提高 SAM3 对同一实例的跨视角追踪一致性。
 
+## 单 pair 可学习性闸门
+
+正式融合消融前，先运行固定 `query=133 -> target=520`、`instance=37` 的 FP32 调试实验：
+
+```bash
+ITERATIONS=1000 \
+OUTPUT_ROOT=outputs/debug_single_pair_baselines \
+bash test_sam/run_single_pair_baselines.sh
+```
+
+脚本依次运行 `sam_only` 和 `constant_prompt`。两者任一未达到训练 IoU 0.95，就停止，不运行 geometry；两者通过后才运行统计量匹配的固定 `random_geometry`。可选的真实特征实验为：
+
+```bash
+PYTHONPATH=src:. python scripts/debug_single_pair_overfit.py \
+  --config test_sam/debug_single_pair.yaml \
+  --mode real_geometry \
+  --iterations 1000 \
+  --output-dir outputs/debug_single_pair_baselines/real_geometry
+```
+
+每组都会写出 `parameter_audit.csv`、`tensor_audit.json`、`module_diagnostics.csv`、训练日志、checkpoint 和 teacher-forced/full-flow 对比图。`constant_prompt` 是注入 FPN2 的固定可学习 feature prompt，用来检查 residual/memory/mask-decoder 接口是否可优化，不代表 SAM3 原生 point-prompt API。
+
 实验不构建 pointmap head，不读取 GT pointmap，也不使用 camera token。融合方法输出 SAM3 FPN residual，然后进入同一套 SAM3 原生 tracker：
 
 ```text

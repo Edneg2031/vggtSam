@@ -373,3 +373,22 @@ bash test_sam/run_all_ablations.sh
 # 全部方法各跑 2 step 的快速链路检查。
 ITERATIONS=2 OUTPUT_ROOT=outputs/test_sam_ablation_smoke \
   bash test_sam/run_all_ablations.sh
+### SAM3/StreamVGGT single-pair learnability gate (phase 1/2)
+# First run a two-step chain/shape smoke test.
+ITERATIONS=2 \
+SKIP_IOU_GATE=1 \
+OUTPUT_ROOT=outputs/debug_single_pair_smoke \
+bash test_sam/run_single_pair_baselines.sh
+
+# Full gate: sam_only and constant_prompt must both reach train IoU >= 0.95
+# before the script runs random_geometry.
+ITERATIONS=1000 \
+OUTPUT_ROOT=outputs/debug_single_pair_baselines \
+bash test_sam/run_single_pair_baselines.sh
+
+# Optional real StreamVGGT comparison after the three baselines pass.
+PYTHONPATH=src:. python scripts/debug_single_pair_overfit.py \
+  --config test_sam/debug_single_pair.yaml \
+  --mode real_geometry \
+  --iterations 1000 \
+  --output-dir outputs/debug_single_pair_baselines/real_geometry

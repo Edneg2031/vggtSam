@@ -1,0 +1,28 @@
+dataset:
+  manifest: data/processed/scannetpp_pinhole_2d/manifest.json
+  scene_id: 00a231a370
+  frame_indices: [133, 162, 520, 566, 477]
+  instance_id: 37
+  query_sequence_index: 0
+
+sam3:
+  repo: externals/sam3
+  checkpoint: /home/bod/86Nas/95_data_bak/FoundationModels/sam3/sam3.pt
+  feature_device: cuda:2
+  tracker_device: cuda:3
+  resolution: 1008
+  reference_prompt_mode: mask
+
+streamvggt:
+  repo: externals/streamvggt
+  checkpoint: /home/bod/86Nas/95_data_bak/FoundationModels/StreamVGGT/checkpoints.pth
+  device: cuda:1
+  streaming_cache: true
+  image_mode: crop
+  layer_indices: [4, 11, 17, 23]
+
+analysis:
+  output_size: [256, 384]
+  topk: 5
+  output_dir: outputs/sam_to_streamvggt_tokens
+  seed: 0

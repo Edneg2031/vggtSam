@@ -1,0 +1,8 @@
+# SAM3 encoder/memory/object-pointer -> StreamVGGT token 诊断。
+# 使用 test_sam 现有五帧序列，不训练模型，也不修改 StreamVGGT KV cache。
+PYTHONPATH=src:. python -m test_sam_for_streamvggt.analyze_tokens \
+  --config test_sam_for_streamvggt/config.yaml \
+  --sam3-feature-device cuda:2 \
+  --tracker-device cuda:3 \
+  --geometry-device cuda:1 \
+  --output-dir outputs/sam_to_streamvggt_tokens
