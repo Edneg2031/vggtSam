@@ -40,6 +40,7 @@ def main() -> None:
             "sam3_device": args.sam3_device,
             "geometry_device": args.geometry_device,
             "geometry_modes": args.geometry_modes,
+            "fallback_prompt_mode": args.fallback_prompt_mode,
             "output_dir": args.output_dir,
         }.items()
         if value is not None
@@ -139,6 +140,7 @@ def run_experiment(config: ExperimentConfig) -> None:
         )
         summary = {
             "mode": mode,
+            "fallback_prompt_mode": config.fallback_prompt_mode,
             **{f"sam3_{key}": value for key, value in original_metrics.items()},
             **{f"bridge_{key}": value for key, value in result["metrics"].items()},
             "accepted_candidates": sum(
@@ -260,6 +262,8 @@ def _evaluate_mode(
                 prompt=sequence.label,
                 output_size=config.output_size,
                 candidate_mask=candidate.mask,
+                supported_mask=candidate.supported_mask,
+                prompt_mode=config.fallback_prompt_mode,
             )
             clipped = refined & candidate.mask
             fallback_raw_iou = binary_iou(refined, target_masks[frame_idx])
@@ -296,6 +300,7 @@ def _evaluate_mode(
                 "sequence_index": frame_idx,
                 "frame_index": sequence.frame_indices[frame_idx],
                 "geometry_index": geometry_idx,
+                "fallback_prompt_mode": config.fallback_prompt_mode,
                 "gt_visible": int(target_masks[frame_idx].any()),
                 "sam3_score": original_score,
                 "sam3_iou": binary_iou(original_mask, target_masks[frame_idx]),
@@ -461,7 +466,11 @@ def _save_report(
             if column == 4:
                 suffix = f" IoU={rows[row_idx]['final_iou']:.3f}"
             draw.text((column * width + 5, y + 7), label + suffix, fill=colors[column])
-    ImageDraw.Draw(canvas).text((5, 2), f"mode={mode}", fill=(0, 0, 0))
+    ImageDraw.Draw(canvas).text(
+        (5, 2),
+        f"mode={mode} prompt={rows[0]['fallback_prompt_mode']}",
+        fill=(0, 0, 0),
+    )
     canvas.save(path)
 
 
@@ -518,6 +527,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sam3-device")
     parser.add_argument("--geometry-device")
     parser.add_argument("--geometry-modes", nargs="+", choices=("zero", "aligned", "shuffled"))
+    parser.add_argument(
+        "--fallback-prompt-mode",
+        choices=("box", "point", "box_point"),
+    )
     parser.add_argument("--output-dir", type=Path)
     return parser.parse_args()
 

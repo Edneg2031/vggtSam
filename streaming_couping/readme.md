@@ -21,13 +21,13 @@ Frozen SAM3 video tracker   Frozen StreamVGGT (causal cache)
         |                         |
         +---- tracker 丢失/低分时---+
                                   v
-                    SAM3 text + geometry-box re-segmentation
+                    SAM3 geometry-prompt re-segmentation
                                   |
                                   v
                          bridge final instance mask
 ```
 
-只有 reference frame 的 GT mask 参与初始化；其他帧 GT 只用于评估。几何投影不会直接作为最终 mask，而是作为 SAM3 的候选框。
+只有 reference frame 的 GT mask 参与初始化；其他帧 GT 只用于评估。几何投影不会直接作为最终 mask，而是作为 SAM3 的当前帧提示。
 默认不会把 SAM3 输出硬裁剪到候选框内，因为 reference frame 可能只观察到物体的一部分。CSV 同时记录原始 refinement 与裁剪版本的 IoU，供消融比较。
 reference frame 用于初始化，不会为自己生成 geometry candidate。
 
@@ -54,6 +54,17 @@ aligned > shuffled
 ```
 
 仅有 `aligned > zero` 不够，因为错误几何也可能提供一个宽松的 box。
+
+## SAM3 提示消融
+
+候选通过几何门控后，可以用三种方式提示当前帧 SAM3：
+
+- `box`：文本 + 几何候选框，当前默认基线。
+- `point`：只用几何支持区域中的 3 个正点，绕开候选框边界。
+- `box_point`：先用文本 + 框选择实例，再用几何正点细化同一实例。
+
+三者都只使用 StreamVGGT 支持点，不读取当前帧 GT。可通过
+`--fallback-prompt-mode` 选择；完整命令见 `commands.txt`。
 
 ## 运行
 
@@ -84,5 +95,5 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_bridge \
 ## 当前边界
 
 - SAM3 和 StreamVGGT 均冻结，没有训练 adapter。
-- fallback 是当前帧的 SAM3 文本 + 几何框重新分割，不会伪装成原视频 memory 的连续更新。
+- fallback 是当前帧的 SAM3 几何提示重新分割，不会伪装成原视频 memory 的连续更新。
 - 当前只验证 `geometry -> tracking`。点云聚合、相机回环优化、双向联合训练均未宣称完成。

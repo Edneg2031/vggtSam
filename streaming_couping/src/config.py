@@ -50,6 +50,7 @@ class ExperimentConfig:
     tracker_low_score: float
     fallback_on_missing_mask: bool
     clip_refined_to_candidate: bool
+    fallback_prompt_mode: str
     output_dir: Path
 
 
@@ -76,6 +77,16 @@ def load_config(
     unsupported = set(geometry_modes) - {"zero", "aligned", "shuffled"}
     if unsupported:
         raise ValueError(f"Unsupported geometry modes: {sorted(unsupported)}")
+    fallback_prompt_mode = str(
+        overrides.get(
+            "fallback_prompt_mode",
+            sam3.get("fallback_prompt_mode", "box"),
+        )
+    )
+    if fallback_prompt_mode not in {"box", "point", "box_point"}:
+        raise ValueError(
+            "sam3.fallback_prompt_mode must be box, point, or box_point."
+        )
 
     output_size = tuple(int(value) for value in bridge.get("output_size", [256, 384]))
     if len(output_size) != 2:
@@ -124,6 +135,7 @@ def load_config(
         clip_refined_to_candidate=bool(
             bridge.get("clip_refined_to_candidate", False)
         ),
+        fallback_prompt_mode=fallback_prompt_mode,
         output_dir=_path(overrides.get("output_dir", raw.get("output", {}).get("dir"))),
     )
 

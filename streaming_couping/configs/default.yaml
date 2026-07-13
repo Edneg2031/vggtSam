@@ -14,6 +14,7 @@ sam3:
   device: cuda:3
   output_threshold: 0.5
   prompt_with_box: true
+  fallback_prompt_mode: box
 
 streamvggt:
   repo: externals/streamvggt
