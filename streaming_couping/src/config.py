@@ -122,7 +122,7 @@ def load_config(
         tracker_low_score=float(bridge.get("tracker_low_score", 0.5)),
         fallback_on_missing_mask=bool(bridge.get("fallback_on_missing_mask", True)),
         clip_refined_to_candidate=bool(
-            bridge.get("clip_refined_to_candidate", True)
+            bridge.get("clip_refined_to_candidate", False)
         ),
         output_dir=_path(overrides.get("output_dir", raw.get("output", {}).get("dir"))),
     )

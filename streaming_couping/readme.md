@@ -28,6 +28,17 @@ Frozen SAM3 video tracker   Frozen StreamVGGT (causal cache)
 ```
 
 只有 reference frame 的 GT mask 参与初始化；其他帧 GT 只用于评估。几何投影不会直接作为最终 mask，而是作为 SAM3 的候选框。
+默认不会把 SAM3 输出硬裁剪到候选框内，因为 reference frame 可能只观察到物体的一部分。CSV 同时记录原始 refinement 与裁剪版本的 IoU，供消融比较。
+reference frame 用于初始化，不会为自己生成 geometry candidate。
+
+## 实现对应
+
+- SAM3 原始视频追踪：`src/backbones/sam3_wrapper.py`
+- StreamVGGT 流式几何：`src/backbones/streamvggt_wrapper.py`
+- reference 物体点缓存：`src/aggregation/point_map_fusion.py`
+- 重访候选框生成：`src/aggregation/mine_revisit_segments.py`
+- fallback 门控：`src/bridge/gating.py`
+- 三组控制、指标与可视化：`src/pipeline.py`
 
 ## 三组控制
 

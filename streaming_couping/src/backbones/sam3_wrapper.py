@@ -91,6 +91,11 @@ class SAM3Wrapper:
     ) -> tuple[torch.Tensor, float]:
         """Refine one geometry proposal with SAM3 text + box prompting."""
 
+        if not self.prompt_with_box:
+            raise RuntimeError(
+                "Geometry fallback requires sam3.prompt_with_box=true; otherwise "
+                "the candidate would not enter SAM3."
+            )
         adapter = self._require_adapter()
         output = adapter.track_from_paths(
             [image_path],
@@ -109,4 +114,3 @@ class SAM3Wrapper:
         if self.adapter is None:
             raise RuntimeError("Call SAM3Wrapper.load() before inference.")
         return self.adapter
-
