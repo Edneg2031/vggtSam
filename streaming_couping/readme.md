@@ -28,6 +28,7 @@ Frozen SAM3 video tracker   Frozen StreamVGGT (causal cache)
 ```
 
 只有 reference frame 的 GT mask 参与初始化；其他帧 GT 只用于评估。几何投影不会直接作为最终 mask，而是作为 SAM3 的当前帧提示。
+这里的当前帧 pointmap 是 frozen StreamVGGT 从当前 RGB 预测的输出，不是预处理数据中的 GT pointmap。历史点与当前点的距离检查完全在 StreamVGGT 的共享重建坐标系中完成。
 默认不会把 SAM3 输出硬裁剪到候选框内，因为 reference frame 可能只观察到物体的一部分。CSV 同时记录原始 refinement 与裁剪版本的 IoU，供消融比较。
 reference frame 用于初始化，不会为自己生成 geometry candidate。
 

@@ -44,7 +44,8 @@ candidate:
   min_projected_fraction: 0.005
   min_supported_points: 8
   min_support_ratio: 0.02
-  # Current StreamVGGT pointmap support in shared-world coordinates (meters).
+  # Current StreamVGGT pointmap support in its shared reconstruction frame.
+  # These are model-space units, not guaranteed metric meters.
   support_abs_distance: 0.15
   support_relative_distance: 0.10
 
