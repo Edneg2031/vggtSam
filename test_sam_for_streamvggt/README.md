@@ -2,6 +2,8 @@
 
 本目录只做诊断，不训练融合网络，也不修改 StreamVGGT KV cache。
 
+当前五帧实验的结论记录在 [`RESULTS_TOKEN_DIAGNOSTIC.md`](RESULTS_TOKEN_DIAGNOSTIC.md)。
+
 固定五帧序列上同时导出：
 
 - SAM3 tracker `fpn2`：`[T, 256, 72, 72]`；
