@@ -77,6 +77,7 @@ is treated as the scene id.
 For every selected frame:
 
 ```text
+images/<image>.JPG
 semantic_masks/<image>.png
 instance_masks/<image>.png
 pointmaps/<image>.npz
@@ -85,6 +86,11 @@ visualizations/semantic/<image>.jpg
 visualizations/instance/<image>.jpg
 visualizations/summary/<image>.jpg
 ```
+
+`images/` is a readable copy of the pinhole RGB input. New manifests point to
+this processed copy rather than the original NAS tree, so later SAM3 worker
+processes do not depend on the raw dataset permissions. Disable this only with
+`--no-cache-images`.
 
 `visualizations/summary` contains RGB / semantic projection / instance
 projection panels. Instance panels include labels such as

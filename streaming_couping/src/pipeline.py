@@ -34,6 +34,7 @@ def main() -> None:
     overrides = {
         key: value
         for key, value in {
+            "manifest": args.manifest,
             "scene_id": args.scene_id,
             "instance_id": args.instance_id,
             "frame_indices": args.frame_indices,
@@ -647,6 +648,7 @@ def _config_json(config: ExperimentConfig) -> dict:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="streaming_couping/configs/default.yaml")
+    parser.add_argument("--manifest", type=Path)
     parser.add_argument("--scene-id")
     parser.add_argument("--instance-id", type=int)
     parser.add_argument("--frame-indices", type=int, nargs="+")

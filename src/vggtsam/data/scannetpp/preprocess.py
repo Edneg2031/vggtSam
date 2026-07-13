@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import shutil
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -47,6 +48,7 @@ class ScanNetPP2DConfig:
     save_visualizations: bool = False
     save_raster: bool = True
     save_pointmaps: bool = True
+    cache_images: bool = True
     skip_existing: bool = True
     dry_run: bool = False
 
@@ -167,7 +169,11 @@ def _process_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
     pointmap_dir = out_scene_dir / "pointmaps"
     raster_dir = out_scene_dir / "raster"
     viz_dir = out_scene_dir / "visualizations"
-    for path in [semantic_dir, instance_dir, pointmap_dir, raster_dir, viz_dir]:
+    image_cache_dir = out_scene_dir / "images"
+    output_dirs = [semantic_dir, instance_dir, pointmap_dir, raster_dir, viz_dir]
+    if config.cache_images:
+        output_dirs.append(image_cache_dir)
+    for path in output_dirs:
         path.mkdir(parents=True, exist_ok=True)
 
     print(f"\n[{scene_id}] loading mesh and annotations")
@@ -255,6 +261,7 @@ def _process_scene(scene_id: str, config: ScanNetPP2DConfig) -> Dict[str, Any]:
             pointmap_dir=pointmap_dir,
             raster_dir=raster_dir,
             viz_dir=viz_dir,
+            image_cache_dir=image_cache_dir,
             objects=objects,
             config=config,
         )
@@ -280,6 +287,7 @@ def _process_frame(
     pointmap_dir: Path,
     raster_dir: Path,
     viz_dir: Path,
+    image_cache_dir: Path,
     objects: Dict[int, Any],
     config: ScanNetPP2DConfig,
 ) -> Optional[Dict[str, Any]]:
@@ -297,12 +305,24 @@ def _process_frame(
     instance_path = instance_dir / f"{stem}.png"
     pointmap_path = pointmap_dir / f"{stem}.npz"
     raster_path = raster_dir / f"{stem}.npz"
-    image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    cached_image_path = image_cache_dir / Path(frame_name).name
+    read_image_path = (
+        cached_image_path
+        if config.cache_images and cached_image_path.is_file() and config.skip_existing
+        else image_path
+    )
+    image_bgr = cv2.imread(str(read_image_path), cv2.IMREAD_COLOR)
     if image_bgr is None:
-        print(f"Skipping unreadable image: {image_path}")
+        print(f"Skipping unreadable image: {read_image_path}")
         return None
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     height, width = image_rgb.shape[:2]
+    manifest_image_path = image_path
+    if config.cache_images:
+        if not cached_image_path.exists() or not config.skip_existing:
+            shutil.copyfile(image_path, cached_image_path)
+            cached_image_path.chmod(0o644)
+        manifest_image_path = cached_image_path
 
     colmap_image = image_by_name.get(frame_name) or image_by_name.get(
         Path(frame_name).name
@@ -322,7 +342,8 @@ def _process_frame(
     ):
         return {
             "image_name": frame_name,
-            "image_path": str(image_path),
+            "image_path": str(manifest_image_path),
+            "image_source_path": str(image_path),
             "semantic_mask": str(semantic_path),
             "instance_mask": str(instance_path),
             "pointmap": str(pointmap_path) if pointmap_path.exists() else None,
@@ -392,7 +413,8 @@ def _process_frame(
     visible_instances = sorted(int(v) for v in np.unique(instance[valid_instance]))
     return {
         "image_name": frame_name,
-        "image_path": str(image_path),
+        "image_path": str(manifest_image_path),
+        "image_source_path": str(image_path),
         "semantic_mask": str(semantic_path),
         "instance_mask": str(instance_path),
         "pointmap": str(pointmap_path) if config.save_pointmaps else None,
@@ -813,6 +835,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--no-pointmaps", dest="save_pointmaps", action="store_false"
     )
     parser.set_defaults(save_pointmaps=None)
+
+    images = parser.add_mutually_exclusive_group()
+    images.add_argument("--cache-images", dest="cache_images", action="store_true")
+    images.add_argument(
+        "--no-cache-images", dest="cache_images", action="store_false"
+    )
+    parser.set_defaults(cache_images=None)
 
     skip = parser.add_mutually_exclusive_group()
     skip.add_argument("--skip-existing", dest="skip_existing", action="store_true")

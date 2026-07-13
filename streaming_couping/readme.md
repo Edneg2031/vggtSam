@@ -87,6 +87,11 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_bridge \
   --config streaming_couping/configs/default.yaml
 ```
 
+旧版预处理 manifest 的 RGB 仍指向原始 NAS。若原图权限不可读，先用
+`scripts/cache_scannetpp_rgb.py` 生成 processed RGB cache 和新 manifest，
+再通过 `--manifest` 传入。`--allow-summary-fallback` 只适合调试：它从
+已有 summary 的左侧 RGB 面板恢复图像，包含顶部标题条，不能作为最终定量输入。
+
 覆盖实验对象：
 
 ```bash

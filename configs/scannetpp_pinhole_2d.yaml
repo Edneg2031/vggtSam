@@ -41,6 +41,9 @@ semantic_ignore_label: 65535
 save_visualizations: true
 save_raster: true
 save_pointmaps: true
+# Cache readable RGB copies beside masks/pointmaps instead of depending on the
+# original NAS tree at training time.
+cache_images: true
 
 skip_existing: true
 dry_run: false

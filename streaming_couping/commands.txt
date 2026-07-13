@@ -1,6 +1,16 @@
+# One-time repair for the five selected RGB frames. The summary fallback is
+# debug-only when the original NAS files are not readable.
+PYTHONPATH=src python scripts/cache_scannetpp_rgb.py \
+  --manifest data/processed/scannetpp_pinhole_2d/manifest.json \
+  --scene-ids 00a231a370 \
+  --frame-indices 133 162 520 566 477 \
+  --allow-summary-fallback \
+  --output-manifest data/processed/scannetpp_pinhole_2d/manifest_rgb_cache.json
+
 for prompt_mode in point box_point; do
   PYTHONPATH=src:. python -m streaming_couping.scripts.run_bridge \
     --config streaming_couping/configs/default.yaml \
+    --manifest data/processed/scannetpp_pinhole_2d/manifest_rgb_cache.json \
     --scene-id 00a231a370 \
     --instance-id 37 \
     --frame-indices 133 162 520 566 477 \
@@ -15,6 +25,7 @@ done
 # recovery; B2 then continues with the original SAM3 memory and the same ID.
 PYTHONPATH=src:. python -m streaming_couping.scripts.run_bridge \
   --config streaming_couping/configs/default.yaml \
+  --manifest data/processed/scannetpp_pinhole_2d/manifest_rgb_cache.json \
   --scene-id 00a231a370 \
   --instance-id 37 \
   --frame-indices 133 162 520 566 477 \
