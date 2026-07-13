@@ -12,7 +12,7 @@ OUTPUT_ROOT=outputs/debug_single_pair_baselines \
 bash test_sam/run_single_pair_baselines.sh
 ```
 
-脚本依次运行 `sam_only` 和 `constant_prompt`。两者任一未达到训练 IoU 0.95，就停止，不运行 geometry；两者通过后才运行统计量匹配的固定 `random_geometry`。可选的真实特征实验为：
+脚本依次运行 `sam_only`、`constant_prompt` 和统计量匹配的固定 `random_geometry`。默认只记录各自是否达到训练 IoU 0.95，不再因 SAM-only 失败而跳过 geometry；大视角变化实验本来就允许原始 SAM 基线失败。只有专门检查最短梯度链路时，才使用 `STRICT_IOU_GATE=1` 恢复严格闸门。可选的真实特征实验为：
 
 ```bash
 PYTHONPATH=src:. python scripts/debug_single_pair_overfit.py \

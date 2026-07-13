@@ -4,7 +4,8 @@ set -euo pipefail
 CONFIG="${CONFIG:-test_sam/debug_single_pair.yaml}"
 ITERATIONS="${ITERATIONS:-1000}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/debug_single_pair_baselines}"
-SKIP_IOU_GATE="${SKIP_IOU_GATE:-0}"
+STRICT_IOU_GATE="${STRICT_IOU_GATE:-0}"
+IOU_TARGET="${IOU_TARGET:-0.95}"
 
 export PYTHONPATH="src:.:${PYTHONPATH:-}"
 mkdir -p "${OUTPUT_ROOT}"
@@ -26,11 +27,12 @@ run_mode() {
 
 check_train_iou() {
   local mode="$1"
-  python - "${OUTPUT_ROOT}/${mode}/training_history.csv" "${mode}" <<'PY'
+  python - "${OUTPUT_ROOT}/${mode}/training_history.csv" "${mode}" "${IOU_TARGET}" <<'PY'
 import csv
 import sys
 
-path, mode = sys.argv[1:]
+path, mode, target = sys.argv[1:]
+target = float(target)
 with open(path, newline="", encoding="utf8") as handle:
     rows = list(csv.DictReader(handle))
 if not rows:
@@ -39,20 +41,12 @@ final = rows[-1]
 train_iou = float(final["train_iou"])
 eval_iou = float(final["eval_iou"])
 print(f"{mode}: final train_iou={train_iou:.4f}, eval_iou={eval_iou:.4f}")
-if train_iou < 0.95:
+if train_iou < target:
     raise SystemExit(2)
 PY
 }
 
 run_mode sam_only
-if [[ "${SKIP_IOU_GATE}" == "1" ]]; then
-  run_mode constant_prompt
-  run_mode random_geometry
-  echo
-  echo "Smoke run completed; IoU gate was intentionally skipped."
-  exit 0
-fi
-
 sam_ok=1
 check_train_iou sam_only || sam_ok=0
 
@@ -60,15 +54,17 @@ run_mode constant_prompt
 prompt_ok=1
 check_train_iou constant_prompt || prompt_ok=0
 
-if [[ "${sam_ok}" != "1" || "${prompt_ok}" != "1" ]]; then
+if [[ "${STRICT_IOU_GATE}" == "1" && ("${sam_ok}" != "1" || "${prompt_ok}" != "1") ]]; then
   echo
-  echo "STOP: SAM-only or constant-prompt did not reach train IoU 0.95."
+  echo "STOP: strict diagnostic gate enabled and a baseline did not reach train IoU ${IOU_TARGET}."
   echo "Inspect parameter_audit.csv, tensor_audit.json, and module_diagnostics.csv."
   exit 2
 fi
 
 run_mode random_geometry
-check_train_iou random_geometry
+random_ok=1
+check_train_iou random_geometry || random_ok=0
 
 echo
-echo "All phase-1/2 single-pair baselines reached train IoU 0.95."
+echo "All baseline experiments completed (no default IoU gate)."
+echo "Reached train IoU ${IOU_TARGET}: sam_only=${sam_ok}, constant_prompt=${prompt_ok}, random_geometry=${random_ok}."

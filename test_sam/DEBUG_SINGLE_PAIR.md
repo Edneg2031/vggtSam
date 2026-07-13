@@ -45,4 +45,4 @@ BCEWithLogits + Dice + presence
 - `training_history.csv`：teacher-forced train IoU 与无 GT full-flow eval IoU。
 - `visualizations/`：query prompt、target GT、teacher-forced mask、full-flow mask。
 
-`sam_only` 和 `constant_prompt` 的最终 train IoU 都达到 `0.95` 才允许进入 geometry 实验。若 train IoU 高但 eval IoU 低，说明 mask decoder 可学习但 object gate 或 memory inference仍有问题；若 `residual_gradient_norm=0`，说明梯度在 SAM3 source flow 内被截断；若 residual gradient 非零而 parameter update 为零，则检查 residual head 和 optimizer。
+训练 IoU `0.95` 只是一项两帧可学习性诊断，不是 geometry 实验的准入条件。默认会完整运行所有基础模式并报告是否达到该值；只有设置 `STRICT_IOU_GATE=1` 时才会因基线未达到阈值而终止。若 train IoU 高但 eval IoU 低，说明 mask decoder 可学习但 object gate 或 memory inference 仍有问题；若 `residual_gradient_norm=0`，说明梯度在 SAM3 source flow 内被截断；若 residual gradient 非零而 parameter update 为零，则检查 residual head 和 optimizer。
