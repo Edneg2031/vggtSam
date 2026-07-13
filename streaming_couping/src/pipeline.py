@@ -252,6 +252,8 @@ def _evaluate_mode(
         )
 
         fallback_score = 0.0
+        fallback_raw_iou = 0.0
+        fallback_clipped_iou = 0.0
         if decision.use_fallback:
             refined, fallback_score = sam3.segment_candidate(
                 sequence.image_paths[frame_idx],
@@ -259,7 +261,12 @@ def _evaluate_mode(
                 output_size=config.output_size,
                 candidate_mask=candidate.mask,
             )
-            final_masks[frame_idx] = refined
+            clipped = refined & candidate.mask
+            fallback_raw_iou = binary_iou(refined, target_masks[frame_idx])
+            fallback_clipped_iou = binary_iou(clipped, target_masks[frame_idx])
+            final_masks[frame_idx] = (
+                clipped if config.clip_refined_to_candidate else refined
+            )
 
         updated_map = False
         if decision.update_map and mode != "zero":
@@ -294,6 +301,13 @@ def _evaluate_mode(
                 "sam3_iou": binary_iou(original_mask, target_masks[frame_idx]),
                 "candidate_iou": binary_iou(candidate.mask, target_masks[frame_idx]),
                 "final_iou": binary_iou(final_masks[frame_idx], target_masks[frame_idx]),
+                "fallback_raw_iou": fallback_raw_iou,
+                "fallback_clipped_iou": fallback_clipped_iou,
+                "candidate_area_ratio": float(candidate.mask.float().mean()),
+                "candidate_centroid_error": _centroid_error(
+                    candidate.mask,
+                    target_masks[frame_idx],
+                ),
                 "projected_points": candidate.projected_points,
                 "supported_points": candidate.supported_points,
                 "projected_fraction": candidate.projected_fraction,
@@ -388,8 +402,11 @@ def _output_mask_to_stream(
 
 
 def _empty_candidate(output_size: tuple[int, int], reason: str) -> RevisitCandidate:
+    empty = torch.zeros(output_size, dtype=torch.bool)
     return RevisitCandidate(
-        mask=torch.zeros(output_size, dtype=torch.bool),
+        mask=empty,
+        projected_mask=empty.clone(),
+        supported_mask=empty.clone(),
         box_xyxy=None,
         projected_points=0,
         supported_points=0,
@@ -457,11 +474,23 @@ def _overlay(image: Image.Image, mask: torch.Tensor, color: tuple[int, int, int]
 
 
 def _draw_candidate(image: Image.Image, candidate: RevisitCandidate) -> Image.Image:
-    output = image.copy()
+    output = _overlay(image, candidate.projected_mask, (255, 190, 0))
+    output = _overlay(output, candidate.supported_mask, (30, 220, 90))
     if candidate.box_xyxy is not None:
         color = (30, 220, 90) if candidate.accepted else (255, 190, 0)
         ImageDraw.Draw(output).rectangle(candidate.box_xyxy, outline=color, width=3)
     return output
+
+
+def _centroid_error(prediction: torch.Tensor, target: torch.Tensor) -> float:
+    if not prediction.any() or not target.any():
+        return float("nan")
+    pred_y, pred_x = prediction.nonzero(as_tuple=True)
+    target_y, target_x = target.nonzero(as_tuple=True)
+    height, width = prediction.shape
+    dx = (pred_x.float().mean() - target_x.float().mean()) / max(width, 1)
+    dy = (pred_y.float().mean() - target_y.float().mean()) / max(height, 1)
+    return float(torch.sqrt(dx * dx + dy * dy))
 
 
 def _write_csv(path: Path, rows: list[dict]) -> None:

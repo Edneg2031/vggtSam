@@ -67,12 +67,11 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_bridge \
 ## 输出
 
 - `summary.csv`：SAM3 与 bridge 的跨视角 IoU、召回率和 absent false-positive ratio。
-- `<mode>/frame_metrics.csv`：每帧投影点数、3D 支持率、candidate/final IoU 和门控原因。
-- `<mode>/tracking_report.png`：`RGB | GT | SAM3 original | geometry candidate | bridge final`。
+- `<mode>/frame_metrics.csv`：每帧投影点数、3D 支持率、candidate/fallback/final IoU 和门控原因。
+- `<mode>/tracking_report.png`：`RGB | GT | SAM3 original | geometry candidate | bridge final`。候选图中黄色是原始投影点，绿色是当前 pointmap 支持的投影点，矩形是送给 SAM3 的候选框。
 
 ## 当前边界
 
 - SAM3 和 StreamVGGT 均冻结，没有训练 adapter。
 - fallback 是当前帧的 SAM3 文本 + 几何框重新分割，不会伪装成原视频 memory 的连续更新。
 - 当前只验证 `geometry -> tracking`。点云聚合、相机回环优化、双向联合训练均未宣称完成。
-

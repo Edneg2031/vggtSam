@@ -93,6 +93,24 @@ def mine_revisit_candidate(
         output_size=output_size,
         image_mode=image_mode,
     )
+    projected_x, projected_y = _processed_to_output(
+        x,
+        y,
+        source_size=source_size,
+        processed_size=processed_size,
+        output_size=output_size,
+        image_mode=image_mode,
+    )
+    supported_x, supported_y = _processed_to_output(
+        x[supported],
+        y[supported],
+        source_size=source_size,
+        processed_size=processed_size,
+        output_size=output_size,
+        image_mode=image_mode,
+    )
+    projected_mask = _point_mask(projected_x, projected_y, output_size)
+    supported_mask = _point_mask(supported_x, supported_y, output_size)
     box = _robust_box(
         output_x,
         output_y,
@@ -119,6 +137,8 @@ def mine_revisit_candidate(
     accepted = not failed
     return RevisitCandidate(
         mask=candidate_mask,
+        projected_mask=projected_mask,
+        supported_mask=supported_mask,
         box_xyxy=box,
         projected_points=projected_points,
         supported_points=supported_points,
@@ -189,6 +209,8 @@ def _robust_box(
 def _rejected(mask: torch.Tensor, reason: str) -> RevisitCandidate:
     return RevisitCandidate(
         mask=mask,
+        projected_mask=mask.clone(),
+        supported_mask=mask.clone(),
         box_xyxy=None,
         projected_points=0,
         supported_points=0,
@@ -197,3 +219,31 @@ def _rejected(mask: torch.Tensor, reason: str) -> RevisitCandidate:
         accepted=False,
         reason=reason,
     )
+
+
+def _point_mask(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    output_size: tuple[int, int],
+) -> torch.Tensor:
+    height, width = output_size
+    mask = torch.zeros(output_size, dtype=torch.bool)
+    if x.numel() == 0:
+        return mask
+    x_index = x.round().long()
+    y_index = y.round().long()
+    inside = (
+        torch.isfinite(x)
+        & torch.isfinite(y)
+        & (x_index >= 0)
+        & (x_index < width)
+        & (y_index >= 0)
+        & (y_index < height)
+    )
+    mask[y_index[inside], x_index[inside]] = True
+    return torch.nn.functional.max_pool2d(
+        mask.float()[None, None],
+        kernel_size=3,
+        stride=1,
+        padding=1,
+    )[0, 0].bool()

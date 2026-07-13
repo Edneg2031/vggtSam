@@ -28,6 +28,8 @@ class TrackingSequence:
 @dataclass(frozen=True)
 class RevisitCandidate:
     mask: torch.Tensor
+    projected_mask: torch.Tensor
+    supported_mask: torch.Tensor
     box_xyxy: tuple[int, int, int, int] | None
     projected_points: int
     supported_points: int

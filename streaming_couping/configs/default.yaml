@@ -27,6 +27,8 @@ bridge:
   geometry_modes: [zero, aligned, shuffled]
   tracker_low_score: 0.5
   fallback_on_missing_mask: true
+  # Keep SAM3's dense result inside the geometry proposal region.
+  clip_refined_to_candidate: true
   max_points_per_observation: 8000
   max_points_per_object: 20000
   # Keep this off until the reference-only map produces a positive control.
@@ -47,4 +49,3 @@ candidate:
 
 output:
   dir: outputs/streaming_couping_stage_b
-

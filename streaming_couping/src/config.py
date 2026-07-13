@@ -49,6 +49,7 @@ class ExperimentConfig:
 
     tracker_low_score: float
     fallback_on_missing_mask: bool
+    clip_refined_to_candidate: bool
     output_dir: Path
 
 
@@ -120,6 +121,9 @@ def load_config(
         ),
         tracker_low_score=float(bridge.get("tracker_low_score", 0.5)),
         fallback_on_missing_mask=bool(bridge.get("fallback_on_missing_mask", True)),
+        clip_refined_to_candidate=bool(
+            bridge.get("clip_refined_to_candidate", True)
+        ),
         output_dir=_path(overrides.get("output_dir", raw.get("output", {}).get("dir"))),
     )
 
@@ -128,4 +132,3 @@ def _path(value: Any) -> Path:
     if value is None or str(value).strip() == "":
         raise ValueError("A required path is missing from the configuration.")
     return Path(value).expanduser()
-
