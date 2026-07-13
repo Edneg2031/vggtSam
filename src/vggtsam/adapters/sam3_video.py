@@ -30,6 +30,7 @@ class SAM3TrackOutput:
     selected_obj_id: Optional[int]
     prompt_frame_idx: int
     prompt_box_xywh: Optional[tuple[float, float, float, float]]
+    scores: Optional[torch.Tensor] = None
     frame_objects: Dict[int, Dict[int, torch.Tensor]] = field(default_factory=dict)
     aux: Dict[str, Any] = field(default_factory=dict)
 
@@ -166,6 +167,7 @@ class SAM3VideoTrackerAdapter:
             [prompted, *propagated],
             output_size=output_size,
         )
+        frame_scores = collect_frame_scores([prompted, *propagated])
         selected_obj_id = select_tracked_object_id(
             frame_objects,
             prompt_frame_idx=prompt_frame_idx,
@@ -177,11 +179,17 @@ class SAM3VideoTrackerAdapter:
             num_frames=len(image_paths),
             output_size=output_size,
         )
+        scores = scores_for_selected_object(
+            frame_scores,
+            selected_obj_id=selected_obj_id,
+            num_frames=len(image_paths),
+        )
         return SAM3TrackOutput(
             masks=masks,
             selected_obj_id=selected_obj_id,
             prompt_frame_idx=prompt_frame_idx,
             prompt_box_xywh=tuple(prompt_box) if prompt_box is not None else None,
+            scores=scores,
             frame_objects=frame_objects,
             aux={
                 "prompt": prompt,
@@ -196,6 +204,10 @@ class SAM3VideoTrackerAdapter:
                     int(frame_idx): len(objects)
                     for frame_idx, objects in frame_objects.items()
                 },
+                "score_semantics": (
+                    "SAM3 out_probs for the selected ID; propagation keeps the "
+                    "initial detector score, while a missing ID is assigned zero"
+                ),
             },
         )
 
@@ -464,6 +476,43 @@ def collect_frame_objects(
             mask = torch.from_numpy(np.asarray(mask_np).astype(bool))
             objects[int(obj_id)] = resize_bool_mask(mask, output_size)
     return frame_objects
+
+
+def collect_frame_scores(
+    results: Sequence[Dict[str, Any]],
+) -> Dict[int, Dict[int, float]]:
+    """Collect SAM3 detector/tracker probabilities without changing mask selection."""
+
+    frame_scores: Dict[int, Dict[int, float]] = {}
+    for result in results:
+        if result is None:
+            continue
+        frame_idx = int(result.get("frame_index", -1))
+        if frame_idx < 0:
+            continue
+        outputs = result.get("outputs", {}) or {}
+        obj_ids = np.asarray(outputs.get("out_obj_ids", []), dtype=np.int64).reshape(-1)
+        probabilities = np.asarray(outputs.get("out_probs", []), dtype=np.float32).reshape(-1)
+        scores = frame_scores.setdefault(frame_idx, {})
+        for obj_id, probability in zip(obj_ids.tolist(), probabilities.tolist()):
+            scores[int(obj_id)] = float(probability)
+    return frame_scores
+
+
+def scores_for_selected_object(
+    frame_scores: Dict[int, Dict[int, float]],
+    *,
+    selected_obj_id: Optional[int],
+    num_frames: int,
+) -> torch.Tensor:
+    scores = torch.zeros(int(num_frames), dtype=torch.float32)
+    if selected_obj_id is None:
+        return scores
+    for frame_idx in range(int(num_frames)):
+        scores[frame_idx] = float(
+            frame_scores.get(frame_idx, {}).get(int(selected_obj_id), 0.0)
+        )
+    return scores
 
 
 def select_tracked_object_id(

@@ -46,3 +46,33 @@ Top-1/Top-5 和 margin 越高越好，定位误差越低越好。
 3. shuffled layer-17 geometry。
 
 只有 aligned 同时优于 zero 与 shuffled，才能说明收益来自正确的跨视角几何对应。
+
+## Layer-17 控制实验结果
+
+固定使用 StreamVGGT layer 17，冻结 SAM3 tracker，仅训练同构 fusion adapter。三组实验使用相同的五帧序列、随机种子和训练步数。
+
+| Experiment | Final cross-view IoU | Best cross-view IoU | Recall | Absent FP |
+|---|---:|---:|---:|---:|
+| Zero geometry | 0.8930 | 0.8951 | 1.0 | 0.0 |
+| Aligned geometry | **0.9262** | **0.9273** | 1.0 | 0.0 |
+| Shuffled geometry | 0.9238 | 0.9238 | 1.0 | 0.0 |
+
+### 当前可以得出的结论
+
+1. **非零 layer-17 特征对最终分割有帮助。** Aligned 相比 zero 的 final cross-view IoU 提高约 `0.0333`，best IoU 提高约 `0.0322`。这与前述 token 检索结果一致，说明 layer 17 不只是具有离线可分性，也能通过 fusion adapter 改善 mask 输出。
+2. **三组均恢复了所有可见帧，且没有在目标消失帧产生误检。** 因此更强的 fusion residual 本身已经能帮助冻结的 SAM3 tracker 越过 object-presence gate；geometry 的主要收益体现在 mask 精度，而非本组实验中的 Tracking Recall。
+3. **正确帧对齐的额外收益目前很弱。** Aligned 只比 shuffled 的 final IoU 高约 `0.0024`，best IoU 高约 `0.0035`。单个随机种子下，这个差距不足以证明正确的跨视角对应是性能提升的原因。
+
+### Shuffled 对照的限制
+
+当前 shuffled 模型在固定循环排列 `[4, 0, 1, 2, 3]` 上训练并评估 700 步。由于训练序列固定，模型可能记住错误排列或把 geometry 当作与帧无关的特征先验。因此“shuffled 接近 aligned”不等于空间对应无用，也可能是当前控制实验允许模型适应固定错位。
+
+### 下一步严格验证
+
+使用 aligned checkpoint，在不继续训练的情况下执行三种推理：
+
+1. aligned geometry；
+2. zero geometry；
+3. shuffled geometry。
+
+这种同一 checkpoint 的 inference-time perturbation 能排除不同模型各自过拟合的问题。若 aligned checkpoint 在推理时打乱或移除 geometry 后明显下降，才能证明模型实际依赖正确的 layer-17 对应。随后应增加多个随机种子和未参与训练的帧/实例验证稳定性。

@@ -1,0 +1,42 @@
+# Stage B: explicit geometry-enhanced re-identification. Both foundation
+# backbones are frozen; only their public geometric/tracking outputs interact.
+dataset:
+  manifest: data/processed/scannetpp_pinhole_2d/manifest.json
+  scene_id: 00a231a370
+  frame_indices: [133, 162, 520, 566, 477]
+  instance_id: 37
+  min_pixels: 128
+  max_area_ratio: 0.25
+  excluded_labels: [object, unknown, wall, floor, ceiling]
+
+sam3:
+  repo: externals/sam3
+  checkpoint: /home/bod/86Nas/95_data_bak/FoundationModels/sam3/sam3.pt
+  device: cuda:3
+  output_threshold: 0.5
+  prompt_with_box: true
+
+streamvggt:
+  repo: externals/streamvggt
+  checkpoint: /home/bod/86Nas/95_data_bak/FoundationModels/StreamVGGT/checkpoints.pth
+  device: cuda:1
+  streaming_cache: true
+  image_mode: crop
+
+bridge:
+  output_size: [256, 384]
+  geometry_modes: [zero, aligned, shuffled]
+  map_update_source: sam3
+  max_points_per_observation: 8000
+  max_points_per_object: 20000
+  splat_radius: 3
+  occlusion_depth_tolerance: 0.02
+  occlusion_relative_tolerance: 0.05
+  map_update_min_prior_iou: 0.1
+  track_update_threshold: 0.7
+  track_fallback_threshold: 0.5
+  geometry_threshold: 0.45
+  min_persistence: 1
+
+output:
+  dir: outputs/test_dframework_stage_b
