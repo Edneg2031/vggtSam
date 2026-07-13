@@ -6,3 +6,8 @@ PYTHONPATH=src:. python -m test_sam_for_streamvggt.analyze_tokens \
   --tracker-device cuda:3 \
   --geometry-device cuda:1 \
   --output-dir outputs/sam_to_streamvggt_tokens
+
+# Layer-17 因果控制：冻结 SAM3 tracker，仅训练 fusion adapter。
+# 依次运行 zero / aligned / shuffled geometry。
+OUTPUT_ROOT=outputs/test_sam_layer17_controls \
+bash test_sam/run_layer17_controls.sh

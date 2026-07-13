@@ -76,6 +76,7 @@ class ExperimentConfig:
     geometry_image_mode: str
     context_grid: tuple[int, int]
     layer_indices: tuple[int, ...]
+    geometry_layer_index: int
     fusion_method: str
     hidden_channels: int
     num_heads: int
@@ -531,11 +532,19 @@ def extract_geometry_features(
         levels = [level.index_select(0, permutation) for level in levels]
         print(f"StreamVGGT frame permutation={permutation.cpu().tolist()}")
     if config.fusion_method != "multilevel_cross_attention":
-        levels = [levels[-1]]
+        if config.geometry_layer_index not in config.layer_indices:
+            raise ValueError(
+                f"geometry_layer_index={config.geometry_layer_index} is not in "
+                f"loaded layer_indices={config.layer_indices}."
+            )
+        selected_position = config.layer_indices.index(config.geometry_layer_index)
+        levels = [levels[selected_position]]
     levels = [level.detach().cpu() for level in levels]
     print(
         f"StreamVGGT layers={config.layer_indices} streaming_cache="
-        f"{config.geometry_streaming_cache} maps="
+        f"{config.geometry_streaming_cache} "
+        f"selected_layer={config.geometry_layer_index if config.fusion_method != 'multilevel_cross_attention' else 'multilevel'} "
+        "maps="
         f"{[tuple(level.shape) for level in levels]}"
     )
     del output
@@ -1180,6 +1189,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument("--tracker-lr", type=float)
+    parser.add_argument("--geometry-layer-index", type=int)
+    parser.add_argument("--residual-init-std", type=float)
     parser.add_argument("--no-compare-direct", action="store_true")
     return parser.parse_args()
 
@@ -1202,6 +1213,8 @@ def apply_cli_overrides(raw: dict[str, Any], args: argparse.Namespace) -> None:
         ("tracker_device", "sam3", "tracker_device"),
         ("sam3_feature_device", "sam3", "feature_device"),
         ("geometry_device", "streamvggt", "device"),
+        ("geometry_layer_index", "fusion", "geometry_layer_index"),
+        ("residual_init_std", "fusion", "residual_init_std"),
         ("direct_device", "sam3", "direct_device"),
     ]
     for argument, section, key in mappings:
@@ -1260,6 +1273,7 @@ def build_config(raw: dict[str, Any]) -> ExperimentConfig:
         geometry_image_mode=str(stream.get("image_mode", "crop")),
         context_grid=tuple(int(value) for value in stream.get("context_grid", [12, 12])),
         layer_indices=tuple(int(value) for value in stream["layer_indices"]),
+        geometry_layer_index=int(fusion.get("geometry_layer_index", 17)),
         fusion_method=str(fusion["method"]),
         hidden_channels=int(fusion.get("hidden_channels", 256)),
         num_heads=int(fusion.get("num_heads", 8)),

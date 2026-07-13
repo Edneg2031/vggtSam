@@ -39,6 +39,17 @@ StreamVGGT aggregator feature(s) ────┘              │
 
 ## 融合消融
 
+### Layer-17 因果控制
+
+Token 诊断显示 StreamVGGT aggregator layer 17 的跨视角实例命中率和目标/背景 margin 最好。下面的最小实验固定使用 layer 17，冻结 SAM3 tracker，仅训练同构 fusion adapter，并依次比较 zero、正确对齐和帧错位 geometry：
+
+```bash
+OUTPUT_ROOT=outputs/test_sam_layer17_controls \
+  bash test_sam/run_layer17_controls.sh
+```
+
+这三组使用相同随机种子、网络结构、参数量、学习率和 residual 初始化。只有 aligned 同时优于 zero 与 shuffled，才能把收益归因于正确的 StreamVGGT 跨视角对应。
+
 | 方法 | 作用 |
 |---|---|
 | `sam_only` | 不加载 StreamVGGT；同容量 SAM residual adapter 基线 |
