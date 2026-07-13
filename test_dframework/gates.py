@@ -12,6 +12,7 @@ class GateConfig:
     track_update_threshold: float = 0.7
     track_fallback_threshold: float = 0.5
     geometry_threshold: float = 0.45
+    fallback_support_threshold: float = 0.05
     min_persistence: int = 1
 
 
@@ -19,7 +20,7 @@ def decide_gates(
     *,
     track_confidence: float,
     update_geometry_confidence: float,
-    fallback_geometry_confidence: float,
+    fallback_geometry_support: float,
     persistence: int,
     has_object_map: bool,
     config: GateConfig,
@@ -33,7 +34,9 @@ def decide_gates(
     """
 
     update_geometry_ok = update_geometry_confidence >= config.geometry_threshold
-    fallback_geometry_ok = fallback_geometry_confidence >= config.geometry_threshold
+    fallback_geometry_ok = (
+        fallback_geometry_support >= config.fallback_support_threshold
+    )
     persistent = persistence >= config.min_persistence
     update = (
         track_confidence >= config.track_update_threshold
@@ -50,7 +53,7 @@ def decide_gates(
     elif fallback:
         reason = "weak tracker with reliable history: use 3D fallback"
     elif track_confidence < config.track_fallback_threshold and not fallback_geometry_ok:
-        reason = "projected-prior geometry confidence below threshold"
+        reason = "historical points lack current-depth support"
     elif not update_geometry_ok:
         reason = "tracker-region geometry confidence below threshold"
     elif not persistent:
@@ -62,7 +65,7 @@ def decide_gates(
         use_fallback=fallback,
         track_confidence=float(track_confidence),
         update_geometry_confidence=float(update_geometry_confidence),
-        fallback_geometry_confidence=float(fallback_geometry_confidence),
+        fallback_geometry_support=float(fallback_geometry_support),
         persistence=int(persistence),
         reason=reason,
     )

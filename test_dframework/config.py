@@ -93,6 +93,9 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Ex
             track_update_threshold=float(bridge.get("track_update_threshold", 0.7)),
             track_fallback_threshold=float(bridge.get("track_fallback_threshold", 0.5)),
             geometry_threshold=float(bridge.get("geometry_threshold", 0.45)),
+            fallback_support_threshold=float(
+                bridge.get("fallback_support_threshold", 0.05)
+            ),
             min_persistence=int(bridge.get("min_persistence", 1)),
         ),
         output_dir=Path(overrides.get("output_dir", output["dir"])),

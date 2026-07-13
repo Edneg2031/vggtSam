@@ -22,7 +22,7 @@ from .geometry import (
     centroid_drift,
     mask_geometry_statistics,
     output_mask_to_stream,
-    project_world_points,
+    project_world_points_with_stats,
     source_mask_to_stream,
 )
 from .metrics import binary_iou, summarize_masks
@@ -215,8 +215,9 @@ def evaluate_mode(
             initialized_map = object_map.has(sequence.instance_id)
 
         entry = object_map.get(sequence.instance_id)
+        projection = None
         if entry is not None and mode != "zero":
-            priors[frame_idx] = project_world_points(
+            projection = project_world_points_with_stats(
                 entry.points,
                 world_to_camera=geometry.world_to_camera[geometry_idx],
                 intrinsics=geometry.intrinsics[geometry_idx],
@@ -228,7 +229,8 @@ def evaluate_mode(
                 observed_world_points=points,
                 occlusion_depth_tolerance=config.occlusion_depth_tolerance,
                 occlusion_relative_tolerance=config.occlusion_relative_tolerance,
-            ).cpu()
+            )
+            priors[frame_idx] = projection.mask.cpu()
 
         if priors[frame_idx].any():
             prior_stream_mask = output_mask_to_stream(
@@ -245,11 +247,14 @@ def evaluate_mode(
             )
         else:
             fallback_geometry_confidence = 0.0
+        fallback_geometry_support = (
+            projection.depth_support_ratio if projection is not None else 0.0
+        )
 
         decision = decide_gates(
             track_confidence=tracker_score,
             update_geometry_confidence=update_geometry_confidence,
-            fallback_geometry_confidence=fallback_geometry_confidence,
+            fallback_geometry_support=fallback_geometry_support,
             persistence=persistence,
             has_object_map=entry is not None and bool(priors[frame_idx].any()),
             config=config.gates,
@@ -301,6 +306,10 @@ def evaluate_mode(
                 "sam3_score": tracker_score,
                 "update_geometry_confidence": update_geometry_confidence,
                 "fallback_geometry_confidence": fallback_geometry_confidence,
+                "fallback_depth_support": fallback_geometry_support,
+                "projected_fraction": (
+                    projection.projected_fraction if projection is not None else 0.0
+                ),
                 "sam3_iou": binary_iou(tracker_mask, target_masks[frame_idx]),
                 "prior_iou": binary_iou(priors[frame_idx], target_masks[frame_idx]),
                 "bridge_iou": binary_iou(bridged[frame_idx], target_masks[frame_idx]),

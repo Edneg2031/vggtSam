@@ -47,7 +47,7 @@ class GeometryBridgeTest(unittest.TestCase):
         reliable = decide_gates(
             track_confidence=0.9,
             update_geometry_confidence=0.8,
-            fallback_geometry_confidence=0.8,
+            fallback_geometry_support=0.8,
             persistence=2,
             has_object_map=True,
             config=config,
@@ -55,7 +55,7 @@ class GeometryBridgeTest(unittest.TestCase):
         lost = decide_gates(
             track_confidence=0.1,
             update_geometry_confidence=0.0,
-            fallback_geometry_confidence=0.8,
+            fallback_geometry_support=0.8,
             persistence=2,
             has_object_map=True,
             config=config,

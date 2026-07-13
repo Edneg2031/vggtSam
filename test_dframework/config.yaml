@@ -36,6 +36,7 @@ bridge:
   track_update_threshold: 0.7
   track_fallback_threshold: 0.5
   geometry_threshold: 0.45
+  fallback_support_threshold: 0.05
   min_persistence: 1
 
 output:

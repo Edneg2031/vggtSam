@@ -30,16 +30,18 @@ GT 只承担两件事：在参考帧生成给 SAM3 的 box prompt、所有帧的
 
 - `update_map`：SAM3 presence proxy、SAM3 mask 区域的几何置信度、持续观测次数以及
   当前 mask 与历史 3D 投影的一致性都可靠时更新地图。
-- `use_fallback`：SAM3 分数低、但历史 3D prior 投影区域内的几何置信度可靠时
-  启用重投影。它不再使用整帧平均置信度。
+- `use_fallback`：SAM3 分数低，且历史实例点与当前 pointmap 在相同像素处的
+  深度一致支持率足够高时启用重投影。StreamVGGT confidence 只用于记录，不再
+  被误当作实例对应置信度。
 
 这两个 gate 必须分开。否则“跟踪分数高才允许 fallback”会使丢失恢复永远
 无法触发。
 
 当前 SAM3 predictor 的 `out_probs` 在传播阶段沿用初始检测分数，不是完整的
 逐帧 matching score。因此代码将“该实例 ID 是否仍有输出”与 `out_probs`
-组合成 presence proxy，并在 CSV 中保留该值。3D prior 还会和当前 pointmap
-做深度遮挡检查，避免被遮挡物体仅凭历史投影产生前景 mask。
+组合成 presence proxy，并在 CSV 中保留该值。3D prior 会要求历史点深度与
+当前 pointmap 深度双向接近；不再使用旧版只检查“历史点不在当前表面后方”的
+单向条件，避免物体离开后把更远的背景误判为当前实例。
 
 ## 控制实验
 

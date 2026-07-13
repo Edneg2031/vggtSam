@@ -36,6 +36,23 @@ class GateDecision:
     use_fallback: bool
     track_confidence: float
     update_geometry_confidence: float
-    fallback_geometry_confidence: float
+    fallback_geometry_support: float
     persistence: int
     reason: str
+
+
+@dataclass(frozen=True)
+class ProjectionResult:
+    mask: torch.Tensor
+    input_points: int
+    in_frame_points: int
+    depth_supported_points: int
+    depth_tested_points: int
+
+    @property
+    def projected_fraction(self) -> float:
+        return self.in_frame_points / max(self.input_points, 1)
+
+    @property
+    def depth_support_ratio(self) -> float:
+        return self.depth_supported_points / max(self.depth_tested_points, 1)
