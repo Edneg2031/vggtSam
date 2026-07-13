@@ -54,10 +54,13 @@ fusion:
 
 training:
   iterations: 700
-  lr: 0.0003
+  # Five-frame overfit uses a 10x-scaled version of 3AM's 2:1 merger/tracker
+  # learning-rate ratio. The encoders remain frozen.
+  lr: 0.0001
+  tracker_lr: 0.00005
   seed: 0
   amp: true
-  train_tracker: false
+  train_tracker: true
   focal_weight: 20.0
   dice_weight: 1.0
   presence_weight: 1.0

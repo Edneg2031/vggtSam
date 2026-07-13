@@ -87,6 +87,7 @@ class ExperimentConfig:
     shuffle_geometry: bool
     iterations: int
     lr: float
+    tracker_lr: float
     seed: int
     amp: bool
     train_tracker: bool
@@ -185,17 +186,27 @@ def run_experiment(config: ExperimentConfig) -> None:
         inject_levels=config.inject_levels,
         residual_init_std=config.residual_init_std,
     ).to(config.tracker_device)
-    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    fusion_trainable = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    tracker_trainable = []
     sam_tracker.requires_grad_(False)
     if config.train_tracker:
-        trainable.extend(enable_tracker_training(sam_tracker))
-    optimizer = torch.optim.AdamW(trainable, lr=config.lr)
+        tracker_trainable = enable_tracker_training(sam_tracker)
+    trainable = fusion_trainable + tracker_trainable
+    parameter_groups = [{"params": fusion_trainable, "lr": config.lr}]
+    if tracker_trainable:
+        parameter_groups.append(
+            {"params": tracker_trainable, "lr": config.tracker_lr}
+        )
+    optimizer = torch.optim.AdamW(parameter_groups)
     print(
         f"fusion={config.fusion_method} zero_geometry={config.zero_geometry} "
         f"shuffle_geometry={config.shuffle_geometry} "
         f"inject_levels={config.inject_levels} "
         f"residual_init_std={config.residual_init_std:g} "
         f"train_tracker={config.train_tracker} "
+        f"fusion_lr={config.lr:g} tracker_lr={config.tracker_lr:g} "
         f"trainable_parameters={sum(parameter.numel() for parameter in trainable)}"
     )
 
@@ -213,13 +224,21 @@ def run_experiment(config: ExperimentConfig) -> None:
     for step in range(0, config.iterations + 1):
         training_step = step > 0
         train_loss_value = 0.0
+        train_focal_value = float("nan")
+        train_dice_value = float("nan")
+        train_presence_value = float("nan")
         gradient_norm = 0.0
+        fusion_gradient_norm = 0.0
+        tracker_gradient_norm = 0.0
         residual_gradient_norm = 0.0
         if training_step:
             model.train()
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(config):
                 train_residuals = model(sam_fpn2, geometry_levels)
+                for residual in train_residuals:
+                    if residual.requires_grad:
+                        residual.retain_grad()
                 train_logits, train_aux = run_sam3_source_tracker_flow(
                     sam_tracker=sam_tracker,
                     sam_tracker_features=sam_features,
@@ -248,13 +267,10 @@ def run_experiment(config: ExperimentConfig) -> None:
                     + config.dice_weight * train_dice
                     + config.presence_weight * train_presence
                 )
-            if step == 1:
-                for residual in train_residuals:
-                    if residual.requires_grad:
-                        residual.retain_grad()
             train_loss.backward()
-            if step == 1:
-                residual_gradient_norm = retained_gradient_norm(train_residuals)
+            residual_gradient_norm = retained_gradient_norm(train_residuals)
+            fusion_gradient_norm = total_gradient_norm(fusion_trainable)
+            tracker_gradient_norm = total_gradient_norm(tracker_trainable)
             if config.gradient_clip > 0:
                 norm = torch.nn.utils.clip_grad_norm_(
                     trainable,
@@ -264,11 +280,14 @@ def run_experiment(config: ExperimentConfig) -> None:
             else:
                 gradient_norm = total_gradient_norm(trainable)
             if step == 1 and (
-                not np.isfinite(gradient_norm) or gradient_norm <= 1e-12
+                not np.isfinite(fusion_gradient_norm)
+                or fusion_gradient_norm <= 1e-12
+                or residual_gradient_norm <= 1e-12
             ):
                 raise RuntimeError(
                     "Fusion adapter received no usable gradient at step 1. "
-                    f"parameter_gradient_norm={gradient_norm}, "
+                    f"fusion_gradient_norm={fusion_gradient_norm}, "
+                    f"tracker_gradient_norm={tracker_gradient_norm}, "
                     f"residual_gradient_norm={residual_gradient_norm}, "
                     f"train_logits_requires_grad={train_logits.requires_grad}. "
                     "If residual_gradient_norm is zero, the gradient is blocked "
@@ -276,6 +295,9 @@ def run_experiment(config: ExperimentConfig) -> None:
                 )
             optimizer.step()
             train_loss_value = float(train_loss.detach().float().cpu())
+            train_focal_value = float(train_focal.detach().float().cpu())
+            train_dice_value = float(train_dice.detach().float().cpu())
+            train_presence_value = float(train_presence.detach().float().cpu())
 
         should_evaluate = (
             step == 0
@@ -330,6 +352,9 @@ def run_experiment(config: ExperimentConfig) -> None:
                     if training_step
                     else float(loss.detach().cpu())
                 ),
+                "train_focal": train_focal_value,
+                "train_dice": train_dice_value,
+                "train_presence": train_presence_value,
                 "focal": float(focal.detach().cpu()),
                 "dice": float(dice.detach().cpu()),
                 "presence": float(presence.detach().cpu()),
@@ -343,6 +368,8 @@ def run_experiment(config: ExperimentConfig) -> None:
                 "object_score_mean": float(object_scores.mean().detach().cpu()),
                 "residual_rms": residual_rms(residuals),
                 "gradient_norm": gradient_norm,
+                "fusion_gradient_norm": fusion_gradient_norm,
+                "tracker_gradient_norm": tracker_gradient_norm,
                 "residual_gradient_norm": residual_gradient_norm,
             }
             append_metrics(metrics_path, row)
@@ -351,14 +378,17 @@ def run_experiment(config: ExperimentConfig) -> None:
             print(
                 f"step={step} eval_loss={row['loss']:.4f} "
                 f"train_loss={row['train_loss']:.4f} "
-                f"focal={row['focal']:.4f} dice={row['dice']:.4f} "
-                f"presence={row['presence']:.4f} "
+                f"train_mask={row['train_focal']:.4f}/{row['train_dice']:.4f} "
+                f"train_presence={row['train_presence']:.4f} "
+                f"eval_mask={row['focal']:.4f}/{row['dice']:.4f} "
+                f"eval_presence={row['presence']:.4f} "
                 f"iou={row['mean_iou']:.4f} pos_iou={row['positive_iou']:.4f} "
                 f"cross_iou={row['cross_view_iou']:.4f} "
                 f"cross_recall={row['cross_view_recall']:.4f} "
                 f"present={present_count}/{len(sequence.frame_indices)} "
                 f"residual_rms={row['residual_rms']:.6f} "
-                f"grad_norm={gradient_norm:.6f} "
+                f"fusion_grad={fusion_gradient_norm:.6f} "
+                f"tracker_grad={tracker_gradient_norm:.6f} "
                 f"residual_grad={residual_gradient_norm:.6f}"
             )
         if step % config.visualize_every == 0 or step == config.iterations:
@@ -495,11 +525,11 @@ def extract_geometry_features(
         if levels[0].shape[0] < 2:
             raise ValueError("Geometry shuffling requires at least two frames.")
         permutation = torch.roll(
-            torch.arange(levels[0].shape[0]),
+            torch.arange(levels[0].shape[0], device=levels[0].device),
             shifts=1,
         )
         levels = [level.index_select(0, permutation) for level in levels]
-        print(f"StreamVGGT frame permutation={permutation.tolist()}")
+        print(f"StreamVGGT frame permutation={permutation.cpu().tolist()}")
     if config.fusion_method != "multilevel_cross_attention":
         levels = [levels[-1]]
     levels = [level.detach().cpu() for level in levels]
@@ -954,6 +984,9 @@ METRIC_FIELDS = [
     "step",
     "loss",
     "train_loss",
+    "train_focal",
+    "train_dice",
+    "train_presence",
     "focal",
     "dice",
     "presence",
@@ -967,6 +1000,8 @@ METRIC_FIELDS = [
     "object_score_mean",
     "residual_rms",
     "gradient_norm",
+    "fusion_gradient_norm",
+    "tracker_gradient_norm",
     "residual_gradient_norm",
 ]
 
@@ -998,6 +1033,24 @@ def plot_training_history(csv_path: Path, output_path: Path) -> None:
         steps,
         [float(row["train_loss"]) for row in rows],
         label="train total",
+    )
+    axes[0].plot(
+        steps,
+        [float(row["train_focal"]) for row in rows],
+        label="train focal",
+        linestyle="--",
+    )
+    axes[0].plot(
+        steps,
+        [float(row["train_dice"]) for row in rows],
+        label="train dice",
+        linestyle="--",
+    )
+    axes[0].plot(
+        steps,
+        [float(row["train_presence"]) for row in rows],
+        label="train presence",
+        linestyle="--",
     )
     axes[0].plot(steps, [float(row["focal"]) for row in rows], label="focal")
     axes[0].plot(steps, [float(row["dice"]) for row in rows], label="dice")
@@ -1098,7 +1151,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--direct-device")
     parser.add_argument("--zero-geometry", action="store_true")
     parser.add_argument("--shuffle-geometry", action="store_true")
-    parser.add_argument("--train-tracker", action="store_true")
+    parser.add_argument(
+        "--train-tracker",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--tracker-lr", type=float)
     parser.add_argument("--no-compare-direct", action="store_true")
     return parser.parse_args()
 
@@ -1116,6 +1174,7 @@ def apply_cli_overrides(raw: dict[str, Any], args: argparse.Namespace) -> None:
         ("frame_indices", "dataset", "frame_indices"),
         ("iterations", "training", "iterations"),
         ("lr", "training", "lr"),
+        ("tracker_lr", "training", "tracker_lr"),
         ("output_dir", "training", "output_dir"),
         ("tracker_device", "sam3", "tracker_device"),
         ("sam3_feature_device", "sam3", "feature_device"),
@@ -1130,8 +1189,8 @@ def apply_cli_overrides(raw: dict[str, Any], args: argparse.Namespace) -> None:
         raw.setdefault("fusion", {})["zero_geometry"] = True
     if args.shuffle_geometry:
         raw.setdefault("fusion", {})["shuffle_geometry"] = True
-    if args.train_tracker:
-        raw.setdefault("training", {})["train_tracker"] = True
+    if args.train_tracker is not None:
+        raw.setdefault("training", {})["train_tracker"] = args.train_tracker
     if args.no_compare_direct:
         raw.setdefault("sam3", {})["compare_direct"] = False
 
@@ -1191,6 +1250,7 @@ def build_config(raw: dict[str, Any]) -> ExperimentConfig:
         shuffle_geometry=bool(fusion.get("shuffle_geometry", False)),
         iterations=int(training.get("iterations", 700)),
         lr=float(training.get("lr", 3e-4)),
+        tracker_lr=float(training.get("tracker_lr", 5e-5)),
         seed=int(training.get("seed", 0)),
         amp=bool(training.get("amp", True)),
         train_tracker=bool(training.get("train_tracker", False)),

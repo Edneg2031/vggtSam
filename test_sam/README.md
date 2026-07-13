@@ -76,7 +76,7 @@ residual 输出层默认使用标准差 `1e-4` 的小初始化。精确零初始
 - 后续帧：完整经过 SAM3 tracker memory、object-presence gate 和 mask decoder。
 - mask：focal loss + Dice loss。
 - presence：逐帧监督目标是否可见，对应 3AM/SAM 的 occlusion/object-score 训练。
-- 默认只训练 fusion adapter；`--train-tracker` 额外训练 SAM3 memory attention 和 mask decoder，接近 3AM 的训练范围。
+- 默认训练 fusion adapter、SAM3 memory attention 和 mask decoder，与 3AM 的可训练范围一致；SAM3/StreamVGGT encoder 保持冻结。`--no-train-tracker` 可恢复只训练 fusion adapter 的旧对照。
 
 训练 forward 使用 GT visibility 选择 SAM3 的可导 mask 分支，避免源码的硬 object gate 把漏检帧 mask 固定为 `-1024` 后截断梯度。CSV、日志和可视化中的跨视角指标来自独立的无 GT 推理 forward，不使用 teacher forcing。
 
