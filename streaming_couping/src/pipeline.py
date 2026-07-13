@@ -41,6 +41,7 @@ def main() -> None:
             "geometry_device": args.geometry_device,
             "geometry_modes": args.geometry_modes,
             "fallback_prompt_mode": args.fallback_prompt_mode,
+            "memory_writeback": args.memory_writeback,
             "output_dir": args.output_dir,
         }.items()
         if value is not None
@@ -123,6 +124,56 @@ def run_experiment(config: ExperimentConfig) -> None:
             sam3=sam3,
             mode=mode,
         )
+        memory_masks = tracking.masks
+        memory_recovery_idx = None
+        memory_obj_id = tracking.selected_obj_id
+        if config.memory_writeback and mode != "zero":
+            memory_recovery_idx = next(
+                (
+                    index
+                    for index, row in enumerate(result["rows"])
+                    if row["use_fallback"] and result["final_masks"][index].any()
+                ),
+                None,
+            )
+            if memory_recovery_idx is not None:
+                memory_tracking = sam3.track_with_memory_writeback(
+                    sequence.image_paths,
+                    prompt=sequence.label,
+                    output_size=config.output_size,
+                    reference_frame_idx=sequence.reference_frame_idx,
+                    reference_mask=target_masks[sequence.reference_frame_idx],
+                    recovery_frame_idx=memory_recovery_idx,
+                    recovery_mask=result["final_masks"][memory_recovery_idx],
+                )
+                memory_masks = memory_tracking.masks
+                memory_obj_id = memory_tracking.selected_obj_id
+        memory_metrics = summarize_masks(
+            memory_masks,
+            target_masks,
+            reference_frame_idx=sequence.reference_frame_idx,
+        )
+        original_future_metrics = summarize_visible_after(
+            tracking.masks,
+            target_masks,
+            recovery_frame_idx=memory_recovery_idx,
+        )
+        bridge_future_metrics = summarize_visible_after(
+            result["final_masks"],
+            target_masks,
+            recovery_frame_idx=memory_recovery_idx,
+        )
+        memory_future_metrics = summarize_visible_after(
+            memory_masks,
+            target_masks,
+            recovery_frame_idx=memory_recovery_idx,
+        )
+        for index, row in enumerate(result["rows"]):
+            row["memory_iou"] = binary_iou(memory_masks[index], target_masks[index])
+            row["is_memory_recovery_frame"] = int(index == memory_recovery_idx)
+            row["after_memory_recovery"] = int(
+                memory_recovery_idx is not None and index > memory_recovery_idx
+            )
         mode_dir = config.output_dir / mode
         mode_dir.mkdir(parents=True, exist_ok=True)
         _write_csv(mode_dir / "frame_metrics.csv", result["rows"])
@@ -138,11 +189,49 @@ def run_experiment(config: ExperimentConfig) -> None:
             output_size=config.output_size,
             mode=mode,
         )
+        if config.memory_writeback and mode != "zero":
+            _save_report(
+                mode_dir / "memory_tracking_report.png",
+                image_paths=sequence.image_paths,
+                frame_indices=sequence.frame_indices,
+                target_masks=target_masks,
+                original_masks=tracking.masks,
+                candidates=result["candidates"],
+                final_masks=memory_masks,
+                rows=result["rows"],
+                output_size=config.output_size,
+                mode=mode,
+                final_label="memory writeback",
+                final_iou_key="memory_iou",
+            )
         summary = {
             "mode": mode,
             "fallback_prompt_mode": config.fallback_prompt_mode,
             **{f"sam3_{key}": value for key, value in original_metrics.items()},
             **{f"bridge_{key}": value for key, value in result["metrics"].items()},
+            **{f"memory_{key}": value for key, value in memory_metrics.items()},
+            **{
+                f"sam3_post_recovery_{key}": value
+                for key, value in original_future_metrics.items()
+            },
+            **{
+                f"bridge_post_recovery_{key}": value
+                for key, value in bridge_future_metrics.items()
+            },
+            **{
+                f"memory_post_recovery_{key}": value
+                for key, value in memory_future_metrics.items()
+            },
+            "memory_writeback": int(config.memory_writeback),
+            "memory_recovery_sequence_index": (
+                memory_recovery_idx if memory_recovery_idx is not None else -1
+            ),
+            "memory_recovery_frame_index": (
+                sequence.frame_indices[memory_recovery_idx]
+                if memory_recovery_idx is not None
+                else -1
+            ),
+            "memory_obj_id": memory_obj_id if memory_obj_id is not None else -1,
             "accepted_candidates": sum(
                 int(candidate.accepted) for candidate in result["candidates"]
             ),
@@ -154,7 +243,13 @@ def run_experiment(config: ExperimentConfig) -> None:
             f"mode={mode:<8} bridge_cross_iou={result['metrics']['cross_view_iou']:.4f} "
             f"recall={result['metrics']['cross_view_recall']:.4f} "
             f"candidates={summary['accepted_candidates']} "
-            f"fallbacks={summary['fallback_frames']}"
+            f"fallbacks={summary['fallback_frames']} "
+            f"memory_iou={memory_metrics['cross_view_iou']:.4f} "
+            f"memory_recovery={summary['memory_recovery_frame_index']} "
+            f"post_recovery="
+            f"{original_future_metrics['iou']:.4f}/"
+            f"{bridge_future_metrics['iou']:.4f}/"
+            f"{memory_future_metrics['iou']:.4f}"
         )
 
     _write_csv(config.output_dir / "summary.csv", summaries)
@@ -363,6 +458,35 @@ def summarize_masks(
     }
 
 
+def summarize_visible_after(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    recovery_frame_idx: int | None,
+) -> dict[str, float | int]:
+    """Measure future visible frames without counting the recovery mask itself."""
+
+    if recovery_frame_idx is None:
+        return {"iou": 0.0, "recall": 0.0, "visible_frames": 0}
+    frame_indices = torch.arange(len(target))
+    visible = target.flatten(1).any(dim=1)
+    selected = visible & (frame_indices > int(recovery_frame_idx))
+    if not selected.any():
+        return {"iou": 0.0, "recall": 0.0, "visible_frames": 0}
+    ious = torch.tensor(
+        [
+            binary_iou(prediction[index], target[index])
+            for index in selected.nonzero(as_tuple=False).flatten().tolist()
+        ],
+        dtype=torch.float32,
+    )
+    return {
+        "iou": float(ious.mean()),
+        "recall": float((ious >= 0.5).float().mean()),
+        "visible_frames": int(selected.sum()),
+    }
+
+
 def _geometry_permutation(
     num_frames: int,
     *,
@@ -434,12 +558,14 @@ def _save_report(
     rows: list[dict],
     output_size: tuple[int, int],
     mode: str,
+    final_label: str = "bridge final",
+    final_iou_key: str = "final_iou",
 ) -> None:
     height, width = output_size
     header = 30
     columns = 5
     canvas = Image.new("RGB", (columns * width, len(image_paths) * (height + header)), "white")
-    labels = ("RGB", "GT", "SAM3 original", "geometry candidate", "bridge final")
+    labels = ("RGB", "GT", "SAM3 original", "geometry candidate", final_label)
     colors = ((0, 0, 0), (0, 220, 70), (230, 55, 55), (255, 190, 0), (45, 110, 255))
     for row_idx, image_path in enumerate(image_paths):
         with Image.open(image_path) as source:
@@ -464,7 +590,7 @@ def _save_report(
                     f"accepted={rows[row_idx]['candidate_accepted']}"
                 )
             if column == 4:
-                suffix = f" IoU={rows[row_idx]['final_iou']:.3f}"
+                suffix = f" IoU={rows[row_idx][final_iou_key]:.3f}"
             draw.text((column * width + 5, y + 7), label + suffix, fill=colors[column])
     ImageDraw.Draw(canvas).text(
         (5, 2),
@@ -530,6 +656,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fallback-prompt-mode",
         choices=("box", "point", "box_point"),
+    )
+    parser.add_argument(
+        "--memory-writeback",
+        action=argparse.BooleanOptionalAction,
+        default=None,
     )
     parser.add_argument("--output-dir", type=Path)
     return parser.parse_args()

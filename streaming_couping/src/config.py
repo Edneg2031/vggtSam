@@ -51,6 +51,7 @@ class ExperimentConfig:
     fallback_on_missing_mask: bool
     clip_refined_to_candidate: bool
     fallback_prompt_mode: str
+    memory_writeback: bool
     output_dir: Path
 
 
@@ -136,6 +137,12 @@ def load_config(
             bridge.get("clip_refined_to_candidate", False)
         ),
         fallback_prompt_mode=fallback_prompt_mode,
+        memory_writeback=bool(
+            overrides.get(
+                "memory_writeback",
+                bridge.get("memory_writeback", False),
+            )
+        ),
         output_dir=_path(overrides.get("output_dir", raw.get("output", {}).get("dir"))),
     )
 

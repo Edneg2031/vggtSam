@@ -28,6 +28,8 @@ bridge:
   geometry_modes: [zero, aligned, shuffled]
   tracker_low_score: 0.5
   fallback_on_missing_mask: true
+  # Evaluate one geometry recovery written into the original SAM3 memory.
+  memory_writeback: false
   # Geometry is a localization prompt, not a hard final-mask boundary.
   clip_refined_to_candidate: false
   max_points_per_observation: 8000

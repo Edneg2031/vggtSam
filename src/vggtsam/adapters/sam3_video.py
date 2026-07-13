@@ -400,13 +400,16 @@ def parse_cuda_device_index(device: str) -> int:
 
 
 def materialize_video_dir(image_paths: Sequence[str | Path], output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.chmod(0o755)
     for idx, image_path in enumerate(image_paths):
         src = Path(image_path).expanduser().resolve()
         dst = output_dir / f"{idx:05d}.jpg"
-        try:
-            os.symlink(src, dst)
-        except OSError:
-            shutil.copyfile(src, dst)
+        # SAM3 may load frames in worker processes. A real, world-readable copy
+        # avoids permission failures caused by symlinks into protected NAS trees
+        # or TemporaryDirectory's default owner-only permissions.
+        shutil.copyfile(src, dst)
+        dst.chmod(0o644)
 
 
 def normalize_reference_mask(
