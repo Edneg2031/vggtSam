@@ -5,6 +5,7 @@ CONFIG="${CONFIG:-test_sam/config.yaml}"
 ITERATIONS="${ITERATIONS:-700}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/test_sam_ablation}"
 FULL_ABLATIONS="${FULL_ABLATIONS:-0}"
+SKIP_SAM_ONLY="${SKIP_SAM_ONLY:-0}"
 
 export PYTHONPATH="src:.:${PYTHONPATH:-}"
 mkdir -p "${OUTPUT_ROOT}"
@@ -35,7 +36,11 @@ python test_sam/test_fusion_shapes.py
 
 # Original SAM3 is evaluated in this first run. It is deterministic for the
 # fixed sequence, so later runs skip loading a duplicate comparison model.
-run_ablation "01_sam_only" "sam_only"
+if [[ "${SKIP_SAM_ONLY}" != "1" ]]; then
+  run_ablation "01_sam_only" "sam_only"
+else
+  echo "Skipping 01_sam_only; starting from geometry controls."
+fi
 
 # Same graph and trainable capacity as 03, but geometry values are all zero.
 run_ablation \

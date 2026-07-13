@@ -111,4 +111,11 @@ ITERATIONS=2 OUTPUT_ROOT=outputs/test_sam_ablation_smoke \
   bash test_sam/run_all_ablations.sh
 ```
 
+已有 SAM-only 结果、希望直接从 geometry 对照开始时使用：
+
+```bash
+SKIP_SAM_ONLY=1 FULL_ABLATIONS=1 \
+  bash test_sam/run_all_ablations.sh
+```
+
 所有实验顺序执行，日志保存在各实验目录的 `run.log`，最终汇总写入 `ablation_summary.csv`。

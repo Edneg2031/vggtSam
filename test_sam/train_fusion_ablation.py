@@ -580,20 +580,43 @@ def run_direct_sam3(
 
 
 def enable_tracker_training(sam_tracker: torch.nn.Module) -> list[torch.nn.Parameter]:
-    modules = []
-    for name in ("memory_attention", "sam_mask_decoder"):
-        module = getattr(sam_tracker, name, None)
-        if module is None:
-            raise RuntimeError(f"SAM3 tracker is missing trainable module {name!r}.")
-        module.requires_grad_(True)
-        modules.append(module)
-    parameters = [
-        parameter
-        for module in modules
-        for parameter in module.parameters()
-        if parameter.requires_grad
+    memory_name = next(
+        (
+            name
+            for name in ("memory_attention", "transformer")
+            if isinstance(getattr(sam_tracker, name, None), torch.nn.Module)
+        ),
+        None,
+    )
+    if memory_name is None:
+        raise RuntimeError(
+            "SAM tracker exposes neither 'memory_attention' nor 'transformer'. "
+            f"Available child modules: {list(dict(sam_tracker.named_children()))}"
+        )
+    decoder_name = "sam_mask_decoder"
+    decoder = getattr(sam_tracker, decoder_name, None)
+    if not isinstance(decoder, torch.nn.Module):
+        raise RuntimeError(
+            f"SAM tracker is missing trainable module {decoder_name!r}."
+        )
+
+    selected = [
+        (memory_name, getattr(sam_tracker, memory_name)),
+        (decoder_name, decoder),
     ]
-    print("train_tracker enables SAM3 memory_attention + sam_mask_decoder.")
+    parameters = []
+    parameter_ids = set()
+    for _, module in selected:
+        module.requires_grad_(True)
+        for parameter in module.parameters():
+            if parameter.requires_grad and id(parameter) not in parameter_ids:
+                parameters.append(parameter)
+                parameter_ids.add(id(parameter))
+    print(
+        "train_tracker enables "
+        + " + ".join(f"SAM3 {name}" for name, _ in selected)
+        + "."
+    )
     return parameters
 
 
