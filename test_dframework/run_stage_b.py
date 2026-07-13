@@ -137,6 +137,7 @@ def run(config: ExperimentConfig) -> None:
             **{f"sam3_{key}": value for key, value in original_metrics.items()},
             **{f"bridge_{key}": value for key, value in result["metrics"].items()},
             "fallback_frames": sum(int(row["use_fallback"]) for row in result["rows"]),
+            "map_initializations": sum(int(row["initialize_map"]) for row in result["rows"]),
             "map_updates": sum(int(row["update_map"]) for row in result["rows"]),
         }
         summaries.append(summary)
@@ -196,10 +197,11 @@ def evaluate_mode(
             update_stream_mask,
             max_points=config.max_points_per_observation,
         )
-        frame_geometry_confidence = (
+        update_geometry_confidence = (
             region_confidence if update_stream_mask.any() else float(confidence.mean())
         )
 
+        initialized_map = False
         if is_reference and mode != "zero":
             object_map.update(
                 instance_id=sequence.instance_id,
@@ -210,6 +212,7 @@ def evaluate_mode(
                 frame_idx=frame_idx,
             )
             persistence = 1
+            initialized_map = object_map.has(sequence.instance_id)
 
         entry = object_map.get(sequence.instance_id)
         if entry is not None and mode != "zero":
@@ -227,9 +230,26 @@ def evaluate_mode(
                 occlusion_relative_tolerance=config.occlusion_relative_tolerance,
             ).cpu()
 
+        if priors[frame_idx].any():
+            prior_stream_mask = output_mask_to_stream(
+                priors[frame_idx],
+                source_size=source_size,
+                processed_size=geometry.processed_size,
+                image_mode=config.image_mode,
+            )
+            _, _, fallback_geometry_confidence, _ = mask_geometry_statistics(
+                points,
+                confidence,
+                prior_stream_mask,
+                max_points=config.max_points_per_observation,
+            )
+        else:
+            fallback_geometry_confidence = 0.0
+
         decision = decide_gates(
             track_confidence=tracker_score,
-            geometry_confidence=frame_geometry_confidence,
+            update_geometry_confidence=update_geometry_confidence,
+            fallback_geometry_confidence=fallback_geometry_confidence,
             persistence=persistence,
             has_object_map=entry is not None and bool(priors[frame_idx].any()),
             config=config.gates,
@@ -253,6 +273,7 @@ def evaluate_mode(
         gate_reason = decision.reason
         if decision.update_map and not geometrically_consistent:
             gate_reason = "reject map update: tracker mask disagrees with 3D prior"
+        updated_map = False
         if (
             not is_reference
             and decision.update_map
@@ -269,6 +290,7 @@ def evaluate_mode(
                 frame_idx=frame_idx,
             )
             persistence += 1
+            updated_map = True
 
         rows.append(
             {
@@ -277,12 +299,14 @@ def evaluate_mode(
                 "geometry_index": geometry_idx,
                 "gt_visible": int(target_masks[frame_idx].any()),
                 "sam3_score": tracker_score,
-                "geometry_confidence": frame_geometry_confidence,
+                "update_geometry_confidence": update_geometry_confidence,
+                "fallback_geometry_confidence": fallback_geometry_confidence,
                 "sam3_iou": binary_iou(tracker_mask, target_masks[frame_idx]),
                 "prior_iou": binary_iou(priors[frame_idx], target_masks[frame_idx]),
                 "bridge_iou": binary_iou(bridged[frame_idx], target_masks[frame_idx]),
                 "prior_tracker_iou": prior_consistency_iou,
-                "update_map": int(decision.update_map and geometrically_consistent),
+                "initialize_map": int(initialized_map),
+                "update_map": int(updated_map),
                 "use_fallback": int(decision.use_fallback),
                 "map_points": int(entry.points.shape[0]) if entry is not None else 0,
                 "gate_reason": gate_reason,

@@ -35,7 +35,7 @@ class GateDecision:
     update_map: bool
     use_fallback: bool
     track_confidence: float
-    geometry_confidence: float
+    update_geometry_confidence: float
+    fallback_geometry_confidence: float
     persistence: int
     reason: str
-

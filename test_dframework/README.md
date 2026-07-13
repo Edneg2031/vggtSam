@@ -28,9 +28,10 @@ GT 只承担两件事：在参考帧生成给 SAM3 的 box prompt、所有帧的
 
 ## 门控
 
-- `update_map`：SAM3 presence proxy、区域几何置信度、持续观测次数以及
+- `update_map`：SAM3 presence proxy、SAM3 mask 区域的几何置信度、持续观测次数以及
   当前 mask 与历史 3D 投影的一致性都可靠时更新地图。
-- `use_fallback`：SAM3 分数低、但历史地图和当前几何可靠时启用 3D 重投影。
+- `use_fallback`：SAM3 分数低、但历史 3D prior 投影区域内的几何置信度可靠时
+  启用重投影。它不再使用整帧平均置信度。
 
 这两个 gate 必须分开。否则“跟踪分数高才允许 fallback”会使丢失恢复永远
 无法触发。
