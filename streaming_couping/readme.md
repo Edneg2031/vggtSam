@@ -1,127 +1,74 @@
-# Streaming Coupling Baseline
+# Streaming Coupling Paired Memory Test
 
-这是一个用于验证 **StreamVGGT 几何是否能帮助 SAM3 在大视角重访时找回实例** 的最小实验，不是完整训练框架。
+该实验只验证一个变量：**几何修正结果是否写入 SAM3 memory**。
+SAM3、StreamVGGT 均冻结，不创建单帧 SAM3 session，不重新检测实例。
+两条分支使用独立但相同初始化的原视频 session，并在恢复帧前后采用相同的
+分段传播时序；代码会检查恢复前输出一致，避免共享状态或执行顺序污染对照。
 
-## 数据流
+## 共同数据流
 
 ```text
-RGB 序列 + reference frame GT instance mask
+RGB 序列 + reference GT instance mask
         |                         |
         v                         v
-Frozen SAM3 video tracker   Frozen StreamVGGT (causal cache)
-原始跨帧 mask              world pointmap + camera + confidence
+SAM3 原视频 session        StreamVGGT causal geometry
+固定 obj_id                 reference instance world points
         |                         |
-        |                    reference mask 内点
+        |                  投影并与当前 pointmap 检查
         |                         v
-        |                  object world-point map
-        |                         |
-        |             投影到当前帧 + 当前 pointmap 支持检查
-        |                         v
-        |                 coarse geometry box
-        |                         |
-        +---- tracker 丢失/低分时---+
-                                  v
-                    SAM3 geometry-prompt re-segmentation
-                                  |
-                                  v
-                         bridge final instance mask
+        +-----------> 3 个几何支持正点
+                              |
+                              v
+             在原 session 内修正同一个 SAM3 obj_id
+                              |
+                              v
+                    共同 recovery mask
 ```
 
-只有 reference frame 的 GT mask 参与初始化；其他帧 GT 只用于评估。几何投影不会直接作为最终 mask，而是作为 SAM3 的当前帧提示。
-这里的当前帧 pointmap 是 frozen StreamVGGT 从当前 RGB 预测的输出，不是预处理数据中的 GT pointmap。历史点与当前点的距离检查完全在 StreamVGGT 的共享重建坐标系中完成。
-默认不会把 SAM3 输出硬裁剪到候选框内，因为 reference frame 可能只观察到物体的一部分。CSV 同时记录原始 refinement 与裁剪版本的 IoU，供消融比较。
-reference frame 用于初始化，不会为自己生成 geometry candidate。
+只有 reference GT mask 用于初始化。其他帧 GT 只计算指标，不参与候选生成、
+恢复帧选择或 SAM3 修正。
 
-## 实现对应
+## 唯一消融变量
 
-- SAM3 原始视频追踪：`src/backbones/sam3_wrapper.py`
-- StreamVGGT 流式几何：`src/backbones/streamvggt_wrapper.py`
-- reference 物体点缓存：`src/aggregation/point_map_fusion.py`
-- 重访候选框生成：`src/aggregation/mine_revisit_segments.py`
-- fallback 门控：`src/bridge/gating.py`
-- 三组控制、指标与可视化：`src/pipeline.py`
+恢复帧之前，两条分支完全相同；恢复帧也使用同一组点和逐像素相同的 mask。
 
-## 三组控制
+- `no_memory`：恢复帧显示修正 mask，但不改变未来 tracker state；未来帧使用
+  未写回修正的原 SAM3 轨迹。
+- `memory`：将同一个修正结果通过 SAM3 原生 memory encoder 写入同一
+  `obj_id`，未来帧从修正后的 memory 继续传播。
 
-- `zero`：不使用 StreamVGGT，结果就是原始 SAM3。
-- `aligned`：使用与当前 RGB 帧对齐的 StreamVGGT 输出。
-- `shuffled`：保留 reference 几何，打乱其余帧几何。它用于检查提升是否真的依赖时序对齐。
-
-有效的几何贡献至少应满足：
+代码会检查 recovery frame 的两份 mask 是否逐像素相同。判断 memory 效果只看：
 
 ```text
-aligned > zero
-aligned > shuffled
+no_memory_post_recovery_iou
+memory_post_recovery_iou
 ```
 
-仅有 `aligned > zero` 不够，因为错误几何也可能提供一个宽松的 box。
-
-## SAM3 提示消融
-
-候选通过几何门控后，可以用三种方式提示当前帧 SAM3：
-
-- `box`：文本 + 几何候选框，当前默认基线。
-- `point`：只用几何支持区域中的 3 个正点，绕开候选框边界。
-- `box_point`：先用文本 + 框选择实例，再用几何正点细化同一实例。
-
-三者都只使用 StreamVGGT 支持点，不读取当前帧 GT。可通过
-`--fallback-prompt-mode` 选择；完整命令见 `commands.txt`。
-
-## Memory 写回消融
-
-几何定位有效后，按三个阶段比较：
-
-- `B0 / sam3_*`：原始 SAM3 视频追踪。
-- `B1 / bridge_*`：SAM3 丢失时，用几何提示做当前帧无状态恢复；不更新原会话。
-- `B2 / memory_*`：只追踪到 B1 的第一次有效恢复，用同一 `obj_id` 写回同一个 SAM3 session；该交互路径运行 SAM3 memory encoder，再继续处理未来帧。后续帧只由 SAM3 memory 追踪，不再使用几何 fallback，也不会提前读取未来帧状态。
-
-为避免把提示信息损失误判成 memory 效果，写回支持两个严格对照：
-
-- `--memory-writeback-prompt-mode mask`：将完整 B1 恢复 mask 送入 SAM3 原生 `add_new_mask` 和 memory encoder。恢复帧的 B1/B2 mask 完全相同，只比较后续帧。
-- `--memory-writeback-prompt-mode matched_points`：要求同时使用 `--fallback-prompt-mode point`；B1/B2 都从同一个几何支持区域提取相同 3 个正点。
-
-完整 mask 写回同时复用 SAM3 点修正路径的实例状态更新：恢复同一 `obj_id`
-的 tracker score、解除 suppression 并确认 masklet，避免 memory 已更新但输出仍被高层门控隐藏。
-
-运行时加 `--memory-writeback`。判断 memory 是否有效，应重点查看
-`sam3_post_recovery_iou`、`bridge_post_recovery_iou` 和
-`memory_post_recovery_iou`。这些指标只统计恢复帧之后目标真实可见的帧，
-不会把恢复帧本身计入收益。
-
 ## 运行
+
+完整服务器命令见 `streaming_couping/commands.txt`。入口为：
 
 ```bash
 PYTHONPATH=src:. python -m streaming_couping.scripts.run_bridge \
   --config streaming_couping/configs/default.yaml
 ```
 
-旧版预处理 manifest 的 RGB 仍指向原始 NAS。若原图权限不可读，先用
-`scripts/cache_scannetpp_rgb.py` 生成 processed RGB cache 和新 manifest，
-再通过 `--manifest` 传入。`--allow-summary-fallback` 只适合调试：它从
-已有 summary 的左侧 RGB 面板恢复图像，包含顶部标题条，不能作为最终定量输入。
-
-覆盖实验对象：
-
-```bash
-PYTHONPATH=src:. python -m streaming_couping.scripts.run_bridge \
-  --config streaming_couping/configs/default.yaml \
-  --scene-id 00a231a370 \
-  --instance-id 37 \
-  --frame-indices 133 162 520 566 477 \
-  --sam3-device cuda:3 \
-  --geometry-device cuda:1 \
-  --output-dir outputs/streaming_couping_inst37
-```
+旧 manifest 的 RGB 若仍指向不可读 NAS，先运行 `commands.txt` 中的
+`scripts/cache_scannetpp_rgb.py`。`--allow-summary-fallback` 仅适合调试，
+不能用于最终定量结果。
 
 ## 输出
 
-- `summary.csv`：SAM3 与 bridge 的跨视角 IoU、召回率和 absent false-positive ratio。
-- `<mode>/frame_metrics.csv`：每帧投影点数、3D 支持率、candidate/fallback/final IoU 和门控原因。
-- `<mode>/tracking_report.png`：`RGB | GT | SAM3 original | geometry candidate | bridge final`。候选图中黄色是原始投影点，绿色是当前 pointmap 支持的投影点，矩形是送给 SAM3 的候选框。
-- `<mode>/memory_tracking_report.png`：`B2` 写回后同一实例 ID 的 SAM3 memory 追踪结果。报告和 CSV 会记录实际写回提示模式。
+- `summary.csv`：no-memory、memory 的总体及恢复后指标。
+- `frame_metrics.csv`：逐帧候选质量、分支 IoU、score 与恢复帧标记。
+- `paired_memory_report.png`：同图逐帧比较 no-memory 与 memory。
+- `resolved_config.json`：实际运行配置。
+
+`summary.csv` 还会显式记录 `same_obj_id=1`、`redetection_used=0`、
+`paired_causal_split=1`，便于检查对照条件。
 
 ## 当前边界
 
-- SAM3 和 StreamVGGT 均冻结，没有训练 adapter。
-- 默认 fallback 是当前帧无状态重分割；只有显式传入 `--memory-writeback` 才运行一次同会话 memory 写回。
-- 当前只验证 `geometry -> tracking`。点云聚合、相机回环优化、双向联合训练均未宣称完成。
+- 当前只测试一次 aligned geometry correction 对后续 memory 的影响。
+- 实例身份始终由同一个 SAM3 session 和同一个 `obj_id` 维持。
+- 不包含重新检测、点云地图更新、相机优化或联合训练。

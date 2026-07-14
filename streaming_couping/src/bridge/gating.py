@@ -1,4 +1,4 @@
-"""Decision gates for geometry-assisted SAM3 re-segmentation."""
+"""Decision gates for geometry-assisted same-instance SAM3 correction."""
 
 from __future__ import annotations
 
@@ -10,24 +10,19 @@ from ..types import RevisitCandidate
 
 
 @dataclass(frozen=True)
-class BridgeDecision:
-    use_tracker: bool
-    use_fallback: bool
-    update_map: bool
+class CorrectionDecision:
+    use_correction: bool
     reason: str
 
 
-def decide_bridge_action(
+def decide_correction(
     *,
     tracker_mask: torch.Tensor,
     tracker_score: float,
     candidate: RevisitCandidate,
     tracker_low_score: float,
     fallback_on_missing_mask: bool,
-    allow_map_update: bool,
-    tracker_candidate_iou: float,
-    map_update_min_iou: float,
-) -> BridgeDecision:
+) -> CorrectionDecision:
     tracker_present = bool(tracker_mask.any())
     tracker_reliable = tracker_present and float(tracker_score) >= float(
         tracker_low_score
@@ -35,29 +30,21 @@ def decide_bridge_action(
     tracker_missing = not tracker_present
     tracker_weak = tracker_missing or not tracker_reliable
 
-    use_fallback = (
+    use_correction = (
         candidate.accepted
         and tracker_weak
         and (fallback_on_missing_mask or not tracker_missing)
     )
-    update_map = (
-        allow_map_update
-        and tracker_reliable
-        and candidate.accepted
-        and tracker_candidate_iou >= float(map_update_min_iou)
-    )
-    if use_fallback:
+    if use_correction:
         reason = "weak/missing tracker mask: refine accepted geometry candidate"
     elif tracker_reliable:
         reason = "reliable SAM3 mask"
     elif not candidate.accepted:
         reason = f"weak tracker; geometry rejected: {candidate.reason}"
     else:
-        reason = "weak tracker; fallback disabled"
-    return BridgeDecision(
-        use_tracker=not use_fallback,
-        use_fallback=use_fallback,
-        update_map=update_map,
+        reason = "weak tracker; correction disabled"
+    return CorrectionDecision(
+        use_correction=use_correction,
         reason=reason,
     )
 

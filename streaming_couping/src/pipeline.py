@@ -1,8 +1,8 @@
-"""Sequence-level explicit geometry bridge evaluation.
+"""Paired same-instance test for geometry correction with/without SAM3 memory.
 
-The first-frame GT mask initializes SAM3 and the object point map. Later GT
-masks are used for metrics only. Geometry produces coarse candidate boxes;
-SAM3 remains responsible for dense segmentation.
+The reference GT mask initializes SAM3 and the object point map. Later GT masks
+are metrics-only. Both branches share one correction mask; only memory writeback
+differs after recovery.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from .aggregation.mine_revisit_segments import mine_revisit_candidate
 from .aggregation.point_map_fusion import ObjectPointMap, sample_masked_observation
 from .backbones.sam3_wrapper import SAM3Wrapper
 from .backbones.streamvggt_wrapper import StreamVGGTWrapper
-from .bridge.gating import binary_iou, decide_bridge_action
+from .bridge.gating import binary_iou, decide_correction
 from .config import ExperimentConfig, load_config
 from .types import GeometrySequence, RevisitCandidate
 
@@ -40,10 +40,6 @@ def main() -> None:
             "frame_indices": args.frame_indices,
             "sam3_device": args.sam3_device,
             "geometry_device": args.geometry_device,
-            "geometry_modes": args.geometry_modes,
-            "fallback_prompt_mode": args.fallback_prompt_mode,
-            "memory_writeback": args.memory_writeback,
-            "memory_writeback_prompt_mode": args.memory_writeback_prompt_mode,
             "output_dir": args.output_dir,
         }.items()
         if value is not None
@@ -92,251 +88,207 @@ def run_experiment(config: ExperimentConfig) -> None:
         reference_frame_idx=sequence.reference_frame_idx,
         reference_mask=target_masks[sequence.reference_frame_idx],
     )
-    original_metrics = summarize_masks(
-        tracking.masks,
+    print(f"recovery-selection SAM3 obj_id={tracking.selected_obj_id}")
+
+    print("loading and running frozen StreamVGGT with causal caches...")
+    geometry = StreamVGGTWrapper(
+        repo_path=config.streamvggt_repo,
+        checkpoint_path=config.streamvggt_checkpoint,
+        device=config.geometry_device,
+        image_mode=config.image_mode,
+        streaming_cache=config.streaming_cache,
+    ).load().extract(sequence.image_paths)
+
+    result = _mine_recovery(
+        config,
+        sequence=sequence,
+        target_masks=target_masks,
+        original_masks=tracking.masks,
+        original_scores=tracking.scores,
+        geometry=geometry,
+    )
+    recovery_idx = next(
+        (
+            index
+            for index, row in enumerate(result["rows"])
+            if row["use_correction"]
+            and result["candidates"][index].supported_mask.any()
+        ),
+        None,
+    )
+    if recovery_idx is None:
+        raise RuntimeError(
+            "No accepted aligned-geometry recovery was found for the paired memory test."
+        )
+
+    no_memory_tracking = sam3.track_split_without_memory(
+        sequence.image_paths,
+        prompt=sequence.label,
+        output_size=config.output_size,
+        reference_frame_idx=sequence.reference_frame_idx,
+        reference_mask=target_masks[sequence.reference_frame_idx],
+        split_frame_idx=recovery_idx,
+    )
+    memory_tracking = sam3.track_with_geometry_point_memory(
+        sequence.image_paths,
+        prompt=sequence.label,
+        output_size=config.output_size,
+        reference_frame_idx=sequence.reference_frame_idx,
+        reference_mask=target_masks[sequence.reference_frame_idx],
+        recovery_frame_idx=recovery_idx,
+        point_prompt_mask=result["candidates"][recovery_idx].supported_mask,
+    )
+    if memory_tracking.selected_obj_id != no_memory_tracking.selected_obj_id:
+        raise RuntimeError(
+            "SAM3 obj_id changed between paired branches: "
+            f"{no_memory_tracking.selected_obj_id} != "
+            f"{memory_tracking.selected_obj_id}."
+        )
+    for index in range(recovery_idx):
+        if not torch.equal(
+            no_memory_tracking.masks[index], memory_tracking.masks[index]
+        ):
+            raise RuntimeError(
+                f"Paired SAM3 sessions diverged before recovery at frame {index}."
+            )
+    corrected_mask = memory_tracking.masks[recovery_idx].clone()
+    no_memory_masks = no_memory_tracking.masks.clone()
+    no_memory_scores = no_memory_tracking.scores.clone()
+    no_memory_masks[recovery_idx] = corrected_mask
+    no_memory_scores[recovery_idx] = 1.0
+    if not torch.equal(no_memory_masks[recovery_idx], memory_tracking.masks[recovery_idx]):
+        raise RuntimeError("Paired branches do not share the same recovery mask.")
+
+    no_memory_metrics = summarize_masks(
+        no_memory_masks,
         target_masks,
         reference_frame_idx=sequence.reference_frame_idx,
     )
-    print(
-        f"SAM3 original obj_id={tracking.selected_obj_id} "
-        f"cross_iou={original_metrics['cross_view_iou']:.4f} "
-        f"recall={original_metrics['cross_view_recall']:.4f}"
+    memory_metrics = summarize_masks(
+        memory_tracking.masks,
+        target_masks,
+        reference_frame_idx=sequence.reference_frame_idx,
     )
-
-    geometry = None
-    if any(mode != "zero" for mode in config.geometry_modes):
-        print("loading and running frozen StreamVGGT with causal caches...")
-        geometry = StreamVGGTWrapper(
-            repo_path=config.streamvggt_repo,
-            checkpoint_path=config.streamvggt_checkpoint,
-            device=config.geometry_device,
-            image_mode=config.image_mode,
-            streaming_cache=config.streaming_cache,
-        ).load().extract(sequence.image_paths)
-
-    summaries = []
-    for mode in config.geometry_modes:
-        result = _evaluate_mode(
-            config,
-            sequence=sequence,
-            target_masks=target_masks,
-            original_masks=tracking.masks,
-            original_scores=tracking.scores,
-            geometry=geometry,
-            sam3=sam3,
-            mode=mode,
+    no_memory_future = summarize_visible_after(
+        no_memory_masks,
+        target_masks,
+        recovery_frame_idx=recovery_idx,
+    )
+    memory_future = summarize_visible_after(
+        memory_tracking.masks,
+        target_masks,
+        recovery_frame_idx=recovery_idx,
+    )
+    for index, row in enumerate(result["rows"]):
+        row["is_recovery_frame"] = int(index == recovery_idx)
+        row["after_recovery"] = int(index > recovery_idx)
+        row["no_memory_score"] = float(no_memory_scores[index])
+        row["memory_score"] = float(memory_tracking.scores[index])
+        row["no_memory_iou"] = binary_iou(
+            no_memory_masks[index], target_masks[index]
         )
-        memory_masks = tracking.masks
-        memory_scores = tracking.scores
-        memory_recovery_idx = None
-        memory_obj_id = tracking.selected_obj_id
-        if config.memory_writeback and mode != "zero":
-            memory_recovery_idx = next(
-                (
-                    index
-                    for index, row in enumerate(result["rows"])
-                    if row["use_fallback"] and result["final_masks"][index].any()
-                ),
-                None,
-            )
-            if memory_recovery_idx is not None:
-                memory_tracking = sam3.track_with_memory_writeback(
-                    sequence.image_paths,
-                    prompt=sequence.label,
-                    output_size=config.output_size,
-                    reference_frame_idx=sequence.reference_frame_idx,
-                    reference_mask=target_masks[sequence.reference_frame_idx],
-                    recovery_frame_idx=memory_recovery_idx,
-                    recovery_mask=result["final_masks"][memory_recovery_idx],
-                    writeback_prompt_mode=config.memory_writeback_prompt_mode,
-                    point_prompt_mask=result["candidates"][
-                        memory_recovery_idx
-                    ].supported_mask,
-                )
-                memory_masks = memory_tracking.masks
-                memory_scores = memory_tracking.scores
-                memory_obj_id = memory_tracking.selected_obj_id
-        memory_metrics = summarize_masks(
-            memory_masks,
-            target_masks,
-            reference_frame_idx=sequence.reference_frame_idx,
-        )
-        original_future_metrics = summarize_visible_after(
-            tracking.masks,
-            target_masks,
-            recovery_frame_idx=memory_recovery_idx,
-        )
-        bridge_future_metrics = summarize_visible_after(
-            result["final_masks"],
-            target_masks,
-            recovery_frame_idx=memory_recovery_idx,
-        )
-        memory_future_metrics = summarize_visible_after(
-            memory_masks,
-            target_masks,
-            recovery_frame_idx=memory_recovery_idx,
-        )
-        for index, row in enumerate(result["rows"]):
-            row["memory_iou"] = binary_iou(memory_masks[index], target_masks[index])
-            row["memory_score"] = float(memory_scores[index])
-            row["memory_writeback_prompt_mode"] = (
-                config.memory_writeback_prompt_mode
-            )
-            row["is_memory_recovery_frame"] = int(index == memory_recovery_idx)
-            row["after_memory_recovery"] = int(
-                memory_recovery_idx is not None and index > memory_recovery_idx
-            )
-        mode_dir = config.output_dir / mode
-        mode_dir.mkdir(parents=True, exist_ok=True)
-        _write_csv(mode_dir / "frame_metrics.csv", result["rows"])
-        _save_report(
-            mode_dir / "tracking_report.png",
-            image_paths=sequence.image_paths,
-            frame_indices=sequence.frame_indices,
-            target_masks=target_masks,
-            original_masks=tracking.masks,
-            candidates=result["candidates"],
-            final_masks=result["final_masks"],
-            rows=result["rows"],
-            output_size=config.output_size,
-            mode=mode,
-        )
-        if config.memory_writeback and mode != "zero":
-            _save_report(
-                mode_dir / "memory_tracking_report.png",
-                image_paths=sequence.image_paths,
-                frame_indices=sequence.frame_indices,
-                target_masks=target_masks,
-                original_masks=tracking.masks,
-                candidates=result["candidates"],
-                final_masks=memory_masks,
-                rows=result["rows"],
-                output_size=config.output_size,
-                mode=mode,
-                final_label="memory writeback",
-                final_iou_key="memory_iou",
-            )
-        summary = {
-            "mode": mode,
-            "fallback_prompt_mode": config.fallback_prompt_mode,
-            "memory_writeback_prompt_mode": config.memory_writeback_prompt_mode,
-            **{f"sam3_{key}": value for key, value in original_metrics.items()},
-            **{f"bridge_{key}": value for key, value in result["metrics"].items()},
-            **{f"memory_{key}": value for key, value in memory_metrics.items()},
-            **{
-                f"sam3_post_recovery_{key}": value
-                for key, value in original_future_metrics.items()
-            },
-            **{
-                f"bridge_post_recovery_{key}": value
-                for key, value in bridge_future_metrics.items()
-            },
-            **{
-                f"memory_post_recovery_{key}": value
-                for key, value in memory_future_metrics.items()
-            },
-            "memory_writeback": int(config.memory_writeback),
-            "memory_recovery_sequence_index": (
-                memory_recovery_idx if memory_recovery_idx is not None else -1
-            ),
-            "memory_recovery_frame_index": (
-                sequence.frame_indices[memory_recovery_idx]
-                if memory_recovery_idx is not None
-                else -1
-            ),
-            "memory_obj_id": memory_obj_id if memory_obj_id is not None else -1,
-            "accepted_candidates": sum(
-                int(candidate.accepted) for candidate in result["candidates"]
-            ),
-            "fallback_frames": sum(int(row["use_fallback"]) for row in result["rows"]),
-            "map_updates": sum(int(row["update_map"]) for row in result["rows"]),
-        }
-        summaries.append(summary)
-        print(
-            f"mode={mode:<8} bridge_cross_iou={result['metrics']['cross_view_iou']:.4f} "
-            f"recall={result['metrics']['cross_view_recall']:.4f} "
-            f"candidates={summary['accepted_candidates']} "
-            f"fallbacks={summary['fallback_frames']} "
-            f"memory_iou={memory_metrics['cross_view_iou']:.4f} "
-            f"memory_prompt={config.memory_writeback_prompt_mode} "
-            f"memory_recovery={summary['memory_recovery_frame_index']} "
-            f"post_recovery="
-            f"{original_future_metrics['iou']:.4f}/"
-            f"{bridge_future_metrics['iou']:.4f}/"
-            f"{memory_future_metrics['iou']:.4f}"
+        row["memory_iou"] = binary_iou(
+            memory_tracking.masks[index], target_masks[index]
         )
 
-    _write_csv(config.output_dir / "summary.csv", summaries)
+    _write_csv(config.output_dir / "frame_metrics.csv", result["rows"])
+    _save_paired_report(
+        config.output_dir / "paired_memory_report.png",
+        image_paths=sequence.image_paths,
+        frame_indices=sequence.frame_indices,
+        target_masks=target_masks,
+        candidates=result["candidates"],
+        no_memory_masks=no_memory_masks,
+        memory_masks=memory_tracking.masks,
+        rows=result["rows"],
+        output_size=config.output_size,
+    )
+    summary = {
+        **{f"no_memory_{key}": value for key, value in no_memory_metrics.items()},
+        **{f"memory_{key}": value for key, value in memory_metrics.items()},
+        **{
+            f"no_memory_post_recovery_{key}": value
+            for key, value in no_memory_future.items()
+        },
+        **{
+            f"memory_post_recovery_{key}": value
+            for key, value in memory_future.items()
+        },
+        "recovery_sequence_index": recovery_idx,
+        "recovery_frame_index": sequence.frame_indices[recovery_idx],
+        "sam3_obj_id": memory_tracking.selected_obj_id,
+        "same_obj_id": 1,
+        "redetection_used": 0,
+        "paired_causal_split": 1,
+        "geometry_prompt_points": min(
+            3,
+            result["candidates"][recovery_idx].supported_points,
+        ),
+        "pre_recovery_masks_equal": 1,
+        "recovery_masks_equal": 1,
+    }
+    _write_csv(config.output_dir / "summary.csv", [summary])
     with (config.output_dir / "resolved_config.json").open("w", encoding="utf8") as handle:
         json.dump(_config_json(config), handle, indent=2)
+    print(
+        f"paired memory test recovery_frame={summary['recovery_frame_index']} "
+        f"obj_id={summary['sam3_obj_id']} post_recovery_iou="
+        f"{no_memory_future['iou']:.4f}/{memory_future['iou']:.4f}"
+    )
     print(f"summary: {config.output_dir / 'summary.csv'}")
 
 
-def _evaluate_mode(
+def _mine_recovery(
     config: ExperimentConfig,
     *,
     sequence,
     target_masks: torch.Tensor,
     original_masks: torch.Tensor,
     original_scores: torch.Tensor,
-    geometry: GeometrySequence | None,
-    sam3: SAM3Wrapper,
-    mode: str,
+    geometry: GeometrySequence,
 ) -> dict:
     num_frames = len(sequence.frame_indices)
-    permutation = _geometry_permutation(
-        num_frames,
-        reference_frame_idx=sequence.reference_frame_idx,
-        mode=mode,
-    )
     object_map = ObjectPointMap(max_points_per_object=config.max_points_per_object)
-    final_masks = original_masks.clone()
     candidates: list[RevisitCandidate] = []
     rows: list[dict] = []
 
-    if mode != "zero":
-        if geometry is None:
-            raise RuntimeError(f"Geometry mode {mode!r} requires StreamVGGT output.")
-        ref = sequence.reference_frame_idx
-        ref_geometry_idx = int(permutation[ref])
-        ref_stream_mask = _output_mask_to_stream(
-            target_masks[ref],
-            source_size=geometry.source_sizes[ref_geometry_idx],
-            processed_size=geometry.processed_size,
-            image_mode=config.image_mode,
-        )
-        points, weights = sample_masked_observation(
-            geometry.world_points[ref_geometry_idx],
-            geometry.confidence[ref_geometry_idx],
-            ref_stream_mask,
-            max_points=config.max_points_per_observation,
-        )
-        object_map.update(
-            instance_id=sequence.instance_id,
-            label=sequence.label,
-            points=points,
-            weights=weights,
-            frame_idx=ref,
-        )
+    ref = sequence.reference_frame_idx
+    ref_stream_mask = _output_mask_to_stream(
+        target_masks[ref],
+        source_size=geometry.source_sizes[ref],
+        processed_size=geometry.processed_size,
+        image_mode=config.image_mode,
+    )
+    points, weights = sample_masked_observation(
+        geometry.world_points[ref],
+        geometry.confidence[ref],
+        ref_stream_mask,
+        max_points=config.max_points_per_observation,
+    )
+    object_map.update(
+        instance_id=sequence.instance_id,
+        label=sequence.label,
+        points=points,
+        weights=weights,
+        frame_idx=ref,
+    )
 
     for frame_idx in range(num_frames):
-        geometry_idx = int(permutation[frame_idx])
         original_mask = original_masks[frame_idx]
         original_score = float(original_scores[frame_idx])
-        if mode == "zero" or frame_idx == sequence.reference_frame_idx:
-            candidate = _empty_candidate(config.output_size, "geometry disabled or reference frame")
+        if frame_idx == ref:
+            candidate = _empty_candidate(config.output_size, "reference frame")
         else:
-            assert geometry is not None
             entry = object_map.get(sequence.instance_id)
             if entry is None:
                 candidate = _empty_candidate(config.output_size, "object map is unavailable")
             else:
                 candidate = mine_revisit_candidate(
                     entry.points,
-                    current_world_points=geometry.world_points[geometry_idx],
-                    world_to_camera=geometry.world_to_camera[geometry_idx],
-                    intrinsics=geometry.intrinsics[geometry_idx],
-                    source_size=geometry.source_sizes[geometry_idx],
+                    current_world_points=geometry.world_points[frame_idx],
+                    world_to_camera=geometry.world_to_camera[frame_idx],
+                    intrinsics=geometry.intrinsics[frame_idx],
+                    source_size=geometry.source_sizes[frame_idx],
                     processed_size=geometry.processed_size,
                     output_size=config.output_size,
                     image_mode=config.image_mode,
@@ -350,73 +302,23 @@ def _evaluate_mode(
                     support_relative_distance=config.support_relative_distance,
                 )
         candidates.append(candidate)
-        tracker_candidate_iou = binary_iou(original_mask, candidate.mask)
-        decision = decide_bridge_action(
+        decision = decide_correction(
             tracker_mask=original_mask,
             tracker_score=original_score,
             candidate=candidate,
             tracker_low_score=config.tracker_low_score,
             fallback_on_missing_mask=config.fallback_on_missing_mask,
-            allow_map_update=config.map_update_enabled,
-            tracker_candidate_iou=tracker_candidate_iou,
-            map_update_min_iou=config.map_update_min_iou,
         )
-
-        fallback_score = 0.0
-        fallback_raw_iou = 0.0
-        fallback_clipped_iou = 0.0
-        if decision.use_fallback:
-            refined, fallback_score = sam3.segment_candidate(
-                sequence.image_paths[frame_idx],
-                prompt=sequence.label,
-                output_size=config.output_size,
-                candidate_mask=candidate.mask,
-                supported_mask=candidate.supported_mask,
-                prompt_mode=config.fallback_prompt_mode,
-            )
-            clipped = refined & candidate.mask
-            fallback_raw_iou = binary_iou(refined, target_masks[frame_idx])
-            fallback_clipped_iou = binary_iou(clipped, target_masks[frame_idx])
-            final_masks[frame_idx] = (
-                clipped if config.clip_refined_to_candidate else refined
-            )
-
-        updated_map = False
-        if decision.update_map and mode != "zero":
-            assert geometry is not None
-            stream_mask = _output_mask_to_stream(
-                final_masks[frame_idx],
-                source_size=geometry.source_sizes[geometry_idx],
-                processed_size=geometry.processed_size,
-                image_mode=config.image_mode,
-            )
-            points, weights = sample_masked_observation(
-                geometry.world_points[geometry_idx],
-                geometry.confidence[geometry_idx],
-                stream_mask,
-                max_points=config.max_points_per_observation,
-            )
-            updated_map = object_map.update(
-                instance_id=sequence.instance_id,
-                label=sequence.label,
-                points=points,
-                weights=weights,
-                frame_idx=frame_idx,
-            ) is not None
 
         rows.append(
             {
                 "sequence_index": frame_idx,
                 "frame_index": sequence.frame_indices[frame_idx],
-                "geometry_index": geometry_idx,
-                "fallback_prompt_mode": config.fallback_prompt_mode,
+                "geometry_index": frame_idx,
                 "gt_visible": int(target_masks[frame_idx].any()),
                 "sam3_score": original_score,
                 "sam3_iou": binary_iou(original_mask, target_masks[frame_idx]),
                 "candidate_iou": binary_iou(candidate.mask, target_masks[frame_idx]),
-                "final_iou": binary_iou(final_masks[frame_idx], target_masks[frame_idx]),
-                "fallback_raw_iou": fallback_raw_iou,
-                "fallback_clipped_iou": fallback_clipped_iou,
                 "candidate_area_ratio": float(candidate.mask.float().mean()),
                 "candidate_centroid_error": _centroid_error(
                     candidate.mask,
@@ -427,21 +329,13 @@ def _evaluate_mode(
                 "projected_fraction": candidate.projected_fraction,
                 "support_ratio": candidate.support_ratio,
                 "candidate_accepted": int(candidate.accepted),
-                "fallback_score": fallback_score,
-                "use_fallback": int(decision.use_fallback),
-                "update_map": int(updated_map),
+                "use_correction": int(decision.use_correction),
                 "gate_reason": decision.reason,
             }
         )
     return {
         "rows": rows,
         "candidates": candidates,
-        "final_masks": final_masks,
-        "metrics": summarize_masks(
-            final_masks,
-            target_masks,
-            reference_frame_idx=sequence.reference_frame_idx,
-        ),
     }
 
 
@@ -501,25 +395,6 @@ def summarize_visible_after(
     }
 
 
-def _geometry_permutation(
-    num_frames: int,
-    *,
-    reference_frame_idx: int,
-    mode: str,
-) -> torch.Tensor:
-    identity = torch.arange(num_frames)
-    if mode in {"zero", "aligned"} or num_frames <= 2:
-        return identity
-    if mode != "shuffled":
-        raise ValueError(f"Unknown geometry mode: {mode}")
-    movable = [index for index in range(num_frames) if index != reference_frame_idx]
-    rotated = movable[-1:] + movable[:-1]
-    output = identity.clone()
-    for destination, source in zip(movable, rotated):
-        output[destination] = source
-    return output
-
-
 def _resize_target_masks(
     masks: list[np.ndarray],
     output_size: tuple[int, int],
@@ -560,26 +435,23 @@ def _empty_candidate(output_size: tuple[int, int], reason: str) -> RevisitCandid
     )
 
 
-def _save_report(
+def _save_paired_report(
     path: Path,
     *,
     image_paths,
     frame_indices,
     target_masks: torch.Tensor,
-    original_masks: torch.Tensor,
     candidates: list[RevisitCandidate],
-    final_masks: torch.Tensor,
+    no_memory_masks: torch.Tensor,
+    memory_masks: torch.Tensor,
     rows: list[dict],
     output_size: tuple[int, int],
-    mode: str,
-    final_label: str = "bridge final",
-    final_iou_key: str = "final_iou",
 ) -> None:
     height, width = output_size
     header = 30
     columns = 5
     canvas = Image.new("RGB", (columns * width, len(image_paths) * (height + header)), "white")
-    labels = ("RGB", "GT", "SAM3 original", "geometry candidate", final_label)
+    labels = ("RGB", "GT", "geometry candidate", "no memory", "memory")
     colors = ((0, 0, 0), (0, 220, 70), (230, 55, 55), (255, 190, 0), (45, 110, 255))
     for row_idx, image_path in enumerate(image_paths):
         with Image.open(image_path) as source:
@@ -587,9 +459,9 @@ def _save_report(
         panels = [
             rgb,
             _overlay(rgb, target_masks[row_idx], colors[1]),
-            _overlay(rgb, original_masks[row_idx], colors[2]),
             _draw_candidate(rgb, candidates[row_idx]),
-            _overlay(rgb, final_masks[row_idx], colors[4]),
+            _overlay(rgb, no_memory_masks[row_idx], colors[3]),
+            _overlay(rgb, memory_masks[row_idx], colors[4]),
         ]
         y = row_idx * (height + header)
         for column, (panel, label) in enumerate(zip(panels, labels)):
@@ -598,22 +470,16 @@ def _save_report(
             suffix = ""
             if column == 0:
                 suffix = f" frame={frame_indices[row_idx]}"
-            if column == 3:
+            if column == 2:
                 suffix = (
                     f" support={rows[row_idx]['support_ratio']:.3f} "
                     f"accepted={rows[row_idx]['candidate_accepted']}"
                 )
+            if column == 3:
+                suffix = f" IoU={rows[row_idx]['no_memory_iou']:.3f}"
             if column == 4:
-                suffix = f" IoU={rows[row_idx][final_iou_key]:.3f}"
+                suffix = f" IoU={rows[row_idx]['memory_iou']:.3f}"
             draw.text((column * width + 5, y + 7), label + suffix, fill=colors[column])
-    ImageDraw.Draw(canvas).text(
-        (5, 2),
-        (
-            f"mode={mode} prompt={rows[0]['fallback_prompt_mode']} "
-            f"memory={rows[0].get('memory_writeback_prompt_mode', 'off')}"
-        ),
-        fill=(0, 0, 0),
-    )
     canvas.save(path)
 
 
@@ -670,24 +536,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-indices", type=int, nargs="+")
     parser.add_argument("--sam3-device")
     parser.add_argument("--geometry-device")
-    parser.add_argument("--geometry-modes", nargs="+", choices=("zero", "aligned", "shuffled"))
-    parser.add_argument(
-        "--fallback-prompt-mode",
-        choices=("box", "point", "box_point"),
-    )
-    parser.add_argument(
-        "--memory-writeback",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
-    parser.add_argument(
-        "--memory-writeback-prompt-mode",
-        choices=("mask", "matched_points"),
-        help=(
-            "mask writes the complete B1 recovery mask; matched_points reuses "
-            "the exact three geometry-supported points used by B1 point mode"
-        ),
-    )
     parser.add_argument("--output-dir", type=Path)
     return parser.parse_args()
 

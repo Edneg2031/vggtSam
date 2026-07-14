@@ -32,11 +32,8 @@ class ExperimentConfig:
     image_mode: str
 
     output_size: tuple[int, int]
-    geometry_modes: tuple[str, ...]
     max_points_per_object: int
     max_points_per_observation: int
-    map_update_enabled: bool
-    map_update_min_iou: float
 
     box_quantile: float
     box_padding_ratio: float
@@ -49,10 +46,6 @@ class ExperimentConfig:
 
     tracker_low_score: float
     fallback_on_missing_mask: bool
-    clip_refined_to_candidate: bool
-    fallback_prompt_mode: str
-    memory_writeback: bool
-    memory_writeback_prompt_mode: str
     output_dir: Path
 
 
@@ -73,41 +66,6 @@ def load_config(
     frame_indices = overrides.get("frame_indices", dataset.get("frame_indices", []))
     if not frame_indices:
         raise ValueError("dataset.frame_indices must contain at least one frame index.")
-    geometry_modes = overrides.get(
-        "geometry_modes", bridge.get("geometry_modes", ["zero", "aligned", "shuffled"])
-    )
-    unsupported = set(geometry_modes) - {"zero", "aligned", "shuffled"}
-    if unsupported:
-        raise ValueError(f"Unsupported geometry modes: {sorted(unsupported)}")
-    fallback_prompt_mode = str(
-        overrides.get(
-            "fallback_prompt_mode",
-            sam3.get("fallback_prompt_mode", "box"),
-        )
-    )
-    if fallback_prompt_mode not in {"box", "point", "box_point"}:
-        raise ValueError(
-            "sam3.fallback_prompt_mode must be box, point, or box_point."
-        )
-    memory_writeback_prompt_mode = str(
-        overrides.get(
-            "memory_writeback_prompt_mode",
-            bridge.get("memory_writeback_prompt_mode", "mask"),
-        )
-    )
-    if memory_writeback_prompt_mode not in {"mask", "matched_points"}:
-        raise ValueError(
-            "bridge.memory_writeback_prompt_mode must be mask or matched_points."
-        )
-    if (
-        memory_writeback_prompt_mode == "matched_points"
-        and fallback_prompt_mode != "point"
-    ):
-        raise ValueError(
-            "matched_points requires sam3.fallback_prompt_mode=point so B1 and B2 "
-            "receive the same three geometry-supported points."
-        )
-
     output_size = tuple(int(value) for value in bridge.get("output_size", [256, 384]))
     if len(output_size) != 2:
         raise ValueError("bridge.output_size must be [height, width].")
@@ -133,13 +91,10 @@ def load_config(
         streaming_cache=bool(stream.get("streaming_cache", True)),
         image_mode=str(stream.get("image_mode", "crop")),
         output_size=(output_size[0], output_size[1]),
-        geometry_modes=tuple(str(value) for value in geometry_modes),
         max_points_per_object=int(bridge.get("max_points_per_object", 20000)),
         max_points_per_observation=int(
             bridge.get("max_points_per_observation", 8000)
         ),
-        map_update_enabled=bool(bridge.get("map_update_enabled", False)),
-        map_update_min_iou=float(bridge.get("map_update_min_iou", 0.25)),
         box_quantile=float(candidate.get("box_quantile", 0.02)),
         box_padding_ratio=float(candidate.get("box_padding_ratio", 0.12)),
         min_projected_points=int(candidate.get("min_projected_points", 24)),
@@ -152,17 +107,6 @@ def load_config(
         ),
         tracker_low_score=float(bridge.get("tracker_low_score", 0.5)),
         fallback_on_missing_mask=bool(bridge.get("fallback_on_missing_mask", True)),
-        clip_refined_to_candidate=bool(
-            bridge.get("clip_refined_to_candidate", False)
-        ),
-        fallback_prompt_mode=fallback_prompt_mode,
-        memory_writeback=bool(
-            overrides.get(
-                "memory_writeback",
-                bridge.get("memory_writeback", False),
-            )
-        ),
-        memory_writeback_prompt_mode=memory_writeback_prompt_mode,
         output_dir=_path(overrides.get("output_dir", raw.get("output", {}).get("dir"))),
     )
 

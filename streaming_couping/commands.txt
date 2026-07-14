@@ -7,23 +7,9 @@ PYTHONPATH=src python scripts/cache_scannetpp_rgb.py \
   --allow-summary-fallback \
   --output-manifest data/processed/scannetpp_pinhole_2d/manifest_rgb_cache.json
 
-for prompt_mode in point box_point; do
-  PYTHONPATH=src:. python -m streaming_couping.scripts.run_bridge \
-    --config streaming_couping/configs/default.yaml \
-    --manifest data/processed/scannetpp_pinhole_2d/manifest_rgb_cache.json \
-    --scene-id 00a231a370 \
-    --instance-id 37 \
-    --frame-indices 133 162 520 566 477 \
-    --sam3-device cuda:3 \
-    --geometry-device cuda:1 \
-    --geometry-modes zero aligned shuffled \
-    --fallback-prompt-mode "${prompt_mode}" \
-    --output-dir "outputs/streaming_couping_${prompt_mode}_controls_inst37"
-done
-
-# B0/B1/B2 memory ablation. Geometry is used once at the first accepted
-# recovery; the complete B1 mask is written into SAM3 so B1/B2 are identical
-# on the recovery frame. B2 then continues from SAM3 memory with the same ID.
+# Paired causal memory experiment. Both branches use the same SAM3 session
+# initialization, same obj_id, same geometry points, and exactly the same
+# recovery mask. The only variable is whether that correction enters memory.
 PYTHONPATH=src:. python -m streaming_couping.scripts.run_bridge \
   --config streaming_couping/configs/default.yaml \
   --manifest data/processed/scannetpp_pinhole_2d/manifest_rgb_cache.json \
@@ -32,40 +18,4 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_bridge \
   --frame-indices 133 162 520 566 477 \
   --sam3-device cuda:3 \
   --geometry-device cuda:1 \
-  --geometry-modes aligned \
-  --fallback-prompt-mode box_point \
-  --memory-writeback \
-  --memory-writeback-prompt-mode mask \
-  --output-dir outputs/streaming_couping_memory_full_mask_inst37
-
-# Strict point-prompt control. B1 and B2 receive the same three positive points
-# extracted from the same geometry-supported mask; only the session memory differs.
-PYTHONPATH=src:. python -m streaming_couping.scripts.run_bridge \
-  --config streaming_couping/configs/default.yaml \
-  --manifest data/processed/scannetpp_pinhole_2d/manifest_rgb_cache.json \
-  --scene-id 00a231a370 \
-  --instance-id 37 \
-  --frame-indices 133 162 520 566 477 \
-  --sam3-device cuda:3 \
-  --geometry-device cuda:1 \
-  --geometry-modes aligned \
-  --fallback-prompt-mode point \
-  --memory-writeback \
-  --memory-writeback-prompt-mode matched_points \
-  --output-dir outputs/streaming_couping_memory_matched_points_inst37
-
-# Next control: change only the geometry alignment while keeping the same
-# instance, prompt mode, thresholds, and memory writeback path.
-PYTHONPATH=src:. python -m streaming_couping.scripts.run_bridge \
-  --config streaming_couping/configs/default.yaml \
-  --manifest data/processed/scannetpp_pinhole_2d/manifest_rgb_cache.json \
-  --scene-id 00a231a370 \
-  --instance-id 37 \
-  --frame-indices 133 162 520 566 477 \
-  --sam3-device cuda:3 \
-  --geometry-device cuda:1 \
-  --geometry-modes zero aligned shuffled \
-  --fallback-prompt-mode box_point \
-  --memory-writeback \
-  --memory-writeback-prompt-mode mask \
-  --output-dir outputs/streaming_couping_memory_geometry_control_inst37
+  --output-dir outputs/streaming_couping_paired_memory_inst37
