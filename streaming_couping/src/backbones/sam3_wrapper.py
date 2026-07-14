@@ -85,7 +85,93 @@ class SAM3Wrapper:
             selected_obj_id=output.selected_obj_id,
         )
 
-    def track_with_geometry_box_point_memory(
+    def recover_mask_with_text_geometry(
+        self,
+        image_path: str | Path,
+        *,
+        prompt: str,
+        output_size: tuple[int, int],
+        candidate_mask: torch.Tensor,
+        supported_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, float]:
+        """Generate one dense recovery mask from text, geometry box, and points."""
+
+        predictor = self.predictor
+        if predictor is None:
+            raise RuntimeError("Call SAM3Wrapper.load() before inference.")
+        if not self.prompt_with_box:
+            raise RuntimeError("Text-guided recovery requires sam3.prompt_with_box=true.")
+        points = _positive_points(supported_mask)
+        if not points:
+            raise ValueError("The geometry-supported recovery points are empty.")
+
+        with tempfile.TemporaryDirectory(prefix="sam3_text_geometry_recovery_") as tmp:
+            tmp_dir = Path(tmp)
+            materialize_video_dir([image_path], tmp_dir)
+            with quiet_sam3_output(True):
+                session = predictor.start_session(resource_path=str(tmp_dir))
+                session_id = session["session_id"] if isinstance(session, dict) else session
+                try:
+                    box = mask_to_normalized_box(
+                        candidate_mask,
+                        image_path=Path(image_path),
+                    )
+                    if box is None:
+                        raise RuntimeError("The geometry recovery box is empty.")
+                    detected = predictor.add_prompt(
+                        session_id=session_id,
+                        frame_idx=0,
+                        text=prompt,
+                        bounding_boxes=[box],
+                        bounding_box_labels=[1],
+                        output_prob_thresh=self.output_threshold,
+                    )
+                    detected_objects = collect_frame_objects(
+                        [detected],
+                        output_size=output_size,
+                    )
+                    temporary_obj_id = select_tracked_object_id(
+                        detected_objects,
+                        prompt_frame_idx=0,
+                        reference_mask=(
+                            supported_mask if supported_mask.any() else candidate_mask
+                        ),
+                    )
+                    if temporary_obj_id is None:
+                        raise RuntimeError(
+                            "Text-guided SAM3 recovery found no matching object."
+                        )
+                    refined = predictor.add_prompt(
+                        session_id=session_id,
+                        frame_idx=0,
+                        points=points,
+                        point_labels=[1] * len(points),
+                        obj_id=int(temporary_obj_id),
+                        output_prob_thresh=self.output_threshold,
+                    )
+                finally:
+                    predictor.close_session(session_id)
+
+        results = [detected, refined]
+        frame_objects = collect_frame_objects(results, output_size=output_size)
+        masks = masks_for_selected_object(
+            frame_objects,
+            selected_obj_id=temporary_obj_id,
+            num_frames=1,
+            output_size=output_size,
+        )
+        frame_scores = collect_frame_scores(results)
+        scores = scores_for_selected_object(
+            frame_scores,
+            selected_obj_id=temporary_obj_id,
+            num_frames=1,
+        )
+        score = float(scores[0]) if scores.numel() else 0.0
+        if score == 0.0 and masks[0].any():
+            score = 1.0
+        return masks[0].detach().cpu().bool(), score
+
+    def track_with_recovery_mask_memory(
         self,
         image_paths: Sequence[str | Path],
         *,
@@ -94,10 +180,9 @@ class SAM3Wrapper:
         reference_frame_idx: int,
         reference_mask: torch.Tensor,
         recovery_frame_idx: int,
-        point_prompt_mask: torch.Tensor,
-        box_xyxy: tuple[int, int, int, int],
+        recovery_mask: torch.Tensor,
     ) -> TrackingSequence:
-        """Correct an existing object with a geometry box and three points."""
+        """Write a shared dense recovery mask into the persistent SAM3 object."""
 
         predictor = self.predictor
         if predictor is None:
@@ -110,14 +195,8 @@ class SAM3Wrapper:
             raise ValueError("Recovery must happen after the reference frame.")
         if recovery_frame_idx >= len(image_paths):
             raise ValueError("Recovery frame is outside the input sequence.")
-        points = _positive_points(point_prompt_mask)
-        if not points:
-            raise ValueError(
-                "The geometry-supported point prompt is empty; it cannot correct "
-                "the SAM3 instance."
-            )
-        box = _normalized_box(box_xyxy, output_size)
-
+        if not recovery_mask.any():
+            raise ValueError("The recovery mask is empty; it cannot update memory.")
         with tempfile.TemporaryDirectory(prefix="sam3_memory_writeback_") as tmp:
             tmp_dir = Path(tmp)
             materialize_video_dir(image_paths, tmp_dir)
@@ -168,13 +247,11 @@ class SAM3Wrapper:
                             "SAM3 did not produce an object ID on the reference frame."
                         )
 
-                    corrected_mask = self._refine_existing_with_box_points(
+                    self._write_mask_to_existing_memory(
                         session_id=session_id,
                         frame_idx=recovery_frame_idx,
                         obj_id=int(selected_obj_id),
-                        points=points,
-                        box=box,
-                        output_size=output_size,
+                        mask=recovery_mask,
                     )
                     future_results = []
                     future_start = recovery_frame_idx + 1
@@ -207,7 +284,7 @@ class SAM3Wrapper:
             selected_obj_id=selected_obj_id,
             num_frames=len(image_paths),
         )
-        masks[recovery_frame_idx] = corrected_mask
+        masks[recovery_frame_idx] = recovery_mask.detach().cpu().bool()
         scores[recovery_frame_idx] = 1.0
         return TrackingSequence(
             masks=masks.bool(),
@@ -320,17 +397,15 @@ class SAM3Wrapper:
             selected_obj_id=int(selected_obj_id),
         )
 
-    def _refine_existing_with_box_points(
+    def _write_mask_to_existing_memory(
         self,
         *,
         session_id: str,
         frame_idx: int,
         obj_id: int,
-        points: list[list[float]],
-        box: torch.Tensor,
-        output_size: tuple[int, int],
-    ) -> torch.Tensor:
-        """Refine one existing ID without detector re-entry or ID recreation."""
+        mask: torch.Tensor,
+    ) -> None:
+        """Encode a full mask into one existing ID without recreating it."""
 
         predictor = self.predictor
         if predictor is None:
@@ -343,7 +418,7 @@ class SAM3Wrapper:
             raise RuntimeError(f"SAM3 tracker object {obj_id} is unavailable.")
         if int(obj_rank) != int(model.rank):
             raise RuntimeError(
-                "Point memory writeback currently requires the selected object "
+                "Mask memory writeback currently requires the selected object "
                 "to be local to the predictor rank."
             )
         tracker_states = model._get_tracker_inference_states_by_obj_ids(
@@ -356,95 +431,15 @@ class SAM3Wrapper:
                 f"{len(tracker_states)}."
             )
         tracker_state = tracker_states[0]
-        self._reactivate_tracker_object(
-            inference_state=inference_state,
-            model=model,
-            frame_idx=frame_idx,
-            obj_id=obj_id,
-        )
-        if box.shape != (4,):
-            raise ValueError(f"Expected a four-value XYXY box, got {tuple(box.shape)}.")
-        _, obj_ids, _, video_res_masks = model.tracker.add_new_points_or_box(
+        model.tracker.add_new_mask(
             inference_state=tracker_state,
             frame_idx=frame_idx,
             obj_id=obj_id,
-            points=points,
-            labels=[1] * len(points),
-            box=box,
-            clear_old_points=True,
-            rel_coordinates=True,
-            use_prev_mem_frame=model.use_prev_mem_frame,
+            mask=mask.detach().bool(),
         )
-        if video_res_masks is None:
-            raise RuntimeError("SAM3 point refinement returned no masks.")
-        obj_ids = [int(candidate) for candidate in obj_ids]
-        if obj_id not in obj_ids:
-            raise RuntimeError(f"SAM3 did not return corrected object {obj_id}.")
-        corrected = video_res_masks[obj_ids.index(obj_id)] > 0.0
-        while corrected.ndim > 2:
-            corrected = corrected[0]
-        corrected = torch.nn.functional.interpolate(
-            corrected.float()[None, None],
-            size=output_size,
-            mode="nearest",
-        )[0, 0].detach().cpu().bool()
         model.tracker.propagate_in_video_preflight(
             tracker_state,
             run_mem_encoder=True,
-        )
-        model.clear_detector_added_cond_frame_in_tracker(
-            tracker_state,
-            obj_id,
-            frame_idx,
-        )
-        return corrected
-
-    @staticmethod
-    def _reactivate_tracker_object(
-        *,
-        inference_state,
-        model,
-        frame_idx: int,
-        obj_id: int,
-    ) -> None:
-        """Mirror SAM3's point-refinement bookkeeping without recreating the ID."""
-
-        tracker_metadata = inference_state["tracker_metadata"]
-        model.add_action_history(
-            inference_state,
-            "refine",
-            frame_idx=frame_idx,
-            obj_ids=[obj_id],
-        )
-        tracker_metadata["obj_id_to_score"][obj_id] = 1.0
-        tracker_metadata["obj_id_to_tracker_score_frame_wise"][frame_idx][obj_id] = 1.0
-
-        if int(model.rank) != 0:
-            return
-        rank0_metadata = tracker_metadata.get("rank0_metadata", {})
-        if "removed_obj_ids" in rank0_metadata:
-            rank0_metadata["removed_obj_ids"].discard(obj_id)
-        if "suppressed_obj_ids" in rank0_metadata:
-            for suppressed in rank0_metadata["suppressed_obj_ids"].values():
-                suppressed.discard(obj_id)
-        confirmation = rank0_metadata.get("masklet_confirmation")
-        if confirmation is None:
-            return
-        obj_index = next(
-            (
-                index
-                for index, candidate_id in enumerate(
-                    tracker_metadata["obj_ids_all_gpu"]
-                )
-                if int(candidate_id) == obj_id
-            ),
-            None,
-        )
-        if obj_index is None or obj_index >= len(confirmation["status"]):
-            return
-        confirmation["status"][obj_index] = 1
-        confirmation["consecutive_det_num"][obj_index] = (
-            model.masklet_confirmation_consecutive_det_thresh
         )
 
     def _require_adapter(self) -> SAM3VideoTrackerAdapter:
@@ -479,21 +474,3 @@ def _positive_points(mask: torch.Tensor, *, max_points: int = 3) -> list[list[fl
         ]
         for index in selected_indices
     ]
-
-
-def _normalized_box(
-    box_xyxy: tuple[int, int, int, int],
-    output_size: tuple[int, int],
-) -> torch.Tensor:
-    """Convert an output-grid XYXY box to SAM's relative coordinates."""
-
-    height, width = output_size
-    x0, y0, x1, y1 = box_xyxy
-    if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
-        raise ValueError(
-            f"Invalid geometry box {box_xyxy} for output size {output_size}."
-        )
-    return torch.tensor(
-        [x0 / width, y0 / height, x1 / width, y1 / height],
-        dtype=torch.float32,
-    )

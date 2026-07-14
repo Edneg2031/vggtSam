@@ -121,6 +121,17 @@ def run_experiment(config: ExperimentConfig) -> None:
             "No accepted aligned-geometry recovery was found for the paired memory test."
         )
 
+    recovery_candidate = result["candidates"][recovery_idx]
+    recovery_mask, recovery_score = sam3.recover_mask_with_text_geometry(
+        sequence.image_paths[recovery_idx],
+        prompt=sequence.label,
+        output_size=config.output_size,
+        candidate_mask=recovery_candidate.mask,
+        supported_mask=recovery_candidate.supported_mask,
+    )
+    if not recovery_mask.any():
+        raise RuntimeError("Text-guided SAM3 recovery returned an empty mask.")
+
     no_memory_tracking = sam3.track_split_without_memory(
         sequence.image_paths,
         prompt=sequence.label,
@@ -129,18 +140,14 @@ def run_experiment(config: ExperimentConfig) -> None:
         reference_mask=target_masks[sequence.reference_frame_idx],
         split_frame_idx=recovery_idx,
     )
-    recovery_candidate = result["candidates"][recovery_idx]
-    if recovery_candidate.box_xyxy is None:
-        raise RuntimeError("The accepted recovery candidate has no geometry box.")
-    memory_tracking = sam3.track_with_geometry_box_point_memory(
+    memory_tracking = sam3.track_with_recovery_mask_memory(
         sequence.image_paths,
         prompt=sequence.label,
         output_size=config.output_size,
         reference_frame_idx=sequence.reference_frame_idx,
         reference_mask=target_masks[sequence.reference_frame_idx],
         recovery_frame_idx=recovery_idx,
-        point_prompt_mask=recovery_candidate.supported_mask,
-        box_xyxy=recovery_candidate.box_xyxy,
+        recovery_mask=recovery_mask,
     )
     if memory_tracking.selected_obj_id != no_memory_tracking.selected_obj_id:
         raise RuntimeError(
@@ -155,7 +162,7 @@ def run_experiment(config: ExperimentConfig) -> None:
             raise RuntimeError(
                 f"Paired SAM3 sessions diverged before recovery at frame {index}."
             )
-    corrected_mask = memory_tracking.masks[recovery_idx].clone()
+    corrected_mask = recovery_mask.clone()
     no_memory_masks = no_memory_tracking.masks.clone()
     no_memory_scores = no_memory_tracking.scores.clone()
     no_memory_masks[recovery_idx] = corrected_mask
@@ -222,10 +229,15 @@ def run_experiment(config: ExperimentConfig) -> None:
         "recovery_frame_index": sequence.frame_indices[recovery_idx],
         "sam3_obj_id": memory_tracking.selected_obj_id,
         "same_obj_id": 1,
-        "redetection_used": 0,
+        "recovery_source": "text_box_points_full_mask",
+        "recovery_reacquisition_used": 1,
+        "paired_branch_redetection_used": 0,
+        "recovery_mask_score": recovery_score,
+        "recovery_mask_iou": binary_iou(
+            recovery_mask,
+            target_masks[recovery_idx],
+        ),
         "paired_causal_split": 1,
-        "geometry_prompt_mode": "box_3points",
-        "geometry_prompt_box": recovery_candidate.box_xyxy,
         "geometry_prompt_points": min(
             3,
             result["candidates"][recovery_idx].supported_points,
