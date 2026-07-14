@@ -30,7 +30,8 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_gt_mask_pose_refinement
   --instance-id 37 \
   --frame-indices 133 162 520 566 477 \
   --reference-sequence-index 0 \
+  --pose-refinement-mode translation_only \
   --geometry-device cuda:1 \
   --confidence-threshold 0.30 \
   --icp-max-correspondence 0.20 \
-  --output-dir outputs/streaming_couping_gt_mask_pose_inst37
+  --output-dir outputs/streaming_couping_gt_mask_translation_inst37

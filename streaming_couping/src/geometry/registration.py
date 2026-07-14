@@ -89,8 +89,9 @@ def robust_icp(
     max_rmse: float = 0.15,
     max_rotation_degrees: float = 45.0,
     max_translation: float = 1.0,
+    translation_only: bool = False,
 ) -> ICPResult:
-    """Align one current instance cloud to its persistent reference cloud."""
+    """Align a current instance cloud with either translation or full SE(3)."""
 
     moving, moving_weights = _finite_points(moving, moving_weights)
     fixed, _ = _finite_points(fixed, None)
@@ -133,11 +134,20 @@ def robust_icp(
         if int(inliers.sum()) < min_inliers:
             break
         weights = moving_weights[inliers] if moving_weights is not None else None
-        delta_rotation, delta_translation = _weighted_rigid(
-            transformed[inliers],
-            fixed[indices[inliers]],
-            weights=weights,
-        )
+        matched_fixed = fixed[indices[inliers]]
+        if translation_only:
+            delta_rotation = identity
+            delta_translation = _weighted_translation(
+                transformed[inliers],
+                matched_fixed,
+                weights=weights,
+            )
+        else:
+            delta_rotation, delta_translation = _weighted_rigid(
+                transformed[inliers],
+                matched_fixed,
+                weights=weights,
+            )
         rotation = delta_rotation @ rotation
         translation = delta_rotation @ translation + delta_translation
         delta_angle = rotation_angle_degrees(delta_rotation)
@@ -337,6 +347,19 @@ def _weighted_rigid(
     rotation = left @ torch.diag(signs) @ right_t
     translation = target_mean - rotation @ source_mean
     return rotation, translation
+
+
+def _weighted_translation(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    weights: torch.Tensor | None,
+) -> torch.Tensor:
+    if weights is None:
+        return (target - source).mean(dim=0)
+    weights = weights.clamp_min(1e-6)
+    weights = weights / weights.sum()
+    return ((target - source) * weights[:, None]).sum(dim=0)
 
 
 def _paired_finite(

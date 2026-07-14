@@ -89,6 +89,10 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_bridge \
 Reference 默认取序列中最早可见帧，确保任意当前帧只使用历史信息；也可用
 `--reference-sequence-index` 显式指定，但指定帧必须包含目标实例。
 
+当前默认 `--pose-refinement-mode translation_only`：固定 StreamVGGT 的旋转，
+只迭代估计实例点云支持的平移增量。`full_se3` 保留为上一版对照，不作为默认
+camera correction。
+
 为消除 StreamVGGT 的任意坐标系和尺度，raw/refined 两条路径共享一次仅由
 reference frame 估计的 `Sim(3)`。GT pose 和 GT pointmap 在 ICP 中不使用，
 只负责公共坐标对齐和最终评价。

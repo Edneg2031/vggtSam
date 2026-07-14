@@ -58,6 +58,7 @@ def main() -> None:
         icp_min_fitness=args.icp_min_fitness,
         icp_max_rmse=args.icp_max_rmse,
         reference_sequence_index=args.reference_sequence_index,
+        pose_refinement_mode=args.pose_refinement_mode,
     )
 
 
@@ -74,6 +75,7 @@ def run_experiment(
     icp_min_fitness: float,
     icp_max_rmse: float,
     reference_sequence_index: int | None,
+    pose_refinement_mode: str,
 ) -> None:
     torch.manual_seed(0)
     np.random.seed(0)
@@ -97,7 +99,8 @@ def run_experiment(
     print(
         f"target scene={sequence.scene_id} frames={sequence.frame_indices} "
         f"instance={sequence.instance_id} label={sequence.label!r} "
-        f"reference={reference} reference_mode={reference_mode}"
+        f"reference={reference} reference_mode={reference_mode} "
+        f"pose_refinement={pose_refinement_mode}"
     )
     print("running frozen StreamVGGT with causal caches...")
     geometry = StreamVGGTWrapper(
@@ -194,6 +197,7 @@ def run_experiment(
                 min_inliers=icp_min_inliers,
                 min_fitness=icp_min_fitness,
                 max_rmse=icp_max_rmse,
+                translation_only=pose_refinement_mode == "translation_only",
             )
             if icp.accepted:
                 refined_points[sequence_index] = apply_rigid(
@@ -258,6 +262,7 @@ def run_experiment(
             "pred_object_points": int(object_mask.sum()),
             "icp_accepted": int(icp.accepted),
             "icp_reason": icp.reason,
+            "pose_refinement_mode": pose_refinement_mode,
             "icp_iterations": icp.iterations,
             "icp_inliers": icp.inliers,
             "icp_fitness": icp.fitness,
@@ -316,6 +321,7 @@ def run_experiment(
         "label": sequence.label,
         "reference_sequence_index": reference,
         "reference_frame_index": sequence.frame_indices[reference],
+        "pose_refinement_mode": pose_refinement_mode,
         "visible_evaluation_frames": len(selected),
         "accepted_icp_frames": sum(row["icp_accepted"] for row in selected),
         "sim3_scale": similarity.scale,
@@ -359,6 +365,7 @@ def run_experiment(
                     "icp_min_inliers": icp_min_inliers,
                     "icp_min_fitness": icp_min_fitness,
                     "icp_max_rmse": icp_max_rmse,
+                    "pose_refinement_mode": pose_refinement_mode,
                 },
                 "similarity": {
                     "scale": similarity.scale,
@@ -579,6 +586,12 @@ def _parse_args() -> argparse.Namespace:
         "--reference-sequence-index",
         type=int,
         help="Reference position in frame-indices; defaults to the earliest visible frame.",
+    )
+    parser.add_argument(
+        "--pose-refinement-mode",
+        choices=("translation_only", "full_se3"),
+        default="translation_only",
+        help="Optimize translation only or a full rigid camera correction.",
     )
     return parser.parse_args()
 
