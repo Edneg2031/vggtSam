@@ -8,23 +8,6 @@ import numpy as np
 import torch
 
 
-def save_pointmap_npz(
-    path: Path,
-    pointmap: torch.Tensor,
-    *,
-    confidence: torch.Tensor | None = None,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    points = pointmap.detach().cpu().numpy().astype(np.float32)
-    payload = {
-        "pointmap": points,
-        "valid": np.isfinite(points).all(axis=-1),
-    }
-    if confidence is not None:
-        payload["confidence"] = confidence.detach().cpu().numpy().astype(np.float32)
-    np.savez_compressed(path, **payload)
-
-
 def save_pointmap_ply(
     path: Path,
     pointmap: torch.Tensor,
@@ -115,4 +98,3 @@ def _write_binary_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> Non
     with path.open("wb") as handle:
         handle.write(header.encode("ascii"))
         vertices.tofile(handle)
-

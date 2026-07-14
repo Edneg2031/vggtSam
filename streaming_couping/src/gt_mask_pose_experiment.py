@@ -15,11 +15,7 @@ from test_sam.data import load_mask_tracking_sequence
 
 from .backbones.streamvggt_wrapper import StreamVGGTWrapper
 from .config import load_config
-from .geometry.export import (
-    save_aggregate_ply,
-    save_pointmap_npz,
-    save_pointmap_ply,
-)
+from .geometry.export import save_aggregate_ply, save_pointmap_ply
 from .geometry.gt_data import load_gt_geometry_sequence
 from .geometry.registration import (
     ICPResult,
@@ -418,22 +414,6 @@ def _export_pointmaps(
     root = output_dir / "pointmaps"
     for index, frame_index in enumerate(frame_indices):
         prefix = root / f"frame_{index:02d}_{frame_index}"
-        save_pointmap_npz(
-            prefix.with_name(prefix.name + "_streamvggt_native.npz"),
-            native_points[index],
-            confidence=confidence[index],
-        )
-        save_pointmap_npz(
-            prefix.with_name(prefix.name + "_raw.npz"),
-            raw_points[index],
-            confidence=confidence[index],
-        )
-        save_pointmap_npz(
-            prefix.with_name(prefix.name + "_refined.npz"),
-            refined_points[index],
-            confidence=confidence[index],
-        )
-        save_pointmap_npz(prefix.with_name(prefix.name + "_gt.npz"), gt_points[index])
         for name, points, point_confidence in (
             ("streamvggt_native", native_points[index], confidence[index]),
             ("raw", raw_points[index], confidence[index]),
