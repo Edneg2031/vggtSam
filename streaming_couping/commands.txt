@@ -36,19 +36,19 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_gt_mask_pose_refinement
   --icp-max-correspondence 0.20 \
   --output-dir outputs/streaming_couping_gt_mask_depth_camera_diag_inst37
 
-# Reverse-direction oracle ablation: the same frozen StreamVGGT tracks and camera
-# initialization enter unmasked BA and current-instance-mask-gated BA. GT poses and
-# pointmaps are evaluation-only after the one reference-frame Sim(3) gauge fix.
-PYTHONPATH=src:. python -m streaming_couping.scripts.run_mask_track_ba \
+# Object-level geometry fusion. All branches share the same reference GT mask,
+# StreamVGGT geometry, Sim3 gauge, and local ICP settings. Corrections move only
+# mask-selected object points; camera poses and the full scene stay unchanged.
+PYTHONPATH=src:. python -m streaming_couping.scripts.run_sam3_mask_object_fusion \
   --config streaming_couping/configs/default.yaml \
   --manifest data/processed/scannetpp_pinhole_2d/manifest_rgb_cache.json \
   --scene-id 00a231a370 \
   --instance-id 37 \
   --frame-indices 133 162 520 566 477 \
   --reference-sequence-index 0 \
+  --sam3-device cuda:3 \
   --geometry-device cuda:1 \
-  --ba-mode full_se3 \
-  --max-query-points 512 \
-  --track-score-mode ignore \
-  --ba-pose-prior-weight 0.10 \
-  --output-dir outputs/streaming_couping_mask_track_ba_ignore_scores_inst37
+  --icp-mode translation_only \
+  --confidence-threshold 0.30 \
+  --icp-max-correspondence 0.20 \
+  --output-dir outputs/streaming_couping_sam3_mask_object_fusion_inst37
