@@ -22,6 +22,14 @@ class GeometrySequence:
 
 
 @dataclass(frozen=True)
+class ReferencePointTracks:
+    query_points: torch.Tensor
+    coordinates: torch.Tensor
+    visibility: torch.Tensor
+    confidence: torch.Tensor
+
+
+@dataclass(frozen=True)
 class TrackingSequence:
     masks: torch.Tensor
     scores: torch.Tensor
