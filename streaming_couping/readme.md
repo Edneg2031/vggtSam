@@ -80,6 +80,9 @@ aligned > shuffled
 - `--memory-writeback-prompt-mode mask`：将完整 B1 恢复 mask 送入 SAM3 原生 `add_new_mask` 和 memory encoder。恢复帧的 B1/B2 mask 完全相同，只比较后续帧。
 - `--memory-writeback-prompt-mode matched_points`：要求同时使用 `--fallback-prompt-mode point`；B1/B2 都从同一个几何支持区域提取相同 3 个正点。
 
+完整 mask 写回同时复用 SAM3 点修正路径的实例状态更新：恢复同一 `obj_id`
+的 tracker score、解除 suppression 并确认 masklet，避免 memory 已更新但输出仍被高层门控隐藏。
+
 运行时加 `--memory-writeback`。判断 memory 是否有效，应重点查看
 `sam3_post_recovery_iou`、`bridge_post_recovery_iou` 和
 `memory_post_recovery_iou`。这些指标只统计恢复帧之后目标真实可见的帧，

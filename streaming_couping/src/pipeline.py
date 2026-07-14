@@ -127,6 +127,7 @@ def run_experiment(config: ExperimentConfig) -> None:
             mode=mode,
         )
         memory_masks = tracking.masks
+        memory_scores = tracking.scores
         memory_recovery_idx = None
         memory_obj_id = tracking.selected_obj_id
         if config.memory_writeback and mode != "zero":
@@ -153,6 +154,7 @@ def run_experiment(config: ExperimentConfig) -> None:
                     ].supported_mask,
                 )
                 memory_masks = memory_tracking.masks
+                memory_scores = memory_tracking.scores
                 memory_obj_id = memory_tracking.selected_obj_id
         memory_metrics = summarize_masks(
             memory_masks,
@@ -176,6 +178,7 @@ def run_experiment(config: ExperimentConfig) -> None:
         )
         for index, row in enumerate(result["rows"]):
             row["memory_iou"] = binary_iou(memory_masks[index], target_masks[index])
+            row["memory_score"] = float(memory_scores[index])
             row["memory_writeback_prompt_mode"] = (
                 config.memory_writeback_prompt_mode
             )
