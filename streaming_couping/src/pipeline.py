@@ -43,6 +43,7 @@ def main() -> None:
             "geometry_modes": args.geometry_modes,
             "fallback_prompt_mode": args.fallback_prompt_mode,
             "memory_writeback": args.memory_writeback,
+            "memory_writeback_prompt_mode": args.memory_writeback_prompt_mode,
             "output_dir": args.output_dir,
         }.items()
         if value is not None
@@ -146,6 +147,10 @@ def run_experiment(config: ExperimentConfig) -> None:
                     reference_mask=target_masks[sequence.reference_frame_idx],
                     recovery_frame_idx=memory_recovery_idx,
                     recovery_mask=result["final_masks"][memory_recovery_idx],
+                    writeback_prompt_mode=config.memory_writeback_prompt_mode,
+                    point_prompt_mask=result["candidates"][
+                        memory_recovery_idx
+                    ].supported_mask,
                 )
                 memory_masks = memory_tracking.masks
                 memory_obj_id = memory_tracking.selected_obj_id
@@ -171,6 +176,9 @@ def run_experiment(config: ExperimentConfig) -> None:
         )
         for index, row in enumerate(result["rows"]):
             row["memory_iou"] = binary_iou(memory_masks[index], target_masks[index])
+            row["memory_writeback_prompt_mode"] = (
+                config.memory_writeback_prompt_mode
+            )
             row["is_memory_recovery_frame"] = int(index == memory_recovery_idx)
             row["after_memory_recovery"] = int(
                 memory_recovery_idx is not None and index > memory_recovery_idx
@@ -208,6 +216,7 @@ def run_experiment(config: ExperimentConfig) -> None:
         summary = {
             "mode": mode,
             "fallback_prompt_mode": config.fallback_prompt_mode,
+            "memory_writeback_prompt_mode": config.memory_writeback_prompt_mode,
             **{f"sam3_{key}": value for key, value in original_metrics.items()},
             **{f"bridge_{key}": value for key, value in result["metrics"].items()},
             **{f"memory_{key}": value for key, value in memory_metrics.items()},
@@ -246,6 +255,7 @@ def run_experiment(config: ExperimentConfig) -> None:
             f"candidates={summary['accepted_candidates']} "
             f"fallbacks={summary['fallback_frames']} "
             f"memory_iou={memory_metrics['cross_view_iou']:.4f} "
+            f"memory_prompt={config.memory_writeback_prompt_mode} "
             f"memory_recovery={summary['memory_recovery_frame_index']} "
             f"post_recovery="
             f"{original_future_metrics['iou']:.4f}/"
@@ -595,7 +605,10 @@ def _save_report(
             draw.text((column * width + 5, y + 7), label + suffix, fill=colors[column])
     ImageDraw.Draw(canvas).text(
         (5, 2),
-        f"mode={mode} prompt={rows[0]['fallback_prompt_mode']}",
+        (
+            f"mode={mode} prompt={rows[0]['fallback_prompt_mode']} "
+            f"memory={rows[0].get('memory_writeback_prompt_mode', 'off')}"
+        ),
         fill=(0, 0, 0),
     )
     canvas.save(path)
@@ -663,6 +676,14 @@ def _parse_args() -> argparse.Namespace:
         "--memory-writeback",
         action=argparse.BooleanOptionalAction,
         default=None,
+    )
+    parser.add_argument(
+        "--memory-writeback-prompt-mode",
+        choices=("mask", "matched_points"),
+        help=(
+            "mask writes the complete B1 recovery mask; matched_points reuses "
+            "the exact three geometry-supported points used by B1 point mode"
+        ),
     )
     parser.add_argument("--output-dir", type=Path)
     return parser.parse_args()

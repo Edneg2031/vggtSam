@@ -52,6 +52,7 @@ class ExperimentConfig:
     clip_refined_to_candidate: bool
     fallback_prompt_mode: str
     memory_writeback: bool
+    memory_writeback_prompt_mode: str
     output_dir: Path
 
 
@@ -87,6 +88,24 @@ def load_config(
     if fallback_prompt_mode not in {"box", "point", "box_point"}:
         raise ValueError(
             "sam3.fallback_prompt_mode must be box, point, or box_point."
+        )
+    memory_writeback_prompt_mode = str(
+        overrides.get(
+            "memory_writeback_prompt_mode",
+            bridge.get("memory_writeback_prompt_mode", "mask"),
+        )
+    )
+    if memory_writeback_prompt_mode not in {"mask", "matched_points"}:
+        raise ValueError(
+            "bridge.memory_writeback_prompt_mode must be mask or matched_points."
+        )
+    if (
+        memory_writeback_prompt_mode == "matched_points"
+        and fallback_prompt_mode != "point"
+    ):
+        raise ValueError(
+            "matched_points requires sam3.fallback_prompt_mode=point so B1 and B2 "
+            "receive the same three geometry-supported points."
         )
 
     output_size = tuple(int(value) for value in bridge.get("output_size", [256, 384]))
@@ -143,6 +162,7 @@ def load_config(
                 bridge.get("memory_writeback", False),
             )
         ),
+        memory_writeback_prompt_mode=memory_writeback_prompt_mode,
         output_dir=_path(overrides.get("output_dir", raw.get("output", {}).get("dir"))),
     )
 

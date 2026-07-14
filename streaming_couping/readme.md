@@ -75,6 +75,11 @@ aligned > shuffled
 - `B1 / bridge_*`：SAM3 丢失时，用几何提示做当前帧无状态恢复；不更新原会话。
 - `B2 / memory_*`：只追踪到 B1 的第一次有效恢复，用同一 `obj_id` 写回同一个 SAM3 session；该交互路径运行 SAM3 memory encoder，再继续处理未来帧。后续帧只由 SAM3 memory 追踪，不再使用几何 fallback，也不会提前读取未来帧状态。
 
+为避免把提示信息损失误判成 memory 效果，写回支持两个严格对照：
+
+- `--memory-writeback-prompt-mode mask`：将完整 B1 恢复 mask 送入 SAM3 原生 `add_new_mask` 和 memory encoder。恢复帧的 B1/B2 mask 完全相同，只比较后续帧。
+- `--memory-writeback-prompt-mode matched_points`：要求同时使用 `--fallback-prompt-mode point`；B1/B2 都从同一个几何支持区域提取相同 3 个正点。
+
 运行时加 `--memory-writeback`。判断 memory 是否有效，应重点查看
 `sam3_post_recovery_iou`、`bridge_post_recovery_iou` 和
 `memory_post_recovery_iou`。这些指标只统计恢复帧之后目标真实可见的帧，
@@ -110,7 +115,7 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_bridge \
 - `summary.csv`：SAM3 与 bridge 的跨视角 IoU、召回率和 absent false-positive ratio。
 - `<mode>/frame_metrics.csv`：每帧投影点数、3D 支持率、candidate/fallback/final IoU 和门控原因。
 - `<mode>/tracking_report.png`：`RGB | GT | SAM3 original | geometry candidate | bridge final`。候选图中黄色是原始投影点，绿色是当前 pointmap 支持的投影点，矩形是送给 SAM3 的候选框。
-- `<mode>/memory_tracking_report.png`：`B2` 写回后同一实例 ID 的 SAM3 memory 追踪结果。
+- `<mode>/memory_tracking_report.png`：`B2` 写回后同一实例 ID 的 SAM3 memory 追踪结果。报告和 CSV 会记录实际写回提示模式。
 
 ## 当前边界
 

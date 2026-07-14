@@ -30,6 +30,9 @@ bridge:
   fallback_on_missing_mask: true
   # Evaluate one geometry recovery written into the original SAM3 memory.
   memory_writeback: false
+  # mask keeps the B1/B2 recovery frame identical and isolates future memory.
+  # matched_points requires sam3.fallback_prompt_mode: point.
+  memory_writeback_prompt_mode: mask
   # Geometry is a localization prompt, not a hard final-mask boundary.
   clip_refined_to_candidate: false
   max_points_per_observation: 8000
