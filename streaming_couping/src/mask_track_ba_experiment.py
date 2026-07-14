@@ -63,6 +63,7 @@ def main() -> None:
         track_iterations=args.track_iterations,
         track_visibility_threshold=args.track_visibility_threshold,
         track_confidence_threshold=args.track_confidence_threshold,
+        track_score_mode=args.track_score_mode,
         ba_mode=args.ba_mode,
         ba_iterations=args.ba_iterations,
         ba_learning_rate=args.ba_learning_rate,
@@ -85,6 +86,7 @@ def run_experiment(
     track_iterations: int,
     track_visibility_threshold: float,
     track_confidence_threshold: float,
+    track_score_mode: str,
     ba_mode: str,
     ba_iterations: int,
     ba_learning_rate: float,
@@ -183,6 +185,14 @@ def run_experiment(
         query_points=query_xy,
         iterations=track_iterations,
     )
+    _print_track_diagnostics(
+        frame_indices=sequence.frame_indices,
+        masks=gt.instance_masks,
+        tracks=tracks,
+        visibility_threshold=track_visibility_threshold,
+        confidence_threshold=track_confidence_threshold,
+        score_mode=track_score_mode,
+    )
     _save_track_visualizations(
         config.output_dir,
         frame_indices=sequence.frame_indices,
@@ -191,6 +201,7 @@ def run_experiment(
         tracks=tracks,
         visibility_threshold=track_visibility_threshold,
         confidence_threshold=track_confidence_threshold,
+        score_mode=track_score_mode,
     )
 
     unmasked_results = []
@@ -203,11 +214,14 @@ def run_experiment(
             )
             gated = unmasked
         else:
-            track_weights = (
-                query_depth_confidence
-                * tracks.visibility[sequence_index]
-                * tracks.confidence[sequence_index]
-            )
+            if track_score_mode == "ignore":
+                track_weights = query_depth_confidence
+            else:
+                track_weights = (
+                    query_depth_confidence
+                    * tracks.visibility[sequence_index]
+                    * tracks.confidence[sequence_index]
+                )
             observed_xy = tracks.coordinates[sequence_index]
             reliable_tracks = _reliable_track_mask(
                 observed_xy,
@@ -216,6 +230,7 @@ def run_experiment(
                 image_size=gt.instance_masks[sequence_index].shape,
                 visibility_threshold=track_visibility_threshold,
                 confidence_threshold=track_confidence_threshold,
+                score_mode=track_score_mode,
             )
             gated_tracks = reliable_tracks & points_inside_mask(
                 gt.instance_masks[sequence_index],
@@ -292,6 +307,7 @@ def run_experiment(
             image_size=gt.instance_masks[sequence_index].shape,
             visibility_threshold=track_visibility_threshold,
             confidence_threshold=track_confidence_threshold,
+            score_mode=track_score_mode,
         )
         inside_instance = points_inside_mask(
             gt.instance_masks[sequence_index],
@@ -302,6 +318,24 @@ def run_experiment(
             "frame_index": frame_index,
             "gt_visible": int(gt.instance_masks[sequence_index].any()),
             "query_points": int(query_xy.shape[0]),
+            "track_visibility_mean": _finite_tensor_mean(
+                tracks.visibility[sequence_index]
+            ),
+            "track_visibility_max": _finite_tensor_max(
+                tracks.visibility[sequence_index]
+            ),
+            "track_confidence_mean": _finite_tensor_mean(
+                tracks.confidence[sequence_index]
+            ),
+            "track_confidence_max": _finite_tensor_max(
+                tracks.confidence[sequence_index]
+            ),
+            "track_displacement_mean": _finite_tensor_mean(
+                torch.linalg.vector_norm(
+                    tracks.coordinates[sequence_index] - tracks.query_points,
+                    dim=-1,
+                )
+            ),
             "reliable_tracks": int(reliable_tracks.sum()),
             "reliable_tracks_inside_instance": int(
                 (reliable_tracks & inside_instance).sum()
@@ -372,6 +406,7 @@ def run_experiment(
         "reference_sequence_index": reference,
         "reference_frame_index": sequence.frame_indices[reference],
         "ba_mode": ba_mode,
+        "track_score_mode": track_score_mode,
         "visible_evaluation_frames": len(selected),
         "query_points": int(query_xy.shape[0]),
         "depth_camera_sim3_scale": similarity.scale,
@@ -412,6 +447,7 @@ def run_experiment(
                     "track_iterations": track_iterations,
                     "track_visibility_threshold": track_visibility_threshold,
                     "track_confidence_threshold": track_confidence_threshold,
+                    "track_score_mode": track_score_mode,
                     "ba_mode": ba_mode,
                     "ba_iterations": ba_iterations,
                     "ba_learning_rate": ba_learning_rate,
@@ -513,17 +549,67 @@ def _reliable_track_mask(
     image_size: tuple[int, int],
     visibility_threshold: float,
     confidence_threshold: float,
+    score_mode: str,
 ) -> torch.Tensor:
     height, width = image_size
-    return (
+    spatially_valid = (
         torch.isfinite(coordinates).all(dim=-1)
         & (coordinates[:, 0] >= 0.0)
         & (coordinates[:, 0] <= width - 1)
         & (coordinates[:, 1] >= 0.0)
         & (coordinates[:, 1] <= height - 1)
+    )
+    if score_mode == "ignore":
+        return spatially_valid
+    if score_mode != "threshold":
+        raise ValueError(f"Unknown track_score_mode={score_mode!r}.")
+    return (
+        spatially_valid
+        & torch.isfinite(visibility)
+        & torch.isfinite(confidence)
         & (visibility >= float(visibility_threshold))
         & (confidence >= float(confidence_threshold))
     )
+
+
+def _print_track_diagnostics(
+    *,
+    frame_indices,
+    masks: torch.Tensor,
+    tracks,
+    visibility_threshold: float,
+    confidence_threshold: float,
+    score_mode: str,
+) -> None:
+    for sequence_index, frame_index in enumerate(frame_indices):
+        reliable = _reliable_track_mask(
+            tracks.coordinates[sequence_index],
+            tracks.visibility[sequence_index],
+            tracks.confidence[sequence_index],
+            image_size=masks[sequence_index].shape,
+            visibility_threshold=visibility_threshold,
+            confidence_threshold=confidence_threshold,
+            score_mode=score_mode,
+        )
+        inside = points_inside_mask(
+            masks[sequence_index],
+            tracks.coordinates[sequence_index],
+        )
+        displacement = torch.linalg.vector_norm(
+            tracks.coordinates[sequence_index] - tracks.query_points,
+            dim=-1,
+        )
+        print(
+            f"track frame={frame_index} "
+            f"vis={_finite_tensor_mean(tracks.visibility[sequence_index]):.6f}/"
+            f"{_finite_tensor_max(tracks.visibility[sequence_index]):.6f} "
+            f"conf={_finite_tensor_mean(tracks.confidence[sequence_index]):.6f}/"
+            f"{_finite_tensor_max(tracks.confidence[sequence_index]):.6f} "
+            f"motion={_finite_tensor_mean(displacement):.3f}/"
+            f"{_finite_tensor_max(displacement):.3f} "
+            f"usable={int(reliable.sum())} "
+            f"inside={int((reliable & inside).sum())}"
+        )
 
 
 def _save_track_visualizations(
@@ -535,6 +621,7 @@ def _save_track_visualizations(
     tracks,
     visibility_threshold: float,
     confidence_threshold: float,
+    score_mode: str,
 ) -> None:
     root = output_dir / "track_visualizations"
     root.mkdir(parents=True, exist_ok=True)
@@ -553,6 +640,7 @@ def _save_track_visualizations(
             image_size=mask.shape,
             visibility_threshold=visibility_threshold,
             confidence_threshold=confidence_threshold,
+            score_mode=score_mode,
         )
         inside = points_inside_mask(
             masks[sequence_index],
@@ -573,6 +661,16 @@ def _save_track_visualizations(
             fill=(255, 255, 255),
         )
         image.save(root / f"frame_{sequence_index:02d}_{frame_index}.png")
+
+
+def _finite_tensor_mean(values: torch.Tensor) -> float:
+    finite = values[torch.isfinite(values)]
+    return float(finite.mean()) if finite.numel() else float("nan")
+
+
+def _finite_tensor_max(values: torch.Tensor) -> float:
+    finite = values[torch.isfinite(values)]
+    return float(finite.max()) if finite.numel() else float("nan")
 
 
 def _export_pointmaps(
@@ -658,6 +756,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--track-iterations", type=int, default=4)
     parser.add_argument("--track-visibility-threshold", type=float, default=0.05)
     parser.add_argument("--track-confidence-threshold", type=float, default=0.05)
+    parser.add_argument(
+        "--track-score-mode",
+        choices=("threshold", "ignore"),
+        default="threshold",
+        help="Use track scores normally or ignore them only for coordinate diagnostics.",
+    )
     parser.add_argument(
         "--ba-mode",
         choices=("translation_only", "full_se3"),

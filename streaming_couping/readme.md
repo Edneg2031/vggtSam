@@ -136,3 +136,6 @@ pointmap 仍只用于 reference-frame `Sim(3)` gauge 和最终指标。
 不是最终的流式滑窗 BA。只有 oracle GT-mask 消融有效后，才把门控替换为 SAM3
 预测 mask 并接入在线窗口。输出包括 `summary.csv`、`frame_metrics.csv`、
 `transforms.json`、`pointmaps/*.ply` 和 `track_visualizations/*.png`。
+
+`--track-score-mode threshold` 使用 StreamVGGT visibility/confidence；`ignore`
+只用于诊断坐标是否有效，并让两条 BA 同时忽略这些分数，不能作为最终方法。

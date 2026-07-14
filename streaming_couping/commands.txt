@@ -49,5 +49,6 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_mask_track_ba \
   --geometry-device cuda:1 \
   --ba-mode full_se3 \
   --max-query-points 512 \
+  --track-score-mode ignore \
   --ba-pose-prior-weight 0.10 \
-  --output-dir outputs/streaming_couping_mask_track_ba_inst37
+  --output-dir outputs/streaming_couping_mask_track_ba_ignore_scores_inst37
