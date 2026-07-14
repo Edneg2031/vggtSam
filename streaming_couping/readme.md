@@ -16,7 +16,7 @@ SAM3 原视频 session        StreamVGGT causal geometry
         |                         |
         |                  投影并与当前 pointmap 检查
         |                         v
-        +-----------> 3 个几何支持正点
+        +-----------> 几何 box + 3 个支持正点
                               |
                               v
              在原 session 内修正同一个 SAM3 obj_id
@@ -30,7 +30,9 @@ SAM3 原视频 session        StreamVGGT causal geometry
 
 ## 唯一消融变量
 
-恢复帧之前，两条分支完全相同；恢复帧也使用同一组点和逐像素相同的 mask。
+恢复帧之前，两条分支完全相同；恢复帧使用同一个几何 box、同一组正点和
+逐像素相同的校正 mask。box 与点直接修正已有 `obj_id`，不经过 detector；
+box 是 SAM3 的提示，不会硬裁剪输出 mask。
 
 - `no_memory`：恢复帧显示修正 mask，但不改变未来 tracker state；未来帧使用
   未写回修正的原 SAM3 轨迹。

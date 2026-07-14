@@ -85,7 +85,7 @@ class SAM3Wrapper:
             selected_obj_id=output.selected_obj_id,
         )
 
-    def track_with_geometry_point_memory(
+    def track_with_geometry_box_point_memory(
         self,
         image_paths: Sequence[str | Path],
         *,
@@ -95,8 +95,9 @@ class SAM3Wrapper:
         reference_mask: torch.Tensor,
         recovery_frame_idx: int,
         point_prompt_mask: torch.Tensor,
+        box_xyxy: tuple[int, int, int, int],
     ) -> TrackingSequence:
-        """Correct an existing object with geometry points and encode its memory."""
+        """Correct an existing object with a geometry box and three points."""
 
         predictor = self.predictor
         if predictor is None:
@@ -115,6 +116,7 @@ class SAM3Wrapper:
                 "The geometry-supported point prompt is empty; it cannot correct "
                 "the SAM3 instance."
             )
+        box = _normalized_box(box_xyxy, output_size)
 
         with tempfile.TemporaryDirectory(prefix="sam3_memory_writeback_") as tmp:
             tmp_dir = Path(tmp)
@@ -166,11 +168,12 @@ class SAM3Wrapper:
                             "SAM3 did not produce an object ID on the reference frame."
                         )
 
-                    corrected_mask = self._refine_existing_with_points(
+                    corrected_mask = self._refine_existing_with_box_points(
                         session_id=session_id,
                         frame_idx=recovery_frame_idx,
                         obj_id=int(selected_obj_id),
                         points=points,
+                        box=box,
                         output_size=output_size,
                     )
                     future_results = []
@@ -317,13 +320,14 @@ class SAM3Wrapper:
             selected_obj_id=int(selected_obj_id),
         )
 
-    def _refine_existing_with_points(
+    def _refine_existing_with_box_points(
         self,
         *,
         session_id: str,
         frame_idx: int,
         obj_id: int,
         points: list[list[float]],
+        box: list[float],
         output_size: tuple[int, int],
     ) -> torch.Tensor:
         """Refine one existing ID without detector re-entry or ID recreation."""
@@ -358,12 +362,13 @@ class SAM3Wrapper:
             frame_idx=frame_idx,
             obj_id=obj_id,
         )
-        _, obj_ids, _, video_res_masks = model.tracker.add_new_points(
+        _, obj_ids, _, video_res_masks = model.tracker.add_new_points_or_box(
             inference_state=tracker_state,
             frame_idx=frame_idx,
             obj_id=obj_id,
             points=points,
             labels=[1] * len(points),
+            box=box,
             clear_old_points=True,
             rel_coordinates=True,
             use_prev_mem_frame=model.use_prev_mem_frame,
@@ -472,3 +477,18 @@ def _positive_points(mask: torch.Tensor, *, max_points: int = 3) -> list[list[fl
         ]
         for index in selected_indices
     ]
+
+
+def _normalized_box(
+    box_xyxy: tuple[int, int, int, int],
+    output_size: tuple[int, int],
+) -> list[float]:
+    """Convert an output-grid XYXY box to SAM's relative coordinates."""
+
+    height, width = output_size
+    x0, y0, x1, y1 = box_xyxy
+    if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
+        raise ValueError(
+            f"Invalid geometry box {box_xyxy} for output size {output_size}."
+        )
+    return [x0 / width, y0 / height, x1 / width, y1 / height]

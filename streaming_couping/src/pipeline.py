@@ -129,14 +129,18 @@ def run_experiment(config: ExperimentConfig) -> None:
         reference_mask=target_masks[sequence.reference_frame_idx],
         split_frame_idx=recovery_idx,
     )
-    memory_tracking = sam3.track_with_geometry_point_memory(
+    recovery_candidate = result["candidates"][recovery_idx]
+    if recovery_candidate.box_xyxy is None:
+        raise RuntimeError("The accepted recovery candidate has no geometry box.")
+    memory_tracking = sam3.track_with_geometry_box_point_memory(
         sequence.image_paths,
         prompt=sequence.label,
         output_size=config.output_size,
         reference_frame_idx=sequence.reference_frame_idx,
         reference_mask=target_masks[sequence.reference_frame_idx],
         recovery_frame_idx=recovery_idx,
-        point_prompt_mask=result["candidates"][recovery_idx].supported_mask,
+        point_prompt_mask=recovery_candidate.supported_mask,
+        box_xyxy=recovery_candidate.box_xyxy,
     )
     if memory_tracking.selected_obj_id != no_memory_tracking.selected_obj_id:
         raise RuntimeError(
@@ -220,6 +224,8 @@ def run_experiment(config: ExperimentConfig) -> None:
         "same_obj_id": 1,
         "redetection_used": 0,
         "paired_causal_split": 1,
+        "geometry_prompt_mode": "box_3points",
+        "geometry_prompt_box": recovery_candidate.box_xyxy,
         "geometry_prompt_points": min(
             3,
             result["candidates"][recovery_idx].supported_points,
