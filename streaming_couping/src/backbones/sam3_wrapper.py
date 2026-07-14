@@ -327,7 +327,7 @@ class SAM3Wrapper:
         frame_idx: int,
         obj_id: int,
         points: list[list[float]],
-        box: list[float],
+        box: torch.Tensor,
         output_size: tuple[int, int],
     ) -> torch.Tensor:
         """Refine one existing ID without detector re-entry or ID recreation."""
@@ -362,6 +362,8 @@ class SAM3Wrapper:
             frame_idx=frame_idx,
             obj_id=obj_id,
         )
+        if box.shape != (4,):
+            raise ValueError(f"Expected a four-value XYXY box, got {tuple(box.shape)}.")
         _, obj_ids, _, video_res_masks = model.tracker.add_new_points_or_box(
             inference_state=tracker_state,
             frame_idx=frame_idx,
@@ -482,7 +484,7 @@ def _positive_points(mask: torch.Tensor, *, max_points: int = 3) -> list[list[fl
 def _normalized_box(
     box_xyxy: tuple[int, int, int, int],
     output_size: tuple[int, int],
-) -> list[float]:
+) -> torch.Tensor:
     """Convert an output-grid XYXY box to SAM's relative coordinates."""
 
     height, width = output_size
@@ -491,4 +493,7 @@ def _normalized_box(
         raise ValueError(
             f"Invalid geometry box {box_xyxy} for output size {output_size}."
         )
-    return [x0 / width, y0 / height, x1 / width, y1 / height]
+    return torch.tensor(
+        [x0 / width, y0 / height, x1 / width, y1 / height],
+        dtype=torch.float32,
+    )
