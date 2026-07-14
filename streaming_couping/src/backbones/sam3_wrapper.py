@@ -431,6 +431,12 @@ class SAM3Wrapper:
                 f"{len(tracker_states)}."
             )
         tracker_state = tracker_states[0]
+        self._reactivate_existing_object(
+            inference_state=inference_state,
+            model=model,
+            frame_idx=frame_idx,
+            obj_id=obj_id,
+        )
         model.tracker.add_new_mask(
             inference_state=tracker_state,
             frame_idx=frame_idx,
@@ -440,6 +446,50 @@ class SAM3Wrapper:
         model.tracker.propagate_in_video_preflight(
             tracker_state,
             run_mem_encoder=True,
+        )
+
+    @staticmethod
+    def _reactivate_existing_object(
+        *,
+        inference_state,
+        model,
+        frame_idx: int,
+        obj_id: int,
+    ) -> None:
+        """Mirror SAM3's native existing-object refinement bookkeeping."""
+
+        tracker_metadata = inference_state["tracker_metadata"]
+        model.add_action_history(
+            inference_state,
+            "refine",
+            frame_idx=frame_idx,
+            obj_ids=[obj_id],
+        )
+        tracker_metadata["obj_id_to_score"][obj_id] = 1.0
+        tracker_metadata["obj_id_to_tracker_score_frame_wise"][frame_idx][obj_id] = 1.0
+
+        if int(model.rank) != 0:
+            return
+        rank0_metadata = tracker_metadata.get("rank0_metadata", {})
+        rank0_metadata.get("removed_obj_ids", set()).discard(obj_id)
+        for suppressed_ids in rank0_metadata.get("suppressed_obj_ids", {}).values():
+            suppressed_ids.discard(obj_id)
+
+        confirmation = rank0_metadata.get("masklet_confirmation")
+        if confirmation is None:
+            return
+        # obj_ids_all_gpu is a NumPy array in SAM3's tracker metadata.
+        matching = [
+            index
+            for index, candidate_id in enumerate(tracker_metadata["obj_ids_all_gpu"])
+            if int(candidate_id) == obj_id
+        ]
+        if not matching or matching[0] >= len(confirmation["status"]):
+            return
+        obj_index = matching[0]
+        confirmation["status"][obj_index] = 1
+        confirmation["consecutive_det_num"][obj_index] = (
+            model.masklet_confirmation_consecutive_det_thresh
         )
 
     def _require_adapter(self) -> SAM3VideoTrackerAdapter:

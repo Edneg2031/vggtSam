@@ -41,7 +41,8 @@ SAM3 原视频 session        StreamVGGT causal geometry
 - `no_memory`：恢复帧显示修正 mask，但不改变未来 tracker state；未来帧使用
   未写回修正的原 SAM3 轨迹。
 - `memory`：将同一个 dense mask 通过 SAM3 原生 memory encoder 写入同一
-  `obj_id`，未来帧从修正后的 memory 继续传播。
+  `obj_id`，并执行 SAM3 原生 existing-object refine 的激活 bookkeeping，
+  未来帧从修正后的 memory 继续传播。该步骤不会创建新实例 ID。
 
 代码会检查 recovery frame 的两份 mask 是否逐像素相同。判断 memory 效果只看：
 

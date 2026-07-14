@@ -232,6 +232,7 @@ def run_experiment(config: ExperimentConfig) -> None:
         "recovery_source": "text_box_points_full_mask",
         "recovery_reacquisition_used": 1,
         "paired_branch_redetection_used": 0,
+        "memory_existing_object_reactivated": 1,
         "recovery_mask_score": recovery_score,
         "recovery_mask_iou": binary_iou(
             recovery_mask,
