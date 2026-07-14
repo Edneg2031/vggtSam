@@ -80,3 +80,26 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_bridge \
 - 持久实例身份始终由原视频 tracker 的同一个 `obj_id` 维持。
 - 临时 text 重查询只生成恢复 mask，不承担持久身份。
 - 不包含点云地图更新、相机优化或联合训练。
+
+## GT Mask 几何可行性实验
+
+`run_gt_mask_pose_refinement` 是独立的反向验证，不改变上述 memory 实验。
+它冻结 StreamVGGT，只用 GT instance mask 从每帧预测 pointmap 中选出同一
+静态物体的点，再用 trimmed point-to-point ICP 求当前帧的 `SE(3)` 修正。
+
+为消除 StreamVGGT 的任意坐标系和尺度，raw/refined 两条路径共享一次仅由
+reference frame 估计的 `Sim(3)`。GT pose 和 GT pointmap 在 ICP 中不使用，
+只负责公共坐标对齐和最终评价。
+
+主要输出：
+
+- `frame_metrics.csv`：逐帧 ICP、pose、全场景/实例 pointmap 误差。
+- `summary.csv`：非 reference 可见帧的 raw/refined 均值。
+- `transforms.json`：共享 Sim(3) 与每帧 ICP 修正矩阵。
+- `pointmaps/*_streamvggt_native.{npz,ply}`：模型原生坐标系的 pointmap。
+- `pointmaps/*_{raw,refined,gt}.npz`：保留网格结构的对齐后 XYZ pointmap。
+- `pointmaps/*_{raw,refined,gt}.ply`：逐帧和整段对齐后场景点云。
+- `pointmaps/*_object.ply`：由 GT instance mask 选出的实例点云。
+
+这里的 `raw` 指经过公共 Sim(3) 坐标对齐、但没有 ICP 修正的原始
+StreamVGGT 输出。运行命令见 `streaming_couping/commands.txt`。
