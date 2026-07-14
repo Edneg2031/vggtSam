@@ -111,6 +111,8 @@ class StreamVGGTLatentAdapter:
         pointmap_dense = None
         confidence_grid = None
         confidence_dense = None
+        depth_dense = None
+        depth_confidence_dense = None
         raw_output = None
         if return_pointmap and getattr(self.model, "point_head", None) is not None:
             with torch.cuda.amp.autocast(enabled=False):
@@ -126,6 +128,15 @@ class StreamVGGTLatentAdapter:
                 confidence_dense,
                 self.token_grid,
             )
+        if return_pointmap and getattr(self.model, "depth_head", None) is not None:
+            with torch.cuda.amp.autocast(enabled=False):
+                depth, depth_confidence = self.model.depth_head(
+                    aggregated_tokens_list,
+                    images=batch_images,
+                    patch_start_idx=patch_start_idx,
+                )
+            depth_dense = ensure_thwc(depth[0]).float()
+            depth_confidence_dense = ensure_thwc(depth_confidence[0]).float()
 
         geometry = GeometryTokens(
             tokens=context_tokens.reshape(1, -1, context_tokens.shape[-1]),
@@ -148,6 +159,8 @@ class StreamVGGTLatentAdapter:
                 "patch_start_idx": patch_start_idx,
                 "pointmap_dense": pointmap_dense,
                 "confidence_dense": confidence_dense,
+                "depth_dense": depth_dense,
+                "depth_confidence_dense": depth_confidence_dense,
             },
         )
         return StreamVGGTLatentOutput(
@@ -181,6 +194,8 @@ class StreamVGGTLatentAdapter:
         pointmap_dense_chunks = []
         confidence_chunks = []
         confidence_dense_chunks = []
+        depth_dense_chunks = []
+        depth_confidence_dense_chunks = []
         patch_start_idx = None
         past_key_values_camera = (
             [None] * self.model.camera_head.trunk_depth
@@ -245,14 +260,40 @@ class StreamVGGTLatentAdapter:
                     )
                 )
 
+            if return_pointmap and getattr(self.model, "depth_head", None) is not None:
+                with torch.cuda.amp.autocast(enabled=False):
+                    depth, depth_confidence = self.model.depth_head(
+                        aggregated_tokens_list,
+                        images=batch_frame,
+                        patch_start_idx=patch_start_idx,
+                    )
+                depth_dense_chunks.append(ensure_thwc(depth[0]).float())
+                depth_confidence_dense_chunks.append(
+                    ensure_thwc(depth_confidence[0]).float()
+                )
+
         context_tokens = torch.cat(context_chunks, dim=1)
         dense_tokens = torch.cat(dense_chunks, dim=1)
         dpt_tokens = [torch.cat(chunks, dim=1) for chunks in dpt_layer_chunks]
         camera_tokens = torch.cat(camera_chunks, dim=1) if camera_chunks else None
         pointmap_grid = torch.cat(pointmap_chunks, dim=0) if pointmap_chunks else None
-        pointmap_dense = torch.cat(pointmap_dense_chunks, dim=0) if pointmap_dense_chunks else None
+        pointmap_dense = (
+            torch.cat(pointmap_dense_chunks, dim=0)
+            if pointmap_dense_chunks
+            else None
+        )
         confidence_grid = torch.cat(confidence_chunks, dim=0) if confidence_chunks else None
-        confidence_dense = torch.cat(confidence_dense_chunks, dim=0) if confidence_dense_chunks else None
+        confidence_dense = (
+            torch.cat(confidence_dense_chunks, dim=0)
+            if confidence_dense_chunks
+            else None
+        )
+        depth_dense = torch.cat(depth_dense_chunks, dim=0) if depth_dense_chunks else None
+        depth_confidence_dense = (
+            torch.cat(depth_confidence_dense_chunks, dim=0)
+            if depth_confidence_dense_chunks
+            else None
+        )
         geometry = GeometryTokens(
             tokens=context_tokens.reshape(1, -1, context_tokens.shape[-1]),
             camera_tokens=camera_tokens,
@@ -274,6 +315,8 @@ class StreamVGGTLatentAdapter:
                 "patch_start_idx": patch_start_idx,
                 "pointmap_dense": pointmap_dense,
                 "confidence_dense": confidence_dense,
+                "depth_dense": depth_dense,
+                "depth_confidence_dense": depth_confidence_dense,
                 "streaming_cache": True,
             },
         )

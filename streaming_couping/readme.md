@@ -97,14 +97,22 @@ camera correction。
 reference frame 估计的 `Sim(3)`。GT pose 和 GT pointmap 在 ICP 中不使用，
 只负责公共坐标对齐和最终评价。
 
+同时保留一个不参与 ICP 的诊断分支：使用 StreamVGGT `depth_head` 的深度和
+`camera_head` 的内外参反投影出 camera-consistent pointmap。由于它与
+`point_head` 输出处在不同的原生 gauge，该分支也只在同一个 reference frame
+独立估计一次 `Sim(3)`，并固定用于全部后续帧。这样比较的是两种几何输出的
+跨帧一致性，不会用每帧 GT 做对齐。
+
 主要输出：
 
 - `frame_metrics.csv`：逐帧 ICP、pose、全场景/实例 pointmap 误差。
 - `summary.csv`：非 reference 可见帧的 raw/refined 均值。
 - `transforms.json`：共享 Sim(3) 与每帧 ICP 修正矩阵。
 - `pointmaps/*_streamvggt_native.ply`：模型原生坐标系的 pointmap。
+- `pointmaps/*_depth_camera_{native,aligned}.ply`：由 depth head 和 camera head
+  反投影得到的 camera-consistent pointmap 诊断分支。
 - `pointmaps/*_{raw,refined,gt}.ply`：逐帧和整段对齐后场景点云。
 - `pointmaps/*_object.ply`：由 GT instance mask 选出的实例点云。
 
-这里的 `raw` 指经过公共 Sim(3) 坐标对齐、但没有 ICP 修正的原始
-StreamVGGT 输出。运行命令见 `streaming_couping/commands.txt`。
+这里的 `raw` 指经过 point-head 分支公共 Sim(3) 坐标对齐、但没有 ICP 修正的
+StreamVGGT pointmap。运行命令见 `streaming_couping/commands.txt`。

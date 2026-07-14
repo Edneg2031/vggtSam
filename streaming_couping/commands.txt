@@ -20,9 +20,9 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_bridge \
   --output-dir outputs/streaming_couping_paired_full_mask_memory_inst37
 
 # Oracle feasibility test for the reverse SAM3 -> geometry direction.
-# GT instance masks only select same-instance StreamVGGT points for ICP; GT poses
-# and pointmaps only fix one shared reference-frame Sim(3) gauge and evaluate it;
-# they never enter the object ICP.
+# It compares the point head, translation-refined point head, and a camera-consistent
+# depth-head unprojection. Each native geometry branch fixes its gauge once at the
+# same reference frame; later-frame GT never enters alignment or object ICP.
 PYTHONPATH=src:. python -m streaming_couping.scripts.run_gt_mask_pose_refinement \
   --config streaming_couping/configs/default.yaml \
   --manifest data/processed/scannetpp_pinhole_2d/manifest_rgb_cache.json \
@@ -34,4 +34,4 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_gt_mask_pose_refinement
   --geometry-device cuda:1 \
   --confidence-threshold 0.30 \
   --icp-max-correspondence 0.20 \
-  --output-dir outputs/streaming_couping_gt_mask_translation_inst37
+  --output-dir outputs/streaming_couping_gt_mask_depth_camera_diag_inst37

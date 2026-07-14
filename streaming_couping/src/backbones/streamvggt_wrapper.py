@@ -59,12 +59,21 @@ class StreamVGGTWrapper:
         )
         points = output.geometry.aux.get("pointmap_dense")
         confidence = output.geometry.aux.get("confidence_dense")
+        depth = output.geometry.aux.get("depth_dense")
+        depth_confidence = output.geometry.aux.get("depth_confidence_dense")
         pose_encoding = output.geometry.camera_tokens
-        if points is None or confidence is None or pose_encoding is None:
+        if (
+            points is None
+            or confidence is None
+            or depth is None
+            or depth_confidence is None
+            or pose_encoding is None
+        ):
             raise RuntimeError(
-                "StreamVGGT did not expose pointmap_dense, confidence_dense, and camera_tokens."
+                "StreamVGGT did not expose pointmap, depth, confidence, and camera outputs."
             )
 
+        from streamvggt.utils.geometry import unproject_depth_map_to_point_map
         from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
 
         processed_size = tuple(int(value) for value in output.aux["image_shape"])
@@ -72,6 +81,15 @@ class StreamVGGTWrapper:
             pose_encoding.float(),
             image_size_hw=processed_size,
         )
+        camera_world_points = torch.from_numpy(
+            unproject_depth_map_to_point_map(
+                depth.detach().float().cpu(),
+                world_to_camera[0].detach().float().cpu(),
+                intrinsics[0].detach().float().cpu(),
+            )
+        ).float()
+        valid_depth = torch.isfinite(depth).all(dim=-1) & (depth[..., 0] > 0.0)
+        camera_world_points[~valid_depth.cpu()] = float("nan")
         source_sizes = []
         for path in image_paths:
             with Image.open(path) as image:
@@ -83,6 +101,11 @@ class StreamVGGTWrapper:
             intrinsics=intrinsics[0].detach().float().cpu(),
             processed_size=(processed_size[0], processed_size[1]),
             source_sizes=tuple(source_sizes),
+            depth=depth.detach().float().cpu(),
+            depth_confidence=_normalize_confidence(
+                depth_confidence.detach().float().cpu()
+            ),
+            camera_world_points=camera_world_points,
         )
 
 

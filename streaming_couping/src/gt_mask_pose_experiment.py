@@ -123,6 +123,8 @@ def run_experiment(
             "GT and StreamVGGT pointmap shapes disagree: "
             f"{tuple(gt.pointmaps.shape)} != {tuple(geometry.world_points.shape)}"
         )
+    if geometry.camera_world_points is None or geometry.depth_confidence is None:
+        raise RuntimeError("StreamVGGT camera-consistent depth pointmap is unavailable.")
 
     correspondence_mask = (
         torch.isfinite(geometry.world_points[reference]).all(dim=-1)
@@ -142,8 +144,32 @@ def run_experiment(
         trim_fraction=alignment_trim_fraction,
     )
     print(
-        f"reference Sim3 scale={similarity.scale:.6f} "
+        f"point-head Sim3 scale={similarity.scale:.6f} "
         f"inliers={similarity.inliers} rmse={similarity.rmse:.6f}"
+    )
+
+    depth_correspondence_mask = (
+        torch.isfinite(geometry.camera_world_points[reference]).all(dim=-1)
+        & torch.isfinite(gt.pointmaps[reference]).all(dim=-1)
+        & (geometry.depth_confidence[reference] >= float(confidence_threshold))
+    )
+    depth_source_alignment = geometry.camera_world_points[reference][
+        depth_correspondence_mask
+    ]
+    depth_target_alignment = gt.pointmaps[reference][depth_correspondence_mask]
+    depth_source_alignment, depth_target_alignment = _paired_subsample(
+        depth_source_alignment,
+        depth_target_alignment,
+        max_points=30_000,
+    )
+    depth_similarity = estimate_similarity(
+        depth_source_alignment,
+        depth_target_alignment,
+        trim_fraction=alignment_trim_fraction,
+    )
+    print(
+        f"depth-camera Sim3 scale={depth_similarity.scale:.6f} "
+        f"inliers={depth_similarity.inliers} rmse={depth_similarity.rmse:.6f}"
     )
 
     raw_points = apply_similarity(
@@ -155,6 +181,18 @@ def run_experiment(
     raw_poses = torch.stack(
         [
             align_world_to_camera(pose, similarity)
+            for pose in geometry.world_to_camera
+        ]
+    )
+    depth_camera_points = apply_similarity(
+        geometry.camera_world_points,
+        depth_similarity.scale,
+        depth_similarity.rotation,
+        depth_similarity.translation,
+    )
+    depth_camera_poses = torch.stack(
+        [
+            align_world_to_camera(pose, depth_similarity)
             for pose in geometry.world_to_camera
         ]
     )
@@ -235,6 +273,10 @@ def run_experiment(
         refined_rotation, refined_translation = pose_errors(
             refined_poses[sequence_index], gt.world_to_camera[sequence_index]
         )
+        depth_rotation, depth_translation = pose_errors(
+            depth_camera_poses[sequence_index],
+            gt.world_to_camera[sequence_index],
+        )
         raw_full = pointmap_errors(
             raw_points[sequence_index], gt.pointmaps[sequence_index]
         )
@@ -251,15 +293,33 @@ def run_experiment(
             gt.pointmaps[sequence_index],
             mask=gt.instance_masks[sequence_index],
         )
+        depth_full = pointmap_errors(
+            depth_camera_points[sequence_index], gt.pointmaps[sequence_index]
+        )
+        depth_object = pointmap_errors(
+            depth_camera_points[sequence_index],
+            gt.pointmaps[sequence_index],
+            mask=gt.instance_masks[sequence_index],
+        )
         target_object = gt.pointmaps[sequence_index][gt.instance_masks[sequence_index]]
         raw_object_cloud = raw_points[sequence_index][object_mask]
         refined_object_cloud = refined_points[sequence_index][object_mask]
+        depth_object_mask = (
+            gt.instance_masks[sequence_index]
+            & torch.isfinite(depth_camera_points[sequence_index]).all(dim=-1)
+            & (
+                geometry.depth_confidence[sequence_index]
+                >= float(confidence_threshold)
+            )
+        )
+        depth_object_cloud = depth_camera_points[sequence_index][depth_object_mask]
         row = {
             "sequence_index": sequence_index,
             "frame_index": frame_index,
             "gt_visible": int(gt.instance_masks[sequence_index].any()),
             "gt_mask_pixels": int(gt.instance_masks[sequence_index].sum()),
             "pred_object_points": int(object_mask.sum()),
+            "depth_camera_object_points": int(depth_object_mask.sum()),
             "icp_accepted": int(icp.accepted),
             "icp_reason": icp.reason,
             "pose_refinement_mode": pose_refinement_mode,
@@ -273,6 +333,8 @@ def run_experiment(
             "refined_pose_rotation_degrees": refined_rotation,
             "raw_pose_translation": raw_translation,
             "refined_pose_translation": refined_translation,
+            "depth_camera_pose_rotation_degrees": depth_rotation,
+            "depth_camera_pose_translation": depth_translation,
             "raw_full_point_rmse": raw_full["rmse"],
             "refined_full_point_rmse": refined_full["rmse"],
             "raw_full_point_mae": raw_full["mae"],
@@ -281,11 +343,18 @@ def run_experiment(
             "refined_object_point_rmse": refined_object["rmse"],
             "raw_object_point_mae": raw_object["mae"],
             "refined_object_point_mae": refined_object["mae"],
+            "depth_camera_full_point_rmse": depth_full["rmse"],
+            "depth_camera_full_point_mae": depth_full["mae"],
+            "depth_camera_object_point_rmse": depth_object["rmse"],
+            "depth_camera_object_point_mae": depth_object["mae"],
             "raw_object_chamfer": symmetric_chamfer(
                 raw_object_cloud, target_object
             ),
             "refined_object_chamfer": symmetric_chamfer(
                 refined_object_cloud, target_object
+            ),
+            "depth_camera_object_chamfer": symmetric_chamfer(
+                depth_object_cloud, target_object
             ),
         }
         rows.append(row)
@@ -294,18 +363,24 @@ def run_experiment(
             f"icp={icp.accepted} fitness={icp.fitness:.3f} rmse={icp.rmse:.4f} "
             f"pose_t={raw_translation:.4f}->{refined_translation:.4f} "
             f"object_chamfer={row['raw_object_chamfer']:.4f}->"
-            f"{row['refined_object_chamfer']:.4f}"
+            f"{row['refined_object_chamfer']:.4f} "
+            f"depth_camera_pose_t={depth_translation:.4f} "
+            f"depth_camera_object_chamfer="
+            f"{row['depth_camera_object_chamfer']:.4f}"
         )
 
     _export_pointmaps(
         config.output_dir,
         frame_indices=sequence.frame_indices,
         native_points=geometry.world_points,
+        depth_native_points=geometry.camera_world_points,
+        depth_camera_points=depth_camera_points,
         raw_points=raw_points,
         refined_points=refined_points,
         gt_points=gt.pointmaps,
         masks=gt.instance_masks,
         confidence=geometry.confidence,
+        depth_confidence=geometry.depth_confidence,
         colors=gt.colors,
         confidence_threshold=confidence_threshold,
     )
@@ -327,6 +402,9 @@ def run_experiment(
         "sim3_scale": similarity.scale,
         "sim3_inliers": similarity.inliers,
         "sim3_rmse": similarity.rmse,
+        "depth_camera_sim3_scale": depth_similarity.scale,
+        "depth_camera_sim3_inliers": depth_similarity.inliers,
+        "depth_camera_sim3_rmse": depth_similarity.rmse,
     }
     for key in (
         "raw_pose_rotation_degrees",
@@ -339,6 +417,11 @@ def run_experiment(
         "refined_object_point_rmse",
         "raw_object_chamfer",
         "refined_object_chamfer",
+        "depth_camera_pose_rotation_degrees",
+        "depth_camera_pose_translation",
+        "depth_camera_full_point_rmse",
+        "depth_camera_object_point_rmse",
+        "depth_camera_object_chamfer",
     ):
         summary[f"mean_{key}"] = _finite_mean(row[key] for row in selected)
     for metric in (
@@ -374,12 +457,20 @@ def run_experiment(
                     "inliers": similarity.inliers,
                     "rmse": similarity.rmse,
                 },
+                "depth_camera_similarity": {
+                    "scale": depth_similarity.scale,
+                    "rotation": depth_similarity.rotation.tolist(),
+                    "translation": depth_similarity.translation.tolist(),
+                    "inliers": depth_similarity.inliers,
+                    "rmse": depth_similarity.rmse,
+                },
                 "icp_corrections": correction_records,
                 "streamvggt_native_world_to_camera": (
                     geometry.world_to_camera.tolist()
                 ),
                 "raw_world_to_camera": raw_poses.tolist(),
                 "refined_world_to_camera": refined_poses.tolist(),
+                "depth_camera_world_to_camera": depth_camera_poses.tolist(),
                 "gt_world_to_camera": gt.world_to_camera.tolist(),
             },
             handle,
@@ -413,11 +504,14 @@ def _export_pointmaps(
     *,
     frame_indices,
     native_points: torch.Tensor,
+    depth_native_points: torch.Tensor,
+    depth_camera_points: torch.Tensor,
     raw_points: torch.Tensor,
     refined_points: torch.Tensor,
     gt_points: torch.Tensor,
     masks: torch.Tensor,
     confidence: torch.Tensor,
+    depth_confidence: torch.Tensor,
     colors: np.ndarray,
     confidence_threshold: float,
 ) -> None:
@@ -426,6 +520,16 @@ def _export_pointmaps(
         prefix = root / f"frame_{index:02d}_{frame_index}"
         for name, points, point_confidence in (
             ("streamvggt_native", native_points[index], confidence[index]),
+            (
+                "depth_camera_native",
+                depth_native_points[index],
+                depth_confidence[index],
+            ),
+            (
+                "depth_camera_aligned",
+                depth_camera_points[index],
+                depth_confidence[index],
+            ),
             ("raw", raw_points[index], confidence[index]),
             ("refined", refined_points[index], confidence[index]),
             ("gt", gt_points[index], None),
@@ -453,6 +557,20 @@ def _export_pointmaps(
         confidence_threshold=confidence_threshold,
     )
     save_aggregate_ply(
+        root / "sequence_depth_camera_native.ply",
+        depth_native_points,
+        colors,
+        confidence=depth_confidence,
+        confidence_threshold=confidence_threshold,
+    )
+    save_aggregate_ply(
+        root / "sequence_depth_camera_aligned.ply",
+        depth_camera_points,
+        colors,
+        confidence=depth_confidence,
+        confidence_threshold=confidence_threshold,
+    )
+    save_aggregate_ply(
         root / "sequence_raw.ply",
         raw_points,
         colors,
@@ -467,6 +585,14 @@ def _export_pointmaps(
         confidence_threshold=confidence_threshold,
     )
     save_aggregate_ply(root / "sequence_gt.ply", gt_points, colors)
+    save_aggregate_ply(
+        root / "object_depth_camera_aligned.ply",
+        depth_camera_points,
+        colors,
+        masks=masks,
+        confidence=depth_confidence,
+        confidence_threshold=confidence_threshold,
+    )
     save_aggregate_ply(
         root / "object_streamvggt_native.ply",
         native_points,

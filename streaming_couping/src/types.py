@@ -16,6 +16,9 @@ class GeometrySequence:
     intrinsics: torch.Tensor
     processed_size: tuple[int, int]
     source_sizes: tuple[tuple[int, int], ...]
+    depth: torch.Tensor | None = None
+    depth_confidence: torch.Tensor | None = None
+    camera_world_points: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
