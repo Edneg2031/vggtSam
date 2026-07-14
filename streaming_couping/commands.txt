@@ -29,6 +29,7 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_gt_mask_pose_refinement
   --scene-id 00a231a370 \
   --instance-id 37 \
   --frame-indices 133 162 520 566 477 \
+  --reference-sequence-index 0 \
   --geometry-device cuda:1 \
   --confidence-threshold 0.30 \
   --icp-max-correspondence 0.20 \

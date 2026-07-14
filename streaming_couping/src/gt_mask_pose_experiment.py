@@ -57,6 +57,7 @@ def main() -> None:
         icp_min_inliers=args.icp_min_inliers,
         icp_min_fitness=args.icp_min_fitness,
         icp_max_rmse=args.icp_max_rmse,
+        reference_sequence_index=args.reference_sequence_index,
     )
 
 
@@ -72,6 +73,7 @@ def run_experiment(
     icp_min_inliers: int,
     icp_min_fitness: float,
     icp_max_rmse: float,
+    reference_sequence_index: int | None,
 ) -> None:
     torch.manual_seed(0)
     np.random.seed(0)
@@ -90,10 +92,12 @@ def run_experiment(
         excluded_labels=config.excluded_labels,
         seed=0,
     )
+    reference = select_causal_reference(sequence, reference_sequence_index)
+    reference_mode = "explicit" if reference_sequence_index is not None else "first_visible"
     print(
         f"target scene={sequence.scene_id} frames={sequence.frame_indices} "
         f"instance={sequence.instance_id} label={sequence.label!r} "
-        f"reference={sequence.reference_frame_idx}"
+        f"reference={reference} reference_mode={reference_mode}"
     )
     print("running frozen StreamVGGT with causal caches...")
     geometry = StreamVGGTWrapper(
@@ -117,7 +121,6 @@ def run_experiment(
             f"{tuple(gt.pointmaps.shape)} != {tuple(geometry.world_points.shape)}"
         )
 
-    reference = sequence.reference_frame_idx
     correspondence_mask = (
         torch.isfinite(geometry.world_points[reference]).all(dim=-1)
         & torch.isfinite(gt.pointmaps[reference]).all(dim=-1)
@@ -497,6 +500,34 @@ def _identity_icp(dtype: torch.dtype, *, reason: str) -> ICPResult:
     )
 
 
+def select_causal_reference(
+    sequence,
+    requested_index: int | None,
+) -> int:
+    if requested_index is None:
+        visible = [
+            index
+            for index, mask in enumerate(sequence.target_masks)
+            if np.asarray(mask).any()
+        ]
+        if not visible:
+            raise ValueError("The selected instance is absent from the whole sequence.")
+        return visible[0]
+
+    index = int(requested_index)
+    if index < 0 or index >= len(sequence.frame_indices):
+        raise ValueError(
+            f"reference_sequence_index={index} is outside "
+            f"[0, {len(sequence.frame_indices) - 1}]."
+        )
+    if not np.asarray(sequence.target_masks[index]).any():
+        raise ValueError(
+            f"Instance {sequence.instance_id} is absent from reference sequence "
+            f"index {index} (frame {sequence.frame_indices[index]})."
+        )
+    return index
+
+
 def _paired_subsample(
     source: torch.Tensor,
     target: torch.Tensor,
@@ -544,6 +575,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--icp-min-inliers", type=int, default=64)
     parser.add_argument("--icp-min-fitness", type=float, default=0.10)
     parser.add_argument("--icp-max-rmse", type=float, default=0.15)
+    parser.add_argument(
+        "--reference-sequence-index",
+        type=int,
+        help="Reference position in frame-indices; defaults to the earliest visible frame.",
+    )
     return parser.parse_args()
 
 

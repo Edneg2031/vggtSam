@@ -86,6 +86,8 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_bridge \
 `run_gt_mask_pose_refinement` 是独立的反向验证，不改变上述 memory 实验。
 它冻结 StreamVGGT，只用 GT instance mask 从每帧预测 pointmap 中选出同一
 静态物体的点，再用 trimmed point-to-point ICP 求当前帧的 `SE(3)` 修正。
+Reference 默认取序列中最早可见帧，确保任意当前帧只使用历史信息；也可用
+`--reference-sequence-index` 显式指定，但指定帧必须包含目标实例。
 
 为消除 StreamVGGT 的任意坐标系和尺度，raw/refined 两条路径共享一次仅由
 reference frame 估计的 `Sim(3)`。GT pose 和 GT pointmap 在 ICP 中不使用，
