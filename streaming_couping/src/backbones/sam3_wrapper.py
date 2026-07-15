@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from pathlib import Path
 import tempfile
 from typing import Sequence
@@ -117,6 +118,48 @@ class SAM3Wrapper:
                 reference_frame_idx=reference_frame_idx,
                 reference_mask=reference_mask,
             )
+
+    def track_with_soft_diagnostics(
+        self,
+        image_paths: Sequence[str | Path],
+        *,
+        prompt: str,
+        output_size: tuple[int, int],
+        reference_frame_idx: int,
+        reference_mask: torch.Tensor,
+        warper=None,
+    ):
+        """Run SAM3 and retain decoder outputs before its hard presence gate."""
+
+        predictor = self.predictor
+        if predictor is None:
+            raise RuntimeError("Call SAM3Wrapper.load() before inference.")
+        tracker = getattr(getattr(predictor, "model", None), "tracker", None)
+        if tracker is None:
+            raise RuntimeError("The loaded SAM3 model does not expose its tracker.")
+        from ..bridge.memory_warp import install_memory_position_warp
+        from ..bridge.sam3_soft_diagnostics import (
+            SAM3SoftOutputCapture,
+            capture_sam3_soft_outputs,
+        )
+
+        capture = SAM3SoftOutputCapture(output_size=output_size)
+        with ExitStack() as stack:
+            if warper is not None:
+                stack.enter_context(install_memory_position_warp(tracker, warper))
+            stack.enter_context(capture_sam3_soft_outputs(tracker, capture))
+            tracking = self.track(
+                image_paths,
+                prompt=prompt,
+                output_size=output_size,
+                reference_frame_idx=reference_frame_idx,
+                reference_mask=reference_mask,
+            )
+        soft = capture.finalize(
+            num_frames=len(image_paths),
+            selected_obj_id=tracking.selected_obj_id,
+        )
+        return tracking, soft
 
     def recover_mask_with_text_geometry(
         self,

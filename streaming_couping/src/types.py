@@ -29,6 +29,13 @@ class TrackingSequence:
 
 
 @dataclass(frozen=True)
+class SAM3SoftSequence:
+    probabilities: torch.Tensor
+    presence_logits: torch.Tensor
+    captures_per_frame: torch.Tensor
+
+
+@dataclass(frozen=True)
 class RevisitCandidate:
     mask: torch.Tensor
     projected_mask: torch.Tensor

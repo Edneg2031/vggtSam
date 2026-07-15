@@ -171,3 +171,15 @@ memory attention 和 mask decoder 都保持 SAM3 原实现。
 和 shuffled，才能支持“几何对齐 memory 位置先验有效”。逐帧结果和 warp 有效
 比例分别写入 `frame_metrics.csv`、`memory_warp_pairs.csv`，总览图为
 `memory_warp_report.png`。运行命令见 `streaming_couping/commands.txt`。
+
+当最终 mask 仍为空时，额外按以下顺序诊断：
+
+1. `geometry_projection_metrics.csv` 和 `geometry_projection_report.png`：只把
+   reference GT 物体 token 投到后续帧，GT 仅评价投影命中率、覆盖率和 IoU。
+2. `frame_metrics.csv` 和 `soft_response_report.png`：读取 SAM3 硬 presence gate
+   之前的 decoder mask、`object_score_logits`、GT/背景响应差和 soft IoU。
+
+若 aligned 投影命中高但 `presence_logit <= 0` 或 soft margin 不提高，问题在
+SAM3 对几何位置先验的消费方式；若 aligned 投影本身不优于 shuffled，则先修正
+StreamVGGT 几何/坐标变换。soft 诊断要求 `soft_capture_count=1`，以保证它对应
+当前单实例 tracker；identity 的 hard/soft 输出都必须与 original 相同。

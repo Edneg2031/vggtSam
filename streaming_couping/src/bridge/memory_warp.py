@@ -182,6 +182,72 @@ class GeometryMemoryPositionWarper:
     def observation_rows(self) -> list[dict[str, float | int]]:
         return [asdict(item) for item in self.observations]
 
+    def project_reference_mask(
+        self,
+        source_mask: torch.Tensor,
+        *,
+        memory_frame: int,
+        current_frame: int,
+        output_size: tuple[int, int],
+        memory_size: tuple[int, int] = (72, 72),
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float | int]]:
+        """Project reference object tokens for metrics-only geometry diagnosis."""
+
+        geometry_memory = self._geometry_index(memory_frame)
+        geometry_current = self._geometry_index(current_frame)
+        sample_grid, valid, displacement = self._build_grid(
+            memory_frame=int(memory_frame),
+            current_frame=int(current_frame),
+            geometry_memory=geometry_memory,
+            geometry_current=geometry_current,
+            memory_size=memory_size,
+        )
+        source_tokens = F.interpolate(
+            source_mask.detach().float()[None, None],
+            size=memory_size,
+            mode="nearest",
+        )[0, 0].bool()
+        selected = source_tokens & valid
+        output_height, output_width = (int(value) for value in output_size)
+        point_mask = torch.zeros(output_height, output_width, dtype=torch.bool)
+        normalized_x = sample_grid[0, ..., 0]
+        normalized_y = sample_grid[0, ..., 1]
+        output_x = ((normalized_x + 1.0) * output_width / 2.0 - 0.5).round().long()
+        output_y = ((normalized_y + 1.0) * output_height / 2.0 - 0.5).round().long()
+        selected &= (
+            (output_x >= 0)
+            & (output_x < output_width)
+            & (output_y >= 0)
+            & (output_y < output_height)
+        )
+        if selected.any():
+            point_mask[output_y[selected], output_x[selected]] = True
+        token_height, token_width = memory_size
+        radius_y = max(1, int(round(output_height / token_height / 2.0)))
+        radius_x = max(1, int(round(output_width / token_width / 2.0)))
+        projected_mask = F.max_pool2d(
+            point_mask.float()[None, None],
+            kernel_size=(2 * radius_y + 1, 2 * radius_x + 1),
+            stride=1,
+            padding=(radius_y, radius_x),
+        )[0, 0].bool()
+        selected_count = int(source_tokens.sum().item())
+        projected_count = int(selected.sum().item())
+        stats = {
+            "source_object_tokens": selected_count,
+            "valid_projected_object_tokens": projected_count,
+            "object_token_valid_ratio": float(
+                projected_count / max(selected_count, 1)
+            ),
+            "unique_projected_pixels": int(point_mask.sum().item()),
+            "mean_object_displacement_pixels": (
+                float(displacement[selected].mean().item())
+                if projected_count
+                else 0.0
+            ),
+        }
+        return projected_mask, point_mask, stats
+
     def _geometry_index(self, sequence_index: int) -> int:
         sequence_index = int(sequence_index)
         if sequence_index < 0 or sequence_index >= len(self.frame_permutation):
