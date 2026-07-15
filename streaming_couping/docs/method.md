@@ -19,19 +19,25 @@
         实例一致mask + 物体级语义点云地图 {O_k: pts, label, traj}
 ```
 
-核心设计原则：**两个分支不做深度权重共享，只在三个显式接口上交互**——(a) 相机约束接口，(b) 跟踪增强接口，(c) 置信度门控。这样可以分别做消融，避免"黑箱缝合"。
+核心设计原则：**两个主干不做权重共享**。主要交互仍通过 (a) 相机约束、
+(b) 跟踪增强、(c) 置信度门控三个显式接口；§3.1 额外允许一个可单独消融的
+低分辨率 adapter，但不能替代显式几何对齐或绕过 SAM3 原始 gate。
 
 ---
 
 ## 1. 桥接模块 (Cross-Modal Bridge)
 
-两个分支的 token 空间不兼容（几何 token 编码深度/相机隐状态，SAM3 memory token 编码外观/语义），不建议直接做 token 级 cross-attention 融合（训练成本高、可解释性差）。推荐**显式几何量作为中介**，而不是隐式特征混合：
+两个分支的 token 空间不兼容（几何 token 编码深度/相机隐状态，SAM3 memory
+token 编码外观/语义）。因此默认使用**显式几何量作为中介**；§3.1 的特征
+融合只发生在独立轻量 adapter 中，并必须通过 aligned/shuffled 对照证明它确实
+消费了时序正确的几何：
 
 - 几何分支只对外暴露：相机位姿 `P_t (R_t, T_t)`、逐像素深度 `D_t`、可选的逐点置信度 `σ_t`（StreamVGGT/VGGT 本身会输出置信度图，直接复用）。
 - 跟踪分支只对外暴露：实例 mask `M_t^k`、实例 ID、跟踪置信度 `c_t^k`（可以用 SAM3 的 objectness/matching score）。
 - 桥接模块是一个轻量模块，职责是把这两组显式量互相转换（2D↔3D 投影、加权残差构造），不承担表征学习任务，因此**可以不联合训练几何/跟踪两个主干**，只训练桥接模块本身（残差网络或简单的可微分几何变换），大幅降低训练成本和过拟合风险。
 
-这是我认为最关键的一个设计选择：**把"融合"做成几何变换而不是特征学习**，可解释性和调试性都更好，也更容易分阶段消融。
+最关键的设计选择仍是让显式几何变换承担空间对齐，学习模块只负责把可信的
+几何证据转成 SAM3 可消费的 residual，而不让两个主干黑箱式联合训练。
 
 ---
 
@@ -72,12 +78,36 @@ L_static = Σ_k || centroid(X_i^k) - centroid(X_j^k) ||^2 ,  k ∈ StaticSet
 
 ### 3.1 3D-aware Memory Warping
 
-SAM3 的 memory attention 本质是在历史帧 memory token 和当前帧 token 之间做 attention 检索。当视角跨度大时，2D空间位置先验（SAM2/SAM3 常用的空间位置编码）会失效。改进方式：
+当前把 §3.1 实现为“显式位置对齐 + 轻量特征融合”，不降低 SAM3 的
+object-presence 阈值：
 
-- 用几何分支提供的 `P_t, D_t`，把历史帧 memory token 对应的空间位置**重投影**到当前视角坐标系，替换掉原有的2D位置编码，作为一个"几何对齐"的位置先验注入 memory attention。
-- 具体做法：SAM3 memory token 原本带一个 spatial embedding `e_pos(u,v)`（当前帧像素坐标系）。改为 `e_pos(π(X_hist, P_t))`，即先把历史token反投影到3D，再重投影到当前帧坐标系，这样即使镜头大幅平移/旋转，位置编码依然是"几何一致"的，而不是"帧间坐标漂移"的。
+```text
+StreamVGGT aggregator layers 4/11/17: [T,2048,24,24]
+        -> shallow self-attention
+        -> sequential cross-attention with deeper layers
+        -> merged geometry: [T,256,24,24]
 
-这个改动的好处是**不需要重训练 SAM3 主干**，只需要替换/新增一路位置编码输入，训练成本可控（只需微调 memory attention 层或加一个轻量 adapter）。
+SAM3 tracker FPN2: [T,256,72,72]
+        + resize(merged geometry) + geometry confidence
+        -> Conv fusion + learned confidence gate
+        -> FPN2 residual: [T,256,72,72]
+        -> original SAM3 memory attention -> mask decoder
+        -> original object_score_logits > 0 gate -> memory encoder
+
+历史 maskmem_pos_enc
+        -> history pixel -> 3D -> current view reprojection
+        -> geometry-warped position encoding
+        -> original SAM3 memory attention
+```
+
+SAM3 与 StreamVGGT 均冻结，只训练多层几何 merger、卷积融合和 FPN2 residual
+adapter。训练使用实例 mask 的 focal/Dice、可见性的 presence BCE，以及
+`aligned > shuffled` 的几何排序损失。训练时使用 GT visibility teacher forcing
+避免正样本在 gate 前被截断；最终推理关闭 teacher forcing，恢复 SAM3 原始 gate。
+
+消融固定为 `original / warp_only / merger_only / complete / shuffled`。只有
+`complete` 优于 `original`、且 aligned 优于 shuffled，才能说明时序正确的 3D
+信息被 SAM3 使用，而不是 adapter 单纯记住该序列。
 
 ### 3.2 3D近邻 Fallback 检索
 

@@ -44,7 +44,7 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_sam3_mask_object_fusion
   --icp-max-correspondence 0.20 \
   --output-dir outputs/streaming_couping_sam3_mask_object_fusion_inst37
 
-# Isolated §3.1 test: only replace SAM3 historical memory spatial position
+# §3.1 warp-only diagnostic: only replace SAM3 historical memory spatial position
 # encoding with StreamVGGT depth+camera reprojection. No fallback prompt,
 # re-detection, recovery-mask writeback, pointmap loss, or camera refinement.
 PYTHONPATH=src:. python -m streaming_couping.scripts.run_memory_warp_ablation \
@@ -61,3 +61,26 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_memory_warp_ablation \
   --presence-thresholds 0.0 0.10 0.20 0.30 0.35 0.40 0.45 0.50 \
   --soft-mask-threshold 0.50 \
   --output-dir outputs/streaming_couping_memory_warp_inst37
+
+# Learned §3.1 line. StreamVGGT layers 4/11/17 are merged, fused with SAM3
+# tracker FPN2, and passed through the original SAM3 memory/decoder/gate flow.
+# SAM3 and StreamVGGT stay frozen; only the geometry adapter is trained.
+PYTHONPATH=src:. python -m streaming_couping.scripts.train_geometry_memory_adapter \
+  --config streaming_couping/configs/default.yaml \
+  --manifest data/processed/scannetpp_pinhole_2d/manifest_rgb_cache.json \
+  --scene-id 00a231a370 \
+  --instance-id 37 \
+  --frame-indices 133 162 520 566 477 \
+  --sam3-device cuda:3 \
+  --sam3-feature-device cuda:2 \
+  --geometry-device cuda:1 \
+  --geometry-layers 4 11 17 \
+  --context-grid 24 24 \
+  --geometry-point-source depth_camera \
+  --min-geometry-confidence 0.20 \
+  --reference-prompt-mode mask \
+  --iterations 700 \
+  --learning-rate 1e-4 \
+  --geometry-rank-weight 0.1 \
+  --visualize-every 50 \
+  --output-dir outputs/streaming_couping_geometry_memory_adapter_inst37

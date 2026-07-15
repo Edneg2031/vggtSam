@@ -47,6 +47,7 @@ class GeometryMemoryPositionWarper:
         min_geometry_confidence: float = 0.0,
         point_source: str = "depth_camera",
         sam_resolution: int = 1008,
+        record_observations: bool = True,
     ) -> None:
         mode = str(mode).strip().lower()
         if mode not in self.MODES:
@@ -77,8 +78,13 @@ class GeometryMemoryPositionWarper:
         self.min_geometry_confidence = float(min_geometry_confidence)
         self.point_source = point_source
         self.sam_resolution = int(sam_resolution)
+        self.record_observations = bool(record_observations)
         self.observations: list[MemoryWarpObservation] = []
         self.hook_calls = 0
+        self._grid_cache: dict[
+            tuple[int, int, int, int, int, int],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = {}
 
     def warp(
         self,
@@ -97,18 +103,19 @@ class GeometryMemoryPositionWarper:
             )
         batch, _, height, width = position_encoding.shape
         if self.mode == "identity":
-            self.observations.append(
-                MemoryWarpObservation(
-                    current_frame=int(current_frame),
-                    memory_frame=int(memory_frame),
-                    geometry_current_frame=int(current_frame),
-                    geometry_memory_frame=int(memory_frame),
-                    total_tokens=height * width,
-                    valid_tokens=height * width,
-                    valid_ratio=1.0,
-                    mean_displacement_pixels=0.0,
+            if self.record_observations:
+                self.observations.append(
+                    MemoryWarpObservation(
+                        current_frame=int(current_frame),
+                        memory_frame=int(memory_frame),
+                        geometry_current_frame=int(current_frame),
+                        geometry_memory_frame=int(memory_frame),
+                        total_tokens=height * width,
+                        valid_tokens=height * width,
+                        valid_ratio=1.0,
+                        mean_displacement_pixels=0.0,
+                    )
                 )
-            )
             return position_encoding
 
         geometry_memory = self._geometry_index(memory_frame)
@@ -142,20 +149,23 @@ class GeometryMemoryPositionWarper:
 
         valid_tokens = int(valid.sum().item())
         total_tokens = int(valid.numel())
-        self.observations.append(
-            MemoryWarpObservation(
-                current_frame=int(current_frame),
-                memory_frame=int(memory_frame),
-                geometry_current_frame=geometry_current,
-                geometry_memory_frame=geometry_memory,
-                total_tokens=total_tokens,
-                valid_tokens=valid_tokens,
-                valid_ratio=valid_tokens / max(total_tokens, 1),
-                mean_displacement_pixels=(
-                    float(displacement[valid].mean().item()) if valid_tokens else 0.0
-                ),
+        if self.record_observations:
+            self.observations.append(
+                MemoryWarpObservation(
+                    current_frame=int(current_frame),
+                    memory_frame=int(memory_frame),
+                    geometry_current_frame=geometry_current,
+                    geometry_memory_frame=geometry_memory,
+                    total_tokens=total_tokens,
+                    valid_tokens=valid_tokens,
+                    valid_ratio=valid_tokens / max(total_tokens, 1),
+                    mean_displacement_pixels=(
+                        float(displacement[valid].mean().item())
+                        if valid_tokens
+                        else 0.0
+                    ),
+                )
             )
-        )
         return warped
 
     def summary(self) -> dict[str, float | int | str | list[int]]:
@@ -268,6 +278,17 @@ class GeometryMemoryPositionWarper:
         memory_size: tuple[int, int],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         height, width = memory_size
+        cache_key = (
+            int(memory_frame),
+            int(current_frame),
+            int(geometry_memory),
+            int(geometry_current),
+            int(height),
+            int(width),
+        )
+        cached = self._grid_cache.get(cache_key)
+        if cached is not None:
+            return cached
         if self.point_source == "depth_camera":
             point_sequence = self.geometry.camera_world_points
             confidence_sequence = self.geometry.depth_confidence
@@ -398,7 +419,9 @@ class GeometryMemoryPositionWarper:
             (current_grid_x - xx).square() + (current_grid_y - yy).square()
         )
         sample_grid = torch.nan_to_num(sample_grid, nan=2.0, posinf=2.0, neginf=-2.0)
-        return sample_grid, valid, displacement
+        output = (sample_grid, valid, displacement)
+        self._grid_cache[cache_key] = output
+        return output
 
 
 @contextmanager
