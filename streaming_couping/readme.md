@@ -179,11 +179,15 @@ reference 观测、Sim(3)、confidence 阈值和 ICP 参数。
 
 每帧由 mask 选出的静态实例点与 reference 实例点估计 `Delta T`；通过 ICP
 门控后，`Delta T` 同时作用于整帧相机位姿和整帧 pointmap，而不是只移动实例
-点。第一轮默认 `translation_only`，不加入阻尼、BA 或多实例约束。
+点。第一轮保持 `translation_only`，并只对同一个 ICP 估计消融
+`Delta t_applied = alpha * Delta t_ICP`，默认 `alpha={0,0.25,0.5,1}`；其中
+`alpha=0` 是严格 raw 对照，`alpha=1` 是未阻尼结果。此阶段不加入 BA 或
+多实例约束。
 
 主要比较 `summary.csv` 中三条分支的 pose/full-point 改善量；
-`camera_trajectories_*.png` 显示 GT、raw、refined 轨迹，`pointmaps/` 保存各分支
-整场景 PLY。GT oracle 是可行性上限；SAM3 两条分支的后续 mask 不使用 GT。
+`camera_trajectories_*.png` 显示 GT、raw、refined 轨迹，`pointmaps/` 保存各
+mask source 和 alpha 的整场景 PLY。GT oracle 是可行性上限；SAM3 两条分支的
+后续 mask 不使用 GT。
 
 ## Memory Warping 诊断消融
 

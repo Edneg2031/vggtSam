@@ -76,6 +76,7 @@ def main() -> None:
         icp_max_rmse=args.icp_max_rmse,
         pose_refinement_mode=args.pose_refinement_mode,
         reference_sequence_index=args.reference_sequence_index,
+        delta_scales=args.delta_scales,
     )
 
 
@@ -93,7 +94,9 @@ def run_experiment(
     icp_max_rmse: float,
     pose_refinement_mode: str,
     reference_sequence_index: int | None,
+    delta_scales: list[float],
 ) -> None:
+    delta_scales = _validate_delta_scales(delta_scales, pose_refinement_mode)
     torch.manual_seed(0)
     np.random.seed(0)
     config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -222,64 +225,70 @@ def run_experiment(
     all_rows: list[dict] = []
     summary_rows: list[dict] = []
     branch_outputs = {}
+    branch_sources = {}
     transforms = {}
     for source in MASK_SOURCES:
-        rows, refined_points, refined_poses, corrections = _run_pose_branch(
-            source,
-            masks=masks[source],
-            reference=reference,
-            reference_points=reference_points,
-            raw_points=aligned_points,
-            raw_poses=raw_poses,
-            confidence=geometry.depth_confidence,
-            gt_masks=gt.instance_masks,
-            gt_points=gt.pointmaps,
-            gt_poses=gt.world_to_camera,
-            frame_indices=sequence.frame_indices,
-            confidence_threshold=confidence_threshold,
-            icp_max_points=icp_max_points,
-            icp_iterations=icp_iterations,
-            icp_trim_fraction=icp_trim_fraction,
-            icp_max_correspondence=icp_max_correspondence,
-            icp_min_inliers=icp_min_inliers,
-            icp_min_fitness=icp_min_fitness,
-            icp_max_rmse=icp_max_rmse,
-            translation_only=pose_refinement_mode == "translation_only",
-        )
-        all_rows.extend(rows)
-        transforms[source] = corrections
-        branch_outputs[source] = (refined_points, refined_poses)
-        summary = _summarize_branch(
-            source,
-            rows,
-            reference=reference,
-            recovery_triggered=recovery["triggered"],
-        )
-        summary.update(
-            {
-                "pose_refinement_mode": pose_refinement_mode,
-                "geometry_source": "depth_head_plus_camera_head",
-                "reference_sim3_scale": similarity.scale,
-                "reference_sim3_inliers": similarity.inliers,
-                "reference_sim3_rmse": similarity.rmse,
-                "recovery_sequence_index": recovery["sequence_index"],
-                "recovery_frame_index": recovery["frame_index"],
-            }
-        )
-        summary_rows.append(summary)
-        _plot_camera_trajectories(
-            config.output_dir / f"camera_trajectories_{source}.png",
-            frame_indices=sequence.frame_indices,
-            gt_world_to_camera=gt.world_to_camera,
-            raw_world_to_camera=raw_poses,
-            refined_world_to_camera=refined_poses,
-            rows=rows,
-            title=f"Depth-camera pose refinement: {source}",
-            raw_translation_key="raw_pose_translation",
-            refined_translation_key="refined_pose_translation",
-            raw_rotation_key="raw_pose_rotation_degrees",
-            refined_rotation_key="refined_pose_rotation_degrees",
-        )
+        for delta_scale in delta_scales:
+            branch_name = f"{source}_alpha_{_format_scale(delta_scale)}"
+            rows, refined_points, refined_poses, corrections = _run_pose_branch(
+                source,
+                delta_scale=delta_scale,
+                masks=masks[source],
+                reference=reference,
+                reference_points=reference_points,
+                raw_points=aligned_points,
+                raw_poses=raw_poses,
+                confidence=geometry.depth_confidence,
+                gt_masks=gt.instance_masks,
+                gt_points=gt.pointmaps,
+                gt_poses=gt.world_to_camera,
+                frame_indices=sequence.frame_indices,
+                confidence_threshold=confidence_threshold,
+                icp_max_points=icp_max_points,
+                icp_iterations=icp_iterations,
+                icp_trim_fraction=icp_trim_fraction,
+                icp_max_correspondence=icp_max_correspondence,
+                icp_min_inliers=icp_min_inliers,
+                icp_min_fitness=icp_min_fitness,
+                icp_max_rmse=icp_max_rmse,
+                translation_only=pose_refinement_mode == "translation_only",
+            )
+            all_rows.extend(rows)
+            transforms[branch_name] = corrections
+            branch_outputs[branch_name] = (refined_points, refined_poses)
+            branch_sources[branch_name] = source
+            summary = _summarize_branch(
+                source,
+                rows,
+                reference=reference,
+                recovery_triggered=recovery["triggered"],
+            )
+            summary.update(
+                {
+                    "delta_scale": delta_scale,
+                    "pose_refinement_mode": pose_refinement_mode,
+                    "geometry_source": "depth_head_plus_camera_head",
+                    "reference_sim3_scale": similarity.scale,
+                    "reference_sim3_inliers": similarity.inliers,
+                    "reference_sim3_rmse": similarity.rmse,
+                    "recovery_sequence_index": recovery["sequence_index"],
+                    "recovery_frame_index": recovery["frame_index"],
+                }
+            )
+            summary_rows.append(summary)
+            _plot_camera_trajectories(
+                config.output_dir / f"camera_trajectories_{branch_name}.png",
+                frame_indices=sequence.frame_indices,
+                gt_world_to_camera=gt.world_to_camera,
+                raw_world_to_camera=raw_poses,
+                refined_world_to_camera=refined_poses,
+                rows=rows,
+                title=f"Depth-camera pose: {source}, alpha={delta_scale:g}",
+                raw_translation_key="raw_pose_translation",
+                refined_translation_key="refined_pose_translation",
+                raw_rotation_key="raw_pose_rotation_degrees",
+                refined_rotation_key="refined_pose_rotation_degrees",
+            )
 
     _export_pointmaps(
         config.output_dir,
@@ -291,6 +300,7 @@ def run_experiment(
         confidence=geometry.depth_confidence,
         confidence_threshold=confidence_threshold,
         masks=masks,
+        branch_sources=branch_sources,
         branch_outputs=branch_outputs,
     )
     _save_mask_report(
@@ -313,6 +323,7 @@ def run_experiment(
                     "geometry_source": "depth_head_plus_camera_head",
                     "camera_delta_applied_to_full_frame": True,
                     "pose_refinement_mode": pose_refinement_mode,
+                    "delta_scales": delta_scales,
                     "reference_sequence_index": reference,
                     "confidence_threshold": confidence_threshold,
                     "icp_max_correspondence": icp_max_correspondence,
@@ -423,6 +434,7 @@ def _run_hard_recovery(
 def _run_pose_branch(
     source,
     *,
+    delta_scale,
     masks,
     reference,
     reference_points,
@@ -472,16 +484,18 @@ def _run_pose_branch(
                 max_rmse=icp_max_rmse,
                 translation_only=translation_only,
             )
-            if icp.accepted:
+            if icp.accepted and float(delta_scale) > 0.0:
+                applied_rotation = icp.rotation
+                applied_translation = icp.translation * float(delta_scale)
                 refined_points[sequence_index] = apply_rigid(
                     raw_points[sequence_index],
-                    icp.rotation,
-                    icp.translation,
+                    applied_rotation,
+                    applied_translation,
                 )
                 refined_poses[sequence_index] = apply_world_correction_to_pose(
                     raw_poses[sequence_index],
-                    icp.rotation,
-                    icp.translation,
+                    applied_rotation,
+                    applied_translation,
                 )
 
         raw_rotation, raw_translation = pose_errors(
@@ -512,6 +526,7 @@ def _run_pose_branch(
         refined_object_cloud = refined_points[sequence_index][gt_masks[sequence_index]]
         row = {
             "mask_source": source,
+            "delta_scale": float(delta_scale),
             "sequence_index": sequence_index,
             "frame_index": frame_index,
             "is_reference": int(sequence_index == reference),
@@ -530,6 +545,14 @@ def _run_pose_branch(
             "icp_rmse": icp.rmse,
             "icp_rotation_degrees": rotation_angle_degrees(icp.rotation),
             "icp_translation": float(torch.linalg.vector_norm(icp.translation)),
+            "applied_icp_translation": float(
+                torch.linalg.vector_norm(icp.translation) * float(delta_scale)
+                if icp.accepted
+                else 0.0
+            ),
+            "correction_applied": int(
+                icp.accepted and float(delta_scale) > 0.0
+            ),
             "raw_pose_rotation_degrees": raw_rotation,
             "refined_pose_rotation_degrees": refined_rotation,
             "raw_pose_translation": raw_translation,
@@ -554,20 +577,23 @@ def _run_pose_branch(
         }
         rows.append(row)
         correction = torch.eye(4, dtype=raw_points.dtype)
-        if icp.accepted:
+        if icp.accepted and float(delta_scale) > 0.0:
             correction[:3, :3] = icp.rotation
-            correction[:3, 3] = icp.translation
+            correction[:3, 3] = icp.translation * float(delta_scale)
         corrections.append(
             {
                 "sequence_index": sequence_index,
                 "frame_index": frame_index,
                 "accepted": icp.accepted,
+                "delta_scale": float(delta_scale),
                 "reason": icp.reason,
+                "estimated_translation": icp.translation.tolist(),
                 "applied": correction.tolist(),
             }
         )
         print(
-            f"source={source:<18} frame={frame_index} "
+            f"source={source:<18} alpha={float(delta_scale):.2f} "
+            f"frame={frame_index} "
             f"visible={row['gt_visible']} mask_iou={row['mask_iou']:.4f} "
             f"icp={icp.accepted} pose_t={raw_translation:.4f}->"
             f"{refined_translation:.4f} full_rmse={raw_full['rmse']:.4f}->"
@@ -632,6 +658,7 @@ def _export_pointmaps(
     confidence,
     confidence_threshold,
     masks,
+    branch_sources,
     branch_outputs,
 ):
     root = output_dir / "pointmaps"
@@ -657,16 +684,17 @@ def _export_pointmaps(
             gt_points[sequence_index],
             colors[sequence_index],
         )
-    for source, (refined_points, _) in branch_outputs.items():
+    for branch_name, (refined_points, _) in branch_outputs.items():
+        source = branch_sources[branch_name]
         save_aggregate_ply(
-            root / f"sequence_{source}_refined.ply",
+            root / f"sequence_{branch_name}_refined.ply",
             refined_points,
             colors,
             confidence=confidence,
             confidence_threshold=confidence_threshold,
         )
         save_aggregate_ply(
-            root / f"object_{source}_selected_raw.ply",
+            root / f"object_{branch_name}_selected_raw.ply",
             raw_points,
             colors,
             masks=masks[source],
@@ -674,7 +702,7 @@ def _export_pointmaps(
             confidence_threshold=confidence_threshold,
         )
         save_aggregate_ply(
-            root / f"object_{source}_selected_refined.ply",
+            root / f"object_{branch_name}_selected_refined.ply",
             refined_points,
             colors,
             masks=masks[source],
@@ -682,7 +710,7 @@ def _export_pointmaps(
             confidence_threshold=confidence_threshold,
         )
         save_aggregate_ply(
-            root / f"object_{source}_gt_region_refined.ply",
+            root / f"object_{branch_name}_gt_region_refined.ply",
             refined_points,
             colors,
             masks=gt_masks,
@@ -690,7 +718,7 @@ def _export_pointmaps(
             confidence_threshold=confidence_threshold,
         )
         for sequence_index, frame_index in enumerate(frame_indices):
-            prefix = root / f"frame_{sequence_index:02d}_{frame_index}_{source}"
+            prefix = root / f"frame_{sequence_index:02d}_{frame_index}_{branch_name}"
             save_pointmap_ply(
                 prefix.with_name(prefix.name + "_refined.ply"),
                 refined_points[sequence_index],
@@ -733,7 +761,36 @@ def _parse_args() -> argparse.Namespace:
         default="translation_only",
     )
     parser.add_argument("--reference-sequence-index", type=int)
+    parser.add_argument(
+        "--delta-scales",
+        type=float,
+        nargs="+",
+        default=[0.0, 0.25, 0.5, 1.0],
+        help="Fractions of the accepted translation correction to apply.",
+    )
     return parser.parse_args()
+
+
+def _validate_delta_scales(values, pose_refinement_mode):
+    scales = []
+    for value in values:
+        value = float(value)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("Every delta scale must be in [0, 1].")
+        if value not in scales:
+            scales.append(value)
+    if not scales:
+        raise ValueError("At least one delta scale is required.")
+    if pose_refinement_mode != "translation_only" and scales != [1.0]:
+        raise ValueError(
+            "Delta damping currently supports translation_only. "
+            "Use --delta-scales 1 with full_se3."
+        )
+    return scales
+
+
+def _format_scale(value):
+    return f"{float(value):.2f}".replace(".", "p")
 
 
 if __name__ == "__main__":

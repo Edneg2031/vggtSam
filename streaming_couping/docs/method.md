@@ -76,7 +76,8 @@ L_static = Σ_k || centroid(X_i^k) - centroid(X_j^k) ||^2 ,  k ∈ StaticSet
 实例 mask。mask 从 StreamVGGT 的 `depth_head + camera_head` pointmap 选择同一
 静态实例点，与 reference 实例点做相同的 translation-only ICP；接受后的
 `Delta T` 同时更新整帧 camera pose 与整帧 pointmap。该实验不训练 backbone，
-也不同时加入阻尼或 BA，先单独验证真实 SAM3 信息能否产生有效相机增量。
+先对 translation 增量使用 `alpha={0,0.25,0.5,1}` 做单变量阻尼消融，不同时
+加入 BA 或多实例约束。该实验用于区分“mask 不可靠”和“单实例位姿增量过强”。
 
 ---
 
