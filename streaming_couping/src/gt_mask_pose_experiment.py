@@ -24,6 +24,7 @@ from .geometry.registration import (
     apply_similarity,
     apply_world_correction_to_pose,
     estimate_similarity,
+    invert_pose,
     pose_errors,
     robust_icp,
     rotation_angle_degrees,
@@ -313,6 +314,10 @@ def run_experiment(
             )
         )
         depth_object_cloud = depth_camera_points[sequence_index][depth_object_mask]
+        gt_center = _camera_center(gt.world_to_camera[sequence_index])
+        raw_center = _camera_center(raw_poses[sequence_index])
+        refined_center = _camera_center(refined_poses[sequence_index])
+        center_delta = refined_center - raw_center
         row = {
             "sequence_index": sequence_index,
             "frame_index": frame_index,
@@ -333,6 +338,19 @@ def run_experiment(
             "refined_pose_rotation_degrees": refined_rotation,
             "raw_pose_translation": raw_translation,
             "refined_pose_translation": refined_translation,
+            "gt_camera_x": float(gt_center[0]),
+            "gt_camera_y": float(gt_center[1]),
+            "gt_camera_z": float(gt_center[2]),
+            "raw_camera_x": float(raw_center[0]),
+            "raw_camera_y": float(raw_center[1]),
+            "raw_camera_z": float(raw_center[2]),
+            "refined_camera_x": float(refined_center[0]),
+            "refined_camera_y": float(refined_center[1]),
+            "refined_camera_z": float(refined_center[2]),
+            "camera_delta_x": float(center_delta[0]),
+            "camera_delta_y": float(center_delta[1]),
+            "camera_delta_z": float(center_delta[2]),
+            "camera_delta_norm": float(torch.linalg.vector_norm(center_delta)),
             "depth_camera_pose_rotation_degrees": depth_rotation,
             "depth_camera_pose_translation": depth_translation,
             "raw_full_point_rmse": raw_full["rmse"],
@@ -385,6 +403,14 @@ def run_experiment(
         confidence_threshold=confidence_threshold,
     )
     _write_csv(config.output_dir / "frame_metrics.csv", rows)
+    _plot_camera_trajectories(
+        config.output_dir / "camera_trajectories.png",
+        frame_indices=sequence.frame_indices,
+        gt_world_to_camera=gt.world_to_camera,
+        raw_world_to_camera=raw_poses,
+        refined_world_to_camera=refined_poses,
+        rows=rows,
+    )
     selected = [
         row
         for row in rows
@@ -477,6 +503,7 @@ def run_experiment(
             indent=2,
         )
     print(f"summary: {config.output_dir / 'summary.csv'}")
+    print(f"camera trajectories: {config.output_dir / 'camera_trajectories.png'}")
     print(f"pointmaps: {config.output_dir / 'pointmaps'}")
 
 
@@ -497,6 +524,179 @@ def pointmap_errors(
         "mae": float(distance.mean()),
         "points": int(valid.sum()),
     }
+
+
+def _camera_center(world_to_camera: torch.Tensor) -> torch.Tensor:
+    return invert_pose(world_to_camera)[:3, 3]
+
+
+def _plot_camera_trajectories(
+    path: Path,
+    *,
+    frame_indices,
+    gt_world_to_camera: torch.Tensor,
+    raw_world_to_camera: torch.Tensor,
+    refined_world_to_camera: torch.Tensor,
+    rows: list[dict],
+) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"could not plot camera trajectories: {exc}")
+        return
+
+    centers = {
+        "GT": _camera_centers(gt_world_to_camera),
+        "Raw": _camera_centers(raw_world_to_camera),
+        "Refined": _camera_centers(refined_world_to_camera),
+    }
+    styles = {
+        "GT": {"color": "#222222", "marker": "o"},
+        "Raw": {"color": "#d55e00", "marker": "^"},
+        "Refined": {"color": "#0072b2", "marker": "s"},
+    }
+    sequence_positions = np.arange(len(frame_indices))
+    frame_labels = [str(value) for value in frame_indices]
+
+    figure = plt.figure(figsize=(14, 10))
+    axis_3d = figure.add_subplot(2, 2, 1, projection="3d")
+    for name, points in centers.items():
+        style = styles[name]
+        axis_3d.plot(
+            points[:, 0],
+            points[:, 1],
+            points[:, 2],
+            label=name,
+            color=style["color"],
+            marker=style["marker"],
+            linewidth=1.8,
+        )
+    raw = centers["Raw"]
+    refined = centers["Refined"]
+    deltas = refined - raw
+    axis_3d.quiver(
+        raw[:, 0],
+        raw[:, 1],
+        raw[:, 2],
+        deltas[:, 0],
+        deltas[:, 1],
+        deltas[:, 2],
+        color="#009e73",
+        alpha=0.8,
+        arrow_length_ratio=0.15,
+    )
+    for index, frame_index in enumerate(frame_indices):
+        axis_3d.text(*centers["GT"][index], str(frame_index), fontsize=7)
+    axis_3d.set_title("Camera-center trajectories (arrows: Raw to Refined)")
+    axis_3d.set_xlabel("world X")
+    axis_3d.set_ylabel("world Y")
+    axis_3d.set_zlabel("world Z")
+    axis_3d.legend(loc="best")
+    _set_equal_3d_limits(axis_3d, np.concatenate(list(centers.values()), axis=0))
+
+    axis_xy = figure.add_subplot(2, 2, 2)
+    for name, points in centers.items():
+        style = styles[name]
+        axis_xy.plot(
+            points[:, 0],
+            points[:, 1],
+            label=name,
+            color=style["color"],
+            marker=style["marker"],
+            linewidth=1.8,
+        )
+    axis_xy.quiver(
+        raw[:, 0],
+        raw[:, 1],
+        deltas[:, 0],
+        deltas[:, 1],
+        angles="xy",
+        scale_units="xy",
+        scale=1,
+        color="#009e73",
+        alpha=0.8,
+    )
+    for index, frame_index in enumerate(frame_indices):
+        axis_xy.annotate(str(frame_index), centers["GT"][index, :2], fontsize=7)
+    axis_xy.set_title("Top-down trajectory (world XY)")
+    axis_xy.set_xlabel("world X")
+    axis_xy.set_ylabel("world Y")
+    axis_xy.set_aspect("equal", adjustable="datalim")
+    axis_xy.grid(True, alpha=0.25)
+    axis_xy.legend(loc="best")
+
+    axis_translation = figure.add_subplot(2, 2, 3)
+    axis_translation.plot(
+        sequence_positions,
+        [row["raw_pose_translation"] for row in rows],
+        label="Raw",
+        color=styles["Raw"]["color"],
+        marker=styles["Raw"]["marker"],
+    )
+    axis_translation.plot(
+        sequence_positions,
+        [row["refined_pose_translation"] for row in rows],
+        label="Refined",
+        color=styles["Refined"]["color"],
+        marker=styles["Refined"]["marker"],
+    )
+    axis_translation.set_title("Camera-center translation error (lower is better)")
+    axis_translation.set_ylabel("error")
+    axis_translation.set_xticks(sequence_positions, frame_labels, rotation=30)
+    axis_translation.set_xlabel("frame index")
+    axis_translation.grid(True, alpha=0.25)
+    axis_translation.legend(loc="best")
+
+    axis_rotation = figure.add_subplot(2, 2, 4)
+    axis_rotation.plot(
+        sequence_positions,
+        [row["raw_pose_rotation_degrees"] for row in rows],
+        label="Raw",
+        color=styles["Raw"]["color"],
+        marker=styles["Raw"]["marker"],
+    )
+    axis_rotation.plot(
+        sequence_positions,
+        [row["refined_pose_rotation_degrees"] for row in rows],
+        label="Refined",
+        color=styles["Refined"]["color"],
+        marker=styles["Refined"]["marker"],
+    )
+    axis_rotation.set_title("Camera rotation error (lower is better)")
+    axis_rotation.set_ylabel("degrees")
+    axis_rotation.set_xticks(sequence_positions, frame_labels, rotation=30)
+    axis_rotation.set_xlabel("frame index")
+    axis_rotation.grid(True, alpha=0.25)
+    axis_rotation.legend(loc="best")
+
+    figure.suptitle(
+        "GT-mask object ICP camera diagnostic\n"
+        "A better object alignment does not necessarily imply a better camera pose",
+        fontsize=13,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.tight_layout(rect=(0, 0, 1, 0.95))
+    figure.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+
+
+def _camera_centers(world_to_camera: torch.Tensor) -> np.ndarray:
+    return np.stack(
+        [_camera_center(pose).detach().cpu().numpy() for pose in world_to_camera]
+    )
+
+
+def _set_equal_3d_limits(axis, points: np.ndarray) -> None:
+    minimum = np.nanmin(points, axis=0)
+    maximum = np.nanmax(points, axis=0)
+    center = 0.5 * (minimum + maximum)
+    radius = max(float(np.max(maximum - minimum)) * 0.55, 1e-3)
+    axis.set_xlim(center[0] - radius, center[0] + radius)
+    axis.set_ylim(center[1] - radius, center[1] + radius)
+    axis.set_zlim(center[2] - radius, center[2] + radius)
 
 
 def _export_pointmaps(
