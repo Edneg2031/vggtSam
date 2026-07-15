@@ -364,6 +364,10 @@ def summarize_masks(
     *,
     reference_frame_idx: int,
 ) -> dict[str, float]:
+    # Metrics are scalar diagnostics. Keeping both masks on CPU avoids mixing
+    # CPU IoU tensors with GPU visibility indices during training-time eval.
+    prediction = prediction.detach().cpu()
+    target = target.detach().cpu()
     ious = torch.tensor(
         [binary_iou(pred, gt) for pred, gt in zip(prediction, target)],
         dtype=torch.float32,
