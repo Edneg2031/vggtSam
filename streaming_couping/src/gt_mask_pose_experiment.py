@@ -199,6 +199,8 @@ def run_experiment(
     )
     refined_points = raw_points.clone()
     refined_poses = raw_poses.clone()
+    depth_camera_refined_points = depth_camera_points.clone()
+    depth_camera_refined_poses = depth_camera_poses.clone()
 
     reference_object_mask = (
         gt.instance_masks[reference]
@@ -211,14 +213,39 @@ def run_experiment(
             "The reference GT instance mask contains too few confident StreamVGGT points: "
             f"{reference_object_points.shape[0]}."
         )
+    reference_depth_object_mask = (
+        gt.instance_masks[reference]
+        & torch.isfinite(depth_camera_points[reference]).all(dim=-1)
+        & (geometry.depth_confidence[reference] >= float(confidence_threshold))
+    )
+    reference_depth_object_points = depth_camera_points[reference][
+        reference_depth_object_mask
+    ]
+    depth_camera_icp_enabled = (
+        reference_depth_object_points.shape[0] >= int(icp_min_inliers)
+    )
+    if not depth_camera_icp_enabled:
+        print(
+            "depth-camera ICP disabled: reference instance has only "
+            f"{reference_depth_object_points.shape[0]} confident points"
+        )
 
     rows = []
     correction_records = []
+    depth_camera_correction_records = []
     for sequence_index, frame_index in enumerate(sequence.frame_indices):
         object_mask = (
             gt.instance_masks[sequence_index]
             & torch.isfinite(raw_points[sequence_index]).all(dim=-1)
             & (geometry.confidence[sequence_index] >= float(confidence_threshold))
+        )
+        depth_object_mask = (
+            gt.instance_masks[sequence_index]
+            & torch.isfinite(depth_camera_points[sequence_index]).all(dim=-1)
+            & (
+                geometry.depth_confidence[sequence_index]
+                >= float(confidence_threshold)
+            )
         )
         if sequence_index == reference:
             icp = _identity_icp(raw_points.dtype, reason="reference frame")
@@ -268,6 +295,73 @@ def run_experiment(
             }
         )
 
+        if not depth_camera_icp_enabled:
+            depth_icp = _identity_icp(
+                depth_camera_points.dtype,
+                reason="too few reference depth-camera object points",
+            )
+        elif sequence_index == reference:
+            depth_icp = _identity_icp(
+                depth_camera_points.dtype,
+                reason="reference frame",
+            )
+        elif not gt.instance_masks[sequence_index].any():
+            depth_icp = _identity_icp(
+                depth_camera_points.dtype,
+                reason="GT instance absent",
+            )
+        else:
+            depth_icp = robust_icp(
+                depth_camera_points[sequence_index][depth_object_mask],
+                reference_depth_object_points,
+                moving_weights=geometry.depth_confidence[sequence_index][
+                    depth_object_mask
+                ],
+                max_points=icp_max_points,
+                iterations=icp_iterations,
+                trim_fraction=icp_trim_fraction,
+                max_correspondence_distance=icp_max_correspondence,
+                min_inliers=icp_min_inliers,
+                min_fitness=icp_min_fitness,
+                max_rmse=icp_max_rmse,
+                translation_only=pose_refinement_mode == "translation_only",
+            )
+            if depth_icp.accepted:
+                # With fixed depth/intrinsics, DeltaT @ point is equivalent to
+                # unprojecting the same depth through DeltaT @ camera_to_world.
+                depth_camera_refined_points[sequence_index] = apply_rigid(
+                    depth_camera_points[sequence_index],
+                    depth_icp.rotation,
+                    depth_icp.translation,
+                )
+                depth_camera_refined_poses[sequence_index] = (
+                    apply_world_correction_to_pose(
+                        depth_camera_poses[sequence_index],
+                        depth_icp.rotation,
+                        depth_icp.translation,
+                    )
+                )
+        depth_estimated_correction = torch.eye(
+            4, dtype=depth_camera_points.dtype
+        )
+        depth_estimated_correction[:3, :3] = depth_icp.rotation
+        depth_estimated_correction[:3, 3] = depth_icp.translation
+        depth_applied_correction = (
+            depth_estimated_correction
+            if depth_icp.accepted
+            else torch.eye(4, dtype=depth_camera_points.dtype)
+        )
+        depth_camera_correction_records.append(
+            {
+                "sequence_index": sequence_index,
+                "frame_index": frame_index,
+                "accepted": depth_icp.accepted,
+                "reason": depth_icp.reason,
+                "estimated": depth_estimated_correction.tolist(),
+                "applied": depth_applied_correction.tolist(),
+            }
+        )
+
         raw_rotation, raw_translation = pose_errors(
             raw_poses[sequence_index], gt.world_to_camera[sequence_index]
         )
@@ -276,6 +370,10 @@ def run_experiment(
         )
         depth_rotation, depth_translation = pose_errors(
             depth_camera_poses[sequence_index],
+            gt.world_to_camera[sequence_index],
+        )
+        depth_refined_rotation, depth_refined_translation = pose_errors(
+            depth_camera_refined_poses[sequence_index],
             gt.world_to_camera[sequence_index],
         )
         raw_full = pointmap_errors(
@@ -302,22 +400,31 @@ def run_experiment(
             gt.pointmaps[sequence_index],
             mask=gt.instance_masks[sequence_index],
         )
+        depth_refined_full = pointmap_errors(
+            depth_camera_refined_points[sequence_index],
+            gt.pointmaps[sequence_index],
+        )
+        depth_refined_object = pointmap_errors(
+            depth_camera_refined_points[sequence_index],
+            gt.pointmaps[sequence_index],
+            mask=gt.instance_masks[sequence_index],
+        )
         target_object = gt.pointmaps[sequence_index][gt.instance_masks[sequence_index]]
         raw_object_cloud = raw_points[sequence_index][object_mask]
         refined_object_cloud = refined_points[sequence_index][object_mask]
-        depth_object_mask = (
-            gt.instance_masks[sequence_index]
-            & torch.isfinite(depth_camera_points[sequence_index]).all(dim=-1)
-            & (
-                geometry.depth_confidence[sequence_index]
-                >= float(confidence_threshold)
-            )
-        )
         depth_object_cloud = depth_camera_points[sequence_index][depth_object_mask]
+        depth_refined_object_cloud = depth_camera_refined_points[sequence_index][
+            depth_object_mask
+        ]
         gt_center = _camera_center(gt.world_to_camera[sequence_index])
         raw_center = _camera_center(raw_poses[sequence_index])
         refined_center = _camera_center(refined_poses[sequence_index])
         center_delta = refined_center - raw_center
+        depth_center = _camera_center(depth_camera_poses[sequence_index])
+        depth_refined_center = _camera_center(
+            depth_camera_refined_poses[sequence_index]
+        )
+        depth_center_delta = depth_refined_center - depth_center
         row = {
             "sequence_index": sequence_index,
             "frame_index": frame_index,
@@ -334,6 +441,18 @@ def run_experiment(
             "icp_rmse": icp.rmse,
             "icp_rotation_degrees": rotation_angle_degrees(icp.rotation),
             "icp_translation": float(torch.linalg.vector_norm(icp.translation)),
+            "depth_camera_icp_accepted": int(depth_icp.accepted),
+            "depth_camera_icp_reason": depth_icp.reason,
+            "depth_camera_icp_iterations": depth_icp.iterations,
+            "depth_camera_icp_inliers": depth_icp.inliers,
+            "depth_camera_icp_fitness": depth_icp.fitness,
+            "depth_camera_icp_rmse": depth_icp.rmse,
+            "depth_camera_icp_rotation_degrees": rotation_angle_degrees(
+                depth_icp.rotation
+            ),
+            "depth_camera_icp_translation": float(
+                torch.linalg.vector_norm(depth_icp.translation)
+            ),
             "raw_pose_rotation_degrees": raw_rotation,
             "refined_pose_rotation_degrees": refined_rotation,
             "raw_pose_translation": raw_translation,
@@ -353,6 +472,20 @@ def run_experiment(
             "camera_delta_norm": float(torch.linalg.vector_norm(center_delta)),
             "depth_camera_pose_rotation_degrees": depth_rotation,
             "depth_camera_pose_translation": depth_translation,
+            "depth_camera_refined_pose_rotation_degrees": depth_refined_rotation,
+            "depth_camera_refined_pose_translation": depth_refined_translation,
+            "depth_camera_x": float(depth_center[0]),
+            "depth_camera_y": float(depth_center[1]),
+            "depth_camera_z": float(depth_center[2]),
+            "depth_camera_refined_x": float(depth_refined_center[0]),
+            "depth_camera_refined_y": float(depth_refined_center[1]),
+            "depth_camera_refined_z": float(depth_refined_center[2]),
+            "depth_camera_delta_x": float(depth_center_delta[0]),
+            "depth_camera_delta_y": float(depth_center_delta[1]),
+            "depth_camera_delta_z": float(depth_center_delta[2]),
+            "depth_camera_delta_norm": float(
+                torch.linalg.vector_norm(depth_center_delta)
+            ),
             "raw_full_point_rmse": raw_full["rmse"],
             "refined_full_point_rmse": refined_full["rmse"],
             "raw_full_point_mae": raw_full["mae"],
@@ -365,6 +498,14 @@ def run_experiment(
             "depth_camera_full_point_mae": depth_full["mae"],
             "depth_camera_object_point_rmse": depth_object["rmse"],
             "depth_camera_object_point_mae": depth_object["mae"],
+            "depth_camera_refined_full_point_rmse": depth_refined_full["rmse"],
+            "depth_camera_refined_full_point_mae": depth_refined_full["mae"],
+            "depth_camera_refined_object_point_rmse": depth_refined_object[
+                "rmse"
+            ],
+            "depth_camera_refined_object_point_mae": depth_refined_object[
+                "mae"
+            ],
             "raw_object_chamfer": symmetric_chamfer(
                 raw_object_cloud, target_object
             ),
@@ -374,6 +515,9 @@ def run_experiment(
             "depth_camera_object_chamfer": symmetric_chamfer(
                 depth_object_cloud, target_object
             ),
+            "depth_camera_refined_object_chamfer": symmetric_chamfer(
+                depth_refined_object_cloud, target_object
+            ),
         }
         rows.append(row)
         print(
@@ -382,9 +526,10 @@ def run_experiment(
             f"pose_t={raw_translation:.4f}->{refined_translation:.4f} "
             f"object_chamfer={row['raw_object_chamfer']:.4f}->"
             f"{row['refined_object_chamfer']:.4f} "
-            f"depth_camera_pose_t={depth_translation:.4f} "
-            f"depth_camera_object_chamfer="
-            f"{row['depth_camera_object_chamfer']:.4f}"
+            f"depth_icp={depth_icp.accepted} "
+            f"depth_pose_t={depth_translation:.4f}->{depth_refined_translation:.4f} "
+            f"depth_object_chamfer={row['depth_camera_object_chamfer']:.4f}->"
+            f"{row['depth_camera_refined_object_chamfer']:.4f}"
         )
 
     _export_pointmaps(
@@ -393,6 +538,7 @@ def run_experiment(
         native_points=geometry.world_points,
         depth_native_points=geometry.camera_world_points,
         depth_camera_points=depth_camera_points,
+        depth_camera_refined_points=depth_camera_refined_points,
         raw_points=raw_points,
         refined_points=refined_points,
         gt_points=gt.pointmaps,
@@ -410,6 +556,24 @@ def run_experiment(
         raw_world_to_camera=raw_poses,
         refined_world_to_camera=refined_poses,
         rows=rows,
+        title="Point-head object ICP camera diagnostic",
+        raw_translation_key="raw_pose_translation",
+        refined_translation_key="refined_pose_translation",
+        raw_rotation_key="raw_pose_rotation_degrees",
+        refined_rotation_key="refined_pose_rotation_degrees",
+    )
+    _plot_camera_trajectories(
+        config.output_dir / "camera_trajectories_depth_camera.png",
+        frame_indices=sequence.frame_indices,
+        gt_world_to_camera=gt.world_to_camera,
+        raw_world_to_camera=depth_camera_poses,
+        refined_world_to_camera=depth_camera_refined_poses,
+        rows=rows,
+        title="Depth-camera object ICP camera diagnostic",
+        raw_translation_key="depth_camera_pose_translation",
+        refined_translation_key="depth_camera_refined_pose_translation",
+        raw_rotation_key="depth_camera_pose_rotation_degrees",
+        refined_rotation_key="depth_camera_refined_pose_rotation_degrees",
     )
     selected = [
         row
@@ -425,6 +589,9 @@ def run_experiment(
         "pose_refinement_mode": pose_refinement_mode,
         "visible_evaluation_frames": len(selected),
         "accepted_icp_frames": sum(row["icp_accepted"] for row in selected),
+        "accepted_depth_camera_icp_frames": sum(
+            row["depth_camera_icp_accepted"] for row in selected
+        ),
         "sim3_scale": similarity.scale,
         "sim3_inliers": similarity.inliers,
         "sim3_rmse": similarity.rmse,
@@ -448,6 +615,11 @@ def run_experiment(
         "depth_camera_full_point_rmse",
         "depth_camera_object_point_rmse",
         "depth_camera_object_chamfer",
+        "depth_camera_refined_pose_rotation_degrees",
+        "depth_camera_refined_pose_translation",
+        "depth_camera_refined_full_point_rmse",
+        "depth_camera_refined_object_point_rmse",
+        "depth_camera_refined_object_chamfer",
     ):
         summary[f"mean_{key}"] = _finite_mean(row[key] for row in selected)
     for metric in (
@@ -459,6 +631,17 @@ def run_experiment(
     ):
         summary[f"mean_{metric}_improvement"] = (
             summary[f"mean_raw_{metric}"] - summary[f"mean_refined_{metric}"]
+        )
+    for metric in (
+        "pose_rotation_degrees",
+        "pose_translation",
+        "full_point_rmse",
+        "object_point_rmse",
+        "object_chamfer",
+    ):
+        summary[f"mean_depth_camera_{metric}_improvement"] = (
+            summary[f"mean_depth_camera_{metric}"]
+            - summary[f"mean_depth_camera_refined_{metric}"]
         )
     _write_csv(config.output_dir / "summary.csv", [summary])
     with (config.output_dir / "transforms.json").open("w", encoding="utf8") as handle:
@@ -491,12 +674,16 @@ def run_experiment(
                     "rmse": depth_similarity.rmse,
                 },
                 "icp_corrections": correction_records,
+                "depth_camera_icp_corrections": depth_camera_correction_records,
                 "streamvggt_native_world_to_camera": (
                     geometry.world_to_camera.tolist()
                 ),
                 "raw_world_to_camera": raw_poses.tolist(),
                 "refined_world_to_camera": refined_poses.tolist(),
                 "depth_camera_world_to_camera": depth_camera_poses.tolist(),
+                "depth_camera_refined_world_to_camera": (
+                    depth_camera_refined_poses.tolist()
+                ),
                 "gt_world_to_camera": gt.world_to_camera.tolist(),
             },
             handle,
@@ -504,6 +691,10 @@ def run_experiment(
         )
     print(f"summary: {config.output_dir / 'summary.csv'}")
     print(f"camera trajectories: {config.output_dir / 'camera_trajectories.png'}")
+    print(
+        "depth-camera trajectories: "
+        f"{config.output_dir / 'camera_trajectories_depth_camera.png'}"
+    )
     print(f"pointmaps: {config.output_dir / 'pointmaps'}")
 
 
@@ -538,6 +729,11 @@ def _plot_camera_trajectories(
     raw_world_to_camera: torch.Tensor,
     refined_world_to_camera: torch.Tensor,
     rows: list[dict],
+    title: str,
+    raw_translation_key: str,
+    refined_translation_key: str,
+    raw_rotation_key: str,
+    refined_rotation_key: str,
 ) -> None:
     try:
         import matplotlib
@@ -631,14 +827,14 @@ def _plot_camera_trajectories(
     axis_translation = figure.add_subplot(2, 2, 3)
     axis_translation.plot(
         sequence_positions,
-        [row["raw_pose_translation"] for row in rows],
+        [row[raw_translation_key] for row in rows],
         label="Raw",
         color=styles["Raw"]["color"],
         marker=styles["Raw"]["marker"],
     )
     axis_translation.plot(
         sequence_positions,
-        [row["refined_pose_translation"] for row in rows],
+        [row[refined_translation_key] for row in rows],
         label="Refined",
         color=styles["Refined"]["color"],
         marker=styles["Refined"]["marker"],
@@ -653,14 +849,14 @@ def _plot_camera_trajectories(
     axis_rotation = figure.add_subplot(2, 2, 4)
     axis_rotation.plot(
         sequence_positions,
-        [row["raw_pose_rotation_degrees"] for row in rows],
+        [row[raw_rotation_key] for row in rows],
         label="Raw",
         color=styles["Raw"]["color"],
         marker=styles["Raw"]["marker"],
     )
     axis_rotation.plot(
         sequence_positions,
-        [row["refined_pose_rotation_degrees"] for row in rows],
+        [row[refined_rotation_key] for row in rows],
         label="Refined",
         color=styles["Refined"]["color"],
         marker=styles["Refined"]["marker"],
@@ -673,7 +869,7 @@ def _plot_camera_trajectories(
     axis_rotation.legend(loc="best")
 
     figure.suptitle(
-        "GT-mask object ICP camera diagnostic\n"
+        f"{title}\n"
         "A better object alignment does not necessarily imply a better camera pose",
         fontsize=13,
     )
@@ -706,6 +902,7 @@ def _export_pointmaps(
     native_points: torch.Tensor,
     depth_native_points: torch.Tensor,
     depth_camera_points: torch.Tensor,
+    depth_camera_refined_points: torch.Tensor,
     raw_points: torch.Tensor,
     refined_points: torch.Tensor,
     gt_points: torch.Tensor,
@@ -728,6 +925,11 @@ def _export_pointmaps(
             (
                 "depth_camera_aligned",
                 depth_camera_points[index],
+                depth_confidence[index],
+            ),
+            (
+                "depth_camera_refined",
+                depth_camera_refined_points[index],
                 depth_confidence[index],
             ),
             ("raw", raw_points[index], confidence[index]),
@@ -771,6 +973,13 @@ def _export_pointmaps(
         confidence_threshold=confidence_threshold,
     )
     save_aggregate_ply(
+        root / "sequence_depth_camera_refined.ply",
+        depth_camera_refined_points,
+        colors,
+        confidence=depth_confidence,
+        confidence_threshold=confidence_threshold,
+    )
+    save_aggregate_ply(
         root / "sequence_raw.ply",
         raw_points,
         colors,
@@ -788,6 +997,14 @@ def _export_pointmaps(
     save_aggregate_ply(
         root / "object_depth_camera_aligned.ply",
         depth_camera_points,
+        colors,
+        masks=masks,
+        confidence=depth_confidence,
+        confidence_threshold=confidence_threshold,
+    )
+    save_aggregate_ply(
+        root / "object_depth_camera_refined.ply",
+        depth_camera_refined_points,
         colors,
         masks=masks,
         confidence=depth_confidence,

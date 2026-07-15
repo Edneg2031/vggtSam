@@ -85,6 +85,39 @@ class SAM3Wrapper:
             selected_obj_id=output.selected_obj_id,
         )
 
+    def track_with_memory_position_warp(
+        self,
+        image_paths: Sequence[str | Path],
+        *,
+        prompt: str,
+        output_size: tuple[int, int],
+        reference_frame_idx: int,
+        reference_mask: torch.Tensor,
+        warper,
+    ) -> TrackingSequence:
+        """Run original SAM3 while changing only historical memory positions."""
+
+        predictor = self.predictor
+        if predictor is None:
+            raise RuntimeError("Call SAM3Wrapper.load() before inference.")
+        tracker = getattr(getattr(predictor, "model", None), "tracker", None)
+        if tracker is None or not hasattr(
+            tracker, "_prepare_memory_conditioned_features"
+        ):
+            raise RuntimeError(
+                "The loaded SAM3 tracker does not expose its memory-conditioning path."
+            )
+        from ..bridge.memory_warp import install_memory_position_warp
+
+        with install_memory_position_warp(tracker, warper):
+            return self.track(
+                image_paths,
+                prompt=prompt,
+                output_size=output_size,
+                reference_frame_idx=reference_frame_idx,
+                reference_mask=reference_mask,
+            )
+
     def recover_mask_with_text_geometry(
         self,
         image_path: str | Path,
