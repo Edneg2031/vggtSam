@@ -58,4 +58,6 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_memory_warp_ablation \
   --modes identity aligned shuffled \
   --geometry-point-source depth_camera \
   --min-geometry-confidence 0.20 \
+  --presence-thresholds 0.0 0.10 0.20 0.30 0.35 0.40 0.45 0.50 \
+  --soft-mask-threshold 0.50 \
   --output-dir outputs/streaming_couping_memory_warp_inst37

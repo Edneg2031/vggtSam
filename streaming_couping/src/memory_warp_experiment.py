@@ -44,6 +44,8 @@ def main() -> None:
         point_source=args.geometry_point_source,
         min_geometry_confidence=args.min_geometry_confidence,
         strict_identity=not args.allow_identity_mismatch,
+        presence_thresholds=tuple(args.presence_thresholds),
+        soft_mask_threshold=args.soft_mask_threshold,
     )
 
 
@@ -54,6 +56,8 @@ def run_experiment(
     point_source: str,
     min_geometry_confidence: float,
     strict_identity: bool,
+    presence_thresholds: tuple[float, ...],
+    soft_mask_threshold: float,
 ) -> None:
     torch.manual_seed(0)
     np.random.seed(0)
@@ -171,6 +175,13 @@ def run_experiment(
         projection_rows,
         reference_frame_idx=sequence.reference_frame_idx,
     )
+    threshold_rows = _presence_threshold_sweep(
+        soft_results,
+        target_masks=target_masks,
+        reference_frame_idx=sequence.reference_frame_idx,
+        presence_thresholds=presence_thresholds,
+        soft_mask_threshold=soft_mask_threshold,
+    )
 
     summary_rows = _summary_rows(
         results,
@@ -193,6 +204,9 @@ def run_experiment(
     _write_csv(config.output_dir / "frame_metrics.csv", frame_rows)
     _write_csv(
         config.output_dir / "geometry_projection_metrics.csv", projection_rows
+    )
+    _write_csv(
+        config.output_dir / "presence_threshold_sweep.csv", threshold_rows
     )
     pair_rows = []
     for mode, warper in warpers.items():
@@ -233,6 +247,8 @@ def run_experiment(
         "modes": ["original", *modes],
         "point_source": point_source,
         "min_geometry_confidence": float(min_geometry_confidence),
+        "presence_thresholds": list(presence_thresholds),
+        "soft_mask_threshold": float(soft_mask_threshold),
         "shuffled_geometry_permutation": list(permutation),
         "identity_matches_original": identity_matches,
         "identity_soft_matches_original": identity_soft_matches,
@@ -263,6 +279,7 @@ def run_experiment(
             f"valid_warp={row['valid_warp_ratio']:.4f}"
         )
     print(f"summary: {config.output_dir / 'summary.csv'}")
+    _print_threshold_sweep(threshold_rows)
     print(f"visualization: {config.output_dir / 'memory_warp_report.png'}")
     if strict_identity and not (identity_matches and identity_soft_matches):
         raise RuntimeError(
@@ -564,6 +581,95 @@ def _projection_summary(
     return output
 
 
+def _presence_threshold_sweep(
+    soft_results: dict[str, SAM3SoftSequence],
+    *,
+    target_masks: torch.Tensor,
+    reference_frame_idx: int,
+    presence_thresholds: Sequence[float],
+    soft_mask_threshold: float,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    visible = target_masks.flatten(1).any(dim=1)
+    cross = visible.clone()
+    cross[int(reference_frame_idx)] = False
+    absent = ~visible
+    for threshold in presence_thresholds:
+        threshold = float(threshold)
+        if threshold < 0.0 or threshold > 1.0:
+            raise ValueError("Presence thresholds must be in [0, 1].")
+        for mode, soft in soft_results.items():
+            presence_probability = torch.sigmoid(soft.presence_logits)
+            gate = torch.isfinite(presence_probability) & (
+                presence_probability > threshold
+            )
+            prediction = (soft.probabilities > float(soft_mask_threshold)) & gate[
+                :, None, None
+            ]
+            # The reference mask is the shared initialization prompt, not a
+            # decoder prediction, so keep it fixed in every threshold control.
+            prediction[int(reference_frame_idx)] = target_masks[
+                int(reference_frame_idx)
+            ]
+            metrics = summarize_masks(
+                prediction,
+                target_masks,
+                reference_frame_idx=reference_frame_idx,
+            )
+            rows.append(
+                {
+                    "presence_threshold": threshold,
+                    "soft_mask_threshold": float(soft_mask_threshold),
+                    "mode": mode,
+                    **metrics,
+                    "cross_presence_recall": (
+                        float(gate[cross].float().mean()) if cross.any() else 0.0
+                    ),
+                    "absent_presence_fp_rate": (
+                        float(gate[absent].float().mean()) if absent.any() else 0.0
+                    ),
+                    "mean_prediction_pixels": float(
+                        prediction.flatten(1).sum(dim=1).float().mean()
+                    ),
+                }
+            )
+    baseline_mode = "identity" if "identity" in soft_results else "original"
+    by_key = {
+        (float(row["presence_threshold"]), str(row["mode"])): row for row in rows
+    }
+    for row in rows:
+        threshold = float(row["presence_threshold"])
+        baseline = by_key[(threshold, baseline_mode)]
+        shuffled = by_key.get((threshold, "shuffled"), baseline)
+        row["cross_iou_gain_over_identity"] = float(
+            row["cross_view_iou"] - baseline["cross_view_iou"]
+        )
+        row["cross_recall_gain_over_identity"] = float(
+            row["cross_view_recall"] - baseline["cross_view_recall"]
+        )
+        row["absent_fp_delta_over_identity"] = float(
+            row["absent_fp_ratio"] - baseline["absent_fp_ratio"]
+        )
+        row["cross_iou_gain_over_shuffled"] = float(
+            row["cross_view_iou"] - shuffled["cross_view_iou"]
+        )
+    return rows
+
+
+def _print_threshold_sweep(rows: list[dict[str, Any]]) -> None:
+    selected_modes = {"original", "aligned", "shuffled"}
+    print("presence threshold sweep (diagnostic only):")
+    for row in rows:
+        if row["mode"] not in selected_modes:
+            continue
+        print(
+            f"  threshold={row['presence_threshold']:.2f} "
+            f"mode={row['mode']:<8} cross_iou={row['cross_view_iou']:.4f} "
+            f"recall={row['cross_view_recall']:.4f} "
+            f"absent_fp={row['absent_fp_ratio']:.6f}"
+        )
+
+
 def _centroid_error(left: torch.Tensor, right: torch.Tensor) -> float:
     if not left.any() or not right.any():
         return float("nan")
@@ -791,6 +897,14 @@ def _parse_args() -> argparse.Namespace:
         help="Use camera-consistent depth unprojection by default.",
     )
     parser.add_argument("--min-geometry-confidence", type=float, default=0.20)
+    parser.add_argument(
+        "--presence-thresholds",
+        type=float,
+        nargs="+",
+        default=(0.0, 0.10, 0.20, 0.30, 0.35, 0.40, 0.45, 0.50),
+        help="Shared diagnostic thresholds applied to every geometry mode.",
+    )
+    parser.add_argument("--soft-mask-threshold", type=float, default=0.50)
     parser.add_argument("--allow-identity-mismatch", action="store_true")
     return parser.parse_args()
 

@@ -183,3 +183,9 @@ memory attention 和 mask decoder 都保持 SAM3 原实现。
 SAM3 对几何位置先验的消费方式；若 aligned 投影本身不优于 shuffled，则先修正
 StreamVGGT 几何/坐标变换。soft 诊断要求 `soft_capture_count=1`，以保证它对应
 当前单实例 tracker；identity 的 hard/soft 输出都必须与 original 相同。
+
+`presence_threshold_sweep.csv` 在不改变 SAM3 memory 的前提下，对所有模式应用
+完全相同的 presence 阈值和 `soft_mask_threshold=0.5`。它只用于判断 aligned
+增量能否越过统一 gate，同时保持 absent FP；不能在当前序列选择最佳阈值后直接
+作为最终结果。阈值 `0.5` 对应 SAM3 原始 `object_score_logits > 0` gate，`0.0`
+则展示完全移除 presence gate 时的 soft mask 上限和误检代价。
