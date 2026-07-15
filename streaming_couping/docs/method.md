@@ -72,6 +72,12 @@ L_static = Σ_k || centroid(X_i^k) - centroid(X_j^k) ||^2 ,  k ∈ StaticSet
 
 这个约束更弱但更鲁棒，建议作为第一阶段实验的主约束，回环残差作为第二阶段加强项。
 
+当前受控实现先比较 `GT oracle / SAM3 original / hard-recovery memory` 三种
+实例 mask。mask 从 StreamVGGT 的 `depth_head + camera_head` pointmap 选择同一
+静态实例点，与 reference 实例点做相同的 translation-only ICP；接受后的
+`Delta T` 同时更新整帧 camera pose 与整帧 pointmap。该实验不训练 backbone，
+也不同时加入阻尼或 BA，先单独验证真实 SAM3 信息能否产生有效相机增量。
+
 ---
 
 ## 3. 几何增强跟踪的具体机制

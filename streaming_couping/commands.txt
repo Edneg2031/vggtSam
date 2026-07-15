@@ -84,3 +84,20 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.train_geometry_memory_adapt
   --geometry-rank-weight 0.1 \
   --visualize-every 50 \
   --output-dir outputs/streaming_couping_geometry_memory_adapter_inst37
+
+# SAM3 -> StreamVGGT camera-pose ablation. GT oracle, original SAM3 and the
+# verified hard-recovery memory masks share one depth+camera geometry forward,
+# reference Sim3 and translation-only ICP. Delta T moves the full frame.
+PYTHONPATH=src:. python -m streaming_couping.scripts.run_sam3_mask_camera_refinement \
+  --config streaming_couping/configs/default.yaml \
+  --manifest data/processed/scannetpp_pinhole_2d/manifest_rgb_cache.json \
+  --scene-id 00a231a370 \
+  --instance-id 37 \
+  --frame-indices 133 162 520 566 477 \
+  --reference-sequence-index 0 \
+  --sam3-device cuda:3 \
+  --geometry-device cuda:1 \
+  --pose-refinement-mode translation_only \
+  --confidence-threshold 0.30 \
+  --icp-max-correspondence 0.20 \
+  --output-dir outputs/streaming_couping_sam3_camera_refinement_inst37
