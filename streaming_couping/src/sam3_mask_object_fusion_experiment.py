@@ -172,50 +172,54 @@ def run_experiment(
         None,
     )
     if recovery_index is None:
-        raise RuntimeError(
-            "No accepted geometry recovery was found. Run the paired bridge "
-            "first or relax only the documented candidate thresholds."
+        print(
+            "no accepted geometry recovery: keeping geometry-memory identical "
+            "to the original SAM3 control"
         )
-    candidate = recovery["candidates"][recovery_index]
-    recovery_mask, recovery_score = sam3.recover_mask_with_text_geometry(
-        sequence.image_paths[recovery_index],
-        prompt=sequence.label,
-        output_size=config.output_size,
-        candidate_mask=candidate.mask,
-        supported_mask=candidate.supported_mask,
-    )
-    if not recovery_mask.any():
-        raise RuntimeError("Geometry-guided SAM3 recovery returned an empty mask.")
-    no_memory_tracking = sam3.track_split_without_memory(
-        sequence.image_paths,
-        prompt=sequence.label,
-        output_size=config.output_size,
-        reference_frame_idx=reference,
-        reference_mask=target_output_masks[reference],
-        split_frame_idx=recovery_index,
-    )
-    memory_tracking = sam3.track_with_recovery_mask_memory(
-        sequence.image_paths,
-        prompt=sequence.label,
-        output_size=config.output_size,
-        reference_frame_idx=reference,
-        reference_mask=target_output_masks[reference],
-        recovery_frame_idx=recovery_index,
-        recovery_mask=recovery_mask,
-    )
-    if no_memory_tracking.selected_obj_id != memory_tracking.selected_obj_id:
-        raise RuntimeError(
-            "SAM3 persistent obj_id differs between paired branches: "
-            f"{no_memory_tracking.selected_obj_id} != "
-            f"{memory_tracking.selected_obj_id}."
+        recovery_score = None
+        no_memory_tracking = original_tracking
+        memory_tracking = original_tracking
+    else:
+        candidate = recovery["candidates"][recovery_index]
+        recovery_mask, recovery_score = sam3.recover_mask_with_text_geometry(
+            sequence.image_paths[recovery_index],
+            prompt=sequence.label,
+            output_size=config.output_size,
+            candidate_mask=candidate.mask,
+            supported_mask=candidate.supported_mask,
         )
-    for index in range(recovery_index):
-        if not torch.equal(
-            no_memory_tracking.masks[index], memory_tracking.masks[index]
-        ):
+        if not recovery_mask.any():
+            raise RuntimeError("Geometry-guided SAM3 recovery returned an empty mask.")
+        no_memory_tracking = sam3.track_split_without_memory(
+            sequence.image_paths,
+            prompt=sequence.label,
+            output_size=config.output_size,
+            reference_frame_idx=reference,
+            reference_mask=target_output_masks[reference],
+            split_frame_idx=recovery_index,
+        )
+        memory_tracking = sam3.track_with_recovery_mask_memory(
+            sequence.image_paths,
+            prompt=sequence.label,
+            output_size=config.output_size,
+            reference_frame_idx=reference,
+            reference_mask=target_output_masks[reference],
+            recovery_frame_idx=recovery_index,
+            recovery_mask=recovery_mask,
+        )
+        if no_memory_tracking.selected_obj_id != memory_tracking.selected_obj_id:
             raise RuntimeError(
-                f"Paired SAM3 branches diverged before recovery at frame {index}."
+                "SAM3 persistent obj_id differs between paired branches: "
+                f"{no_memory_tracking.selected_obj_id} != "
+                f"{memory_tracking.selected_obj_id}."
             )
+        for index in range(recovery_index):
+            if not torch.equal(
+                no_memory_tracking.masks[index], memory_tracking.masks[index]
+            ):
+                raise RuntimeError(
+                    f"Paired SAM3 branches diverged before recovery at frame {index}."
+                )
 
     similarity = _reference_similarity(
         geometry.world_points[reference],
@@ -303,6 +307,17 @@ def run_experiment(
                 reference=reference,
             )
         )
+        summaries[-1].update(
+            {
+                "recovery_triggered": int(recovery_index is not None),
+                "recovery_sequence_index": recovery_index,
+                "recovery_frame_index": (
+                    sequence.frame_indices[recovery_index]
+                    if recovery_index is not None
+                    else None
+                ),
+            }
+        )
 
     _export_results(
         config.output_dir,
@@ -355,8 +370,13 @@ def run_experiment(
                     "rmse": similarity.rmse,
                 },
                 "recovery": {
+                    "triggered": recovery_index is not None,
                     "sequence_index": recovery_index,
-                    "frame_index": sequence.frame_indices[recovery_index],
+                    "frame_index": (
+                        sequence.frame_indices[recovery_index]
+                        if recovery_index is not None
+                        else None
+                    ),
                     "score": recovery_score,
                     "persistent_obj_id": memory_tracking.selected_obj_id,
                     "paired_original_session": True,
@@ -626,7 +646,7 @@ def _save_mask_report(
     gt_masks: torch.Tensor,
     original_masks: torch.Tensor,
     memory_masks: torch.Tensor,
-    recovery_index: int,
+    recovery_index: int | None,
     output_size: tuple[int, int],
 ) -> None:
     height, width = output_size
