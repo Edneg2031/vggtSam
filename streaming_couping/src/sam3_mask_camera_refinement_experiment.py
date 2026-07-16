@@ -65,7 +65,8 @@ def main() -> None:
     }
     run_experiment(
         load_config(args.config, overrides),
-        confidence_threshold=args.confidence_threshold,
+        alignment_confidence_threshold=args.alignment_confidence_threshold,
+        icp_confidence_threshold=args.icp_confidence_threshold,
         alignment_trim_fraction=args.alignment_trim_fraction,
         icp_max_points=args.icp_max_points,
         icp_iterations=args.icp_iterations,
@@ -83,7 +84,8 @@ def main() -> None:
 def run_experiment(
     config: ExperimentConfig,
     *,
-    confidence_threshold: float,
+    alignment_confidence_threshold: float,
+    icp_confidence_threshold: float,
     alignment_trim_fraction: float,
     icp_max_points: int,
     icp_iterations: int,
@@ -177,7 +179,7 @@ def run_experiment(
         geometry.camera_world_points[reference],
         geometry.depth_confidence[reference],
         gt.pointmaps[reference],
-        confidence_threshold=confidence_threshold,
+        confidence_threshold=alignment_confidence_threshold,
         trim_fraction=alignment_trim_fraction,
     )
     aligned_points = apply_similarity(
@@ -213,7 +215,10 @@ def run_experiment(
     reference_valid = (
         gt.instance_masks[reference]
         & torch.isfinite(aligned_points[reference]).all(dim=-1)
-        & (geometry.depth_confidence[reference] >= float(confidence_threshold))
+        & (
+            geometry.depth_confidence[reference]
+            >= float(icp_confidence_threshold)
+        )
     )
     reference_points = aligned_points[reference][reference_valid]
     if reference_points.shape[0] < int(icp_min_inliers):
@@ -243,7 +248,7 @@ def run_experiment(
                 gt_points=gt.pointmaps,
                 gt_poses=gt.world_to_camera,
                 frame_indices=sequence.frame_indices,
-                confidence_threshold=confidence_threshold,
+                icp_confidence_threshold=icp_confidence_threshold,
                 icp_max_points=icp_max_points,
                 icp_iterations=icp_iterations,
                 icp_trim_fraction=icp_trim_fraction,
@@ -274,7 +279,8 @@ def run_experiment(
                 "mask_source": source,
                 "delta_scale": delta_scale,
                 "pose_refinement_mode": pose_refinement_mode,
-                "confidence_threshold": confidence_threshold,
+                "alignment_confidence_threshold": alignment_confidence_threshold,
+                "icp_confidence_threshold": icp_confidence_threshold,
                 "alignment_trim_fraction": alignment_trim_fraction,
                 "icp_max_points": icp_max_points,
                 "icp_iterations": icp_iterations,
@@ -299,6 +305,12 @@ def run_experiment(
                 },
             }
             summary_rows.append(summary)
+            print(
+                f"trajectory source={source:<18} alpha={delta_scale:.2f} "
+                f"ATE_RMSE={summary['raw_ate_rmse']:.4f}->"
+                f"{summary['refined_ate_rmse']:.4f} "
+                f"improvement={summary['ate_rmse_improvement']:.4f}"
+            )
             _plot_camera_trajectories(
                 config.output_dir / f"camera_trajectories_{branch_name}.png",
                 frame_indices=sequence.frame_indices,
@@ -321,7 +333,7 @@ def run_experiment(
         gt_masks=gt.instance_masks,
         colors=gt.colors,
         confidence=geometry.depth_confidence,
-        confidence_threshold=confidence_threshold,
+        confidence_threshold=icp_confidence_threshold,
         masks=masks,
         branch_sources=branch_sources,
         branch_outputs=branch_outputs,
@@ -348,7 +360,8 @@ def run_experiment(
                     "pose_refinement_mode": pose_refinement_mode,
                     "delta_scales": delta_scales,
                     "reference_sequence_index": reference,
-                    "confidence_threshold": confidence_threshold,
+                    "alignment_confidence_threshold": alignment_confidence_threshold,
+                    "icp_confidence_threshold": icp_confidence_threshold,
                     "alignment_trim_fraction": alignment_trim_fraction,
                     "icp_max_points": icp_max_points,
                     "icp_iterations": icp_iterations,
@@ -475,7 +488,7 @@ def _run_pose_branch(
     gt_points,
     gt_poses,
     frame_indices,
-    confidence_threshold,
+    icp_confidence_threshold,
     icp_max_points,
     icp_iterations,
     icp_trim_fraction,
@@ -493,7 +506,10 @@ def _run_pose_branch(
         selected = (
             masks[sequence_index]
             & torch.isfinite(raw_points[sequence_index]).all(dim=-1)
-            & (confidence[sequence_index] >= float(confidence_threshold))
+            & (
+                confidence[sequence_index]
+                >= float(icp_confidence_threshold)
+            )
         )
         moving = raw_points[sequence_index][selected]
         if sequence_index == reference:
@@ -710,7 +726,25 @@ def _summarize_branch(source, rows, *, reference, recovery_triggered):
         summary[f"mean_{metric}_improvement"] = (
             summary[f"mean_raw_{metric}"] - summary[f"mean_refined_{metric}"]
         )
+    summary["raw_ate_rmse"] = _finite_rmse(
+        row["raw_pose_translation"] for row in rows
+    )
+    summary["refined_ate_rmse"] = _finite_rmse(
+        row["refined_pose_translation"] for row in rows
+    )
+    summary["ate_rmse_improvement"] = (
+        summary["raw_ate_rmse"] - summary["refined_ate_rmse"]
+    )
+    summary["ate_alignment"] = "fixed_reference_sim3"
     return summary
+
+
+def _finite_rmse(values) -> float:
+    array = np.asarray(
+        [float(value) for value in values if np.isfinite(float(value))],
+        dtype=np.float64,
+    )
+    return float(np.sqrt(np.mean(array**2))) if array.size else float("nan")
 
 
 def _export_pointmaps(
@@ -812,7 +846,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sam3-device")
     parser.add_argument("--geometry-device")
     parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--confidence-threshold", type=float, default=0.30)
+    parser.add_argument(
+        "--alignment-confidence-threshold",
+        type=float,
+        default=0.30,
+        help="StreamVGGT confidence threshold used only for reference Sim3.",
+    )
+    parser.add_argument(
+        "--icp-confidence-threshold",
+        type=float,
+        default=0.15,
+        help="StreamVGGT confidence threshold used for reference/current ICP points.",
+    )
     parser.add_argument("--alignment-trim-fraction", type=float, default=0.70)
     parser.add_argument("--icp-max-points", type=int, default=2048)
     parser.add_argument("--icp-iterations", type=int, default=30)

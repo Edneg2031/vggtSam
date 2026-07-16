@@ -175,16 +175,17 @@ original 分支保持相同，并在 `summary.csv` 记录 `recovery_triggered=0`
 `run_sam3_mask_camera_refinement` 回到 SAM3 -> geometry 的相机修正主线。它只用
 StreamVGGT `depth_head + camera_head` 生成 camera-consistent pointmap，并比较
 `GT oracle / SAM3 original / SAM3 hard-memory` 三种实例 mask。三条分支共享
-reference 观测、Sim(3)、confidence 阈值和 ICP 参数。
+reference 观测、Sim(3) 和 ICP 参数。几何置信度拆成两个互不混用的阈值：
+`alignment_confidence_threshold=0.30` 只固定 reference Sim(3)，
+`icp_confidence_threshold=0.15` 只筛选 reference/current 实例 ICP 点。
 
 每帧由 mask 选出的静态实例点与 reference 实例点估计 `Delta T`；通过 ICP
 门控后，`Delta T` 同时作用于整帧相机位姿和整帧 pointmap，而不是只移动实例
-点。第一轮保持 `translation_only`，并只对同一个 ICP 估计消融
-`Delta t_applied = alpha * Delta t_ICP`，默认 `alpha={0,0.25,0.5,1}`；其中
-`alpha=0` 是严格 raw 对照，`alpha=1` 是未阻尼结果。此阶段不加入 BA 或
-多实例约束。
+点。当前基线保持 `translation_only`，并使用
+`Delta t_applied = 0.5 * Delta t_ICP` 抑制过冲。此阶段不加入 BA 或多实例约束。
 
-主要比较 `summary.csv` 中三条分支的 pose/full-point 改善量；
+主要比较 `summary.csv` 中三条分支的 pose/full-point 改善量与 ATE RMSE；ATE
+使用固定 reference Sim(3) 后的全部相机中心计算，不对 refined 轨迹再次对齐。
 `camera_trajectories_*.png` 显示 GT、raw、refined 轨迹，`pointmaps/` 保存各
 mask source 和 alpha 的整场景 PLY。GT oracle 是可行性上限；SAM3 两条分支的
 后续 mask 不使用 GT。
