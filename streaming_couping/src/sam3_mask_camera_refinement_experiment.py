@@ -423,6 +423,7 @@ def run_experiment(
         config.output_dir,
         raw_points=aligned_points,
         gt_points=gt.pointmaps,
+        gt_masks=gt.instance_masks,
         colors=gt.colors,
         confidence=geometry_confidence,
         confidence_threshold=icp_confidence_threshold,
@@ -1186,6 +1187,7 @@ def _export_pointmaps(
     *,
     raw_points,
     gt_points,
+    gt_masks,
     colors,
     confidence,
     confidence_threshold,
@@ -1205,6 +1207,12 @@ def _export_pointmaps(
         confidence_threshold=confidence_threshold,
     )
     save_aggregate_ply(root / "scene_gt.ply", gt_points, colors)
+    save_aggregate_ply(
+        root / "object_gt.ply",
+        gt_points,
+        colors,
+        masks=gt_masks,
+    )
     save_aggregate_ply(
         root / "object_raw.ply",
         raw_points,
