@@ -1205,6 +1205,14 @@ def _export_pointmaps(
         confidence_threshold=confidence_threshold,
     )
     save_aggregate_ply(root / "scene_gt.ply", gt_points, colors)
+    save_aggregate_ply(
+        root / "object_raw.ply",
+        raw_points,
+        colors,
+        masks=masks["sam3_hard_memory"],
+        confidence=confidence,
+        confidence_threshold=confidence_threshold,
+    )
     for branch_name, (refined_points, _) in branch_outputs.items():
         source = branch_sources[branch_name]
         if source != "sam3_hard_memory":

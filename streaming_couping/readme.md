@@ -210,8 +210,8 @@ mask source 和 alpha 的整场景 PLY。GT oracle 是可行性上限；hard-mem
 
 当前单实例调参模式不再输出 `sam3_original` 分支或逐帧 PLY。GT oracle 只保留
 CSV 指标；每个 hard-memory alpha 仅保存 `scene_*.ply` 与 `object_*.ply`，另有
-共享的 `scene_raw.ply` 和 `scene_gt.ply`。重跑时会清理该目录中的旧 PLY，避免
-历史调试文件混入结果。
+共享的 `scene_raw.ply`、`object_raw.ply` 和 `scene_gt.ply`。重跑时会清理该
+目录中的旧 PLY，避免历史调试文件混入结果。
 
 ## Memory Warping 诊断消融
 
