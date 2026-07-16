@@ -648,11 +648,17 @@ def _save_mask_report(
     memory_masks: torch.Tensor,
     recovery_index: int | None,
     output_size: tuple[int, int],
+    include_original: bool = True,
 ) -> None:
     height, width = output_size
     header = 28
-    labels = ("RGB", "GT", "SAM3 original", "geometry + memory")
-    colors = ((0, 0, 0), (0, 210, 70), (255, 180, 0), (45, 105, 255))
+    labels = ["RGB", "GT"]
+    colors = [(0, 0, 0), (0, 210, 70)]
+    if include_original:
+        labels.append("SAM3 original")
+        colors.append((255, 180, 0))
+    labels.append("geometry + memory")
+    colors.append((45, 105, 255))
     canvas = Image.new(
         "RGB",
         (len(labels) * width, len(image_paths) * (height + header)),
@@ -663,19 +669,17 @@ def _save_mask_report(
             rgb = source.convert("RGB").resize(
                 (width, height), Image.Resampling.BILINEAR
             )
-        panels = (
-            rgb,
-            _overlay(rgb, gt_masks[row], colors[1]),
-            _overlay(rgb, original_masks[row], colors[2]),
-            _overlay(rgb, memory_masks[row], colors[3]),
-        )
+        panels = [rgb, _overlay(rgb, gt_masks[row], colors[1])]
+        if include_original:
+            panels.append(_overlay(rgb, original_masks[row], (255, 180, 0)))
+        panels.append(_overlay(rgb, memory_masks[row], (45, 105, 255)))
         y = row * (height + header)
         for column, (label, panel) in enumerate(zip(labels, panels)):
             canvas.paste(panel, (column * width, y + header))
             suffix = f" frame={frame_indices[row]}" if column == 0 else ""
-            if column == 2:
+            if label == "SAM3 original":
                 suffix = f" IoU={binary_iou(original_masks[row], gt_masks[row]):.3f}"
-            if column == 3:
+            if label == "geometry + memory":
                 suffix = (
                     f" IoU={binary_iou(memory_masks[row], gt_masks[row]):.3f}"
                     + (" recovery" if row == recovery_index else "")

@@ -81,6 +81,11 @@ mask，并使用 StreamVGGT `point_head` 世界点云做 translation-only ICP。
 若 causal map 的实例指标改善但整场景指标下降，则增加无 GT 的 scene guard：
 在实例 ICP 平移方向上离散测试多个阻尼系数，以历史高置信场景点的 trimmed
 NN RMSE/fitness 为约束，选取不破坏全局重合度的最大增量。
+当前单场景实验中该自一致性 guard 未产生阻尼，说明 point-head 场景可能整体
+自洽但仍偏离真实坐标。该路线降级为诊断，先通过固定 alpha 消融量化单实例
+约束的 Pareto 边界；若无法兼顾实例与全局误差，再进入多实例共享位姿优化。
+该消融中 object map 始终用完整实例 ICP 更新，alpha 只阻尼整帧 pointmap 增量，
+避免把“历史地图质量”和“全局修正强度”混成同一个变量。
 
 ---
 

@@ -85,29 +85,24 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.train_geometry_memory_adapt
   --visualize-every 50 \
   --output-dir outputs/streaming_couping_geometry_memory_adapter_inst37
 
-# 当前正式 point-head 路径：reference_only 是旧版固定首帧基线，causal 会在
-# 可靠 ICP 后扩展实例地图；其余变量完全一致。ATE 仅作为位姿 proxy 诊断。
+# Point-head causal-map 平移阻尼消融：固定其余变量，只扫描 alpha。
+# scene guard 已证明不会阻尼当前片段，因此关闭；ATE 仍只作为位姿 proxy。
 PYTHONPATH=src:. python -m streaming_couping.scripts.run_sam3_mask_camera_refinement \
   --config streaming_couping/configs/default.yaml \
   --manifest data/processed/scannetpp_pinhole_2d/manifest_rgb_cache.json \
   --scene-id 00a231a370 \
   --instance-id 37 \
-  --frame-indices 133 162 520 566 477 \
+  --frame-indices 133 162 520 566 432 470 477 \
   --reference-sequence-index 0 \
   --sam3-device cuda:3 \
   --geometry-device cuda:1 \
   --geometry-source point_head \
   --pose-refinement-mode translation_only \
-  --delta-scales 1.0 \
-  --object-map-modes reference_only causal \
+  --delta-scales 0 0.25 0.5 0.75 1.0 \
+  --object-map-modes causal \
   --object-map-voxel-size 0.02 \
   --object-map-max-points 16384 \
-  --scene-consistency guard \
-  --scene-candidate-scales 0 0.25 0.5 0.75 1.0 \
-  --scene-confidence-threshold 0.30 \
-  --scene-rmse-tolerance 0.05 \
-  --scene-fitness-drop-tolerance 0.05 \
-  --scene-min-inliers 128 \
+  --scene-consistency off \
   --alignment-confidence-threshold 0.30 \
   --icp-confidence-threshold 0.30 \
   --alignment-trim-fraction 0.70 \
@@ -115,4 +110,4 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_sam3_mask_camera_refine
   --icp-max-correspondence 0.20 \
   --icp-min-fitness 0.10 \
   --icp-max-rmse 0.15 \
-  --output-dir outputs/streaming_couping_sam3_point_head_scene_guard_inst37
+  --output-dir outputs/streaming_couping_sam3_point_head_alpha_ablation_inst37

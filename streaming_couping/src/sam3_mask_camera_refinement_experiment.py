@@ -16,7 +16,7 @@ from .backbones.sam3_wrapper import SAM3Wrapper
 from .backbones.streamvggt_wrapper import StreamVGGTWrapper
 from .bridge.gating import binary_iou
 from .config import ExperimentConfig, load_config
-from .geometry.export import save_aggregate_ply, save_pointmap_ply
+from .geometry.export import save_aggregate_ply
 from .geometry.gt_data import load_gt_geometry_sequence
 from .geometry.registration import (
     align_world_to_camera,
@@ -46,7 +46,7 @@ from .sam3_mask_object_fusion_experiment import (
 )
 
 
-MASK_SOURCES = ("gt_oracle", "sam3_original", "sam3_hard_memory")
+MASK_SOURCES = ("gt_oracle", "sam3_hard_memory")
 
 
 def main() -> None:
@@ -255,11 +255,6 @@ def run_experiment(
 
     masks = {
         "gt_oracle": gt.instance_masks.clone(),
-        "sam3_original": _sam_masks_to_stream(
-            original_tracking.masks,
-            geometry=geometry,
-            image_mode=config.image_mode,
-        ),
         "sam3_hard_memory": _sam_masks_to_stream(
             hard_tracking.masks,
             geometry=geometry,
@@ -406,32 +401,29 @@ def run_experiment(
                     f"{summary['refined_ate_rmse']:.4f} "
                     f"improvement={summary['ate_rmse_improvement']:.4f}"
                 )
-                _plot_camera_trajectories(
-                    config.output_dir / f"camera_trajectories_{branch_name}.png",
-                    frame_indices=sequence.frame_indices,
-                    gt_world_to_camera=gt.world_to_camera,
-                    raw_world_to_camera=raw_poses,
-                    refined_world_to_camera=refined_poses,
-                    rows=rows,
-                    title=(
-                        f"{geometry_source}: {source}, {object_map_mode}, "
-                        f"{scene_consistency}, "
-                        f"alpha={delta_scale:g}"
-                    ),
-                    raw_translation_key="raw_pose_translation",
-                    refined_translation_key="refined_pose_translation",
-                    raw_rotation_key="raw_pose_rotation_degrees",
-                    refined_rotation_key="refined_pose_rotation_degrees",
-                )
+                if source == "sam3_hard_memory":
+                    _plot_camera_trajectories(
+                        config.output_dir / f"camera_trajectories_{branch_name}.png",
+                        frame_indices=sequence.frame_indices,
+                        gt_world_to_camera=gt.world_to_camera,
+                        raw_world_to_camera=raw_poses,
+                        refined_world_to_camera=refined_poses,
+                        rows=rows,
+                        title=(
+                            f"{geometry_source}: {source}, {object_map_mode}, "
+                            f"{scene_consistency}, alpha={delta_scale:g}"
+                        ),
+                        raw_translation_key="raw_pose_translation",
+                        refined_translation_key="refined_pose_translation",
+                        raw_rotation_key="raw_pose_rotation_degrees",
+                        refined_rotation_key="refined_pose_rotation_degrees",
+                    )
 
     _export_pointmaps(
         config.output_dir,
-        frame_indices=sequence.frame_indices,
         raw_points=aligned_points,
         gt_points=gt.pointmaps,
-        gt_masks=gt.instance_masks,
         colors=gt.colors,
-        geometry_source=geometry_source,
         confidence=geometry_confidence,
         confidence_threshold=icp_confidence_threshold,
         masks=masks,
@@ -447,6 +439,7 @@ def run_experiment(
         memory_masks=hard_tracking.masks,
         recovery_index=recovery["sequence_index"],
         output_size=config.output_size,
+        include_original=False,
     )
     _write_csv(config.output_dir / "frame_metrics.csv", all_rows)
     _write_csv(config.output_dir / "summary.csv", summary_rows)
@@ -690,9 +683,9 @@ def _run_pose_branch(
                 max_rmse=icp_max_rmse,
                 translation_only=translation_only,
             )
-            if icp.accepted and float(delta_scale) > 0.0:
+            if icp.accepted:
                 applied_delta_scale = float(delta_scale)
-                if scene_consistency == "guard":
+                if scene_consistency == "guard" and applied_delta_scale > 0.0:
                     scene_support = (
                         torch.isfinite(raw_points[sequence_index]).all(dim=-1)
                         & (
@@ -727,14 +720,19 @@ def _run_pose_branch(
                         applied_rotation,
                         applied_translation,
                     )
-                    if object_map_mode == "causal":
-                        object_map = _merge_object_map(
-                            object_map,
-                            refined_points[sequence_index][selected],
-                            voxel_size=object_map_voxel_size,
-                            max_points=object_map_max_points,
-                        )
-                        object_map_updated = True
+                if object_map_mode == "causal":
+                    map_observation = apply_rigid(
+                        moving,
+                        icp.rotation,
+                        icp.translation,
+                    )
+                    object_map = _merge_object_map(
+                        object_map,
+                        map_observation,
+                        voxel_size=object_map_voxel_size,
+                        max_points=object_map_max_points,
+                    )
+                    object_map_updated = True
 
         if sequence_index != reference and scene_consistency == "guard":
             scene_map_valid = (
@@ -821,6 +819,9 @@ def _run_pose_branch(
             "object_map_new_points": int(object_map.shape[0])
             - object_map_points_before,
             "object_map_updated": int(object_map_updated),
+            "object_map_update_uses_full_icp": int(
+                object_map_mode == "causal" and icp.accepted
+            ),
             "raw_pose_rotation_degrees": raw_rotation,
             "refined_pose_rotation_degrees": refined_rotation,
             "raw_pose_translation": raw_translation,
@@ -1183,12 +1184,9 @@ def _finite_rmse(values) -> float:
 def _export_pointmaps(
     output_dir,
     *,
-    frame_indices,
     raw_points,
     gt_points,
-    gt_masks,
     colors,
-    geometry_source,
     confidence,
     confidence_threshold,
     masks,
@@ -1196,78 +1194,36 @@ def _export_pointmaps(
     branch_outputs,
 ):
     root = output_dir / "pointmaps"
+    root.mkdir(parents=True, exist_ok=True)
+    for stale_ply in root.glob("*.ply"):
+        stale_ply.unlink()
     save_aggregate_ply(
-        root / f"sequence_{geometry_source}_raw.ply",
+        root / "scene_raw.ply",
         raw_points,
         colors,
         confidence=confidence,
         confidence_threshold=confidence_threshold,
     )
-    save_aggregate_ply(root / "sequence_gt.ply", gt_points, colors)
-    for sequence_index, frame_index in enumerate(frame_indices):
-        prefix = root / f"frame_{sequence_index:02d}_{frame_index}"
-        save_pointmap_ply(
-            prefix.with_name(prefix.name + f"_{geometry_source}_raw.ply"),
-            raw_points[sequence_index],
-            colors[sequence_index],
-            confidence=confidence[sequence_index],
-            confidence_threshold=confidence_threshold,
-        )
-        save_pointmap_ply(
-            prefix.with_name(prefix.name + "_gt.ply"),
-            gt_points[sequence_index],
-            colors[sequence_index],
-        )
+    save_aggregate_ply(root / "scene_gt.ply", gt_points, colors)
     for branch_name, (refined_points, _) in branch_outputs.items():
         source = branch_sources[branch_name]
+        if source != "sam3_hard_memory":
+            continue
         save_aggregate_ply(
-            root / f"sequence_{branch_name}_refined.ply",
+            root / f"scene_{branch_name}.ply",
             refined_points,
             colors,
             confidence=confidence,
             confidence_threshold=confidence_threshold,
         )
         save_aggregate_ply(
-            root / f"object_{branch_name}_selected_raw.ply",
-            raw_points,
-            colors,
-            masks=masks[source],
-            confidence=confidence,
-            confidence_threshold=confidence_threshold,
-        )
-        save_aggregate_ply(
-            root / f"object_{branch_name}_selected_refined.ply",
+            root / f"object_{branch_name}.ply",
             refined_points,
             colors,
             masks=masks[source],
             confidence=confidence,
             confidence_threshold=confidence_threshold,
         )
-        save_aggregate_ply(
-            root / f"object_{branch_name}_gt_region_refined.ply",
-            refined_points,
-            colors,
-            masks=gt_masks,
-            confidence=confidence,
-            confidence_threshold=confidence_threshold,
-        )
-        for sequence_index, frame_index in enumerate(frame_indices):
-            prefix = root / f"frame_{sequence_index:02d}_{frame_index}_{branch_name}"
-            save_pointmap_ply(
-                prefix.with_name(prefix.name + "_refined.ply"),
-                refined_points[sequence_index],
-                colors[sequence_index],
-                confidence=confidence[sequence_index],
-                confidence_threshold=confidence_threshold,
-            )
-            save_pointmap_ply(
-                prefix.with_name(prefix.name + "_selected_object.ply"),
-                refined_points[sequence_index],
-                colors[sequence_index],
-                mask=masks[source][sequence_index],
-                confidence=confidence[sequence_index],
-                confidence_threshold=confidence_threshold,
-            )
 
 
 def _parse_args() -> argparse.Namespace:
