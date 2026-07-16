@@ -72,12 +72,12 @@ L_static = Σ_k || centroid(X_i^k) - centroid(X_j^k) ||^2 ,  k ∈ StaticSet
 
 这个约束更弱但更鲁棒，建议作为第一阶段实验的主约束，回环残差作为第二阶段加强项。
 
-当前受控实现先比较 `GT oracle / SAM3 original / hard-recovery memory` 三种
-实例 mask。mask 从 StreamVGGT 的 `depth_head + camera_head` pointmap 选择同一
-静态实例点，与 reference 实例点做相同的 translation-only ICP；接受后的
-`Delta T` 同时更新整帧 camera pose 与整帧 pointmap。该实验不训练 backbone，
-先对 translation 增量使用 `alpha={0,0.25,0.5,1}` 做单变量阻尼消融，不同时
-加入 BA 或多实例约束。该实验用于区分“mask 不可靠”和“单实例位姿增量过强”。
+当前受控实现比较 `GT oracle / SAM3 original / hard-recovery memory` 三种实例
+mask，并使用 StreamVGGT `point_head` 世界点云做 translation-only ICP。接受后的
+`Delta T` 作用于整帧 pointmap；同步相机轨迹仅作为 proxy，不解释为严格相机
+优化。`reference_only` 固定使用首帧实例点，`causal` 则在可靠 ICP 后把新表面
+体素合入持久 object map。两者共享 mask、pointmap、Sim(3) 和 ICP 参数，用于
+验证历史实例地图能否缓解首帧局部可见造成的配准偏差。
 
 ---
 
