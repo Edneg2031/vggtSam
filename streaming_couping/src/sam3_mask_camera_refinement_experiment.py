@@ -23,6 +23,7 @@ from .geometry.registration import (
     apply_rigid,
     apply_similarity,
     apply_world_correction_to_pose,
+    nearest_neighbors,
     pose_errors,
     robust_icp,
     rotation_angle_degrees,
@@ -82,6 +83,14 @@ def main() -> None:
         object_map_modes=args.object_map_modes,
         object_map_voxel_size=args.object_map_voxel_size,
         object_map_max_points=args.object_map_max_points,
+        scene_consistency=args.scene_consistency,
+        scene_candidate_scales=args.scene_candidate_scales,
+        scene_confidence_threshold=args.scene_confidence_threshold,
+        scene_rmse_tolerance=args.scene_rmse_tolerance,
+        scene_fitness_drop_tolerance=args.scene_fitness_drop_tolerance,
+        scene_min_inliers=args.scene_min_inliers,
+        scene_map_voxel_size=args.scene_map_voxel_size,
+        scene_map_max_points=args.scene_map_max_points,
     )
 
 
@@ -105,13 +114,30 @@ def run_experiment(
     object_map_modes: list[str],
     object_map_voxel_size: float,
     object_map_max_points: int,
+    scene_consistency: str,
+    scene_candidate_scales: list[float],
+    scene_confidence_threshold: float,
+    scene_rmse_tolerance: float,
+    scene_fitness_drop_tolerance: float,
+    scene_min_inliers: int,
+    scene_map_voxel_size: float,
+    scene_map_max_points: int,
 ) -> None:
     delta_scales = _validate_delta_scales(delta_scales, pose_refinement_mode)
     object_map_modes = _validate_object_map_modes(object_map_modes)
+    scene_candidate_scales = _validate_scene_candidate_scales(
+        scene_candidate_scales
+    )
+    if scene_consistency == "guard" and pose_refinement_mode != "translation_only":
+        raise ValueError("Scene consistency guard currently requires translation_only.")
     if float(object_map_voxel_size) < 0.0:
         raise ValueError("object_map_voxel_size must be non-negative.")
     if int(object_map_max_points) < 1:
         raise ValueError("object_map_max_points must be positive.")
+    if float(scene_map_voxel_size) < 0.0:
+        raise ValueError("scene_map_voxel_size must be non-negative.")
+    if int(scene_map_max_points) < 1 or int(scene_min_inliers) < 1:
+        raise ValueError("Scene map sizes and inlier counts must be positive.")
     torch.manual_seed(0)
     np.random.seed(0)
     config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -267,7 +293,7 @@ def run_experiment(
         for object_map_mode in object_map_modes:
             for delta_scale in delta_scales:
                 branch_name = (
-                    f"{source}_{object_map_mode}_alpha_"
+                    f"{source}_{object_map_mode}_{scene_consistency}_alpha_"
                     f"{_format_scale(delta_scale)}"
                 )
                 rows, refined_points, refined_poses, corrections = _run_pose_branch(
@@ -276,6 +302,14 @@ def run_experiment(
                     object_map_mode=object_map_mode,
                     object_map_voxel_size=object_map_voxel_size,
                     object_map_max_points=object_map_max_points,
+                    scene_consistency=scene_consistency,
+                    scene_candidate_scales=scene_candidate_scales,
+                    scene_confidence_threshold=scene_confidence_threshold,
+                    scene_rmse_tolerance=scene_rmse_tolerance,
+                    scene_fitness_drop_tolerance=scene_fitness_drop_tolerance,
+                    scene_min_inliers=scene_min_inliers,
+                    scene_map_voxel_size=scene_map_voxel_size,
+                    scene_map_max_points=scene_map_max_points,
                     masks=masks[source],
                     reference=reference,
                     reference_points=reference_points,
@@ -319,6 +353,16 @@ def run_experiment(
                     "object_map_mode": object_map_mode,
                     "object_map_voxel_size": object_map_voxel_size,
                     "object_map_max_points": object_map_max_points,
+                    "scene_consistency": scene_consistency,
+                    "scene_candidate_scales": " ".join(
+                        str(value) for value in scene_candidate_scales
+                    ),
+                    "scene_confidence_threshold": scene_confidence_threshold,
+                    "scene_rmse_tolerance": scene_rmse_tolerance,
+                    "scene_fitness_drop_tolerance": scene_fitness_drop_tolerance,
+                    "scene_min_inliers": scene_min_inliers,
+                    "scene_map_voxel_size": scene_map_voxel_size,
+                    "scene_map_max_points": scene_map_max_points,
                     "pose_refinement_mode": pose_refinement_mode,
                     "alignment_confidence_threshold": alignment_confidence_threshold,
                     "icp_confidence_threshold": icp_confidence_threshold,
@@ -356,6 +400,7 @@ def run_experiment(
                 )
                 print(
                     f"trajectory source={source:<18} map={object_map_mode:<14} "
+                    f"scene={scene_consistency:<5} "
                     f"alpha={delta_scale:.2f} "
                     f"{ate_name}={summary['raw_ate_rmse']:.4f}->"
                     f"{summary['refined_ate_rmse']:.4f} "
@@ -370,6 +415,7 @@ def run_experiment(
                     rows=rows,
                     title=(
                         f"{geometry_source}: {source}, {object_map_mode}, "
+                        f"{scene_consistency}, "
                         f"alpha={delta_scale:g}"
                     ),
                     raw_translation_key="raw_pose_translation",
@@ -421,6 +467,14 @@ def run_experiment(
                     "object_map_modes": object_map_modes,
                     "object_map_voxel_size": object_map_voxel_size,
                     "object_map_max_points": object_map_max_points,
+                    "scene_consistency": scene_consistency,
+                    "scene_candidate_scales": scene_candidate_scales,
+                    "scene_confidence_threshold": scene_confidence_threshold,
+                    "scene_rmse_tolerance": scene_rmse_tolerance,
+                    "scene_fitness_drop_tolerance": scene_fitness_drop_tolerance,
+                    "scene_min_inliers": scene_min_inliers,
+                    "scene_map_voxel_size": scene_map_voxel_size,
+                    "scene_map_max_points": scene_map_max_points,
                     "reference_sequence_index": reference,
                     "alignment_confidence_threshold": alignment_confidence_threshold,
                     "icp_confidence_threshold": icp_confidence_threshold,
@@ -555,6 +609,14 @@ def _run_pose_branch(
     object_map_mode,
     object_map_voxel_size,
     object_map_max_points,
+    scene_consistency,
+    scene_candidate_scales,
+    scene_confidence_threshold,
+    scene_rmse_tolerance,
+    scene_fitness_drop_tolerance,
+    scene_min_inliers,
+    scene_map_voxel_size,
+    scene_map_max_points,
     masks,
     reference,
     reference_points,
@@ -578,6 +640,11 @@ def _run_pose_branch(
     refined_points = raw_points.clone()
     refined_poses = raw_poses.clone()
     object_map = reference_points.clone()
+    reference_scene_valid = (
+        torch.isfinite(raw_points[reference]).all(dim=-1)
+        & (confidence[reference] >= float(scene_confidence_threshold))
+    )
+    scene_map = raw_points[reference][reference_scene_valid].clone()
     rows = []
     corrections = []
     for sequence_index, frame_index in enumerate(frame_indices):
@@ -592,6 +659,15 @@ def _run_pose_branch(
         moving = raw_points[sequence_index][selected]
         object_map_points_before = int(object_map.shape[0])
         object_map_updated = False
+        applied_delta_scale = 0.0
+        scene_guard = {
+            "reason": "disabled",
+            "raw_rmse": float("nan"),
+            "raw_fitness": float("nan"),
+            "refined_rmse": float("nan"),
+            "refined_fitness": float("nan"),
+            "inliers": 0,
+        }
         if sequence_index == reference:
             icp = _identity_icp(raw_points.dtype, reason="reference frame")
         elif moving.shape[0] < int(icp_min_inliers):
@@ -615,26 +691,65 @@ def _run_pose_branch(
                 translation_only=translation_only,
             )
             if icp.accepted and float(delta_scale) > 0.0:
-                applied_rotation = icp.rotation
-                applied_translation = icp.translation * float(delta_scale)
-                refined_points[sequence_index] = apply_rigid(
-                    raw_points[sequence_index],
-                    applied_rotation,
-                    applied_translation,
-                )
-                refined_poses[sequence_index] = apply_world_correction_to_pose(
-                    raw_poses[sequence_index],
-                    applied_rotation,
-                    applied_translation,
-                )
-                if object_map_mode == "causal":
-                    object_map = _merge_object_map(
-                        object_map,
-                        refined_points[sequence_index][selected],
-                        voxel_size=object_map_voxel_size,
-                        max_points=object_map_max_points,
+                applied_delta_scale = float(delta_scale)
+                if scene_consistency == "guard":
+                    scene_support = (
+                        torch.isfinite(raw_points[sequence_index]).all(dim=-1)
+                        & (
+                            confidence[sequence_index]
+                            >= float(scene_confidence_threshold)
+                        )
+                        & ~masks[sequence_index]
                     )
-                    object_map_updated = True
+                    applied_delta_scale, scene_guard = _select_scene_guard_scale(
+                        raw_points[sequence_index][scene_support],
+                        scene_map,
+                        translation=icp.translation,
+                        max_scale=float(delta_scale),
+                        candidate_scales=scene_candidate_scales,
+                        max_points=icp_max_points,
+                        trim_fraction=icp_trim_fraction,
+                        max_correspondence=icp_max_correspondence,
+                        min_inliers=scene_min_inliers,
+                        rmse_tolerance=scene_rmse_tolerance,
+                        fitness_drop_tolerance=scene_fitness_drop_tolerance,
+                    )
+                applied_rotation = icp.rotation
+                applied_translation = icp.translation * applied_delta_scale
+                if applied_delta_scale > 0.0:
+                    refined_points[sequence_index] = apply_rigid(
+                        raw_points[sequence_index],
+                        applied_rotation,
+                        applied_translation,
+                    )
+                    refined_poses[sequence_index] = apply_world_correction_to_pose(
+                        raw_poses[sequence_index],
+                        applied_rotation,
+                        applied_translation,
+                    )
+                    if object_map_mode == "causal":
+                        object_map = _merge_object_map(
+                            object_map,
+                            refined_points[sequence_index][selected],
+                            voxel_size=object_map_voxel_size,
+                            max_points=object_map_max_points,
+                        )
+                        object_map_updated = True
+
+        if sequence_index != reference and scene_consistency == "guard":
+            scene_map_valid = (
+                torch.isfinite(refined_points[sequence_index]).all(dim=-1)
+                & (
+                    confidence[sequence_index]
+                    >= float(scene_confidence_threshold)
+                )
+            )
+            scene_map = _merge_object_map(
+                scene_map,
+                refined_points[sequence_index][scene_map_valid],
+                voxel_size=scene_map_voxel_size,
+                max_points=scene_map_max_points,
+            )
 
         raw_rotation, raw_translation = pose_errors(
             raw_poses[sequence_index], gt_poses[sequence_index]
@@ -665,7 +780,9 @@ def _run_pose_branch(
         row = {
             "mask_source": source,
             "delta_scale": float(delta_scale),
+            "applied_delta_scale": applied_delta_scale,
             "object_map_mode": object_map_mode,
+            "scene_consistency": scene_consistency,
             "sequence_index": sequence_index,
             "frame_index": frame_index,
             "is_reference": int(sequence_index == reference),
@@ -685,13 +802,20 @@ def _run_pose_branch(
             "icp_rotation_degrees": rotation_angle_degrees(icp.rotation),
             "icp_translation": float(torch.linalg.vector_norm(icp.translation)),
             "applied_icp_translation": float(
-                torch.linalg.vector_norm(icp.translation) * float(delta_scale)
+                torch.linalg.vector_norm(icp.translation) * applied_delta_scale
                 if icp.accepted
                 else 0.0
             ),
             "correction_applied": int(
-                icp.accepted and float(delta_scale) > 0.0
+                icp.accepted and applied_delta_scale > 0.0
             ),
+            "scene_guard_reason": scene_guard["reason"],
+            "scene_raw_rmse": scene_guard["raw_rmse"],
+            "scene_refined_rmse": scene_guard["refined_rmse"],
+            "scene_raw_fitness": scene_guard["raw_fitness"],
+            "scene_refined_fitness": scene_guard["refined_fitness"],
+            "scene_guard_inliers": scene_guard["inliers"],
+            "scene_map_points": int(scene_map.shape[0]),
             "object_map_points_before": object_map_points_before,
             "object_map_points_after": int(object_map.shape[0]),
             "object_map_new_points": int(object_map.shape[0])
@@ -721,16 +845,19 @@ def _run_pose_branch(
         }
         rows.append(row)
         correction = torch.eye(4, dtype=raw_points.dtype)
-        if icp.accepted and float(delta_scale) > 0.0:
+        if icp.accepted and applied_delta_scale > 0.0:
             correction[:3, :3] = icp.rotation
-            correction[:3, 3] = icp.translation * float(delta_scale)
+            correction[:3, 3] = icp.translation * applied_delta_scale
         corrections.append(
             {
                 "sequence_index": sequence_index,
                 "frame_index": frame_index,
                 "accepted": icp.accepted,
                 "delta_scale": float(delta_scale),
+                "applied_delta_scale": applied_delta_scale,
                 "object_map_mode": object_map_mode,
+                "scene_consistency": scene_consistency,
+                "scene_guard": scene_guard,
                 "object_map_points_before": object_map_points_before,
                 "object_map_points_after": int(object_map.shape[0]),
                 "object_map_updated": object_map_updated,
@@ -741,6 +868,7 @@ def _run_pose_branch(
         )
         print(
             f"source={source:<18} alpha={float(delta_scale):.2f} "
+            f"applied={applied_delta_scale:.2f} "
             f"map={object_map_mode:<14} "
             f"frame={frame_index} "
             f"visible={row['gt_visible']} mask_iou={row['mask_iou']:.4f} "
@@ -749,6 +877,145 @@ def _run_pose_branch(
             f"{refined_full['rmse']:.4f}"
         )
     return rows, refined_points, refined_poses, corrections
+
+
+def _select_scene_guard_scale(
+    moving_scene,
+    scene_map,
+    *,
+    translation,
+    max_scale,
+    candidate_scales,
+    max_points,
+    trim_fraction,
+    max_correspondence,
+    min_inliers,
+    rmse_tolerance,
+    fitness_drop_tolerance,
+):
+    raw = _scene_nn_score(
+        moving_scene,
+        scene_map,
+        max_points=max_points,
+        trim_fraction=trim_fraction,
+        max_correspondence=max_correspondence,
+        min_inliers=min_inliers,
+    )
+    if not raw["valid"]:
+        return float(max_scale), {
+            "reason": "insufficient scene overlap; keep object ICP",
+            "raw_rmse": raw["rmse"],
+            "raw_fitness": raw["fitness"],
+            "refined_rmse": raw["rmse"],
+            "refined_fitness": raw["fitness"],
+            "inliers": raw["inliers"],
+        }
+
+    best_scale = 0.0
+    best = raw
+    for fraction in sorted(float(value) for value in candidate_scales):
+        scale = float(max_scale) * fraction
+        candidate = _scene_nn_score(
+            moving_scene + translation * scale,
+            scene_map,
+            max_points=max_points,
+            trim_fraction=trim_fraction,
+            max_correspondence=max_correspondence,
+            min_inliers=min_inliers,
+        )
+        if not candidate["valid"]:
+            continue
+        rmse_ok = candidate["rmse"] <= raw["rmse"] * (
+            1.0 + float(rmse_tolerance)
+        )
+        fitness_ok = candidate["fitness"] >= raw["fitness"] - float(
+            fitness_drop_tolerance
+        )
+        if rmse_ok and fitness_ok and scale >= best_scale:
+            best_scale = scale
+            best = candidate
+    if best_scale >= float(max_scale) - 1e-8:
+        reason = "full object ICP passes scene guard"
+    elif best_scale > 0.0:
+        reason = "object ICP damped by scene guard"
+    else:
+        reason = "object ICP blocked by scene guard"
+    return best_scale, {
+        "reason": reason,
+        "raw_rmse": raw["rmse"],
+        "raw_fitness": raw["fitness"],
+        "refined_rmse": best["rmse"],
+        "refined_fitness": best["fitness"],
+        "inliers": best["inliers"],
+    }
+
+
+def _scene_nn_score(
+    moving,
+    fixed,
+    *,
+    max_points,
+    trim_fraction,
+    max_correspondence,
+    min_inliers,
+):
+    moving = moving[torch.isfinite(moving).all(dim=-1)].float()
+    fixed = fixed[torch.isfinite(fixed).all(dim=-1)].float()
+    moving = _deterministic_point_subsample(moving, max_points)
+    fixed = _deterministic_point_subsample(fixed, max_points)
+    if moving.shape[0] < int(min_inliers) or fixed.shape[0] < int(min_inliers):
+        return {
+            "valid": False,
+            "rmse": float("nan"),
+            "fitness": 0.0,
+            "inliers": 0,
+        }
+    distances, _ = nearest_neighbors(moving, fixed)
+    supported = torch.isfinite(distances) & (
+        distances <= float(max_correspondence)
+    )
+    support_count = int(supported.sum())
+    fitness = support_count / max(int(moving.shape[0]), 1)
+    if support_count < int(min_inliers):
+        return {
+            "valid": False,
+            "rmse": float("nan"),
+            "fitness": fitness,
+            "inliers": support_count,
+        }
+    supported_distances = distances[supported]
+    threshold = torch.quantile(
+        supported_distances,
+        min(1.0, max(0.1, float(trim_fraction))),
+    )
+    inliers = supported & (distances <= threshold)
+    inlier_count = int(inliers.sum())
+    if inlier_count < int(min_inliers):
+        return {
+            "valid": False,
+            "rmse": float("nan"),
+            "fitness": fitness,
+            "inliers": inlier_count,
+        }
+    rmse = float(torch.sqrt((distances[inliers] ** 2).mean()))
+    return {
+        "valid": True,
+        "rmse": rmse,
+        "fitness": fitness,
+        "inliers": inlier_count,
+    }
+
+
+def _deterministic_point_subsample(points, max_points):
+    if points.shape[0] <= int(max_points):
+        return points
+    indices = torch.linspace(
+        0,
+        points.shape[0] - 1,
+        steps=int(max_points),
+        device=points.device,
+    ).long()
+    return points[indices]
 
 
 def _merge_object_map(
@@ -850,6 +1117,21 @@ def _summarize_branch(source, rows, *, reference, recovery_triggered):
         "mean_visible_camera_delta_norm": _finite_mean(
             row["camera_delta_norm"] for row in visible
         ),
+        "mean_visible_applied_delta_scale": _finite_mean(
+            row["applied_delta_scale"] for row in visible
+        ),
+        "scene_guard_damped_visible_frames": sum(
+            row["icp_accepted"]
+            and row["applied_delta_scale"] < row["delta_scale"]
+            for row in visible
+        ),
+        "mean_visible_scene_raw_rmse": _finite_mean(
+            row["scene_raw_rmse"] for row in visible
+        ),
+        "mean_visible_scene_refined_rmse": _finite_mean(
+            row["scene_refined_rmse"] for row in visible
+        ),
+        "final_scene_map_points": rows[-1]["scene_map_points"],
         "object_map_updates": sum(row["object_map_updated"] for row in rows),
         "final_object_map_points": rows[-1]["object_map_points_after"],
         "hard_recovery_triggered": int(recovery_triggered),
@@ -1046,6 +1328,28 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--object-map-voxel-size", type=float, default=0.02)
     parser.add_argument("--object-map-max-points", type=int, default=16384)
+    parser.add_argument(
+        "--scene-consistency",
+        choices=("off", "guard"),
+        default="off",
+        help="Damp object ICP when it degrades causal non-object scene overlap.",
+    )
+    parser.add_argument(
+        "--scene-candidate-scales",
+        type=float,
+        nargs="+",
+        default=[0.0, 0.25, 0.5, 0.75, 1.0],
+    )
+    parser.add_argument("--scene-confidence-threshold", type=float, default=0.30)
+    parser.add_argument("--scene-rmse-tolerance", type=float, default=0.05)
+    parser.add_argument(
+        "--scene-fitness-drop-tolerance",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument("--scene-min-inliers", type=int, default=128)
+    parser.add_argument("--scene-map-voxel-size", type=float, default=0.05)
+    parser.add_argument("--scene-map-max-points", type=int, default=32768)
     return parser.parse_args()
 
 
@@ -1077,6 +1381,20 @@ def _validate_object_map_modes(values):
     if not modes:
         raise ValueError("At least one object map mode is required.")
     return modes
+
+
+def _validate_scene_candidate_scales(values):
+    scales = []
+    for value in values:
+        value = float(value)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("Every scene candidate scale must be in [0, 1].")
+        if value not in scales:
+            scales.append(value)
+    for required in (0.0, 1.0):
+        if required not in scales:
+            scales.append(required)
+    return sorted(scales)
 
 
 def _format_scale(value):

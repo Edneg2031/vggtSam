@@ -102,6 +102,12 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_sam3_mask_camera_refine
   --object-map-modes reference_only causal \
   --object-map-voxel-size 0.02 \
   --object-map-max-points 16384 \
+  --scene-consistency guard \
+  --scene-candidate-scales 0 0.25 0.5 0.75 1.0 \
+  --scene-confidence-threshold 0.30 \
+  --scene-rmse-tolerance 0.05 \
+  --scene-fitness-drop-tolerance 0.05 \
+  --scene-min-inliers 128 \
   --alignment-confidence-threshold 0.30 \
   --icp-confidence-threshold 0.30 \
   --alignment-trim-fraction 0.70 \
@@ -109,4 +115,4 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_sam3_mask_camera_refine
   --icp-max-correspondence 0.20 \
   --icp-min-fitness 0.10 \
   --icp-max-rmse 0.15 \
-  --output-dir outputs/streaming_couping_sam3_point_head_refinement_inst37
+  --output-dir outputs/streaming_couping_sam3_point_head_scene_guard_inst37

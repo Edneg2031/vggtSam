@@ -78,6 +78,9 @@ mask，并使用 StreamVGGT `point_head` 世界点云做 translation-only ICP。
 优化。`reference_only` 固定使用首帧实例点，`causal` 则在可靠 ICP 后把新表面
 体素合入持久 object map。两者共享 mask、pointmap、Sim(3) 和 ICP 参数，用于
 验证历史实例地图能否缓解首帧局部可见造成的配准偏差。
+若 causal map 的实例指标改善但整场景指标下降，则增加无 GT 的 scene guard：
+在实例 ICP 平移方向上离散测试多个阻尼系数，以历史高置信场景点的 trimmed
+NN RMSE/fitness 为约束，选取不破坏全局重合度的最大增量。
 
 ---
 
