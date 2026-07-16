@@ -259,3 +259,9 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_sam3_mask_camera_refine
   --icp-min-fitness 0.10 \
   --icp-max-rmse 0.15 \
   --output-dir outputs/camera_ablation_08_full_se3_inst37
+
+# 汇总 1-8 组相机位姿消融结果。
+# 全部实验运行完成后执行；之后只需复制这个总表。
+PYTHONPATH=src:. python -m streaming_couping.scripts.summarize_camera_ablations \
+  --input-glob "outputs/camera_ablation_*/summary.csv" \
+  --output outputs/camera_ablation_all_summary.csv

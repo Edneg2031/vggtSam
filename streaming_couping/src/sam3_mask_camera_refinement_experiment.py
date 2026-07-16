@@ -257,24 +257,47 @@ def run_experiment(
             transforms[branch_name] = corrections
             branch_outputs[branch_name] = (refined_points, refined_poses)
             branch_sources[branch_name] = source
-            summary = _summarize_branch(
+            branch_metrics = _summarize_branch(
                 source,
                 rows,
                 reference=reference,
                 recovery_triggered=recovery["triggered"],
             )
-            summary.update(
-                {
-                    "delta_scale": delta_scale,
-                    "pose_refinement_mode": pose_refinement_mode,
-                    "geometry_source": "depth_head_plus_camera_head",
-                    "reference_sim3_scale": similarity.scale,
-                    "reference_sim3_inliers": similarity.inliers,
-                    "reference_sim3_rmse": similarity.rmse,
-                    "recovery_sequence_index": recovery["sequence_index"],
-                    "recovery_frame_index": recovery["frame_index"],
-                }
-            )
+            summary = {
+                "experiment_name": config.output_dir.name,
+                "scene_id": sequence.scene_id,
+                "instance_id": sequence.instance_id,
+                "instance_label": sequence.label,
+                "frame_indices": " ".join(
+                    str(frame_index) for frame_index in sequence.frame_indices
+                ),
+                "mask_source": source,
+                "delta_scale": delta_scale,
+                "pose_refinement_mode": pose_refinement_mode,
+                "confidence_threshold": confidence_threshold,
+                "alignment_trim_fraction": alignment_trim_fraction,
+                "icp_max_points": icp_max_points,
+                "icp_iterations": icp_iterations,
+                "icp_trim_fraction": icp_trim_fraction,
+                "icp_max_correspondence": icp_max_correspondence,
+                "icp_min_inliers": icp_min_inliers,
+                "icp_min_fitness": icp_min_fitness,
+                "icp_max_rmse": icp_max_rmse,
+                "reference_sequence_index": reference,
+                "reference_frame_index": sequence.frame_indices[reference],
+                "geometry_source": "depth_head_plus_camera_head",
+                "reference_selected_points": int(reference_points.shape[0]),
+                "reference_sim3_scale": similarity.scale,
+                "reference_sim3_inliers": similarity.inliers,
+                "reference_sim3_rmse": similarity.rmse,
+                "recovery_sequence_index": recovery["sequence_index"],
+                "recovery_frame_index": recovery["frame_index"],
+                **{
+                    key: value
+                    for key, value in branch_metrics.items()
+                    if key not in {"mask_source", "reference_sequence_index"}
+                },
+            }
             summary_rows.append(summary)
             _plot_camera_trajectories(
                 config.output_dir / f"camera_trajectories_{branch_name}.png",
@@ -326,7 +349,14 @@ def run_experiment(
                     "delta_scales": delta_scales,
                     "reference_sequence_index": reference,
                     "confidence_threshold": confidence_threshold,
+                    "alignment_trim_fraction": alignment_trim_fraction,
+                    "icp_max_points": icp_max_points,
+                    "icp_iterations": icp_iterations,
+                    "icp_trim_fraction": icp_trim_fraction,
                     "icp_max_correspondence": icp_max_correspondence,
+                    "icp_min_inliers": icp_min_inliers,
+                    "icp_min_fitness": icp_min_fitness,
+                    "icp_max_rmse": icp_max_rmse,
                     "gt_usage": "GT oracle branch, reference Sim3, and metrics only",
                 },
                 "similarity": {
@@ -607,17 +637,53 @@ def _summarize_branch(source, rows, *, reference, recovery_triggered):
         row for row in rows if row["gt_visible"] and row["sequence_index"] != reference
     ]
     absent = [row for row in rows if not row["gt_visible"]]
+    accepted_visible = [row for row in visible if row["icp_accepted"]]
+    rejected_visible = [row for row in visible if not row["icp_accepted"]]
     summary = {
         "mask_source": source,
         "reference_sequence_index": reference,
         "visible_evaluation_frames": len(visible),
-        "accepted_visible_icp_frames": sum(row["icp_accepted"] for row in visible),
+        "accepted_visible_icp_frames": len(accepted_visible),
         "accepted_absent_icp_frames": sum(row["icp_accepted"] for row in absent),
+        "visible_icp_acceptance_rate": len(accepted_visible) / max(len(visible), 1),
+        "accepted_visible_frame_indices": " ".join(
+            str(row["frame_index"]) for row in accepted_visible
+        ),
+        "rejected_visible_frame_indices": " ".join(
+            str(row["frame_index"]) for row in rejected_visible
+        ),
+        "rejected_visible_icp_reasons": " | ".join(
+            f"{row['frame_index']}:{row['icp_reason']}" for row in rejected_visible
+        ),
         "mean_cross_view_mask_iou": _finite_mean(
             row["mask_iou"] for row in visible
         ),
         "mean_selected_contamination_ratio": _finite_mean(
             row["selected_contamination_ratio"] for row in visible
+        ),
+        "mean_visible_selected_points": _finite_mean(
+            row["selected_points"] for row in visible
+        ),
+        "mean_accepted_visible_icp_inliers": _finite_mean(
+            row["icp_inliers"] for row in accepted_visible
+        ),
+        "mean_accepted_visible_icp_fitness": _finite_mean(
+            row["icp_fitness"] for row in accepted_visible
+        ),
+        "mean_accepted_visible_icp_rmse": _finite_mean(
+            row["icp_rmse"] for row in accepted_visible
+        ),
+        "mean_accepted_visible_icp_rotation_degrees": _finite_mean(
+            row["icp_rotation_degrees"] for row in accepted_visible
+        ),
+        "mean_accepted_visible_icp_translation": _finite_mean(
+            row["icp_translation"] for row in accepted_visible
+        ),
+        "mean_accepted_visible_applied_icp_translation": _finite_mean(
+            row["applied_icp_translation"] for row in accepted_visible
+        ),
+        "mean_visible_camera_delta_norm": _finite_mean(
+            row["camera_delta_norm"] for row in visible
         ),
         "hard_recovery_triggered": int(recovery_triggered),
     }
