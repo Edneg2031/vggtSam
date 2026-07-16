@@ -694,6 +694,8 @@ def _run_pose_branch(
             ),
             "object_map_points_before": object_map_points_before,
             "object_map_points_after": int(object_map.shape[0]),
+            "object_map_new_points": int(object_map.shape[0])
+            - object_map_points_before,
             "object_map_updated": int(object_map_updated),
             "raw_pose_rotation_degrees": raw_rotation,
             "refined_pose_rotation_degrees": refined_rotation,
@@ -756,28 +758,43 @@ def _merge_object_map(
     voxel_size: float,
     max_points: int,
 ) -> torch.Tensor:
-    points = torch.cat((existing, observation), dim=0)
-    points = points[torch.isfinite(points).all(dim=-1)]
-    if points.numel() == 0:
-        return points
-    if float(voxel_size) > 0.0:
-        voxel_keys = torch.floor(points / float(voxel_size)).to(torch.int64).cpu()
-        _, first_indices = np.unique(
-            voxel_keys.numpy(),
-            axis=0,
-            return_index=True,
-        )
-        first_indices = np.sort(first_indices)
-        points = points[torch.from_numpy(first_indices).to(points.device)]
-    if points.shape[0] > int(max_points):
+    existing = existing[torch.isfinite(existing).all(dim=-1)]
+    observation = observation[torch.isfinite(observation).all(dim=-1)]
+    if existing.shape[0] >= int(max_points):
         indices = torch.linspace(
             0,
-            points.shape[0] - 1,
+            existing.shape[0] - 1,
             steps=int(max_points),
-            device=points.device,
+            device=existing.device,
         ).long()
-        points = points[indices]
-    return points
+        return existing[indices]
+    if observation.numel() == 0:
+        return existing
+    if float(voxel_size) > 0.0:
+        existing_keys = torch.floor(existing / float(voxel_size)).to(torch.int64)
+        observation_keys = torch.floor(observation / float(voxel_size)).to(torch.int64)
+        occupied = {tuple(key) for key in existing_keys.cpu().tolist()}
+        new_indices = []
+        for index, key in enumerate(observation_keys.cpu().tolist()):
+            voxel = tuple(key)
+            if voxel not in occupied:
+                occupied.add(voxel)
+                new_indices.append(index)
+        if not new_indices:
+            return existing
+        observation = observation[
+            torch.tensor(new_indices, dtype=torch.long, device=observation.device)
+        ]
+    remaining = int(max_points) - existing.shape[0]
+    if observation.shape[0] > remaining:
+        indices = torch.linspace(
+            0,
+            observation.shape[0] - 1,
+            steps=remaining,
+            device=observation.device,
+        ).long()
+        observation = observation[indices]
+    return torch.cat((existing, observation), dim=0)
 
 
 def _summarize_branch(source, rows, *, reference, recovery_triggered):
