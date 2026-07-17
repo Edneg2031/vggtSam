@@ -540,7 +540,8 @@ def _run_hard_recovery(
         (
             index
             for index, row in enumerate(result["rows"])
-            if row["use_correction"]
+            if index > sequence.reference_frame_idx
+            and row["use_correction"]
             and result["candidates"][index].supported_mask.any()
         ),
         None,

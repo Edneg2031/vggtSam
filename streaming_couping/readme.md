@@ -215,6 +215,19 @@ CSV 指标；每个 hard-memory alpha 仅保存 `scene_*.ply` 与 `object_*.ply`
 `mask_sources.png` 仍保留 SAM3 original，按 RGB / GT / SAM3 original /
 hard-memory 四列展示，作为恢复前后的直观对照。
 
+## 多实例共享点云增量
+
+`run_multi_instance_camera_refinement` 在同一 RGB 序列上只运行一次 StreamVGGT，
+并加载一次 SAM3 模型。每个实例使用独立 tracker session、persistent memory 和
+causal object map，避免实例 ID/外观记忆互相污染；几何优化阶段则是联合的：
+每帧只在各实例自己的 object map 内建立对应，先做实例内置信度/ICP 门控，再对
+各实例建议平移做一致性筛选和实例等权平均，最终只产生一个共享 `Delta T_t`。
+默认至少两个实例通过门控才修正整帧 pointmap，不能把三个独立平移依次叠加。
+
+主要输出为 `summary.csv`（共享轨迹/整场景指标）、`instance_summary.csv`
+（各实例 mask 与点云指标）、`mask_sources.png`、共享修正后的场景/对象 PLY，
+以及 `semantic_map/object_{id}.ply + object_registry.json`。
+
 ## Memory Warping 诊断消融
 
 `run_memory_warp_ablation` 只诊断 §3.1 的位置编码分支，不使用几何 fallback、
