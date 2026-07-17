@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-
 import torch
 
 
@@ -16,9 +14,6 @@ class GeometrySequence:
     intrinsics: torch.Tensor
     processed_size: tuple[int, int]
     source_sizes: tuple[tuple[int, int], ...]
-    depth: torch.Tensor | None = None
-    depth_confidence: torch.Tensor | None = None
-    camera_world_points: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -36,13 +31,6 @@ class SAM3MaskCandidate:
 
 
 @dataclass(frozen=True)
-class SAM3SoftSequence:
-    probabilities: torch.Tensor
-    presence_logits: torch.Tensor
-    captures_per_frame: torch.Tensor
-
-
-@dataclass(frozen=True)
 class RevisitCandidate:
     mask: torch.Tensor
     projected_mask: torch.Tensor
@@ -54,14 +42,3 @@ class RevisitCandidate:
     support_ratio: float
     accepted: bool
     reason: str
-
-
-@dataclass(frozen=True)
-class SequenceInput:
-    scene_id: str
-    frame_indices: tuple[int, ...]
-    image_paths: tuple[Path, ...]
-    target_masks: torch.Tensor
-    instance_id: int
-    label: str
-    reference_frame_idx: int

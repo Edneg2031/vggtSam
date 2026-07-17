@@ -24,9 +24,9 @@ from .backbones.sam3_wrapper import SAM3Wrapper
 from .backbones.streamvggt_wrapper import StreamVGGTWrapper
 from .bridge.gating import binary_iou
 from .config import ExperimentConfig, load_config
-from .pipeline import (
-    _mine_recovery,
-    _resize_target_masks,
+from .recovery import (
+    mine_recovery,
+    resize_target_masks,
     summarize_masks,
     summarize_visible_after,
 )
@@ -49,7 +49,6 @@ def main() -> None:
         for key, value in {
             "manifest": args.manifest,
             "scene_id": args.scene_id,
-            "instance_id": instance_ids[0],
             "frame_indices": args.frame_indices,
             "sam3_device": args.sam3_device,
             "geometry_device": args.geometry_device,
@@ -92,7 +91,7 @@ def run_experiment(
             excluded_labels=config.excluded_labels,
             seed=0,
         )
-        resized = _resize_target_masks(sequence.target_masks, config.output_size)
+        resized = resize_target_masks(sequence.target_masks, config.output_size)
         if reference_sequence_index is None:
             visible_indices = resized.flatten(1).any(dim=1).nonzero(
                 as_tuple=False
@@ -154,7 +153,7 @@ def run_experiment(
             f"reference={sequence.frame_indices[sequence.reference_frame_idx]}"
         )
         result = _run_instance(
-            replace(config, instance_id=int(instance_id)),
+            config,
             sequence=sequence,
             target_masks=target_masks[int(instance_id)],
             geometry=geometry,
@@ -527,7 +526,7 @@ def _prepare_recovery(
     sam3: SAM3Wrapper,
     candidate_cache: dict[int, list[SAM3MaskCandidate]],
 ) -> dict:
-    mined = _mine_recovery(
+    mined = mine_recovery(
         config,
         sequence=sequence,
         target_masks=target_masks,
@@ -652,12 +651,12 @@ def _prepare_recovery(
         base["reason"] = "selected SAM3 candidate mask is empty"
         return base
     if support_coverage < float(
-        config.hard_memory_min_recovery_support_recall
+        config.recovery_min_support_coverage
     ):
         base["reason"] = (
             "selected full mask failed geometry support coverage: "
             f"{support_coverage:.4f} < "
-            f"{config.hard_memory_min_recovery_support_recall:.4f}"
+            f"{config.recovery_min_support_coverage:.4f}"
         )
         return base
     base["recovery_mask"] = selected.mask.detach().cpu().bool()
@@ -701,9 +700,6 @@ def _permute_geometry(
         intrinsics=permute_tensor(geometry.intrinsics),
         processed_size=geometry.processed_size,
         source_sizes=tuple(geometry.source_sizes[index] for index in permutation),
-        depth=permute_tensor(geometry.depth),
-        depth_confidence=permute_tensor(geometry.depth_confidence),
-        camera_world_points=permute_tensor(geometry.camera_world_points),
     )
 
 

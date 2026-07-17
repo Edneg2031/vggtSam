@@ -1,8 +1,7 @@
-"""SAM3 wrapper backed by the repository's tested video adapter."""
+"""Minimal SAM3 interface for tracking, re-detection, and memory writeback."""
 
 from __future__ import annotations
 
-from contextlib import ExitStack
 from pathlib import Path
 import tempfile
 from typing import Sequence
@@ -26,7 +25,7 @@ from ..types import SAM3MaskCandidate, TrackingSequence
 
 
 class SAM3Wrapper:
-    """Run original SAM3 tracking and same-instance geometry correction."""
+    """Expose only the SAM3 operations used by the active ablation."""
 
     def __init__(
         self,
@@ -68,6 +67,8 @@ class SAM3Wrapper:
         reference_frame_idx: int,
         reference_mask: torch.Tensor,
     ) -> TrackingSequence:
+        """Run the frozen original SAM3 tracker."""
+
         adapter = self._require_adapter()
         output = adapter.track_from_paths(
             image_paths,
@@ -86,81 +87,6 @@ class SAM3Wrapper:
             selected_obj_id=output.selected_obj_id,
         )
 
-    def track_with_memory_position_warp(
-        self,
-        image_paths: Sequence[str | Path],
-        *,
-        prompt: str,
-        output_size: tuple[int, int],
-        reference_frame_idx: int,
-        reference_mask: torch.Tensor,
-        warper,
-    ) -> TrackingSequence:
-        """Run original SAM3 while changing only historical memory positions."""
-
-        predictor = self.predictor
-        if predictor is None:
-            raise RuntimeError("Call SAM3Wrapper.load() before inference.")
-        tracker = getattr(getattr(predictor, "model", None), "tracker", None)
-        if tracker is None or not hasattr(
-            tracker, "_prepare_memory_conditioned_features"
-        ):
-            raise RuntimeError(
-                "The loaded SAM3 tracker does not expose its memory-conditioning path."
-            )
-        from ..bridge.memory_warp import install_memory_position_warp
-
-        with install_memory_position_warp(tracker, warper):
-            return self.track(
-                image_paths,
-                prompt=prompt,
-                output_size=output_size,
-                reference_frame_idx=reference_frame_idx,
-                reference_mask=reference_mask,
-            )
-
-    def track_with_soft_diagnostics(
-        self,
-        image_paths: Sequence[str | Path],
-        *,
-        prompt: str,
-        output_size: tuple[int, int],
-        reference_frame_idx: int,
-        reference_mask: torch.Tensor,
-        warper=None,
-    ):
-        """Run SAM3 and retain decoder outputs before its hard presence gate."""
-
-        predictor = self.predictor
-        if predictor is None:
-            raise RuntimeError("Call SAM3Wrapper.load() before inference.")
-        tracker = getattr(getattr(predictor, "model", None), "tracker", None)
-        if tracker is None:
-            raise RuntimeError("The loaded SAM3 model does not expose its tracker.")
-        from ..bridge.memory_warp import install_memory_position_warp
-        from ..bridge.sam3_soft_diagnostics import (
-            SAM3SoftOutputCapture,
-            capture_sam3_soft_outputs,
-        )
-
-        capture = SAM3SoftOutputCapture(output_size=output_size)
-        with ExitStack() as stack:
-            if warper is not None:
-                stack.enter_context(install_memory_position_warp(tracker, warper))
-            stack.enter_context(capture_sam3_soft_outputs(tracker, capture))
-            tracking = self.track(
-                image_paths,
-                prompt=prompt,
-                output_size=output_size,
-                reference_frame_idx=reference_frame_idx,
-                reference_mask=reference_mask,
-            )
-        soft = capture.finalize(
-            num_frames=len(image_paths),
-            selected_obj_id=tracking.selected_obj_id,
-        )
-        return tracking, soft
-
     def propose_text_masks(
         self,
         image_path: str | Path,
@@ -168,19 +94,17 @@ class SAM3Wrapper:
         prompt: str,
         output_size: tuple[int, int],
     ) -> list[SAM3MaskCandidate]:
-        """Return every mask from one frozen SAM3 global-text query."""
+        """Return every full mask from one global-text query."""
 
-        predictor = self.predictor
-        if predictor is None:
-            raise RuntimeError("Call SAM3Wrapper.load() before inference.")
+        predictor = self._require_predictor()
         with tempfile.TemporaryDirectory(prefix="sam3_text_candidates_") as tmp:
-            tmp_dir = Path(tmp)
-            materialize_video_dir([image_path], tmp_dir)
+            video_dir = Path(tmp)
+            materialize_video_dir([image_path], video_dir)
             with quiet_sam3_output(True):
-                session = predictor.start_session(resource_path=str(tmp_dir))
-                session_id = (
-                    session["session_id"] if isinstance(session, dict) else session
+                session = predictor.start_session(
+                    resource_path=str(video_dir)
                 )
+                session_id = _session_id(session)
                 try:
                     detected = predictor.add_prompt(
                         session_id=session_id,
@@ -191,14 +115,14 @@ class SAM3Wrapper:
                 finally:
                     predictor.close_session(session_id)
 
-        frame_objects = collect_frame_objects(
+        objects = collect_frame_objects(
             [detected],
             output_size=output_size,
         ).get(0, {})
-        frame_scores = collect_frame_scores([detected]).get(0, {})
+        scores = collect_frame_scores([detected]).get(0, {})
         candidates = []
-        for obj_id, mask in sorted(frame_objects.items()):
-            score = float(frame_scores.get(int(obj_id), 0.0))
+        for obj_id, mask in sorted(objects.items()):
+            score = float(scores.get(int(obj_id), 0.0))
             if score == 0.0 and mask.any():
                 score = 1.0
             candidates.append(
@@ -210,101 +134,72 @@ class SAM3Wrapper:
             )
         return candidates
 
-    def recover_mask_with_text_geometry(
+    def track_split_without_memory(
         self,
-        image_path: str | Path,
+        image_paths: Sequence[str | Path],
         *,
         prompt: str,
         output_size: tuple[int, int],
-        candidate_mask: torch.Tensor,
-        supported_mask: torch.Tensor,
-        prompt_mode: str = "text_box_points",
-    ) -> tuple[torch.Tensor, float]:
-        """Recover a dense mask while geometry identifies the intended instance."""
+        reference_frame_idx: int,
+        reference_mask: torch.Tensor,
+        split_frame_idx: int,
+    ) -> TrackingSequence:
+        """Repeat the memory branch's causal split without writing a mask."""
 
-        predictor = self.predictor
-        if predictor is None:
-            raise RuntimeError("Call SAM3Wrapper.load() before inference.")
-        if prompt_mode == "text_box_points" and not self.prompt_with_box:
-            raise RuntimeError("Text-guided recovery requires sam3.prompt_with_box=true.")
-        if prompt_mode not in {"text_box_points", "global_text_select"}:
-            raise ValueError(f"Unsupported recovery prompt_mode={prompt_mode!r}.")
-        points = _positive_points(supported_mask)
-        if not points:
-            raise ValueError("The geometry-supported recovery points are empty.")
-
-        with tempfile.TemporaryDirectory(prefix="sam3_text_geometry_recovery_") as tmp:
-            tmp_dir = Path(tmp)
-            materialize_video_dir([image_path], tmp_dir)
+        predictor = self._require_predictor()
+        reference_frame_idx, split_frame_idx = _validate_split(
+            image_paths,
+            reference_frame_idx=reference_frame_idx,
+            split_frame_idx=split_frame_idx,
+        )
+        with tempfile.TemporaryDirectory(prefix="sam3_no_memory_") as tmp:
+            video_dir = Path(tmp)
+            materialize_video_dir(image_paths, video_dir)
             with quiet_sam3_output(True):
-                session = predictor.start_session(resource_path=str(tmp_dir))
-                session_id = session["session_id"] if isinstance(session, dict) else session
+                session = predictor.start_session(
+                    resource_path=str(video_dir)
+                )
+                session_id = _session_id(session)
                 try:
-                    detect_kwargs = {
-                        "session_id": session_id,
-                        "frame_idx": 0,
-                        "text": prompt,
-                        "output_prob_thresh": self.output_threshold,
-                    }
-                    if prompt_mode == "text_box_points":
-                        box = mask_to_normalized_box(
-                            candidate_mask,
-                            image_path=Path(image_path),
-                        )
-                        if box is None:
-                            raise RuntimeError("The geometry recovery box is empty.")
-                        detect_kwargs["bounding_boxes"] = [box]
-                        detect_kwargs["bounding_box_labels"] = [1]
-                    detected = predictor.add_prompt(**detect_kwargs)
-                    detected_objects = collect_frame_objects(
-                        [detected],
-                        output_size=output_size,
-                    )
-                    temporary_obj_id = select_tracked_object_id(
-                        detected_objects,
-                        prompt_frame_idx=0,
-                        reference_mask=(
-                            supported_mask if supported_mask.any() else candidate_mask
-                        ),
-                    )
-                    if temporary_obj_id is None:
-                        raise RuntimeError(
-                            "Text-guided SAM3 recovery found no matching object."
-                        )
-                    if prompt_mode == "text_box_points":
-                        refined = predictor.add_prompt(
+                    prompted = predictor.add_prompt(
+                        **self._reference_prompt_kwargs(
                             session_id=session_id,
-                            frame_idx=0,
-                            points=points,
-                            point_labels=[1] * len(points),
-                            obj_id=int(temporary_obj_id),
+                            image_paths=image_paths,
+                            prompt=prompt,
+                            reference_frame_idx=reference_frame_idx,
+                            reference_mask=reference_mask,
+                        )
+                    )
+                    before_split = list(
+                        predictor.propagate_in_video(
+                            session_id=session_id,
+                            propagation_direction="forward",
+                            start_frame_idx=reference_frame_idx,
+                            max_frame_num_to_track=(
+                                split_frame_idx - reference_frame_idx
+                            ),
                             output_prob_thresh=self.output_threshold,
                         )
+                    )
+                    selected_obj_id = _select_persistent_id(
+                        [prompted, *before_split],
+                        output_size=output_size,
+                        reference_frame_idx=reference_frame_idx,
+                        reference_mask=reference_mask,
+                    )
+                    after_split = self._propagate_future(
+                        session_id=session_id,
+                        image_paths=image_paths,
+                        start_frame_idx=split_frame_idx + 1,
+                    )
                 finally:
                     predictor.close_session(session_id)
-
-        results = (
-            [detected, refined]
-            if prompt_mode == "text_box_points"
-            else [detected]
-        )
-        frame_objects = collect_frame_objects(results, output_size=output_size)
-        masks = masks_for_selected_object(
-            frame_objects,
-            selected_obj_id=temporary_obj_id,
-            num_frames=1,
+        return _collect_tracking(
+            [prompted, *before_split, *after_split],
+            selected_obj_id=selected_obj_id,
+            num_frames=len(image_paths),
             output_size=output_size,
         )
-        frame_scores = collect_frame_scores(results)
-        scores = scores_for_selected_object(
-            frame_scores,
-            selected_obj_id=temporary_obj_id,
-            num_frames=1,
-        )
-        score = float(scores[0]) if scores.numel() else 0.0
-        if score == 0.0 and masks[0].any():
-            score = 1.0
-        return masks[0].detach().cpu().bool(), score
 
     def track_with_recovery_mask_memory(
         self,
@@ -317,47 +212,38 @@ class SAM3Wrapper:
         recovery_frame_idx: int,
         recovery_mask: torch.Tensor,
     ) -> TrackingSequence:
-        """Write a shared dense recovery mask into the persistent SAM3 object."""
+        """Write one full mask into the original persistent SAM3 object."""
 
-        predictor = self.predictor
-        if predictor is None:
-            raise RuntimeError("Call SAM3Wrapper.load() before inference.")
-        if not image_paths:
-            raise ValueError("At least one image is required for memory writeback.")
-        recovery_frame_idx = int(recovery_frame_idx)
-        reference_frame_idx = int(reference_frame_idx)
-        if recovery_frame_idx <= reference_frame_idx:
-            raise ValueError("Recovery must happen after the reference frame.")
-        if recovery_frame_idx >= len(image_paths):
-            raise ValueError("Recovery frame is outside the input sequence.")
+        predictor = self._require_predictor()
+        reference_frame_idx, recovery_frame_idx = _validate_split(
+            image_paths,
+            reference_frame_idx=reference_frame_idx,
+            split_frame_idx=recovery_frame_idx,
+        )
         if not recovery_mask.any():
-            raise ValueError("The recovery mask is empty; it cannot update memory.")
-        with tempfile.TemporaryDirectory(prefix="sam3_memory_writeback_") as tmp:
-            tmp_dir = Path(tmp)
-            materialize_video_dir(image_paths, tmp_dir)
+            raise ValueError("The recovery mask is empty.")
+
+        with tempfile.TemporaryDirectory(
+            prefix="sam3_memory_writeback_"
+        ) as tmp:
+            video_dir = Path(tmp)
+            materialize_video_dir(image_paths, video_dir)
             with quiet_sam3_output(True):
-                session = predictor.start_session(resource_path=str(tmp_dir))
-                session_id = session["session_id"] if isinstance(session, dict) else session
+                session = predictor.start_session(
+                    resource_path=str(video_dir)
+                )
+                session_id = _session_id(session)
                 try:
-                    add_kwargs = {
-                        "session_id": session_id,
-                        "frame_idx": reference_frame_idx,
-                        "text": prompt,
-                        "output_prob_thresh": self.output_threshold,
-                    }
-                    if self.prompt_with_box:
-                        reference_box = mask_to_normalized_box(
-                            reference_mask,
-                            image_path=Path(image_paths[reference_frame_idx]),
+                    prompted = predictor.add_prompt(
+                        **self._reference_prompt_kwargs(
+                            session_id=session_id,
+                            image_paths=image_paths,
+                            prompt=prompt,
+                            reference_frame_idx=reference_frame_idx,
+                            reference_mask=reference_mask,
                         )
-                        if reference_box is not None:
-                            add_kwargs["bounding_boxes"] = [reference_box]
-                            add_kwargs["bounding_box_labels"] = [1]
-                    prompted = predictor.add_prompt(**add_kwargs)
-                    # Stop at the recovery frame. Running the full sequence and
-                    # then correcting an earlier frame would leak future tracker
-                    # state into what is intended to be a causal memory test.
-                    pre_recovery_results = list(
+                    )
+                    before_recovery = list(
                         predictor.propagate_in_video(
                             session_id=session_id,
                             propagation_direction="forward",
@@ -368,312 +254,87 @@ class SAM3Wrapper:
                             output_prob_thresh=self.output_threshold,
                         )
                     )
-                    original_objects = collect_frame_objects(
-                        [prompted, *pre_recovery_results],
+                    selected_obj_id = _select_persistent_id(
+                        [prompted, *before_recovery],
                         output_size=output_size,
-                    )
-                    selected_obj_id = select_tracked_object_id(
-                        original_objects,
-                        prompt_frame_idx=reference_frame_idx,
+                        reference_frame_idx=reference_frame_idx,
                         reference_mask=reference_mask,
                     )
-                    if selected_obj_id is None:
-                        raise RuntimeError(
-                            "SAM3 did not produce an object ID on the reference frame."
-                        )
-
                     self._write_mask_to_existing_memory(
                         session_id=session_id,
                         frame_idx=recovery_frame_idx,
-                        obj_id=int(selected_obj_id),
+                        obj_id=selected_obj_id,
                         mask=recovery_mask,
                     )
-                    future_results = []
-                    future_start = recovery_frame_idx + 1
-                    if future_start < len(image_paths):
-                        future_results = list(
-                            predictor.propagate_in_video(
-                                session_id=session_id,
-                                propagation_direction="forward",
-                                start_frame_idx=future_start,
-                                max_frame_num_to_track=(
-                                    len(image_paths) - 1 - future_start
-                                ),
-                                output_prob_thresh=self.output_threshold,
-                            )
-                        )
+                    after_recovery = self._propagate_future(
+                        session_id=session_id,
+                        image_paths=image_paths,
+                        start_frame_idx=recovery_frame_idx + 1,
+                    )
                 finally:
                     predictor.close_session(session_id)
 
-        results = [prompted, *pre_recovery_results, *future_results]
-        frame_objects = collect_frame_objects(results, output_size=output_size)
-        frame_scores = collect_frame_scores(results)
-        masks = masks_for_selected_object(
-            frame_objects,
+        tracking = _collect_tracking(
+            [prompted, *before_recovery, *after_recovery],
             selected_obj_id=selected_obj_id,
             num_frames=len(image_paths),
             output_size=output_size,
         )
-        scores = scores_for_selected_object(
-            frame_scores,
-            selected_obj_id=selected_obj_id,
-            num_frames=len(image_paths),
-        )
+        masks = tracking.masks.clone()
+        scores = tracking.scores.clone()
         masks[recovery_frame_idx] = recovery_mask.detach().cpu().bool()
         scores[recovery_frame_idx] = 1.0
         return TrackingSequence(
-            masks=masks.bool(),
-            scores=scores.float(),
-            selected_obj_id=int(selected_obj_id),
+            masks=masks,
+            scores=scores,
+            selected_obj_id=tracking.selected_obj_id,
         )
 
-    def track_with_recovery_masks_memory(
+    def _reference_prompt_kwargs(
         self,
-        image_paths: Sequence[str | Path],
         *,
+        session_id: str,
+        image_paths: Sequence[str | Path],
         prompt: str,
-        output_size: tuple[int, int],
         reference_frame_idx: int,
         reference_mask: torch.Tensor,
-        recovery_masks: dict[int, torch.Tensor],
-    ) -> TrackingSequence:
-        """Causally write several dense masks into one persistent SAM3 ID."""
-
-        predictor = self.predictor
-        if predictor is None:
-            raise RuntimeError("Call SAM3Wrapper.load() before inference.")
-        if not image_paths:
-            raise ValueError("At least one image is required for memory writeback.")
-        reference_frame_idx = int(reference_frame_idx)
-        ordered_recoveries = sorted(
-            (int(frame_idx), mask.detach().cpu().bool())
-            for frame_idx, mask in recovery_masks.items()
-        )
-        if not ordered_recoveries:
-            return self.track(
-                image_paths,
-                prompt=prompt,
-                output_size=output_size,
-                reference_frame_idx=reference_frame_idx,
-                reference_mask=reference_mask,
+    ) -> dict:
+        kwargs = {
+            "session_id": session_id,
+            "frame_idx": reference_frame_idx,
+            "text": prompt,
+            "output_prob_thresh": self.output_threshold,
+        }
+        if self.prompt_with_box:
+            box = mask_to_normalized_box(
+                reference_mask,
+                image_path=Path(image_paths[reference_frame_idx]),
             )
-        for frame_idx, mask in ordered_recoveries:
-            if frame_idx <= reference_frame_idx:
-                raise ValueError("Every recovery must follow the reference frame.")
-            if frame_idx >= len(image_paths):
-                raise ValueError("A recovery frame is outside the input sequence.")
-            if not mask.any():
-                raise ValueError(
-                    f"Recovery mask at sequence index {frame_idx} is empty."
-                )
+            if box is not None:
+                kwargs["bounding_boxes"] = [box]
+                kwargs["bounding_box_labels"] = [1]
+        return kwargs
 
-        with tempfile.TemporaryDirectory(prefix="sam3_recurrent_memory_") as tmp:
-            tmp_dir = Path(tmp)
-            materialize_video_dir(image_paths, tmp_dir)
-            with quiet_sam3_output(True):
-                session = predictor.start_session(resource_path=str(tmp_dir))
-                session_id = (
-                    session["session_id"] if isinstance(session, dict) else session
-                )
-                try:
-                    add_kwargs = {
-                        "session_id": session_id,
-                        "frame_idx": reference_frame_idx,
-                        "text": prompt,
-                        "output_prob_thresh": self.output_threshold,
-                    }
-                    if self.prompt_with_box:
-                        reference_box = mask_to_normalized_box(
-                            reference_mask,
-                            image_path=Path(image_paths[reference_frame_idx]),
-                        )
-                        if reference_box is not None:
-                            add_kwargs["bounding_boxes"] = [reference_box]
-                            add_kwargs["bounding_box_labels"] = [1]
-                    prompted = predictor.add_prompt(**add_kwargs)
-
-                    propagation_results = []
-                    selected_obj_id = None
-                    segment_start = reference_frame_idx
-                    for recovery_frame_idx, recovery_mask in ordered_recoveries:
-                        segment_results = list(
-                            predictor.propagate_in_video(
-                                session_id=session_id,
-                                propagation_direction="forward",
-                                start_frame_idx=segment_start,
-                                max_frame_num_to_track=(
-                                    recovery_frame_idx - segment_start
-                                ),
-                                output_prob_thresh=self.output_threshold,
-                            )
-                        )
-                        propagation_results.extend(segment_results)
-                        if selected_obj_id is None:
-                            frame_objects = collect_frame_objects(
-                                [prompted, *propagation_results],
-                                output_size=output_size,
-                            )
-                            selected_obj_id = select_tracked_object_id(
-                                frame_objects,
-                                prompt_frame_idx=reference_frame_idx,
-                                reference_mask=reference_mask,
-                            )
-                            if selected_obj_id is None:
-                                raise RuntimeError(
-                                    "SAM3 did not produce an object ID on the "
-                                    "reference frame."
-                                )
-                        self._write_mask_to_existing_memory(
-                            session_id=session_id,
-                            frame_idx=recovery_frame_idx,
-                            obj_id=int(selected_obj_id),
-                            mask=recovery_mask,
-                        )
-                        segment_start = recovery_frame_idx + 1
-
-                    if segment_start < len(image_paths):
-                        propagation_results.extend(
-                            list(
-                                predictor.propagate_in_video(
-                                    session_id=session_id,
-                                    propagation_direction="forward",
-                                    start_frame_idx=segment_start,
-                                    max_frame_num_to_track=(
-                                        len(image_paths) - 1 - segment_start
-                                    ),
-                                    output_prob_thresh=self.output_threshold,
-                                )
-                            )
-                        )
-                finally:
-                    predictor.close_session(session_id)
-
-        results = [prompted, *propagation_results]
-        frame_objects = collect_frame_objects(results, output_size=output_size)
-        frame_scores = collect_frame_scores(results)
-        masks = masks_for_selected_object(
-            frame_objects,
-            selected_obj_id=selected_obj_id,
-            num_frames=len(image_paths),
-            output_size=output_size,
-        )
-        scores = scores_for_selected_object(
-            frame_scores,
-            selected_obj_id=selected_obj_id,
-            num_frames=len(image_paths),
-        )
-        for recovery_frame_idx, recovery_mask in ordered_recoveries:
-            masks[recovery_frame_idx] = recovery_mask
-            scores[recovery_frame_idx] = 1.0
-        return TrackingSequence(
-            masks=masks.bool(),
-            scores=scores.float(),
-            selected_obj_id=int(selected_obj_id),
-        )
-
-    def track_split_without_memory(
+    def _propagate_future(
         self,
-        image_paths: Sequence[str | Path],
         *,
-        prompt: str,
-        output_size: tuple[int, int],
-        reference_frame_idx: int,
-        reference_mask: torch.Tensor,
-        split_frame_idx: int,
-    ) -> TrackingSequence:
-        """Run the same causal split as memory writeback, without correction."""
-
-        predictor = self.predictor
-        if predictor is None:
-            raise RuntimeError("Call SAM3Wrapper.load() before inference.")
-        split_frame_idx = int(split_frame_idx)
-        reference_frame_idx = int(reference_frame_idx)
-        if split_frame_idx <= reference_frame_idx:
-            raise ValueError("The causal split must happen after the reference frame.")
-        if split_frame_idx >= len(image_paths):
-            raise ValueError("The causal split is outside the input sequence.")
-
-        with tempfile.TemporaryDirectory(prefix="sam3_no_memory_") as tmp:
-            tmp_dir = Path(tmp)
-            materialize_video_dir(image_paths, tmp_dir)
-            with quiet_sam3_output(True):
-                session = predictor.start_session(resource_path=str(tmp_dir))
-                session_id = session["session_id"] if isinstance(session, dict) else session
-                try:
-                    add_kwargs = {
-                        "session_id": session_id,
-                        "frame_idx": reference_frame_idx,
-                        "text": prompt,
-                        "output_prob_thresh": self.output_threshold,
-                    }
-                    if self.prompt_with_box:
-                        reference_box = mask_to_normalized_box(
-                            reference_mask,
-                            image_path=Path(image_paths[reference_frame_idx]),
-                        )
-                        if reference_box is not None:
-                            add_kwargs["bounding_boxes"] = [reference_box]
-                            add_kwargs["bounding_box_labels"] = [1]
-                    prompted = predictor.add_prompt(**add_kwargs)
-                    before_split = list(
-                        predictor.propagate_in_video(
-                            session_id=session_id,
-                            propagation_direction="forward",
-                            start_frame_idx=reference_frame_idx,
-                            max_frame_num_to_track=(
-                                split_frame_idx - reference_frame_idx
-                            ),
-                            output_prob_thresh=self.output_threshold,
-                        )
-                    )
-                    frame_objects = collect_frame_objects(
-                        [prompted, *before_split],
-                        output_size=output_size,
-                    )
-                    selected_obj_id = select_tracked_object_id(
-                        frame_objects,
-                        prompt_frame_idx=reference_frame_idx,
-                        reference_mask=reference_mask,
-                    )
-                    if selected_obj_id is None:
-                        raise RuntimeError(
-                            "SAM3 did not produce an object ID on the reference frame."
-                        )
-                    after_split = []
-                    future_start = split_frame_idx + 1
-                    if future_start < len(image_paths):
-                        after_split = list(
-                            predictor.propagate_in_video(
-                                session_id=session_id,
-                                propagation_direction="forward",
-                                start_frame_idx=future_start,
-                                max_frame_num_to_track=(
-                                    len(image_paths) - 1 - future_start
-                                ),
-                                output_prob_thresh=self.output_threshold,
-                            )
-                        )
-                finally:
-                    predictor.close_session(session_id)
-
-        results = [prompted, *before_split, *after_split]
-        frame_objects = collect_frame_objects(results, output_size=output_size)
-        frame_scores = collect_frame_scores(results)
-        masks = masks_for_selected_object(
-            frame_objects,
-            selected_obj_id=selected_obj_id,
-            num_frames=len(image_paths),
-            output_size=output_size,
-        )
-        scores = scores_for_selected_object(
-            frame_scores,
-            selected_obj_id=selected_obj_id,
-            num_frames=len(image_paths),
-        )
-        return TrackingSequence(
-            masks=masks.bool(),
-            scores=scores.float(),
-            selected_obj_id=int(selected_obj_id),
+        session_id: str,
+        image_paths: Sequence[str | Path],
+        start_frame_idx: int,
+    ) -> list:
+        if start_frame_idx >= len(image_paths):
+            return []
+        predictor = self._require_predictor()
+        return list(
+            predictor.propagate_in_video(
+                session_id=session_id,
+                propagation_direction="forward",
+                start_frame_idx=start_frame_idx,
+                max_frame_num_to_track=(
+                    len(image_paths) - 1 - start_frame_idx
+                ),
+                output_prob_thresh=self.output_threshold,
+            )
         )
 
     def _write_mask_to_existing_memory(
@@ -684,21 +345,16 @@ class SAM3Wrapper:
         obj_id: int,
         mask: torch.Tensor,
     ) -> None:
-        """Encode a full mask into one existing ID without recreating it."""
-
-        predictor = self.predictor
-        if predictor is None:
-            raise RuntimeError("Call SAM3Wrapper.load() before inference.")
-        session = predictor._get_session(session_id)
-        inference_state = session["state"]
+        predictor = self._require_predictor()
+        inference_state = predictor._get_session(session_id)["state"]
         model = predictor.model
         obj_rank = model._get_gpu_id_by_obj_id(inference_state, obj_id)
         if obj_rank is None:
-            raise RuntimeError(f"SAM3 tracker object {obj_id} is unavailable.")
+            raise RuntimeError(f"SAM3 object {obj_id} is unavailable.")
         if int(obj_rank) != int(model.rank):
             raise RuntimeError(
-                "Mask memory writeback currently requires the selected object "
-                "to be local to the predictor rank."
+                "Memory writeback requires the object to be local to the "
+                "predictor rank."
             )
         tracker_states = model._get_tracker_inference_states_by_obj_ids(
             inference_state,
@@ -706,16 +362,16 @@ class SAM3Wrapper:
         )
         if len(tracker_states) != 1:
             raise RuntimeError(
-                f"Expected one SAM3 tracker state for object {obj_id}, got "
+                f"Expected one tracker state for object {obj_id}, got "
                 f"{len(tracker_states)}."
             )
-        tracker_state = tracker_states[0]
         self._reactivate_existing_object(
             inference_state=inference_state,
             model=model,
             frame_idx=frame_idx,
             obj_id=obj_id,
         )
+        tracker_state = tracker_states[0]
         model.tracker.add_new_mask(
             inference_state=tracker_state,
             frame_idx=frame_idx,
@@ -737,30 +393,28 @@ class SAM3Wrapper:
     ) -> None:
         """Mirror SAM3's native existing-object refinement bookkeeping."""
 
-        tracker_metadata = inference_state["tracker_metadata"]
+        metadata = inference_state["tracker_metadata"]
         model.add_action_history(
             inference_state,
             "refine",
             frame_idx=frame_idx,
             obj_ids=[obj_id],
         )
-        tracker_metadata["obj_id_to_score"][obj_id] = 1.0
-        tracker_metadata["obj_id_to_tracker_score_frame_wise"][frame_idx][obj_id] = 1.0
-
+        metadata["obj_id_to_score"][obj_id] = 1.0
+        metadata["obj_id_to_tracker_score_frame_wise"][frame_idx][obj_id] = 1.0
         if int(model.rank) != 0:
             return
-        rank0_metadata = tracker_metadata.get("rank0_metadata", {})
-        rank0_metadata.get("removed_obj_ids", set()).discard(obj_id)
-        for suppressed_ids in rank0_metadata.get("suppressed_obj_ids", {}).values():
-            suppressed_ids.discard(obj_id)
 
-        confirmation = rank0_metadata.get("masklet_confirmation")
+        rank0 = metadata.get("rank0_metadata", {})
+        rank0.get("removed_obj_ids", set()).discard(obj_id)
+        for suppressed in rank0.get("suppressed_obj_ids", {}).values():
+            suppressed.discard(obj_id)
+        confirmation = rank0.get("masklet_confirmation")
         if confirmation is None:
             return
-        # obj_ids_all_gpu is a NumPy array in SAM3's tracker metadata.
         matching = [
             index
-            for index, candidate_id in enumerate(tracker_metadata["obj_ids_all_gpu"])
+            for index, candidate_id in enumerate(metadata["obj_ids_all_gpu"])
             if int(candidate_id) == obj_id
         ]
         if not matching or matching[0] >= len(confirmation["status"]):
@@ -776,30 +430,73 @@ class SAM3Wrapper:
             raise RuntimeError("Call SAM3Wrapper.load() before inference.")
         return self.adapter
 
+    def _require_predictor(self):
+        if self.predictor is None:
+            raise RuntimeError("Call SAM3Wrapper.load() before inference.")
+        return self.predictor
 
-def _positive_points(mask: torch.Tensor, *, max_points: int = 3) -> list[list[float]]:
-    """Choose stable positive prompts from the geometry-supported pixels."""
 
-    coordinates = mask.bool().nonzero().float()
-    if coordinates.numel() == 0:
-        return []
-    height, width = mask.shape
+def _session_id(session) -> str:
+    return session["session_id"] if isinstance(session, dict) else session
 
-    # Start at the supported-pixel medoid, then spread the remaining prompts
-    # with farthest-point sampling. Every returned point is an observed support
-    # pixel rather than the center of a potentially hollow candidate box.
-    centroid = coordinates.mean(dim=0, keepdim=True)
-    selected_indices = [int(torch.argmin(torch.cdist(coordinates, centroid)))]
-    while len(selected_indices) < min(max_points, coordinates.shape[0]):
-        selected = coordinates[selected_indices]
-        distance = torch.cdist(coordinates, selected).amin(dim=1)
-        distance[selected_indices] = -1
-        selected_indices.append(int(torch.argmax(distance)))
 
-    return [
-        [
-            float((coordinates[index, 1] + 0.5) / width),
-            float((coordinates[index, 0] + 0.5) / height),
-        ]
-        for index in selected_indices
-    ]
+def _validate_split(
+    image_paths: Sequence[str | Path],
+    *,
+    reference_frame_idx: int,
+    split_frame_idx: int,
+) -> tuple[int, int]:
+    if not image_paths:
+        raise ValueError("At least one image is required.")
+    reference_frame_idx = int(reference_frame_idx)
+    split_frame_idx = int(split_frame_idx)
+    if split_frame_idx <= reference_frame_idx:
+        raise ValueError("Recovery must happen after the reference frame.")
+    if split_frame_idx >= len(image_paths):
+        raise ValueError("Recovery frame is outside the input sequence.")
+    return reference_frame_idx, split_frame_idx
+
+
+def _select_persistent_id(
+    results: list,
+    *,
+    output_size: tuple[int, int],
+    reference_frame_idx: int,
+    reference_mask: torch.Tensor,
+) -> int:
+    objects = collect_frame_objects(results, output_size=output_size)
+    obj_id = select_tracked_object_id(
+        objects,
+        prompt_frame_idx=reference_frame_idx,
+        reference_mask=reference_mask,
+    )
+    if obj_id is None:
+        raise RuntimeError(
+            "SAM3 did not produce an object ID on the reference frame."
+        )
+    return int(obj_id)
+
+
+def _collect_tracking(
+    results: list,
+    *,
+    selected_obj_id: int,
+    num_frames: int,
+    output_size: tuple[int, int],
+) -> TrackingSequence:
+    objects = collect_frame_objects(results, output_size=output_size)
+    frame_scores = collect_frame_scores(results)
+    return TrackingSequence(
+        masks=masks_for_selected_object(
+            objects,
+            selected_obj_id=selected_obj_id,
+            num_frames=num_frames,
+            output_size=output_size,
+        ).bool(),
+        scores=scores_for_selected_object(
+            frame_scores,
+            selected_obj_id=selected_obj_id,
+            num_frames=num_frames,
+        ).float(),
+        selected_obj_id=selected_obj_id,
+    )

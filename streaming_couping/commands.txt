@@ -1,172 +1,21 @@
-# Text + geometry produces one shared dense recovery mask. Both causal branches
-# keep the original obj_id; only the memory branch writes that mask into SAM3.
-PYTHONPATH=src:. python -m streaming_couping.scripts.run_bridge \
-  --config streaming_couping/configs/default.yaml \
-  --manifest data/processed/scannetpp_pinhole_2d/manifest.json \
-  --scene-id 00a231a370 \
-  --instance-id 37 \
-  --frame-indices 133 162 520 566 477 \
-  --sam3-device cuda:3 \
-  --geometry-device cuda:1 \
-  --output-dir outputs/streaming_couping_paired_full_mask_memory_inst37
-
-# Oracle feasibility test for the reverse SAM3 -> geometry direction.
-# It independently runs object ICP on (1) direct point-head points and (2) a
-# depth+camera unprojected pointmap. Each branch fixes its gauge once at the same
-# reference frame, estimates its own delta, and exports pointmap/pose trajectories.
-PYTHONPATH=src:. python -m streaming_couping.scripts.run_gt_mask_pose_refinement \
-  --config streaming_couping/configs/default.yaml \
-  --manifest data/processed/scannetpp_pinhole_2d/manifest.json \
-  --scene-id 00a231a370 \
-  --instance-id 37 \
-  --frame-indices 133 162 520 566 477 \
-  --reference-sequence-index 0 \
-  --pose-refinement-mode translation_only \
-  --geometry-device cuda:1 \
-  --confidence-threshold 0.30 \
-  --icp-max-correspondence 0.20 \
-  --output-dir outputs/streaming_couping_gt_mask_depth_camera_diag_inst37
-
-# Object-level geometry fusion. All branches share the same reference GT mask,
-# StreamVGGT geometry, Sim3 gauge, and local ICP settings. Corrections move only
-# mask-selected object points; camera poses and the full scene stay unchanged.
-PYTHONPATH=src:. python -m streaming_couping.scripts.run_sam3_mask_object_fusion \
-  --config streaming_couping/configs/default.yaml \
-  --manifest data/processed/scannetpp_pinhole_2d/manifest.json \
-  --scene-id 00a231a370 \
-  --instance-id 37 \
-  --frame-indices 133 162 520 566 477 \
-  --reference-sequence-index 0 \
-  --sam3-device cuda:3 \
-  --geometry-device cuda:1 \
-  --icp-mode translation_only \
-  --confidence-threshold 0.30 \
-  --icp-max-correspondence 0.20 \
-  --output-dir outputs/streaming_couping_sam3_mask_object_fusion_inst37
-
-# §3.1 warp-only diagnostic: only replace SAM3 historical memory spatial position
-# encoding with StreamVGGT depth+camera reprojection. No fallback prompt,
-# re-detection, recovery-mask writeback, pointmap loss, or camera refinement.
-PYTHONPATH=src:. python -m streaming_couping.scripts.run_memory_warp_ablation \
-  --config streaming_couping/configs/default.yaml \
-  --manifest data/processed/scannetpp_pinhole_2d/manifest.json \
-  --scene-id 00a231a370 \
-  --instance-id 37 \
-  --frame-indices 133 162 520 566 477 \
-  --sam3-device cuda:3 \
-  --geometry-device cuda:1 \
-  --modes identity aligned shuffled \
-  --geometry-point-source depth_camera \
-  --min-geometry-confidence 0.20 \
-  --presence-thresholds 0.0 0.10 0.20 0.30 0.35 0.40 0.45 0.50 \
-  --soft-mask-threshold 0.50 \
-  --output-dir outputs/streaming_couping_memory_warp_inst37
-
-# Learned §3.1 line. StreamVGGT layers 4/11/17 are merged, fused with SAM3
-# tracker FPN2, and passed through the original SAM3 memory/decoder/gate flow.
-# SAM3 and StreamVGGT stay frozen; only the geometry adapter is trained.
-PYTHONPATH=src:. python -m streaming_couping.scripts.train_geometry_memory_adapter \
-  --config streaming_couping/configs/default.yaml \
-  --manifest data/processed/scannetpp_pinhole_2d/manifest.json \
-  --scene-id 00a231a370 \
-  --instance-id 37 \
-  --frame-indices 133 162 520 566 477 \
-  --sam3-device cuda:3 \
-  --sam3-feature-device cuda:2 \
-  --geometry-device cuda:1 \
-  --geometry-layers 4 11 17 \
-  --context-grid 24 24 \
-  --geometry-point-source depth_camera \
-  --min-geometry-confidence 0.20 \
-  --reference-prompt-mode mask \
-  --iterations 700 \
-  --learning-rate 1e-4 \
-  --geometry-rank-weight 0.1 \
-  --visualize-every 50 \
-  --output-dir outputs/streaming_couping_geometry_memory_adapter_inst37
-
-# Point-head causal-map 平移阻尼消融：固定其余变量，只扫描 alpha。
-# scene guard 已证明不会阻尼当前片段，因此关闭；ATE 仍只作为位姿 proxy。
-PYTHONPATH=src:. python -m streaming_couping.scripts.run_sam3_mask_camera_refinement \
-  --config streaming_couping/configs/default.yaml \
-  --manifest data/processed/scannetpp_pinhole_2d/manifest.json \
-  --scene-id 00a231a370 \
-  --instance-id 37 \
-  --frame-indices 133 162 520 566 432 470 477 \
-  --reference-sequence-index 0 \
-  --sam3-device cuda:3 \
-  --geometry-device cuda:1 \
-  --geometry-source point_head \
-  --pose-refinement-mode translation_only \
-  --delta-scales 0 0.25 0.5 0.75 1.0 \
-  --object-map-modes causal \
-  --object-map-voxel-size 0.02 \
-  --object-map-max-points 16384 \
-  --scene-consistency off \
-  --alignment-confidence-threshold 0.30 \
-  --icp-confidence-threshold 0.30 \
-  --alignment-trim-fraction 0.70 \
-  --icp-trim-fraction 0.70 \
-  --icp-max-correspondence 0.20 \
-  --icp-min-fitness 0.10 \
-  --icp-max-rmse 0.15 \
-  --output-dir outputs/streaming_couping_sam3_point_head_alpha_ablation_inst37
-
-# 三实例循环 hard-memory + 共享平移。每个实例独立维护 SAM3 obj_id 和
-# StreamVGGT object map；可靠新视角扩充 object map，面积塌缩/缺失时允许
-# 多次恢复，并把完整 mask 写回同一 obj_id。先用 alpha=0 单独检查 mask，
-# 再用 alpha=0.25 检查共享 point-head 平移，避免混淆两个实验变量。
-PYTHONPATH=src:. python -m streaming_couping.scripts.run_multi_instance_camera_refinement \
-  --config streaming_couping/configs/default.yaml \
-  --instance-ids 37 68 54 \
-  --output-dir outputs/streaming_couping_recurrent_hard_memory_37_68_54 \
-  --manifest data/processed/scannetpp_pinhole_2d/manifest.json \
-  --scene-id 00a231a370 \
-  --frame-indices 90 105 119 130 140 210 240 \
-  --alignment-reference-sequence-index 0 \
-  --sam3-device cuda:3 \
-  --geometry-device cuda:1 \
-  --geometry-source point_head \
-  --hard-recovery-prompt-mode global_text_select \
-  --delta-scales 0 0.25 \
-  --joint-min-instances 2 \
-  --joint-max-instance-disagreement 0.15 \
-  --object-map-voxel-size 0.02 \
-  --object-map-max-points 16384 \
-  --alignment-confidence-threshold 0.30 \
-  --icp-confidence-threshold 0.30 \
-  --alignment-trim-fraction 0.70 \
-  --icp-trim-fraction 0.70 \
-  --icp-max-correspondence 0.20 \
-  --icp-min-fitness 0.10 \
-  --icp-max-rmse 0.15
-
-# 几何恢复候选选择消融（先只测 bed 54，不混入相机/点云优化）。
-# 四条分支共享同一次 SAM3 文本候选、同一次 StreamVGGT 输出、相同 hard-memory
-# 门控和同一 obj_id 写回；唯一变量是如何从 SAM3 候选中选择目标实例：
-# geometry_only / descriptor_only / geometry_descriptor / shuffled_descriptor。
-# descriptor 使用此前诊断最好的 StreamVGGT aggregator layer 17。
-PYTHONPATH=src:. python -m streaming_couping.scripts.run_recovery_selection_ablation \
-  --config streaming_couping/configs/default.yaml \
-  --manifest data/processed/scannetpp_pinhole_2d/manifest.json \
-  --scene-id 00a231a370 \
-  --instance-id 54 \
-  --frame-indices 90 105 119 130 140 210 240 \
-  --reference-sequence-index 0 \
-  --sam3-device cuda:3 \
-  --geometry-device cuda:1 \
-  --modes geometry_only descriptor_only geometry_descriptor shuffled_descriptor \
-  --descriptor-layer 17 \
-  --descriptor-geometry-weight 1.0 \
-  --descriptor-weight 1.0 \
-  --output-dir outputs/streaming_couping_recovery_selection_bed54
-
-# 当前主实验：固定 7 帧序列，不使用过大的 bed(54)，分别评估
-# cabinet(37) 与 wardrobe(68)。StreamVGGT 只提取一次，但两个实例各自维护
-# SAM3 obj_id，结果中包含四个严格受控分支：
-# original / 只修恢复帧 / aligned same-ID memory / shuffled geometry memory。
-# 这里固定首帧 90 为 reference；如果某实例在首帧不可见，程序会直接报错，
-# 不会静默改用未来帧。reference 之后的 GT 只用于指标。
+# 当前主实验：几何恢复与 SAM3 same-ID memory writeback 因果消融。
+#
+# 固定 ScanNet++ 场景与 7 帧压力序列，暂不使用面积过大且首帧局部可见的
+# bed(54)。cabinet(37) 和 wardrobe(68) 共享一次 StreamVGGT 几何提取，
+# 但分别维护自己的 SAM3 obj_id、恢复 mask 和评估结果。
+#
+# 四个分支：
+#   1. original
+#   2. geometry_recovery_no_memory
+#   3. geometry_recovery_same_id_memory
+#   4. shuffled_geometry_same_id_memory
+#
+# 第 2、3 个分支使用逐像素完全相同的完整恢复 mask，唯一变量是是否写入
+# SAM3 memory。第 4 个分支只打乱非 reference 帧的 StreamVGGT 几何对应，
+# RGB、SAM3 全图文本候选和阈值保持不变。
+#
+# 帧 90 固定为 reference。若某个实例在帧 90 不可见，程序会直接报错，
+# 不会静默使用未来 GT 帧初始化。
 PYTHONPATH=src:. python -m streaming_couping.scripts.run_recovery_writeback_ablation \
   --config streaming_couping/configs/default.yaml \
   --manifest data/processed/scannetpp_pinhole_2d/manifest.json \
