@@ -41,6 +41,7 @@ from .sam3_mask_camera_refinement_experiment import (
     _format_scale,
     _merge_object_map,
     _run_hard_recovery,
+    _select_missing_only_hard_fallback,
     _select_geometry_source,
 )
 from .sam3_mask_object_fusion_experiment import (
@@ -238,15 +239,39 @@ def run_experiment(
         raise RuntimeError("GT mask conversion differs from GT geometry loading.")
 
     hard_tracking = {}
+    mask_choices = {}
     recovery = {}
     for instance_id in instance_ids:
-        hard_tracking[instance_id], recovery[instance_id] = _run_hard_recovery(
+        memory_tracking, recovery[instance_id] = _run_hard_recovery(
             replace(config, instance_id=instance_id),
             sequence=sequences[instance_id],
             target_output_masks=target_output_masks[instance_id],
             original_tracking=original_tracking[instance_id],
             geometry=geometry,
             sam3=sam3,
+            require_missing_tracker=True,
+            min_recovery_support_recall=0.5,
+        )
+        hard_tracking[instance_id], mask_choices[instance_id] = (
+            _select_missing_only_hard_fallback(
+                original_tracking[instance_id],
+                memory_tracking,
+                eligible_sequence_indices=recovery[instance_id].get(
+                    "eligible_sequence_indices", ()
+                ),
+            )
+        )
+        recovery[instance_id]["output_policy"] = (
+            "per_instance_missing_mask_and_geometry_gate"
+        )
+        recovery[instance_id]["fallback_frame_indices"] = [
+            shared.frame_indices[index]
+            for index, source in enumerate(mask_choices[instance_id])
+            if source == "hard_memory_fallback"
+        ]
+        print(
+            f"instance={instance_id} hard-memory fallback frames="
+            f"{[shared.frame_indices[index] for index, source in enumerate(mask_choices[instance_id]) if source == 'hard_memory_fallback']}"
         )
     del sam3
     if torch.cuda.is_available():
@@ -306,6 +331,7 @@ def run_experiment(
                 for instance_id in instance_ids
             },
             masks=hard_masks,
+            mask_choices=mask_choices,
             gt_masks=gt_masks,
             raw_points=raw_points,
             raw_poses=raw_poses,
@@ -409,6 +435,13 @@ def run_experiment(
                     },
                     "shared_pose_delta": True,
                     "instance_balanced_correspondences": True,
+                    "hard_memory_policy": (
+                        "per_instance_missing_mask_and_geometry_gate"
+                    ),
+                    "hard_memory_output_selection": (
+                        "SAM3 original when nonempty; same-instance memory only "
+                        "when original is empty and that frame passes geometry gate"
+                    ),
                     "joint_min_instances": joint_min_instances,
                     "joint_max_instance_disagreement": (
                         joint_max_instance_disagreement
@@ -442,6 +475,7 @@ def _run_joint_branch(
     instance_ids,
     references,
     masks,
+    mask_choices,
     gt_masks,
     raw_points,
     raw_poses,
@@ -639,6 +673,7 @@ def _run_joint_branch(
                     "sequence_index": sequence_index,
                     "frame_index": frame_index,
                     "instance_id": instance_id,
+                    "mask_source_choice": mask_choices[instance_id][sequence_index],
                     "gt_visible": int(gt_mask.any()),
                     "is_instance_reference": int(
                         sequence_index == references[instance_id]
@@ -1182,7 +1217,12 @@ def _save_multi_mask_report(
         "RGB", (columns * width, len(image_paths) * (height + header)), "white"
     )
     draw = ImageDraw.Draw(canvas)
-    column_names = ("RGB", "GT instances", "SAM3 original", "hard memory")
+    column_names = (
+        "RGB",
+        "GT instances",
+        "SAM3 original",
+        "hard fallback (missing + geometry gate)",
+    )
     for row, image_path in enumerate(image_paths):
         with Image.open(image_path) as image:
             rgb = image.convert("RGB").resize((width, height))

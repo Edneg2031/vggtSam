@@ -44,6 +44,7 @@ from .sam3_mask_object_fusion_experiment import (
     _sam_masks_to_stream,
     _save_mask_report,
 )
+from .types import TrackingSequence
 
 
 MASK_SOURCES = ("gt_oracle", "sam3_hard_memory")
@@ -220,14 +221,29 @@ def run_experiment(
             f"{tuple(geometry_confidence.shape)} does not match pointmap grid "
             f"{tuple(geometry_points.shape[:-1])}."
         )
-    hard_tracking, recovery = _run_hard_recovery(
+    memory_tracking, recovery = _run_hard_recovery(
         config,
         sequence=sequence,
         target_output_masks=target_output_masks,
         original_tracking=original_tracking,
         geometry=geometry,
         sam3=sam3,
+        require_missing_tracker=True,
+        min_recovery_support_recall=0.5,
     )
+    hard_tracking, hard_mask_choices = _select_missing_only_hard_fallback(
+        original_tracking,
+        memory_tracking,
+        eligible_sequence_indices=recovery.get("eligible_sequence_indices", ()),
+    )
+    recovery["output_policy"] = (
+        "per_instance_missing_mask_and_geometry_gate"
+    )
+    recovery["fallback_frame_indices"] = [
+        sequence.frame_indices[index]
+        for index, source in enumerate(hard_mask_choices)
+        if source == "hard_memory_fallback"
+    ]
     del sam3
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -527,6 +543,8 @@ def _run_hard_recovery(
     original_tracking,
     geometry,
     sam3,
+    require_missing_tracker=True,
+    min_recovery_support_recall=0.5,
 ):
     result = _mine_recovery(
         config,
@@ -536,16 +554,18 @@ def _run_hard_recovery(
         original_scores=original_tracking.scores,
         geometry=geometry,
     )
-    recovery_index = next(
-        (
-            index
-            for index, row in enumerate(result["rows"])
-            if index > sequence.reference_frame_idx
-            and row["use_correction"]
-            and result["candidates"][index].supported_mask.any()
-        ),
-        None,
-    )
+    eligible_indices = [
+        index
+        for index, row in enumerate(result["rows"])
+        if index > sequence.reference_frame_idx
+        and row["use_correction"]
+        and (
+            not require_missing_tracker
+            or not original_tracking.masks[index].any()
+        )
+        and result["candidates"][index].supported_mask.any()
+    ]
+    recovery_index = eligible_indices[0] if eligible_indices else None
     if recovery_index is None:
         print("hard recovery not triggered; hard branch equals SAM3 original")
         return original_tracking, {
@@ -553,6 +573,8 @@ def _run_hard_recovery(
             "sequence_index": None,
             "frame_index": None,
             "persistent_obj_id": original_tracking.selected_obj_id,
+            "eligible_sequence_indices": [],
+            "reason": "no missing-mask frame passed the geometry gate",
         }
     candidate = result["candidates"][recovery_index]
     recovery_mask, recovery_score = sam3.recover_mask_with_text_geometry(
@@ -564,6 +586,26 @@ def _run_hard_recovery(
     )
     if not recovery_mask.any():
         raise RuntimeError("Hard geometry-guided recovery returned an empty mask.")
+    support = candidate.supported_mask.to(recovery_mask.device).bool()
+    support_recall = float((recovery_mask.bool() & support).sum()) / max(
+        int(support.sum()), 1
+    )
+    if support_recall < float(min_recovery_support_recall):
+        print(
+            f"hard recovery rejected frame={sequence.frame_indices[recovery_index]} "
+            f"support_recall={support_recall:.4f} < "
+            f"{float(min_recovery_support_recall):.4f}"
+        )
+        return original_tracking, {
+            "triggered": False,
+            "sequence_index": recovery_index,
+            "frame_index": sequence.frame_indices[recovery_index],
+            "mask_score": float(recovery_score),
+            "support_recall": support_recall,
+            "persistent_obj_id": original_tracking.selected_obj_id,
+            "eligible_sequence_indices": [],
+            "reason": "recovered mask failed geometry-support validation",
+        }
     tracking = sam3.track_with_recovery_mask_memory(
         sequence.image_paths,
         prompt=sequence.label,
@@ -593,8 +635,46 @@ def _run_hard_recovery(
         "sequence_index": recovery_index,
         "frame_index": sequence.frame_indices[recovery_index],
         "mask_score": float(recovery_score),
+        "support_recall": support_recall,
         "persistent_obj_id": tracking.selected_obj_id,
+        "eligible_sequence_indices": eligible_indices,
+        "reason": "missing SAM3 mask recovered and written to same-object memory",
     }
+
+
+def _select_missing_only_hard_fallback(
+    original_tracking,
+    memory_tracking,
+    *,
+    eligible_sequence_indices,
+):
+    """Use memory only for missing masks with an accepted geometry candidate."""
+    if original_tracking.selected_obj_id != memory_tracking.selected_obj_id:
+        raise RuntimeError(
+            "Cannot merge tracks with different persistent SAM3 obj_id values."
+        )
+    original_present = original_tracking.masks.flatten(1).any(dim=1)
+    memory_present = memory_tracking.masks.flatten(1).any(dim=1)
+    geometry_eligible = torch.zeros_like(original_present)
+    for index in eligible_sequence_indices:
+        geometry_eligible[int(index)] = True
+    use_memory = ~original_present & memory_present & geometry_eligible
+    masks = torch.where(
+        use_memory[:, None, None], memory_tracking.masks, original_tracking.masks
+    )
+    scores = torch.where(use_memory, memory_tracking.scores, original_tracking.scores)
+    choices = [
+        "hard_memory_fallback" if bool(value) else "sam3_original"
+        for value in use_memory
+    ]
+    return (
+        TrackingSequence(
+            masks=masks,
+            scores=scores,
+            selected_obj_id=original_tracking.selected_obj_id,
+        ),
+        choices,
+    )
 
 
 def _run_pose_branch(
