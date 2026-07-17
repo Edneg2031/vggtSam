@@ -40,8 +40,7 @@ from .pipeline import _resize_target_masks
 from .sam3_mask_camera_refinement_experiment import (
     _format_scale,
     _merge_object_map,
-    _run_hard_recovery,
-    _select_missing_only_hard_fallback,
+    _run_recurrent_hard_memory,
     _select_geometry_source,
 )
 from .sam3_mask_object_fusion_experiment import (
@@ -243,38 +242,28 @@ def run_experiment(
     hard_tracking = {}
     mask_choices = {}
     recovery = {}
+    hard_memory_rows = []
     for instance_id in instance_ids:
-        memory_tracking, recovery[instance_id] = _run_hard_recovery(
+        (
+            hard_tracking[instance_id],
+            recovery[instance_id],
+            instance_memory_rows,
+        ) = _run_recurrent_hard_memory(
             replace(config, instance_id=instance_id),
             sequence=sequences[instance_id],
             target_output_masks=target_output_masks[instance_id],
             original_tracking=original_tracking[instance_id],
             geometry=geometry,
             sam3=sam3,
-            require_missing_tracker=True,
-            min_recovery_support_recall=0.5,
             recovery_prompt_mode=hard_recovery_prompt_mode,
         )
-        hard_tracking[instance_id], mask_choices[instance_id] = (
-            _select_missing_only_hard_fallback(
-                original_tracking[instance_id],
-                memory_tracking,
-                eligible_sequence_indices=recovery[instance_id].get(
-                    "eligible_sequence_indices", ()
-                ),
-            )
-        )
-        recovery[instance_id]["output_policy"] = (
-            "per_instance_missing_mask_and_geometry_gate"
-        )
-        recovery[instance_id]["fallback_frame_indices"] = [
-            shared.frame_indices[index]
-            for index, source in enumerate(mask_choices[instance_id])
-            if source == "hard_memory_fallback"
+        hard_memory_rows.extend(instance_memory_rows)
+        mask_choices[instance_id] = [
+            row["mask_source_choice"] for row in instance_memory_rows
         ]
         print(
-            f"instance={instance_id} hard-memory fallback frames="
-            f"{[shared.frame_indices[index] for index, source in enumerate(mask_choices[instance_id]) if source == 'hard_memory_fallback']}"
+            f"instance={instance_id} recurrent hard-memory recoveries="
+            f"{recovery[instance_id]['recovery_frame_indices']}"
         )
     del sam3
     if torch.cuda.is_available():
@@ -424,7 +413,39 @@ def run_experiment(
     )
     _write_csv(config.output_dir / "summary.csv", summary_rows)
     _write_csv(config.output_dir / "frame_metrics.csv", frame_rows)
+    hard_memory_by_frame = {
+        (int(row["instance_id"]), int(row["sequence_index"])): row
+        for row in hard_memory_rows
+    }
+    for row in instance_rows:
+        diagnostic = hard_memory_by_frame[
+            (int(row["instance_id"]), int(row["sequence_index"]))
+        ]
+        row.update(
+            {
+                "sam_memory_tracker_score": diagnostic["tracker_score"],
+                "sam_memory_mask_area_ratio": diagnostic["mask_area_ratio"],
+                "sam_memory_support_coverage": diagnostic[
+                    "mask_support_coverage"
+                ],
+                "sam_memory_tracker_weak": diagnostic["tracker_weak"],
+                "sam_memory_tracker_weak_reason": diagnostic[
+                    "tracker_weak_reason"
+                ],
+                "sam_memory_recovery_applied": diagnostic[
+                    "recovery_applied"
+                ],
+                "sam_memory_map_update": diagnostic["map_update"],
+                "sam_memory_map_observations": diagnostic[
+                    "object_map_observations_after"
+                ],
+            }
+        )
     _write_csv(config.output_dir / "instance_metrics.csv", instance_rows)
+    _write_csv(
+        config.output_dir / "hard_memory_metrics.csv",
+        hard_memory_rows,
+    )
     _write_csv(
         config.output_dir / "instance_summary.csv",
         _summarize_instances(instance_rows, instance_ids, sequences),
@@ -442,11 +463,12 @@ def run_experiment(
                     "shared_pose_delta": True,
                     "instance_balanced_correspondences": True,
                     "hard_memory_policy": (
-                        "per_instance_missing_mask_and_geometry_gate"
+                        "per_instance_recurrent_geometry_memory"
                     ),
                     "hard_memory_output_selection": (
-                        "SAM3 original when nonempty; same-instance memory only "
-                        "when original is empty and that frame passes geometry gate"
+                        "reliable masks update the instance 3D map; missing, "
+                        "low-score, or area-collapsed masks can trigger repeated "
+                        "same-obj_id dense-mask memory writeback"
                     ),
                     "hard_recovery_prompt_mode": hard_recovery_prompt_mode,
                     "negative_delta_is_diagnostic_only": True,
@@ -1229,7 +1251,7 @@ def _save_multi_mask_report(
         "RGB",
         "GT instances",
         "SAM3 original",
-        "hard fallback (missing + geometry gate)",
+        "recurrent hard memory",
     )
     for row, image_path in enumerate(image_paths):
         with Image.open(image_path) as image:

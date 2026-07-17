@@ -46,6 +46,10 @@ class ExperimentConfig:
 
     tracker_low_score: float
     fallback_on_missing_mask: bool
+    hard_memory_min_area_ratio: float
+    hard_memory_min_support_coverage: float
+    hard_memory_min_recovery_support_recall: float
+    hard_memory_max_recoveries: int
     output_dir: Path
 
 
@@ -70,7 +74,7 @@ def load_config(
     if len(output_size) != 2:
         raise ValueError("bridge.output_size must be [height, width].")
 
-    return ExperimentConfig(
+    config = ExperimentConfig(
         manifest=_path(overrides.get("manifest", dataset.get("manifest"))),
         scene_id=str(overrides.get("scene_id", dataset.get("scene_id"))),
         frame_indices=tuple(int(value) for value in frame_indices),
@@ -107,8 +111,33 @@ def load_config(
         ),
         tracker_low_score=float(bridge.get("tracker_low_score", 0.5)),
         fallback_on_missing_mask=bool(bridge.get("fallback_on_missing_mask", True)),
+        hard_memory_min_area_ratio=float(
+            bridge.get("hard_memory_min_area_ratio", 0.20)
+        ),
+        hard_memory_min_support_coverage=float(
+            bridge.get("hard_memory_min_support_coverage", 0.50)
+        ),
+        hard_memory_min_recovery_support_recall=float(
+            bridge.get("hard_memory_min_recovery_support_recall", 0.50)
+        ),
+        hard_memory_max_recoveries=int(
+            bridge.get("hard_memory_max_recoveries", 8)
+        ),
         output_dir=_path(overrides.get("output_dir", raw.get("output", {}).get("dir"))),
     )
+    if not 0.0 <= config.hard_memory_min_area_ratio <= 1.0:
+        raise ValueError("bridge.hard_memory_min_area_ratio must be in [0, 1].")
+    if not 0.0 <= config.hard_memory_min_support_coverage <= 1.0:
+        raise ValueError(
+            "bridge.hard_memory_min_support_coverage must be in [0, 1]."
+        )
+    if not 0.0 <= config.hard_memory_min_recovery_support_recall <= 1.0:
+        raise ValueError(
+            "bridge.hard_memory_min_recovery_support_recall must be in [0, 1]."
+        )
+    if config.hard_memory_max_recoveries < 0:
+        raise ValueError("bridge.hard_memory_max_recoveries must be non-negative.")
+    return config
 
 
 def _path(value: Any) -> Path:

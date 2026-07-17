@@ -12,9 +12,20 @@ import torch
 
 from test_sam.data import load_mask_tracking_sequence
 
+from .aggregation.mine_revisit_segments import mine_revisit_candidate
+from .aggregation.point_map_fusion import (
+    ObjectPointMap,
+    sample_masked_observation,
+)
 from .backbones.sam3_wrapper import SAM3Wrapper
 from .backbones.streamvggt_wrapper import StreamVGGTWrapper
 from .bridge.gating import binary_iou
+from .bridge.segment_descriptor import (
+    DescriptorMemory,
+    SELECTION_MODES,
+    pool_segment_descriptor,
+    select_mask_candidate,
+)
 from .config import ExperimentConfig, load_config
 from .geometry.export import save_aggregate_ply
 from .geometry.gt_data import load_gt_geometry_sequence
@@ -38,13 +49,16 @@ from .gt_mask_pose_experiment import (
     pointmap_errors,
     select_causal_reference,
 )
-from .pipeline import _mine_recovery, _resize_target_masks
+from .pipeline import (
+    _empty_candidate,
+    _output_mask_to_stream,
+    _resize_target_masks,
+)
 from .sam3_mask_object_fusion_experiment import (
     _reference_similarity,
     _sam_masks_to_stream,
     _save_mask_report,
 )
-from .types import TrackingSequence
 
 
 MASK_SOURCES = ("gt_oracle", "sam3_hard_memory")
@@ -221,29 +235,15 @@ def run_experiment(
             f"{tuple(geometry_confidence.shape)} does not match pointmap grid "
             f"{tuple(geometry_points.shape[:-1])}."
         )
-    memory_tracking, recovery = _run_hard_recovery(
+    hard_tracking, recovery, hard_memory_rows = _run_recurrent_hard_memory(
         config,
         sequence=sequence,
         target_output_masks=target_output_masks,
         original_tracking=original_tracking,
         geometry=geometry,
         sam3=sam3,
-        require_missing_tracker=True,
-        min_recovery_support_recall=0.5,
+        recovery_prompt_mode="global_text_select",
     )
-    hard_tracking, hard_mask_choices = _select_missing_only_hard_fallback(
-        original_tracking,
-        memory_tracking,
-        eligible_sequence_indices=recovery.get("eligible_sequence_indices", ()),
-    )
-    recovery["output_policy"] = (
-        "per_instance_missing_mask_and_geometry_gate"
-    )
-    recovery["fallback_frame_indices"] = [
-        sequence.frame_indices[index]
-        for index, source in enumerate(hard_mask_choices)
-        if source == "hard_memory_fallback"
-    ]
     del sam3
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -460,6 +460,10 @@ def run_experiment(
     )
     _write_csv(config.output_dir / "frame_metrics.csv", all_rows)
     _write_csv(config.output_dir / "summary.csv", summary_rows)
+    _write_csv(
+        config.output_dir / "hard_memory_metrics.csv",
+        hard_memory_rows,
+    )
     with (config.output_dir / "transforms.json").open("w", encoding="utf8") as handle:
         json.dump(
             {
@@ -535,7 +539,7 @@ def _select_geometry_source(geometry, geometry_source):
     raise ValueError(f"Unsupported geometry_source={geometry_source!r}.")
 
 
-def _run_hard_recovery(
+def _run_recurrent_hard_memory(
     config,
     *,
     sequence,
@@ -543,143 +547,597 @@ def _run_hard_recovery(
     original_tracking,
     geometry,
     sam3,
-    require_missing_tracker=True,
-    min_recovery_support_recall=0.5,
-    recovery_prompt_mode="text_box_points",
+    recovery_prompt_mode="global_text_select",
+    geometry_features=None,
+    candidate_selection_mode="geometry_only",
+    descriptor_geometry_weight=1.0,
+    descriptor_weight=1.0,
+    text_candidate_cache=None,
 ):
-    result = _mine_recovery(
+    """Run a causal instance map -> SAM3 memory -> instance map loop."""
+
+    if int(config.hard_memory_max_recoveries) < 0:
+        raise ValueError("hard_memory_max_recoveries must be non-negative.")
+    if candidate_selection_mode not in SELECTION_MODES:
+        raise ValueError(
+            f"Unsupported candidate_selection_mode={candidate_selection_mode!r}."
+        )
+    if candidate_selection_mode != "geometry_only" and geometry_features is None:
+        raise ValueError(
+            f"{candidate_selection_mode} requires StreamVGGT descriptor features."
+        )
+    if geometry_features is not None:
+        if geometry_features.ndim != 4:
+            raise ValueError(
+                "geometry_features must be [T,C,H,W], got "
+                f"{tuple(geometry_features.shape)}."
+            )
+        if geometry_features.shape[0] != len(sequence.frame_indices):
+            raise ValueError(
+                "geometry_features frame count does not match the sequence."
+            )
+    descriptor_permutation = tuple(range(len(sequence.frame_indices)))
+    if candidate_selection_mode == "shuffled_descriptor":
+        descriptor_permutation = tuple(
+            [*range(1, len(sequence.frame_indices)), 0]
+        )
+    recovery_masks: dict[int, torch.Tensor] = {}
+    recovery_scores: dict[int, float] = {}
+    recovery_support_recalls: dict[int, float] = {}
+    rejected_recoveries: dict[int, str] = {}
+    candidate_selection_rows: list[dict] = []
+    tracking = original_tracking
+    last_scan = None
+
+    for _ in range(int(config.hard_memory_max_recoveries) + 1):
+        last_scan = _scan_recurrent_hard_memory(
+            config,
+            sequence=sequence,
+            target_output_masks=target_output_masks,
+            tracking=tracking,
+            geometry=geometry,
+            recovery_masks=recovery_masks,
+            recovery_scores=recovery_scores,
+            rejected_recoveries=rejected_recoveries,
+        )
+        request = last_scan["recovery_request"]
+        if request is None:
+            break
+        if len(recovery_masks) >= int(config.hard_memory_max_recoveries):
+            rejected_recoveries[int(request["sequence_index"])] = (
+                "hard-memory recovery limit reached"
+            )
+            break
+
+        recovery_index = int(request["sequence_index"])
+        candidate = request["candidate"]
+        try:
+            if recovery_prompt_mode == "global_text_select":
+                cache_key = (
+                    int(sequence.instance_id),
+                    int(recovery_index),
+                    str(sequence.label),
+                )
+                text_candidates = (
+                    text_candidate_cache.get(cache_key)
+                    if text_candidate_cache is not None
+                    else None
+                )
+                if text_candidates is None:
+                    text_candidates = sam3.propose_text_masks(
+                        sequence.image_paths[recovery_index],
+                        prompt=sequence.label,
+                        output_size=config.output_size,
+                    )
+                    if text_candidate_cache is not None:
+                        text_candidate_cache[cache_key] = text_candidates
+                history_descriptor = _build_historical_descriptor(
+                    config,
+                    sequence=sequence,
+                    target_output_masks=target_output_masks,
+                    tracking=tracking,
+                    geometry=geometry,
+                    geometry_features=geometry_features,
+                    descriptor_permutation=descriptor_permutation,
+                    scan_rows=last_scan["rows"],
+                    recovery_masks=recovery_masks,
+                    before_sequence_index=recovery_index,
+                )
+                candidate_descriptors = [
+                    _pool_output_descriptor(
+                        config,
+                        output_mask=text_candidate.mask,
+                        sequence_index=recovery_index,
+                        feature_sequence_index=descriptor_permutation[
+                            recovery_index
+                        ],
+                        sequence=sequence,
+                        geometry=geometry,
+                        geometry_features=geometry_features,
+                    )
+                    for text_candidate in text_candidates
+                ]
+                selection = select_mask_candidate(
+                    text_candidates,
+                    supported_mask=candidate.supported_mask,
+                    candidate_descriptors=candidate_descriptors,
+                    history_descriptor=(
+                        history_descriptor[0]
+                        if history_descriptor is not None
+                        else None
+                    ),
+                    mode=candidate_selection_mode,
+                    geometry_weight=descriptor_geometry_weight,
+                    descriptor_weight=descriptor_weight,
+                )
+                recovery_mask = selection.candidate.mask
+                recovery_score = selection.candidate.score
+                for row in selection.rows:
+                    candidate_selection_rows.append(
+                        {
+                            "candidate_selection_mode": (
+                                candidate_selection_mode
+                            ),
+                            "sequence_index": recovery_index,
+                            "frame_index": sequence.frame_indices[
+                                recovery_index
+                            ],
+                            "instance_id": sequence.instance_id,
+                            "instance_label": sequence.label,
+                            "history_descriptor_observations": (
+                                history_descriptor[1]
+                                if history_descriptor is not None
+                                else 0
+                            ),
+                            "history_descriptor_weight": (
+                                history_descriptor[2]
+                                if history_descriptor is not None
+                                else 0.0
+                            ),
+                            "descriptor_feature_frame_index": (
+                                sequence.frame_indices[
+                                    descriptor_permutation[recovery_index]
+                                ]
+                            ),
+                            **row,
+                            "candidate_gt_iou": binary_iou(
+                                text_candidates[
+                                    int(row["candidate_index"])
+                                ].mask,
+                                target_output_masks[recovery_index],
+                            ),
+                        }
+                    )
+            else:
+                recovery_mask, recovery_score = (
+                    sam3.recover_mask_with_text_geometry(
+                        sequence.image_paths[recovery_index],
+                        prompt=sequence.label,
+                        output_size=config.output_size,
+                        candidate_mask=candidate.mask,
+                        supported_mask=candidate.supported_mask,
+                        prompt_mode=recovery_prompt_mode,
+                    )
+                )
+        except (RuntimeError, ValueError) as error:
+            rejected_recoveries[recovery_index] = (
+                f"recovery inference failed: {error}"
+            )
+            print(
+                f"instance={sequence.instance_id} hard-memory rejected "
+                f"frame={sequence.frame_indices[recovery_index]} "
+                f"reason={rejected_recoveries[recovery_index]}"
+            )
+            continue
+
+        support = candidate.supported_mask.bool()
+        support_recall = float((recovery_mask.bool() & support).sum()) / max(
+            int(support.sum()), 1
+        )
+        if (
+            not recovery_mask.any()
+            or support_recall
+            < float(config.hard_memory_min_recovery_support_recall)
+        ):
+            rejected_recoveries[recovery_index] = (
+                "recovered mask failed geometry support: "
+                f"recall={support_recall:.4f}"
+            )
+            print(
+                f"instance={sequence.instance_id} hard-memory rejected "
+                f"frame={sequence.frame_indices[recovery_index]} "
+                f"reason={rejected_recoveries[recovery_index]}"
+            )
+            continue
+
+        recovery_masks[recovery_index] = recovery_mask.detach().cpu().bool()
+        recovery_scores[recovery_index] = float(recovery_score)
+        recovery_support_recalls[recovery_index] = support_recall
+        previous_tracking = tracking
+        tracking = sam3.track_with_recovery_masks_memory(
+            sequence.image_paths,
+            prompt=sequence.label,
+            output_size=config.output_size,
+            reference_frame_idx=sequence.reference_frame_idx,
+            reference_mask=target_output_masks[sequence.reference_frame_idx],
+            recovery_masks=recovery_masks,
+        )
+        if tracking.selected_obj_id != original_tracking.selected_obj_id:
+            raise RuntimeError(
+                "Recurrent hard memory changed the persistent SAM3 obj_id: "
+                f"{original_tracking.selected_obj_id} -> "
+                f"{tracking.selected_obj_id}."
+            )
+        for index in range(recovery_index):
+            if not torch.equal(
+                tracking.masks[index], previous_tracking.masks[index]
+            ):
+                raise RuntimeError(
+                    "Adding a later hard-memory recovery changed an earlier "
+                    f"prediction at sequence index {index}."
+                )
+        print(
+            f"instance={sequence.instance_id} recurrent hard-memory recovery "
+            f"frame={sequence.frame_indices[recovery_index]} "
+            f"support_recall={support_recall:.4f} "
+            f"recoveries={len(recovery_masks)} "
+            f"obj_id={tracking.selected_obj_id}"
+        )
+
+    last_scan = _scan_recurrent_hard_memory(
         config,
         sequence=sequence,
-        target_masks=target_output_masks,
-        original_masks=original_tracking.masks,
-        original_scores=original_tracking.scores,
+        target_output_masks=target_output_masks,
+        tracking=tracking,
         geometry=geometry,
+        recovery_masks=recovery_masks,
+        recovery_scores=recovery_scores,
+        rejected_recoveries=rejected_recoveries,
     )
-    eligible_indices = [
-        index
-        for index, row in enumerate(result["rows"])
-        if index > sequence.reference_frame_idx
-        and row["use_correction"]
-        and (
-            not require_missing_tracker
-            or not original_tracking.masks[index].any()
-        )
-        and result["candidates"][index].supported_mask.any()
-    ]
-    recovery_index = eligible_indices[0] if eligible_indices else None
-    if recovery_index is None:
-        print("hard recovery not triggered; hard branch equals SAM3 original")
-        return original_tracking, {
-            "triggered": False,
-            "sequence_index": None,
-            "frame_index": None,
-            "persistent_obj_id": original_tracking.selected_obj_id,
-            "eligible_sequence_indices": [],
-            "prompt_mode": recovery_prompt_mode,
-            "reason": "no missing-mask frame passed the geometry gate",
-        }
-    candidate = result["candidates"][recovery_index]
-    recovery_mask, recovery_score = sam3.recover_mask_with_text_geometry(
-        sequence.image_paths[recovery_index],
-        prompt=sequence.label,
-        output_size=config.output_size,
-        candidate_mask=candidate.mask,
-        supported_mask=candidate.supported_mask,
-        prompt_mode=recovery_prompt_mode,
-    )
-    if not recovery_mask.any():
-        raise RuntimeError("Hard geometry-guided recovery returned an empty mask.")
-    support = candidate.supported_mask.to(recovery_mask.device).bool()
-    support_recall = float((recovery_mask.bool() & support).sum()) / max(
-        int(support.sum()), 1
-    )
-    if support_recall < float(min_recovery_support_recall):
-        print(
-            f"hard recovery rejected frame={sequence.frame_indices[recovery_index]} "
-            f"support_recall={support_recall:.4f} < "
-            f"{float(min_recovery_support_recall):.4f}"
-        )
-        return original_tracking, {
-            "triggered": False,
-            "sequence_index": recovery_index,
-            "frame_index": sequence.frame_indices[recovery_index],
-            "mask_score": float(recovery_score),
-            "support_recall": support_recall,
-            "persistent_obj_id": original_tracking.selected_obj_id,
-            "eligible_sequence_indices": [],
-            "prompt_mode": recovery_prompt_mode,
-            "reason": "recovered mask failed geometry-support validation",
-        }
-    tracking = sam3.track_with_recovery_mask_memory(
-        sequence.image_paths,
-        prompt=sequence.label,
-        output_size=config.output_size,
-        reference_frame_idx=sequence.reference_frame_idx,
-        reference_mask=target_output_masks[sequence.reference_frame_idx],
-        recovery_frame_idx=recovery_index,
-        recovery_mask=recovery_mask,
-    )
-    if tracking.selected_obj_id != original_tracking.selected_obj_id:
-        raise RuntimeError(
-            "Hard recovery changed the persistent SAM3 obj_id: "
-            f"{original_tracking.selected_obj_id} -> {tracking.selected_obj_id}."
-        )
-    for index in range(recovery_index):
-        if not torch.equal(tracking.masks[index], original_tracking.masks[index]):
-            raise RuntimeError(
-                "Original and hard-recovery tracks diverged before recovery at "
-                f"sequence index {index}."
-            )
-    print(
-        f"hard recovery frame={sequence.frame_indices[recovery_index]} "
-        f"score={recovery_score:.4f} obj_id={tracking.selected_obj_id}"
-    )
+    rows = last_scan["rows"]
+    for row in rows:
+        row["candidate_selection_mode"] = candidate_selection_mode
+    recovery_indices = sorted(recovery_masks)
     return tracking, {
-        "triggered": True,
-        "sequence_index": recovery_index,
-        "frame_index": sequence.frame_indices[recovery_index],
-        "mask_score": float(recovery_score),
-        "support_recall": support_recall,
-        "persistent_obj_id": tracking.selected_obj_id,
-        "eligible_sequence_indices": eligible_indices,
-        "prompt_mode": recovery_prompt_mode,
-        "reason": "missing SAM3 mask recovered and written to same-object memory",
-    }
-
-
-def _select_missing_only_hard_fallback(
-    original_tracking,
-    memory_tracking,
-    *,
-    eligible_sequence_indices,
-):
-    """Use memory only for missing masks with an accepted geometry candidate."""
-    if original_tracking.selected_obj_id != memory_tracking.selected_obj_id:
-        raise RuntimeError(
-            "Cannot merge tracks with different persistent SAM3 obj_id values."
-        )
-    original_present = original_tracking.masks.flatten(1).any(dim=1)
-    memory_present = memory_tracking.masks.flatten(1).any(dim=1)
-    geometry_eligible = torch.zeros_like(original_present)
-    for index in eligible_sequence_indices:
-        geometry_eligible[int(index)] = True
-    use_memory = ~original_present & memory_present & geometry_eligible
-    masks = torch.where(
-        use_memory[:, None, None], memory_tracking.masks, original_tracking.masks
-    )
-    scores = torch.where(use_memory, memory_tracking.scores, original_tracking.scores)
-    choices = [
-        "hard_memory_fallback" if bool(value) else "sam3_original"
-        for value in use_memory
-    ]
-    return (
-        TrackingSequence(
-            masks=masks,
-            scores=scores,
-            selected_obj_id=original_tracking.selected_obj_id,
+        "triggered": bool(recovery_indices),
+        "recovery_count": len(recovery_indices),
+        "sequence_index": recovery_indices[0] if recovery_indices else None,
+        "frame_index": (
+            sequence.frame_indices[recovery_indices[0]]
+            if recovery_indices
+            else None
         ),
-        choices,
+        "recovery_sequence_indices": recovery_indices,
+        "recovery_frame_indices": [
+            sequence.frame_indices[index] for index in recovery_indices
+        ],
+        "recovery_scores": {
+            str(sequence.frame_indices[index]): recovery_scores[index]
+            for index in recovery_indices
+        },
+        "recovery_support_recalls": {
+            str(sequence.frame_indices[index]): recovery_support_recalls[index]
+            for index in recovery_indices
+        },
+        "rejected_recoveries": {
+            str(sequence.frame_indices[index]): reason
+            for index, reason in rejected_recoveries.items()
+        },
+        "persistent_obj_id": tracking.selected_obj_id,
+        "prompt_mode": recovery_prompt_mode,
+        "candidate_selection_mode": candidate_selection_mode,
+        "descriptor_feature_permutation": descriptor_permutation,
+        "candidate_selection_rows": candidate_selection_rows,
+        "output_policy": "recurrent_same_obj_id_geometry_memory",
+        "reason": (
+            "reliable masks update the external instance map; weak masks can "
+            "trigger repeated dense-mask writeback into the same SAM3 obj_id"
+        ),
+    }, rows
+
+
+def _build_historical_descriptor(
+    config,
+    *,
+    sequence,
+    target_output_masks,
+    tracking,
+    geometry,
+    geometry_features,
+    descriptor_permutation,
+    scan_rows,
+    recovery_masks,
+    before_sequence_index,
+):
+    if geometry_features is None:
+        return None
+    memory = DescriptorMemory()
+    reference = int(sequence.reference_frame_idx)
+    rows_by_index = {
+        int(row["sequence_index"]): row
+        for row in scan_rows
+    }
+    for sequence_index in range(int(before_sequence_index)):
+        row = rows_by_index.get(sequence_index)
+        if sequence_index != reference and (
+            row is None or not bool(row["map_update"])
+        ):
+            continue
+        if sequence_index == reference:
+            selected_mask = target_output_masks[sequence_index]
+        elif sequence_index in recovery_masks:
+            selected_mask = recovery_masks[sequence_index]
+        else:
+            selected_mask = tracking.masks[sequence_index]
+        pooled = _pool_output_descriptor(
+            config,
+            output_mask=selected_mask,
+            sequence_index=sequence_index,
+            feature_sequence_index=descriptor_permutation[sequence_index],
+            sequence=sequence,
+            geometry=geometry,
+            geometry_features=geometry_features,
+        )
+        if pooled is not None:
+            memory.update(
+                pooled.descriptor,
+                weight=float(pooled.valid_tokens),
+            )
+    if memory.descriptor is None:
+        return None
+    return memory.descriptor, memory.observations, memory.total_weight
+
+
+def _pool_output_descriptor(
+    config,
+    *,
+    output_mask,
+    sequence_index,
+    feature_sequence_index,
+    sequence,
+    geometry,
+    geometry_features,
+):
+    if geometry_features is None:
+        return None
+    stream_mask = _output_mask_to_stream(
+        output_mask.detach().cpu().bool(),
+        source_size=geometry.source_sizes[sequence_index],
+        processed_size=geometry.processed_size,
+        image_mode=config.image_mode,
     )
+    return pool_segment_descriptor(
+        geometry_features[feature_sequence_index],
+        stream_mask,
+        confidence=geometry.confidence[feature_sequence_index],
+    )
+
+
+def _scan_recurrent_hard_memory(
+    config,
+    *,
+    sequence,
+    target_output_masks,
+    tracking,
+    geometry,
+    recovery_masks,
+    recovery_scores,
+    rejected_recoveries,
+):
+    """Replay one tracking result causally and request the first new recovery."""
+
+    object_map = ObjectPointMap(
+        max_points_per_object=config.max_points_per_object
+    )
+    reference = int(sequence.reference_frame_idx)
+    reference_mask = target_output_masks[reference].detach().cpu().bool()
+    reference_stream_mask = _output_mask_to_stream(
+        reference_mask,
+        source_size=geometry.source_sizes[reference],
+        processed_size=geometry.processed_size,
+        image_mode=config.image_mode,
+    )
+    points, weights = sample_masked_observation(
+        geometry.world_points[reference],
+        geometry.confidence[reference],
+        reference_stream_mask,
+        max_points=config.max_points_per_observation,
+    )
+    reference_entry = object_map.update(
+        instance_id=sequence.instance_id,
+        label=sequence.label,
+        points=points,
+        weights=weights,
+        frame_idx=reference,
+    )
+    if reference_entry is None:
+        raise RuntimeError(
+            f"Instance {sequence.instance_id} reference mask contains no usable "
+            "StreamVGGT points."
+        )
+
+    reliable_areas = [int(reference_mask.sum())]
+    rows = []
+    recovery_request = None
+    recovery_indices = sorted(int(index) for index in recovery_masks)
+    for sequence_index, frame_index in enumerate(sequence.frame_indices):
+        entry = object_map.get(sequence.instance_id)
+        map_points_before = int(entry.points.shape[0]) if entry is not None else 0
+        map_observations_before = int(entry.observations) if entry is not None else 0
+        if sequence_index == reference:
+            candidate = _empty_candidate(config.output_size, "reference frame")
+        elif entry is None:
+            candidate = _empty_candidate(
+                config.output_size, "object map is unavailable"
+            )
+        else:
+            candidate = mine_revisit_candidate(
+                entry.points,
+                current_world_points=geometry.world_points[sequence_index],
+                world_to_camera=geometry.world_to_camera[sequence_index],
+                intrinsics=geometry.intrinsics[sequence_index],
+                source_size=geometry.source_sizes[sequence_index],
+                processed_size=geometry.processed_size,
+                output_size=config.output_size,
+                image_mode=config.image_mode,
+                box_quantile=config.box_quantile,
+                box_padding_ratio=config.box_padding_ratio,
+                min_projected_points=config.min_projected_points,
+                min_projected_fraction=config.min_projected_fraction,
+                min_supported_points=config.min_supported_points,
+                min_support_ratio=config.min_support_ratio,
+                support_abs_distance=config.support_abs_distance,
+                support_relative_distance=config.support_relative_distance,
+            )
+
+        if sequence_index == reference:
+            selected_mask = reference_mask
+            selected_score = 1.0
+            source = "reference_prompt"
+        elif sequence_index in recovery_masks:
+            selected_mask = recovery_masks[sequence_index].bool()
+            selected_score = float(recovery_scores[sequence_index])
+            source = "geometry_recovery"
+        else:
+            selected_mask = tracking.masks[sequence_index].detach().cpu().bool()
+            selected_score = float(tracking.scores[sequence_index])
+            source = (
+                "sam3_memory_propagation"
+                if any(index < sequence_index for index in recovery_indices)
+                else "sam3_original"
+            )
+
+        mask_pixels = int(selected_mask.sum())
+        reference_area = max(float(np.median(reliable_areas)), 1.0)
+        area_ratio = mask_pixels / reference_area
+        support_pixels = int(candidate.supported_mask.sum())
+        support_coverage = float(
+            (selected_mask & candidate.supported_mask.bool()).sum()
+        ) / max(support_pixels, 1)
+        geometry_matches_mask = bool(
+            candidate.accepted
+            and support_pixels > 0
+            and support_coverage
+            >= float(config.hard_memory_min_support_coverage)
+        )
+
+        weak_reasons = []
+        if sequence_index != reference and source != "geometry_recovery":
+            if mask_pixels == 0:
+                weak_reasons.append("mask missing")
+            elif mask_pixels < int(config.min_pixels):
+                weak_reasons.append("too few mask pixels")
+            elif area_ratio < float(config.hard_memory_min_area_ratio):
+                weak_reasons.append("mask area collapsed")
+            if (
+                selected_score < float(config.tracker_low_score)
+                and not geometry_matches_mask
+            ):
+                weak_reasons.append("low tracker score without geometry agreement")
+        weak = bool(weak_reasons)
+
+        should_request = bool(
+            sequence_index > reference
+            and sequence_index not in recovery_masks
+            and sequence_index not in rejected_recoveries
+            and weak
+            and candidate.accepted
+            and candidate.supported_mask.any()
+        )
+        if should_request and recovery_request is None:
+            recovery_request = {
+                "sequence_index": sequence_index,
+                "candidate": candidate,
+            }
+
+        map_updated = False
+        update_points = 0
+        if sequence_index != reference:
+            reliable_for_map = bool(
+                source == "geometry_recovery"
+                or (not weak and geometry_matches_mask)
+            )
+            if reliable_for_map and selected_mask.any():
+                stream_mask = _output_mask_to_stream(
+                    selected_mask,
+                    source_size=geometry.source_sizes[sequence_index],
+                    processed_size=geometry.processed_size,
+                    image_mode=config.image_mode,
+                )
+                new_points, new_weights = sample_masked_observation(
+                    geometry.world_points[sequence_index],
+                    geometry.confidence[sequence_index],
+                    stream_mask,
+                    max_points=config.max_points_per_observation,
+                )
+                update_points = int(new_points.shape[0])
+                if update_points >= int(config.min_supported_points):
+                    object_map.update(
+                        instance_id=sequence.instance_id,
+                        label=sequence.label,
+                        points=new_points,
+                        weights=new_weights,
+                        frame_idx=sequence_index,
+                    )
+                    reliable_areas.append(mask_pixels)
+                    map_updated = True
+
+        current_entry = object_map.get(sequence.instance_id)
+        rows.append(
+            {
+                "sequence_index": sequence_index,
+                "frame_index": frame_index,
+                "instance_id": sequence.instance_id,
+                "instance_label": sequence.label,
+                "persistent_obj_id": tracking.selected_obj_id,
+                "gt_visible": int(target_output_masks[sequence_index].any()),
+                "mask_source_choice": source,
+                "tracker_score": selected_score,
+                "mask_pixels": mask_pixels,
+                "reliable_area_baseline": reference_area,
+                "mask_area_ratio": area_ratio,
+                "mask_iou": binary_iou(
+                    selected_mask, target_output_masks[sequence_index]
+                ),
+                "candidate_accepted": int(candidate.accepted),
+                "candidate_reason": candidate.reason,
+                "candidate_iou": binary_iou(
+                    candidate.mask, target_output_masks[sequence_index]
+                ),
+                "projected_points": candidate.projected_points,
+                "supported_points": candidate.supported_points,
+                "projected_fraction": candidate.projected_fraction,
+                "support_ratio": candidate.support_ratio,
+                "mask_support_coverage": support_coverage,
+                "geometry_matches_mask": int(geometry_matches_mask),
+                "tracker_weak": int(weak),
+                "tracker_weak_reason": " | ".join(weak_reasons),
+                "recovery_requested": int(should_request),
+                "recovery_applied": int(source == "geometry_recovery"),
+                "recovery_rejected_reason": rejected_recoveries.get(
+                    sequence_index, ""
+                ),
+                "map_update": int(map_updated),
+                "map_update_points": update_points,
+                "object_map_points_before": map_points_before,
+                "object_map_points_after": (
+                    int(current_entry.points.shape[0])
+                    if current_entry is not None
+                    else 0
+                ),
+                "object_map_observations_before": map_observations_before,
+                "object_map_observations_after": (
+                    int(current_entry.observations)
+                    if current_entry is not None
+                    else 0
+                ),
+            }
+        )
+
+    return {
+        "rows": rows,
+        "recovery_request": recovery_request,
+    }
 
 
 def _run_pose_branch(

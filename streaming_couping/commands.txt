@@ -112,13 +112,14 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_sam3_mask_camera_refine
   --icp-max-rmse 0.15 \
   --output-dir outputs/streaming_couping_sam3_point_head_alpha_ablation_inst37
 
-# 三实例共享平移诊断：-1 只用于检查修正方向，不能作为推理配置。
-# hard recovery 先用全图文本提出完整实例，再用几何支持点选择对应实例，
-# 避免首帧局部可见形成的几何框把 bed 等大物体裁成局部。
+# 三实例循环 hard-memory + 共享平移。每个实例独立维护 SAM3 obj_id 和
+# StreamVGGT object map；可靠新视角扩充 object map，面积塌缩/缺失时允许
+# 多次恢复，并把完整 mask 写回同一 obj_id。先用 alpha=0 单独检查 mask，
+# 再用 alpha=0.25 检查共享 point-head 平移，避免混淆两个实验变量。
 PYTHONPATH=src:. python -m streaming_couping.scripts.run_multi_instance_camera_refinement \
   --config streaming_couping/configs/default.yaml \
   --instance-ids 37 68 54 \
-  --output-dir outputs/streaming_couping_joint_direction_prompt_diag_37_68_54 \
+  --output-dir outputs/streaming_couping_recurrent_hard_memory_37_68_54 \
   --manifest data/processed/scannetpp_pinhole_2d/manifest.json \
   --scene-id 00a231a370 \
   --frame-indices 90 105 119 130 140 210 240 \
@@ -127,7 +128,7 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_multi_instance_camera_r
   --geometry-device cuda:1 \
   --geometry-source point_head \
   --hard-recovery-prompt-mode global_text_select \
-  --delta-scales -1 0 0.25 0.5 1.0 \
+  --delta-scales 0 0.25 \
   --joint-min-instances 2 \
   --joint-max-instance-disagreement 0.15 \
   --object-map-voxel-size 0.02 \
@@ -139,3 +140,23 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_multi_instance_camera_r
   --icp-max-correspondence 0.20 \
   --icp-min-fitness 0.10 \
   --icp-max-rmse 0.15
+
+# 几何恢复候选选择消融（先只测 bed 54，不混入相机/点云优化）。
+# 四条分支共享同一次 SAM3 文本候选、同一次 StreamVGGT 输出、相同 hard-memory
+# 门控和同一 obj_id 写回；唯一变量是如何从 SAM3 候选中选择目标实例：
+# geometry_only / descriptor_only / geometry_descriptor / shuffled_descriptor。
+# descriptor 使用此前诊断最好的 StreamVGGT aggregator layer 17。
+PYTHONPATH=src:. python -m streaming_couping.scripts.run_recovery_selection_ablation \
+  --config streaming_couping/configs/default.yaml \
+  --manifest data/processed/scannetpp_pinhole_2d/manifest.json \
+  --scene-id 00a231a370 \
+  --instance-id 54 \
+  --frame-indices 90 105 119 130 140 210 240 \
+  --reference-sequence-index 0 \
+  --sam3-device cuda:3 \
+  --geometry-device cuda:1 \
+  --modes geometry_only descriptor_only geometry_descriptor shuffled_descriptor \
+  --descriptor-layer 17 \
+  --descriptor-geometry-weight 1.0 \
+  --descriptor-weight 1.0 \
+  --output-dir outputs/streaming_couping_recovery_selection_bed54

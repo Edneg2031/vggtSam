@@ -29,6 +29,13 @@ class TrackingSequence:
 
 
 @dataclass(frozen=True)
+class SAM3MaskCandidate:
+    obj_id: int
+    mask: torch.Tensor
+    score: float
+
+
+@dataclass(frozen=True)
 class SAM3SoftSequence:
     probabilities: torch.Tensor
     presence_logits: torch.Tensor

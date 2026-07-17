@@ -66,19 +66,23 @@ class StreamVGGTWrapper:
         image_paths: Sequence[str | Path],
         *,
         layer_indices: Sequence[int] = (4, 11, 17),
-        context_grid: tuple[int, int] = (24, 24),
+        context_grid: tuple[int, int] | None = (24, 24),
     ) -> tuple[GeometrySequence, tuple[torch.Tensor, ...]]:
         """Run StreamVGGT once and return explicit geometry plus latent maps."""
 
         if self.model is None:
             raise RuntimeError("Call StreamVGGTWrapper.load() before inference.")
         layer_indices = tuple(int(index) for index in layer_indices)
-        if len(layer_indices) < 2:
-            raise ValueError("Feature merging requires at least two geometry layers.")
+        if not layer_indices:
+            raise ValueError("At least one StreamVGGT layer must be requested.")
         adapter = StreamVGGTLatentAdapter(
             self.model,
             device=self.device,
-            context_grid=tuple(int(value) for value in context_grid),
+            context_grid=(
+                tuple(int(value) for value in context_grid)
+                if context_grid is not None
+                else (12, 12)
+            ),
             dpt_layer_indices=layer_indices,
             image_mode=self.image_mode,
         )
@@ -96,7 +100,11 @@ class StreamVGGTWrapper:
             raw_levels,
             patch_start_idx=int(patch_start_idx),
             patch_shape=tuple(int(value) for value in patch_shape),
-            output_grid=tuple(int(value) for value in context_grid),
+            output_grid=(
+                tuple(int(value) for value in context_grid)
+                if context_grid is not None
+                else tuple(int(value) for value in patch_shape)
+            ),
         )
         geometry = self._geometry_from_output(output, image_paths)
         return geometry, tuple(level.detach().float().cpu() for level in levels)

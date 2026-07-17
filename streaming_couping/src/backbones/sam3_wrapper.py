@@ -22,7 +22,7 @@ from vggtsam.adapters.sam3_video import (
     select_tracked_object_id,
 )
 
-from ..types import TrackingSequence
+from ..types import SAM3MaskCandidate, TrackingSequence
 
 
 class SAM3Wrapper:
@@ -160,6 +160,55 @@ class SAM3Wrapper:
             selected_obj_id=tracking.selected_obj_id,
         )
         return tracking, soft
+
+    def propose_text_masks(
+        self,
+        image_path: str | Path,
+        *,
+        prompt: str,
+        output_size: tuple[int, int],
+    ) -> list[SAM3MaskCandidate]:
+        """Return every mask from one frozen SAM3 global-text query."""
+
+        predictor = self.predictor
+        if predictor is None:
+            raise RuntimeError("Call SAM3Wrapper.load() before inference.")
+        with tempfile.TemporaryDirectory(prefix="sam3_text_candidates_") as tmp:
+            tmp_dir = Path(tmp)
+            materialize_video_dir([image_path], tmp_dir)
+            with quiet_sam3_output(True):
+                session = predictor.start_session(resource_path=str(tmp_dir))
+                session_id = (
+                    session["session_id"] if isinstance(session, dict) else session
+                )
+                try:
+                    detected = predictor.add_prompt(
+                        session_id=session_id,
+                        frame_idx=0,
+                        text=prompt,
+                        output_prob_thresh=self.output_threshold,
+                    )
+                finally:
+                    predictor.close_session(session_id)
+
+        frame_objects = collect_frame_objects(
+            [detected],
+            output_size=output_size,
+        ).get(0, {})
+        frame_scores = collect_frame_scores([detected]).get(0, {})
+        candidates = []
+        for obj_id, mask in sorted(frame_objects.items()):
+            score = float(frame_scores.get(int(obj_id), 0.0))
+            if score == 0.0 and mask.any():
+                score = 1.0
+            candidates.append(
+                SAM3MaskCandidate(
+                    obj_id=int(obj_id),
+                    mask=mask.detach().cpu().bool(),
+                    score=score,
+                )
+            )
+        return candidates
 
     def recover_mask_with_text_geometry(
         self,
@@ -372,6 +421,150 @@ class SAM3Wrapper:
         )
         masks[recovery_frame_idx] = recovery_mask.detach().cpu().bool()
         scores[recovery_frame_idx] = 1.0
+        return TrackingSequence(
+            masks=masks.bool(),
+            scores=scores.float(),
+            selected_obj_id=int(selected_obj_id),
+        )
+
+    def track_with_recovery_masks_memory(
+        self,
+        image_paths: Sequence[str | Path],
+        *,
+        prompt: str,
+        output_size: tuple[int, int],
+        reference_frame_idx: int,
+        reference_mask: torch.Tensor,
+        recovery_masks: dict[int, torch.Tensor],
+    ) -> TrackingSequence:
+        """Causally write several dense masks into one persistent SAM3 ID."""
+
+        predictor = self.predictor
+        if predictor is None:
+            raise RuntimeError("Call SAM3Wrapper.load() before inference.")
+        if not image_paths:
+            raise ValueError("At least one image is required for memory writeback.")
+        reference_frame_idx = int(reference_frame_idx)
+        ordered_recoveries = sorted(
+            (int(frame_idx), mask.detach().cpu().bool())
+            for frame_idx, mask in recovery_masks.items()
+        )
+        if not ordered_recoveries:
+            return self.track(
+                image_paths,
+                prompt=prompt,
+                output_size=output_size,
+                reference_frame_idx=reference_frame_idx,
+                reference_mask=reference_mask,
+            )
+        for frame_idx, mask in ordered_recoveries:
+            if frame_idx <= reference_frame_idx:
+                raise ValueError("Every recovery must follow the reference frame.")
+            if frame_idx >= len(image_paths):
+                raise ValueError("A recovery frame is outside the input sequence.")
+            if not mask.any():
+                raise ValueError(
+                    f"Recovery mask at sequence index {frame_idx} is empty."
+                )
+
+        with tempfile.TemporaryDirectory(prefix="sam3_recurrent_memory_") as tmp:
+            tmp_dir = Path(tmp)
+            materialize_video_dir(image_paths, tmp_dir)
+            with quiet_sam3_output(True):
+                session = predictor.start_session(resource_path=str(tmp_dir))
+                session_id = (
+                    session["session_id"] if isinstance(session, dict) else session
+                )
+                try:
+                    add_kwargs = {
+                        "session_id": session_id,
+                        "frame_idx": reference_frame_idx,
+                        "text": prompt,
+                        "output_prob_thresh": self.output_threshold,
+                    }
+                    if self.prompt_with_box:
+                        reference_box = mask_to_normalized_box(
+                            reference_mask,
+                            image_path=Path(image_paths[reference_frame_idx]),
+                        )
+                        if reference_box is not None:
+                            add_kwargs["bounding_boxes"] = [reference_box]
+                            add_kwargs["bounding_box_labels"] = [1]
+                    prompted = predictor.add_prompt(**add_kwargs)
+
+                    propagation_results = []
+                    selected_obj_id = None
+                    segment_start = reference_frame_idx
+                    for recovery_frame_idx, recovery_mask in ordered_recoveries:
+                        segment_results = list(
+                            predictor.propagate_in_video(
+                                session_id=session_id,
+                                propagation_direction="forward",
+                                start_frame_idx=segment_start,
+                                max_frame_num_to_track=(
+                                    recovery_frame_idx - segment_start
+                                ),
+                                output_prob_thresh=self.output_threshold,
+                            )
+                        )
+                        propagation_results.extend(segment_results)
+                        if selected_obj_id is None:
+                            frame_objects = collect_frame_objects(
+                                [prompted, *propagation_results],
+                                output_size=output_size,
+                            )
+                            selected_obj_id = select_tracked_object_id(
+                                frame_objects,
+                                prompt_frame_idx=reference_frame_idx,
+                                reference_mask=reference_mask,
+                            )
+                            if selected_obj_id is None:
+                                raise RuntimeError(
+                                    "SAM3 did not produce an object ID on the "
+                                    "reference frame."
+                                )
+                        self._write_mask_to_existing_memory(
+                            session_id=session_id,
+                            frame_idx=recovery_frame_idx,
+                            obj_id=int(selected_obj_id),
+                            mask=recovery_mask,
+                        )
+                        segment_start = recovery_frame_idx + 1
+
+                    if segment_start < len(image_paths):
+                        propagation_results.extend(
+                            list(
+                                predictor.propagate_in_video(
+                                    session_id=session_id,
+                                    propagation_direction="forward",
+                                    start_frame_idx=segment_start,
+                                    max_frame_num_to_track=(
+                                        len(image_paths) - 1 - segment_start
+                                    ),
+                                    output_prob_thresh=self.output_threshold,
+                                )
+                            )
+                        )
+                finally:
+                    predictor.close_session(session_id)
+
+        results = [prompted, *propagation_results]
+        frame_objects = collect_frame_objects(results, output_size=output_size)
+        frame_scores = collect_frame_scores(results)
+        masks = masks_for_selected_object(
+            frame_objects,
+            selected_obj_id=selected_obj_id,
+            num_frames=len(image_paths),
+            output_size=output_size,
+        )
+        scores = scores_for_selected_object(
+            frame_scores,
+            selected_obj_id=selected_obj_id,
+            num_frames=len(image_paths),
+        )
+        for recovery_frame_idx, recovery_mask in ordered_recoveries:
+            masks[recovery_frame_idx] = recovery_mask
+            scores[recovery_frame_idx] = 1.0
         return TrackingSequence(
             masks=masks.bool(),
             scores=scores.float(),

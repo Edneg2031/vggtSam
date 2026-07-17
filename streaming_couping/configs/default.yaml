@@ -26,6 +26,12 @@ bridge:
   output_size: [256, 384]
   tracker_low_score: 0.5
   fallback_on_missing_mask: true
+  # Recurrent hard-memory gate. A nonempty but collapsed mask can still trigger
+  # recovery; aligned geometry can rescue a low tracker score.
+  hard_memory_min_area_ratio: 0.20
+  hard_memory_min_support_coverage: 0.50
+  hard_memory_min_recovery_support_recall: 0.50
+  hard_memory_max_recoveries: 8
   max_points_per_observation: 8000
   max_points_per_object: 20000
 
