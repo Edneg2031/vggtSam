@@ -160,3 +160,20 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_recovery_selection_abla
   --descriptor-geometry-weight 1.0 \
   --descriptor-weight 1.0 \
   --output-dir outputs/streaming_couping_recovery_selection_bed54
+
+# 当前主实验：固定 7 帧序列，不使用过大的 bed(54)，分别评估
+# cabinet(37) 与 wardrobe(68)。StreamVGGT 只提取一次，但两个实例各自维护
+# SAM3 obj_id，结果中包含四个严格受控分支：
+# original / 只修恢复帧 / aligned same-ID memory / shuffled geometry memory。
+# 这里固定首帧 90 为 reference；如果某实例在首帧不可见，程序会直接报错，
+# 不会静默改用未来帧。reference 之后的 GT 只用于指标。
+PYTHONPATH=src:. python -m streaming_couping.scripts.run_recovery_writeback_ablation \
+  --config streaming_couping/configs/default.yaml \
+  --manifest data/processed/scannetpp_pinhole_2d/manifest.json \
+  --scene-id 00a231a370 \
+  --instance-ids 37 68 \
+  --frame-indices 90 105 119 130 140 210 240 \
+  --reference-sequence-index 0 \
+  --sam3-device cuda:3 \
+  --geometry-device cuda:1 \
+  --output-dir outputs/streaming_couping_recovery_writeback_37_68

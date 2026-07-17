@@ -116,6 +116,29 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_bridge \
 - 临时 text 重查询只生成恢复 mask，不承担持久身份。
 - 不包含点云地图更新、相机优化或联合训练。
 
+## 四分支因果消融
+
+`run_recovery_writeback_ablation` 在同一 RGB 序列上分别评估实例，不混合
+不同实例的 SAM3 memory。当前主测试使用 cabinet(37) 和 wardrobe(68)，暂不
+使用首帧局部可见且面积过大的 bed(54)。
+
+四条分支为：
+
+1. `original`
+2. `geometry_recovery_no_memory`
+3. `geometry_recovery_same_id_memory`
+4. `shuffled_geometry_same_id_memory`
+
+第 2、3 条分支共享逐像素完全相同的全图文本候选 mask，并在相同恢复帧做因果
+切分；代码同时检查 no-memory 切分没有改变原 SAM3 预测、恢复前两分支完全一致、
+写回后仍使用原 `obj_id`。shuffled 分支固定 reference 几何，只循环打乱后续
+StreamVGGT 输出，RGB、SAM3 文本候选和阈值不变。
+
+主要输出为 `summary.csv`、`frame_metrics.csv`、
+`candidate_diagnostics.csv`，以及每个实例目录中的
+`recovery_writeback_report.png`。候选 CSV 中的 GT IoU 只用于 oracle 诊断，
+不参与候选选择。
+
 ## GT Mask 几何可行性实验
 
 `run_gt_mask_pose_refinement` 是独立的反向验证，不改变上述 memory 实验。
