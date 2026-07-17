@@ -112,20 +112,22 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_sam3_mask_camera_refine
   --icp-max-rmse 0.15 \
   --output-dir outputs/streaming_couping_sam3_point_head_alpha_ablation_inst37
 
-# 三个静态实例联合相机修正：各自维护 SAM3 memory/object map，
-# 每帧用实例约束对应联合求一个共享平移，并只对整帧 pointmap 应用一次。
+# 三实例共享平移诊断：-1 只用于检查修正方向，不能作为推理配置。
+# hard recovery 先用全图文本提出完整实例，再用几何支持点选择对应实例，
+# 避免首帧局部可见形成的几何框把 bed 等大物体裁成局部。
 PYTHONPATH=src:. python -m streaming_couping.scripts.run_multi_instance_camera_refinement \
   --config streaming_couping/configs/default.yaml \
   --instance-ids 37 68 54 \
-  --output-dir outputs/streaming_couping_joint_instances_37_68_54 \
+  --output-dir outputs/streaming_couping_joint_direction_prompt_diag_37_68_54 \
   --manifest data/processed/scannetpp_pinhole_2d/manifest.json \
   --scene-id 00a231a370 \
-  --frame-indices 133 162 520 566 432 470 477 \
+  --frame-indices 90 105 119 130 140 210 240 \
   --alignment-reference-sequence-index 0 \
   --sam3-device cuda:3 \
   --geometry-device cuda:1 \
   --geometry-source point_head \
-  --delta-scales 1.0 \
+  --hard-recovery-prompt-mode global_text_select \
+  --delta-scales -1 0 0.25 0.5 1.0 \
   --joint-min-instances 2 \
   --joint-max-instance-disagreement 0.15 \
   --object-map-voxel-size 0.02 \

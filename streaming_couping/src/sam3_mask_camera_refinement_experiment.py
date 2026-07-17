@@ -545,6 +545,7 @@ def _run_hard_recovery(
     sam3,
     require_missing_tracker=True,
     min_recovery_support_recall=0.5,
+    recovery_prompt_mode="text_box_points",
 ):
     result = _mine_recovery(
         config,
@@ -574,6 +575,7 @@ def _run_hard_recovery(
             "frame_index": None,
             "persistent_obj_id": original_tracking.selected_obj_id,
             "eligible_sequence_indices": [],
+            "prompt_mode": recovery_prompt_mode,
             "reason": "no missing-mask frame passed the geometry gate",
         }
     candidate = result["candidates"][recovery_index]
@@ -583,6 +585,7 @@ def _run_hard_recovery(
         output_size=config.output_size,
         candidate_mask=candidate.mask,
         supported_mask=candidate.supported_mask,
+        prompt_mode=recovery_prompt_mode,
     )
     if not recovery_mask.any():
         raise RuntimeError("Hard geometry-guided recovery returned an empty mask.")
@@ -604,6 +607,7 @@ def _run_hard_recovery(
             "support_recall": support_recall,
             "persistent_obj_id": original_tracking.selected_obj_id,
             "eligible_sequence_indices": [],
+            "prompt_mode": recovery_prompt_mode,
             "reason": "recovered mask failed geometry-support validation",
         }
     tracking = sam3.track_with_recovery_mask_memory(
@@ -638,6 +642,7 @@ def _run_hard_recovery(
         "support_recall": support_recall,
         "persistent_obj_id": tracking.selected_obj_id,
         "eligible_sequence_indices": eligible_indices,
+        "prompt_mode": recovery_prompt_mode,
         "reason": "missing SAM3 mask recovered and written to same-object memory",
     }
 

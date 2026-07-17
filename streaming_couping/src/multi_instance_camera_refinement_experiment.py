@@ -107,6 +107,7 @@ def main() -> None:
         joint_min_instances=args.joint_min_instances,
         joint_max_instance_disagreement=args.joint_max_instance_disagreement,
         joint_max_translation=args.joint_max_translation,
+        hard_recovery_prompt_mode=args.hard_recovery_prompt_mode,
         delta_scales=args.delta_scales,
         object_map_voxel_size=args.object_map_voxel_size,
         object_map_max_points=args.object_map_max_points,
@@ -132,6 +133,7 @@ def run_experiment(
     joint_min_instances: int,
     joint_max_instance_disagreement: float,
     joint_max_translation: float,
+    hard_recovery_prompt_mode: str,
     delta_scales: list[float],
     object_map_voxel_size: float,
     object_map_max_points: int,
@@ -251,6 +253,7 @@ def run_experiment(
             sam3=sam3,
             require_missing_tracker=True,
             min_recovery_support_recall=0.5,
+            recovery_prompt_mode=hard_recovery_prompt_mode,
         )
         hard_tracking[instance_id], mask_choices[instance_id] = (
             _select_missing_only_hard_fallback(
@@ -360,19 +363,22 @@ def run_experiment(
         transforms[branch_name] = result["corrections"]
         if final_object_maps is None:
             final_object_maps = result["object_maps"]
-        summary_rows.append(
-            _summarize_joint_branch(
-                result,
-                config=config,
-                instance_ids=instance_ids,
-                labels={iid: sequences[iid].label for iid in instance_ids},
-                geometry_source=geometry_source,
-                delta_scale=delta_scale,
-                similarity=similarity,
-                joint_min_instances=joint_min_instances,
-                joint_max_instance_disagreement=joint_max_instance_disagreement,
-            )
+        branch_summary = _summarize_joint_branch(
+            result,
+            config=config,
+            instance_ids=instance_ids,
+            labels={iid: sequences[iid].label for iid in instance_ids},
+            geometry_source=geometry_source,
+            delta_scale=delta_scale,
+            similarity=similarity,
+            joint_min_instances=joint_min_instances,
+            joint_max_instance_disagreement=joint_max_instance_disagreement,
         )
+        branch_summary["hard_recovery_prompt_mode"] = hard_recovery_prompt_mode
+        branch_summary["delta_direction"] = (
+            "opposite_diagnostic" if float(delta_scale) < 0.0 else "estimated"
+        )
+        summary_rows.append(branch_summary)
         _plot_camera_trajectories(
             config.output_dir / f"camera_trajectories_{branch_name}.png",
             frame_indices=shared.frame_indices,
@@ -442,6 +448,8 @@ def run_experiment(
                         "SAM3 original when nonempty; same-instance memory only "
                         "when original is empty and that frame passes geometry gate"
                     ),
+                    "hard_recovery_prompt_mode": hard_recovery_prompt_mode,
+                    "negative_delta_is_diagnostic_only": True,
                     "joint_min_instances": joint_min_instances,
                     "joint_max_instance_disagreement": (
                         joint_max_instance_disagreement
@@ -555,7 +563,7 @@ def _run_joint_branch(
             if joint.accepted
             else torch.zeros_like(joint.translation)
         )
-        if joint.accepted and float(delta_scale) > 0.0:
+        if joint.accepted and float(delta_scale) != 0.0:
             identity = torch.eye(3, dtype=raw_points.dtype, device=raw_points.device)
             refined_points[sequence_index] = apply_rigid(
                 raw_points[sequence_index], identity, applied_translation
@@ -1287,8 +1295,8 @@ def _validate_delta_scales(values):
     result = []
     for value in values:
         value = float(value)
-        if not 0.0 <= value <= 1.0:
-            raise ValueError("Every delta scale must be in [0, 1].")
+        if not -1.0 <= value <= 1.0:
+            raise ValueError("Every diagnostic delta scale must be in [-1, 1].")
         if value not in result:
             result.append(value)
     if not result:
@@ -1334,6 +1342,15 @@ def _parse_args():
         "--joint-max-instance-disagreement", type=float, default=0.15
     )
     parser.add_argument("--joint-max-translation", type=float, default=1.0)
+    parser.add_argument(
+        "--hard-recovery-prompt-mode",
+        choices=("text_box_points", "global_text_select"),
+        default="global_text_select",
+        help=(
+            "Use global SAM3 text proposals selected by geometry, or the legacy "
+            "geometry box plus positive-point refinement."
+        ),
+    )
     parser.add_argument("--delta-scales", type=float, nargs="+", default=[1.0])
     parser.add_argument("--object-map-voxel-size", type=float, default=0.02)
     parser.add_argument("--object-map-max-points", type=int, default=16384)

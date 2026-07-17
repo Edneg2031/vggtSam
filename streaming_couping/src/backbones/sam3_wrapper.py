@@ -169,14 +169,17 @@ class SAM3Wrapper:
         output_size: tuple[int, int],
         candidate_mask: torch.Tensor,
         supported_mask: torch.Tensor,
+        prompt_mode: str = "text_box_points",
     ) -> tuple[torch.Tensor, float]:
-        """Generate one dense recovery mask from text, geometry box, and points."""
+        """Recover a dense mask while geometry identifies the intended instance."""
 
         predictor = self.predictor
         if predictor is None:
             raise RuntimeError("Call SAM3Wrapper.load() before inference.")
-        if not self.prompt_with_box:
+        if prompt_mode == "text_box_points" and not self.prompt_with_box:
             raise RuntimeError("Text-guided recovery requires sam3.prompt_with_box=true.")
+        if prompt_mode not in {"text_box_points", "global_text_select"}:
+            raise ValueError(f"Unsupported recovery prompt_mode={prompt_mode!r}.")
         points = _positive_points(supported_mask)
         if not points:
             raise ValueError("The geometry-supported recovery points are empty.")
@@ -188,20 +191,22 @@ class SAM3Wrapper:
                 session = predictor.start_session(resource_path=str(tmp_dir))
                 session_id = session["session_id"] if isinstance(session, dict) else session
                 try:
-                    box = mask_to_normalized_box(
-                        candidate_mask,
-                        image_path=Path(image_path),
-                    )
-                    if box is None:
-                        raise RuntimeError("The geometry recovery box is empty.")
-                    detected = predictor.add_prompt(
-                        session_id=session_id,
-                        frame_idx=0,
-                        text=prompt,
-                        bounding_boxes=[box],
-                        bounding_box_labels=[1],
-                        output_prob_thresh=self.output_threshold,
-                    )
+                    detect_kwargs = {
+                        "session_id": session_id,
+                        "frame_idx": 0,
+                        "text": prompt,
+                        "output_prob_thresh": self.output_threshold,
+                    }
+                    if prompt_mode == "text_box_points":
+                        box = mask_to_normalized_box(
+                            candidate_mask,
+                            image_path=Path(image_path),
+                        )
+                        if box is None:
+                            raise RuntimeError("The geometry recovery box is empty.")
+                        detect_kwargs["bounding_boxes"] = [box]
+                        detect_kwargs["bounding_box_labels"] = [1]
+                    detected = predictor.add_prompt(**detect_kwargs)
                     detected_objects = collect_frame_objects(
                         [detected],
                         output_size=output_size,
@@ -217,18 +222,23 @@ class SAM3Wrapper:
                         raise RuntimeError(
                             "Text-guided SAM3 recovery found no matching object."
                         )
-                    refined = predictor.add_prompt(
-                        session_id=session_id,
-                        frame_idx=0,
-                        points=points,
-                        point_labels=[1] * len(points),
-                        obj_id=int(temporary_obj_id),
-                        output_prob_thresh=self.output_threshold,
-                    )
+                    if prompt_mode == "text_box_points":
+                        refined = predictor.add_prompt(
+                            session_id=session_id,
+                            frame_idx=0,
+                            points=points,
+                            point_labels=[1] * len(points),
+                            obj_id=int(temporary_obj_id),
+                            output_prob_thresh=self.output_threshold,
+                        )
                 finally:
                     predictor.close_session(session_id)
 
-        results = [detected, refined]
+        results = (
+            [detected, refined]
+            if prompt_mode == "text_box_points"
+            else [detected]
+        )
         frame_objects = collect_frame_objects(results, output_size=output_size)
         masks = masks_for_selected_object(
             frame_objects,
