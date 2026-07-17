@@ -212,6 +212,8 @@ mask source 和 alpha 的整场景 PLY。GT oracle 是可行性上限；hard-mem
 CSV 指标；每个 hard-memory alpha 仅保存 `scene_*.ply` 与 `object_*.ply`，另有
 共享的 `scene_raw.ply`、`scene_gt.ply`、`object_raw.ply` 和 `object_gt.ply`。
 重跑时会清理该目录中的旧 PLY，避免历史调试文件混入结果。
+`mask_sources.png` 仍保留 SAM3 original，按 RGB / GT / SAM3 original /
+hard-memory 四列展示，作为恢复前后的直观对照。
 
 ## Memory Warping 诊断消融
 

@@ -111,3 +111,30 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_sam3_mask_camera_refine
   --icp-min-fitness 0.10 \
   --icp-max-rmse 0.15 \
   --output-dir outputs/streaming_couping_sam3_point_head_alpha_ablation_inst37
+
+# 三个静态实例的同序列泛化测试：37=cabinet，68=wardrobe，54=bed。
+# 每个实例独立运行完全相同的 alpha 消融，结果汇总到 summary_all_instances.csv。
+PYTHONPATH=src:. python -m streaming_couping.scripts.run_sam3_mask_camera_refinement_batch \
+  --config streaming_couping/configs/default.yaml \
+  --instance-ids 37 68 54 \
+  --output-dir outputs/streaming_couping_three_instances \
+  --manifest data/processed/scannetpp_pinhole_2d/manifest_rgb_cache.json \
+  --scene-id 00a231a370 \
+  --frame-indices 133 162 520 566 432 470 477 \
+  --reference-sequence-index 0 \
+  --sam3-device cuda:3 \
+  --geometry-device cuda:1 \
+  --geometry-source point_head \
+  --pose-refinement-mode translation_only \
+  --delta-scales 0 0.25 0.5 0.75 1.0 \
+  --object-map-modes causal \
+  --object-map-voxel-size 0.02 \
+  --object-map-max-points 16384 \
+  --scene-consistency off \
+  --alignment-confidence-threshold 0.30 \
+  --icp-confidence-threshold 0.30 \
+  --alignment-trim-fraction 0.70 \
+  --icp-trim-fraction 0.70 \
+  --icp-max-correspondence 0.20 \
+  --icp-min-fitness 0.10 \
+  --icp-max-rmse 0.15

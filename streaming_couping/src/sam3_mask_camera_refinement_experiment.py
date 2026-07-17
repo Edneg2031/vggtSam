@@ -440,7 +440,7 @@ def run_experiment(
         memory_masks=hard_tracking.masks,
         recovery_index=recovery["sequence_index"],
         output_size=config.output_size,
-        include_original=False,
+        include_original=True,
     )
     _write_csv(config.output_dir / "frame_metrics.csv", all_rows)
     _write_csv(config.output_dir / "summary.csv", summary_rows)
