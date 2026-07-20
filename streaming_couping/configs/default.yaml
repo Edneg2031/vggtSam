@@ -25,8 +25,15 @@ bridge:
   output_size: [256, 384]
   tracker_low_score: 0.5
   fallback_on_missing_mask: true
+  # A non-empty, high-score mask may still be tracking the wrong instance.
+  # Trigger recovery when it covers too little aligned 3D support.
+  fallback_on_geometry_disagreement: true
+  tracker_min_geometry_coverage: 0.25
   # Fraction of projected support pixels that the selected dense mask must cover.
   recovery_min_support_coverage: 0.50
+  # Only jointly reliable tracker observations may expand the persistent map.
+  map_update_min_score: 0.50
+  map_update_min_geometry_coverage: 0.50
   max_points_per_observation: 8000
   max_points_per_object: 20000
 
@@ -43,5 +50,14 @@ candidate:
   support_abs_distance: 0.15
   support_relative_distance: 0.10
 
+point_cloud:
+  # Confidence is normalized independently on each StreamVGGT frame.
+  confidence_threshold: 0.30
+  max_points: 400000
+  # GT geometry is evaluation-only. Distances are meters after one fixed
+  # reference-frame Sim(3) alignment.
+  metric_max_points: 4096
+  metric_thresholds: [0.05, 0.10]
+
 output:
-  dir: outputs/streaming_couping_recovery_writeback_37_68
+  dir: outputs/streaming_couping_complete_ablation_37_68_54

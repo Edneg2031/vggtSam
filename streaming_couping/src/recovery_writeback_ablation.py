@@ -1,8 +1,10 @@
-"""Causal ablation for geometry recovery and same-ID SAM3 memory writeback.
+"""Causal ablation for bidirectional instance memory and SAM3 writeback.
 
-The experiment keeps candidate generation, the selected dense recovery mask,
-and the causal split fixed between the aligned no-memory and memory branches.
-GT masks after the reference frame are metrics-only.
+One invocation runs both a deployable natural joint gate and a scheduled
+intervention probe. The probe guarantees that memory writeback can be tested
+even when the frozen tracker is too strong to trigger recovery naturally.
+GT after the reference is metrics-only except in explicitly named oracle
+upper-bound branches.
 """
 
 from __future__ import annotations
@@ -24,6 +26,14 @@ from .backbones.sam3_wrapper import SAM3Wrapper
 from .backbones.streamvggt_wrapper import StreamVGGTWrapper
 from .bridge.gating import binary_iou
 from .config import ExperimentConfig, load_config
+from .instance_point_cloud import (
+    export_instance_point_clouds,
+    load_processed_colors,
+)
+from .instance_map_evaluation import (
+    evaluate_instance_maps,
+    prepare_map_evaluation,
+)
 from .recovery import (
     mine_recovery,
     resize_target_masks,
@@ -36,8 +46,15 @@ from .types import GeometrySequence, SAM3MaskCandidate, TrackingSequence
 MODES = (
     "original",
     "geometry_recovery_no_memory",
+    "reference_geometry_same_id_memory",
     "geometry_recovery_same_id_memory",
     "shuffled_geometry_same_id_memory",
+    "oracle_candidate_same_id_memory",
+    "oracle_mask_same_id_memory",
+)
+EVENT_POLICIES = (
+    "natural_joint_gate",
+    "scheduled_probe",
 )
 
 
@@ -61,6 +78,8 @@ def main() -> None:
         config,
         instance_ids=instance_ids,
         reference_sequence_index=args.reference_sequence_index,
+        event_policies=args.event_policies,
+        probe_sequence_index=args.probe_sequence_index,
     )
 
 
@@ -69,6 +88,8 @@ def run_experiment(
     *,
     instance_ids: Sequence[int],
     reference_sequence_index: int | None,
+    event_policies: Sequence[str] = EVENT_POLICIES,
+    probe_sequence_index: int = 4,
 ) -> None:
     torch.manual_seed(0)
     np.random.seed(0)
@@ -119,9 +140,26 @@ def run_experiment(
 
     _validate_shared_sequence(sequences)
     shared = sequences[int(instance_ids[0])]
+    event_policies = tuple(dict.fromkeys(str(value) for value in event_policies))
+    invalid_policies = [
+        value for value in event_policies if value not in EVENT_POLICIES
+    ]
+    if invalid_policies:
+        raise ValueError(f"Unknown event policies: {invalid_policies}.")
+    probe_sequence_index = int(probe_sequence_index)
+    if "scheduled_probe" in event_policies and not (
+        shared.reference_frame_idx
+        < probe_sequence_index
+        < len(shared.frame_indices) - 1
+    ):
+        raise ValueError(
+            "The scheduled probe must be after the reference and before the "
+            "last selected frame so that future propagation can be measured."
+        )
     print(
         f"causal recovery ablation scene={shared.scene_id} "
-        f"frames={shared.frame_indices} instances={list(instance_ids)}"
+        f"frames={shared.frame_indices} instances={list(instance_ids)} "
+        f"policies={list(event_policies)} probe_index={probe_sequence_index}"
     )
 
     print("extracting frozen StreamVGGT geometry once...")
@@ -132,6 +170,33 @@ def run_experiment(
         image_mode=config.image_mode,
         streaming_cache=config.streaming_cache,
     ).load().extract(shared.image_paths)
+    point_cloud_colors = load_processed_colors(
+        shared.image_paths,
+        processed_size=geometry.processed_size,
+        image_mode=config.image_mode,
+    )
+    map_evaluation_context = None
+    map_evaluation_errors = []
+    try:
+        map_evaluation_context = prepare_map_evaluation(
+            config,
+            scene_id=shared.scene_id,
+            frame_indices=shared.frame_indices,
+            geometry=geometry,
+            reference_frame_idx=shared.reference_frame_idx,
+        )
+        print(
+            "prepared evaluation-only GT map alignment: "
+            f"scale={map_evaluation_context.sim3_scale:.4f} "
+            f"rmse={map_evaluation_context.sim3_rmse:.4f}"
+        )
+    except Exception as error:
+        message = (
+            "map-quality evaluation disabled because GT preparation failed: "
+            f"{type(error).__name__}: {error}"
+        )
+        print(f"WARNING: {message}")
+        map_evaluation_errors.append(message)
 
     print("loading frozen SAM3...")
     sam3 = SAM3Wrapper(
@@ -144,7 +209,12 @@ def run_experiment(
 
     all_summary_rows = []
     all_frame_rows = []
+    all_gate_rows = []
     all_candidate_rows = []
+    all_candidate_screening_rows = []
+    all_point_cloud_summary_rows = []
+    all_point_cloud_frame_rows = []
+    all_map_quality_rows = []
     instance_metadata = {}
     for instance_id in instance_ids:
         sequence = sequences[int(instance_id)]
@@ -152,41 +222,192 @@ def run_experiment(
             f"running instance={instance_id} label={sequence.label!r} "
             f"reference={sequence.frame_indices[sequence.reference_frame_idx]}"
         )
-        result = _run_instance(
+        instance_dir = config.output_dir / f"instance_{instance_id}"
+        instance_dir.mkdir(parents=True, exist_ok=True)
+        original = sam3.track(
+            sequence.image_paths,
+            prompt=sequence.label,
+            output_size=config.output_size,
+            reference_frame_idx=sequence.reference_frame_idx,
+            reference_mask=target_masks[int(instance_id)][
+                sequence.reference_frame_idx
+            ],
+        )
+        candidate_cache: dict[int, list[SAM3MaskCandidate]] = {}
+        screening = _screen_candidate_frames(
             config,
             sequence=sequence,
             target_masks=target_masks[int(instance_id)],
             geometry=geometry,
             sam3=sam3,
+            original=original,
+            candidate_cache=candidate_cache,
         )
-        all_summary_rows.extend(result["summary_rows"])
-        all_frame_rows.extend(result["frame_rows"])
-        all_candidate_rows.extend(result["candidate_rows"])
-        instance_metadata[str(instance_id)] = result["metadata"]
-        instance_dir = config.output_dir / f"instance_{instance_id}"
-        instance_dir.mkdir(parents=True, exist_ok=True)
-        _write_csv(instance_dir / "summary.csv", result["summary_rows"])
-        _write_csv(instance_dir / "frame_metrics.csv", result["frame_rows"])
+        all_candidate_rows.extend(screening["candidate_rows"])
+        all_candidate_screening_rows.extend(screening["summary_rows"])
         _write_csv(
-            instance_dir / "candidate_diagnostics.csv",
-            result["candidate_rows"],
+            instance_dir / "candidate_screening.csv",
+            screening["summary_rows"],
         )
-        _save_report(
-            instance_dir / "recovery_writeback_report.png",
-            image_paths=sequence.image_paths,
-            frame_indices=sequence.frame_indices,
-            target_masks=target_masks[int(instance_id)],
-            predictions=result["predictions"],
-            aligned_recovery_index=result["aligned_recovery_index"],
-            shuffled_recovery_index=result["shuffled_recovery_index"],
-            output_size=config.output_size,
-        )
+        policy_metadata = {}
+        for event_policy in event_policies:
+            forced_index = (
+                probe_sequence_index
+                if event_policy == "scheduled_probe"
+                else None
+            )
+            print(
+                f"  policy={event_policy} "
+                f"forced_sequence_index={forced_index}"
+            )
+            result = _run_instance(
+                config,
+                sequence=sequence,
+                target_masks=target_masks[int(instance_id)],
+                geometry=geometry,
+                sam3=sam3,
+                original=original,
+                candidate_cache=candidate_cache,
+                event_policy=event_policy,
+                forced_recovery_index=forced_index,
+            )
+            policy_dir = instance_dir / event_policy
+            policy_dir.mkdir(parents=True, exist_ok=True)
+            point_cloud_result = export_instance_point_clouds(
+                policy_dir / "pointclouds",
+                frame_indices=sequence.frame_indices,
+                geometry=geometry,
+                colors=point_cloud_colors,
+                predictions=result["predictions"],
+                reference_frame_idx=sequence.reference_frame_idx,
+                reference_mask=torch.from_numpy(
+                    np.asarray(
+                        sequence.target_masks[sequence.reference_frame_idx]
+                    )
+                ).bool(),
+                image_mode=config.image_mode,
+                confidence_threshold=(
+                    config.point_cloud_confidence_threshold
+                ),
+                max_points=config.point_cloud_max_points,
+            )
+            point_cloud_summary_rows = [
+                {
+                    "scene_id": sequence.scene_id,
+                    "instance_id": int(instance_id),
+                    "instance_label": sequence.label,
+                    "event_policy": event_policy,
+                    **row,
+                }
+                for row in point_cloud_result["summary_rows"]
+            ]
+            point_cloud_frame_rows = [
+                {
+                    "scene_id": sequence.scene_id,
+                    "instance_id": int(instance_id),
+                    "instance_label": sequence.label,
+                    "event_policy": event_policy,
+                    **row,
+                }
+                for row in point_cloud_result["frame_rows"]
+            ]
+            map_quality_rows = []
+            if map_evaluation_context is not None:
+                try:
+                    map_quality_rows = evaluate_instance_maps(
+                        config,
+                        context=map_evaluation_context,
+                        sequence=sequence,
+                        target_masks=target_masks[int(instance_id)],
+                        geometry=geometry,
+                        predictions=result["predictions"],
+                        event_policy=event_policy,
+                    )
+                except Exception as error:
+                    message = (
+                        f"instance={instance_id} policy={event_policy}: "
+                        f"{type(error).__name__}: {error}"
+                    )
+                    print(f"WARNING: map-quality evaluation failed: {message}")
+                    map_evaluation_errors.append(message)
+
+            all_summary_rows.extend(result["summary_rows"])
+            all_frame_rows.extend(result["frame_rows"])
+            all_gate_rows.extend(result["gate_rows"])
+            all_candidate_rows.extend(result["candidate_rows"])
+            all_point_cloud_summary_rows.extend(point_cloud_summary_rows)
+            all_point_cloud_frame_rows.extend(point_cloud_frame_rows)
+            all_map_quality_rows.extend(map_quality_rows)
+            policy_metadata[event_policy] = result["metadata"]
+            _write_csv(policy_dir / "summary.csv", result["summary_rows"])
+            _write_csv(policy_dir / "frame_metrics.csv", result["frame_rows"])
+            _write_csv(
+                policy_dir / "geometry_gate_diagnostics.csv",
+                result["gate_rows"],
+            )
+            _write_csv(
+                policy_dir / "candidate_diagnostics.csv",
+                result["candidate_rows"],
+            )
+            _write_csv(
+                policy_dir / "pointcloud_summary.csv",
+                point_cloud_summary_rows,
+            )
+            _write_csv(
+                policy_dir / "pointcloud_frame_metrics.csv",
+                point_cloud_frame_rows,
+            )
+            _write_csv(
+                policy_dir / "map_quality.csv",
+                map_quality_rows,
+            )
+            _save_report(
+                policy_dir / "recovery_writeback_report.png",
+                image_paths=sequence.image_paths,
+                frame_indices=sequence.frame_indices,
+                target_masks=target_masks[int(instance_id)],
+                predictions=result["predictions"],
+                aligned_recovery_index=result["aligned_recovery_index"],
+                shuffled_recovery_index=result["shuffled_recovery_index"],
+                output_size=config.output_size,
+            )
+        instance_metadata[str(instance_id)] = {
+            "label": sequence.label,
+            "policies": policy_metadata,
+        }
 
     _write_csv(config.output_dir / "summary.csv", all_summary_rows)
     _write_csv(config.output_dir / "frame_metrics.csv", all_frame_rows)
     _write_csv(
+        config.output_dir / "geometry_gate_diagnostics.csv",
+        all_gate_rows,
+    )
+    _write_csv(
         config.output_dir / "candidate_diagnostics.csv",
         all_candidate_rows,
+    )
+    _write_csv(
+        config.output_dir / "candidate_screening.csv",
+        all_candidate_screening_rows,
+    )
+    threshold_sweep_rows = _summarize_threshold_sweep(
+        all_candidate_screening_rows
+    )
+    _write_csv(
+        config.output_dir / "threshold_sweep.csv",
+        threshold_sweep_rows,
+    )
+    _write_csv(
+        config.output_dir / "pointcloud_summary.csv",
+        all_point_cloud_summary_rows,
+    )
+    _write_csv(
+        config.output_dir / "pointcloud_frame_metrics.csv",
+        all_point_cloud_frame_rows,
+    )
+    _write_csv(
+        config.output_dir / "map_quality.csv",
+        all_map_quality_rows,
     )
     metadata = {
         "experiment": "causal_geometry_recovery_memory_writeback_ablation",
@@ -194,24 +415,70 @@ def run_experiment(
         "frame_indices": list(config.frame_indices),
         "instance_ids": [int(value) for value in instance_ids],
         "modes": list(MODES),
+        "event_policies": list(event_policies),
+        "scheduled_probe_sequence_index": probe_sequence_index,
+        "scheduled_probe_frame_index": shared.frame_indices[
+            probe_sequence_index
+        ],
         "reference_policy": (
             "explicit_sequence_index"
             if reference_sequence_index is not None
             else "earliest_visible_frame_per_instance"
         ),
         "aligned_pair_shares_exact_recovery_mask": True,
-        "later_gt_used_for_selection": False,
+        "later_gt_used_for_selection": (
+            "only oracle_candidate and oracle_mask upper bounds"
+        ),
         "shuffled_control": (
             "reference geometry fixed; non-reference StreamVGGT outputs are "
             "cyclically permuted while RGB and SAM3 candidates stay fixed"
         ),
+        "point_cloud": {
+            "coordinate_system": "streamvggt_point_head_native",
+            "reference_mask": "initialization_gt",
+            "later_masks": "branch_tracking_predictions",
+            "confidence_threshold": (
+                config.point_cloud_confidence_threshold
+            ),
+            "max_points_per_export": config.point_cloud_max_points,
+            "icp_used": False,
+            "gt_geometry_used": False,
+        },
+        "map_quality_evaluation": {
+            "enabled": map_evaluation_context is not None,
+            "alignment": "fixed_reference_frame_sim3",
+            "gt_geometry_role": "evaluation_only",
+            "metric_max_points": config.map_metric_max_points,
+            "metric_thresholds": list(config.map_metric_thresholds),
+            "errors": map_evaluation_errors,
+        },
+        "threshold_sweep": {
+            "role": "posthoc_diagnostic_only",
+            "tracker_score_thresholds": [0.30, 0.50, 0.70],
+            "tracker_geometry_coverage_thresholds": [0.10, 0.25, 0.50],
+            "candidate_support_coverage_thresholds": [0.25, 0.50, 0.75],
+        },
         "instances": instance_metadata,
     }
     with (config.output_dir / "metadata.json").open("w", encoding="utf8") as handle:
         json.dump(metadata, handle, indent=2, allow_nan=True)
     print(f"summary: {config.output_dir / 'summary.csv'}")
     print(f"frames: {config.output_dir / 'frame_metrics.csv'}")
+    print(
+        "gates: "
+        f"{config.output_dir / 'geometry_gate_diagnostics.csv'}"
+    )
     print(f"candidates: {config.output_dir / 'candidate_diagnostics.csv'}")
+    print(
+        "candidate screening: "
+        f"{config.output_dir / 'candidate_screening.csv'}"
+    )
+    print(f"threshold sweep: {config.output_dir / 'threshold_sweep.csv'}")
+    print(f"map quality: {config.output_dir / 'map_quality.csv'}")
+    print(
+        "point clouds: "
+        f"{config.output_dir / 'instance_<id>' / '<event_policy>' / 'pointclouds'}"
+    )
 
 
 def _run_instance(
@@ -221,15 +488,11 @@ def _run_instance(
     target_masks: torch.Tensor,
     geometry: GeometrySequence,
     sam3: SAM3Wrapper,
+    original: TrackingSequence,
+    candidate_cache: dict[int, list[SAM3MaskCandidate]],
+    event_policy: str,
+    forced_recovery_index: int | None,
 ) -> dict:
-    original = sam3.track(
-        sequence.image_paths,
-        prompt=sequence.label,
-        output_size=config.output_size,
-        reference_frame_idx=sequence.reference_frame_idx,
-        reference_mask=target_masks[sequence.reference_frame_idx],
-    )
-    candidate_cache: dict[int, list[SAM3MaskCandidate]] = {}
     aligned = _prepare_recovery(
         config,
         sequence=sequence,
@@ -240,77 +503,67 @@ def _run_instance(
         geometry_permutation=tuple(range(len(sequence.frame_indices))),
         sam3=sam3,
         candidate_cache=candidate_cache,
+        map_update_policy="joint_reliable",
+        event_policy=event_policy,
+        forced_recovery_index=forced_recovery_index,
     )
-
-    predictions: dict[str, TrackingSequence] = {"original": original}
-    if aligned["recovery_mask"] is None:
-        aligned_no_memory = original
-        aligned_memory = original
-    else:
-        recovery_index = int(aligned["recovery_index"])
-        split = sam3.track_split_without_memory(
-            sequence.image_paths,
-            prompt=sequence.label,
-            output_size=config.output_size,
-            reference_frame_idx=sequence.reference_frame_idx,
-            reference_mask=target_masks[sequence.reference_frame_idx],
-            split_frame_idx=recovery_index,
-        )
-        if split.selected_obj_id != original.selected_obj_id:
-            raise RuntimeError(
-                "Aligned no-memory branch changed the persistent obj_id: "
-                f"{original.selected_obj_id} -> {split.selected_obj_id}."
-            )
-        for index in range(len(sequence.frame_indices)):
-            if not torch.equal(split.masks[index], original.masks[index]):
-                raise RuntimeError(
-                    "The causal no-memory split changed the original SAM3 "
-                    f"prediction at sequence index {index}; the paired control "
-                    "is therefore invalid."
-                )
-        no_memory_masks = split.masks.clone()
-        no_memory_scores = split.scores.clone()
-        no_memory_masks[recovery_index] = aligned["recovery_mask"]
-        no_memory_scores[recovery_index] = 1.0
-        aligned_no_memory = TrackingSequence(
-            masks=no_memory_masks,
-            scores=no_memory_scores,
-            selected_obj_id=split.selected_obj_id,
-        )
-        aligned_memory = sam3.track_with_recovery_mask_memory(
-            sequence.image_paths,
-            prompt=sequence.label,
-            output_size=config.output_size,
-            reference_frame_idx=sequence.reference_frame_idx,
-            reference_mask=target_masks[sequence.reference_frame_idx],
-            recovery_frame_idx=recovery_index,
-            recovery_mask=aligned["recovery_mask"],
-        )
-        if aligned_memory.selected_obj_id != original.selected_obj_id:
-            raise RuntimeError(
-                "Aligned memory branch changed the persistent obj_id: "
-                f"{original.selected_obj_id} -> "
-                f"{aligned_memory.selected_obj_id}."
-            )
-        if not torch.equal(
-            aligned_no_memory.masks[recovery_index],
-            aligned_memory.masks[recovery_index],
+    if (
+        event_policy == "scheduled_probe"
+        and aligned["recovery_mask"] is None
+    ):
+        requested_index = forced_recovery_index
+        for alternative_index in range(
+            int(sequence.reference_frame_idx) + 1,
+            len(sequence.frame_indices) - 1,
         ):
-            raise RuntimeError(
-                "Aligned no-memory and memory branches do not share the exact "
-                "same recovery mask."
+            if alternative_index == requested_index:
+                continue
+            alternative = _prepare_recovery(
+                config,
+                sequence=sequence,
+                target_masks=target_masks,
+                original=original,
+                geometry=geometry,
+                geometry_alignment="aligned",
+                geometry_permutation=tuple(
+                    range(len(sequence.frame_indices))
+                ),
+                sam3=sam3,
+                candidate_cache=candidate_cache,
+                map_update_policy="joint_reliable",
+                event_policy=event_policy,
+                forced_recovery_index=alternative_index,
+                allow_natural_trigger=False,
             )
-        for index in range(recovery_index):
-            if not torch.equal(
-                aligned_no_memory.masks[index],
-                aligned_memory.masks[index],
-            ):
-                raise RuntimeError(
-                    "Aligned branches diverged before recovery at sequence "
-                    f"index {index}."
+            if alternative["recovery_mask"] is not None:
+                alternative["scheduled_probe_requested_index"] = (
+                    requested_index
                 )
-    predictions["geometry_recovery_no_memory"] = aligned_no_memory
-    predictions["geometry_recovery_same_id_memory"] = aligned_memory
+                alternative["scheduled_probe_used_fallback"] = True
+                alternative["scheduled_probe_fallback_reason"] = (
+                    aligned["reason"]
+                )
+                aligned = alternative
+                break
+
+    # Every geometry control is evaluated at the primary aligned event frame.
+    # This prevents different trigger times from becoming a hidden variable.
+    control_index = aligned["recovery_index"]
+    reference_geometry = _prepare_recovery(
+        config,
+        sequence=sequence,
+        target_masks=target_masks,
+        original=original,
+        geometry=geometry,
+        geometry_alignment="aligned_reference_only",
+        geometry_permutation=tuple(range(len(sequence.frame_indices))),
+        sam3=sam3,
+        candidate_cache=candidate_cache,
+        map_update_policy="reference_only",
+        event_policy=event_policy,
+        forced_recovery_index=control_index,
+        allow_natural_trigger=False,
+    )
 
     permutation = _shuffled_permutation(
         len(sequence.frame_indices),
@@ -327,27 +580,96 @@ def _run_instance(
         geometry_permutation=permutation,
         sam3=sam3,
         candidate_cache=candidate_cache,
+        map_update_policy="joint_reliable",
+        event_policy=event_policy,
+        forced_recovery_index=control_index,
+        allow_natural_trigger=False,
     )
-    if shuffled["recovery_mask"] is None:
-        shuffled_memory = original
-    else:
-        shuffled_index = int(shuffled["recovery_index"])
-        shuffled_memory = sam3.track_with_recovery_mask_memory(
-            sequence.image_paths,
-            prompt=sequence.label,
-            output_size=config.output_size,
-            reference_frame_idx=sequence.reference_frame_idx,
-            reference_mask=target_masks[sequence.reference_frame_idx],
-            recovery_frame_idx=shuffled_index,
-            recovery_mask=shuffled["recovery_mask"],
-        )
-        if shuffled_memory.selected_obj_id != original.selected_obj_id:
+
+    predictions: dict[str, TrackingSequence] = {"original": original}
+    applied = {mode: False for mode in MODES}
+    predictions["geometry_recovery_no_memory"] = _current_only_tracking(
+        original,
+        recovery_index=aligned["recovery_index"],
+        recovery_mask=aligned["recovery_mask"],
+    )
+    applied["geometry_recovery_no_memory"] = (
+        aligned["recovery_mask"] is not None
+    )
+    predictions["reference_geometry_same_id_memory"], applied[
+        "reference_geometry_same_id_memory"
+    ] = _writeback_or_original(
+        config,
+        sequence=sequence,
+        target_masks=target_masks,
+        sam3=sam3,
+        original=original,
+        recovery_index=reference_geometry["recovery_index"],
+        recovery_mask=reference_geometry["recovery_mask"],
+    )
+    predictions["geometry_recovery_same_id_memory"], applied[
+        "geometry_recovery_same_id_memory"
+    ] = _writeback_or_original(
+        config,
+        sequence=sequence,
+        target_masks=target_masks,
+        sam3=sam3,
+        original=original,
+        recovery_index=aligned["recovery_index"],
+        recovery_mask=aligned["recovery_mask"],
+    )
+    predictions["shuffled_geometry_same_id_memory"], applied[
+        "shuffled_geometry_same_id_memory"
+    ] = _writeback_or_original(
+        config,
+        sequence=sequence,
+        target_masks=target_masks,
+        sam3=sam3,
+        original=original,
+        recovery_index=shuffled["recovery_index"],
+        recovery_mask=shuffled["recovery_mask"],
+    )
+    predictions["oracle_candidate_same_id_memory"], applied[
+        "oracle_candidate_same_id_memory"
+    ] = _writeback_or_original(
+        config,
+        sequence=sequence,
+        target_masks=target_masks,
+        sam3=sam3,
+        original=original,
+        recovery_index=aligned["recovery_index"],
+        recovery_mask=aligned["oracle_candidate_mask"],
+    )
+    oracle_mask = (
+        target_masks[int(aligned["recovery_index"])]
+        if aligned["recovery_index"] is not None
+        and target_masks[int(aligned["recovery_index"])].any()
+        else None
+    )
+    predictions["oracle_mask_same_id_memory"], applied[
+        "oracle_mask_same_id_memory"
+    ] = _writeback_or_original(
+        config,
+        sequence=sequence,
+        target_masks=target_masks,
+        sam3=sam3,
+        original=original,
+        recovery_index=aligned["recovery_index"],
+        recovery_mask=oracle_mask,
+    )
+
+    aligned_memory = predictions["geometry_recovery_same_id_memory"]
+    aligned_no_memory = predictions["geometry_recovery_no_memory"]
+    if applied["geometry_recovery_same_id_memory"]:
+        recovery_index = int(aligned["recovery_index"])
+        if not torch.equal(
+            aligned_no_memory.masks[recovery_index],
+            aligned_memory.masks[recovery_index],
+        ):
             raise RuntimeError(
-                "Shuffled memory branch changed the persistent obj_id: "
-                f"{original.selected_obj_id} -> "
-                f"{shuffled_memory.selected_obj_id}."
+                "The aligned no-memory and memory branches did not use the "
+                "same intervention mask."
             )
-    predictions["shuffled_geometry_same_id_memory"] = shuffled_memory
 
     original_metrics = summarize_masks(
         original.masks,
@@ -355,11 +677,27 @@ def _run_instance(
         reference_frame_idx=sequence.reference_frame_idx,
     )
     aligned_index = aligned["recovery_index"]
+    mode_events = {
+        "original": aligned,
+        "geometry_recovery_no_memory": aligned,
+        "reference_geometry_same_id_memory": reference_geometry,
+        "geometry_recovery_same_id_memory": aligned,
+        "shuffled_geometry_same_id_memory": shuffled,
+        "oracle_candidate_same_id_memory": aligned,
+        "oracle_mask_same_id_memory": aligned,
+    }
+    selectors = {
+        "original": "none",
+        "geometry_recovery_no_memory": "geometry",
+        "reference_geometry_same_id_memory": "reference_geometry",
+        "geometry_recovery_same_id_memory": "geometry",
+        "shuffled_geometry_same_id_memory": "shuffled_geometry",
+        "oracle_candidate_same_id_memory": "gt_oracle_text_candidate",
+        "oracle_mask_same_id_memory": "gt_mask_upper_bound",
+    }
     summary_rows = []
     for mode in MODES:
-        event = shuffled if mode == "shuffled_geometry_same_id_memory" else aligned
-        if mode == "original":
-            event = aligned
+        event = mode_events[mode]
         tracking = predictions[mode]
         metrics = summarize_masks(
             tracking.masks,
@@ -376,10 +714,19 @@ def _run_instance(
                 "scene_id": sequence.scene_id,
                 "instance_id": int(sequence.instance_id),
                 "instance_label": sequence.label,
+                "event_policy": event_policy,
+                "scheduled_probe_requested_sequence_index": aligned[
+                    "scheduled_probe_requested_index"
+                ],
+                "scheduled_probe_used_fallback": int(
+                    aligned["scheduled_probe_used_fallback"]
+                ),
                 "frame_indices": " ".join(
                     str(value) for value in sequence.frame_indices
                 ),
                 "mode": mode,
+                "candidate_selector": selectors[mode],
+                "map_update_policy": event["map_update_policy"],
                 "geometry_alignment": event["geometry_alignment"],
                 "geometry_permutation": " ".join(
                     str(value) for value in event["geometry_permutation"]
@@ -397,10 +744,10 @@ def _run_instance(
                     tracking.masks, target_masks
                 ),
                 "recovery_requested": int(event["recovery_requested"]),
-                "recovery_applied": int(
-                    event["recovery_mask"] is not None
-                    and mode != "original"
-                ),
+                "natural_gate_request_count": event[
+                    "natural_gate_request_count"
+                ],
+                "recovery_applied": int(applied[mode]),
                 "recovery_sequence_index": event["recovery_index"],
                 "recovery_frame_index": event["recovery_frame_index"],
                 "recovery_reason": event["reason"],
@@ -417,7 +764,19 @@ def _run_instance(
                 "geometry_selected_oracle": event[
                     "geometry_selected_oracle"
                 ],
-                "recovery_mask_iou": event["selected_candidate_gt_iou"],
+                "recovery_mask_iou": (
+                    (
+                        1.0
+                        if mode == "oracle_mask_same_id_memory"
+                        else (
+                            event["oracle_candidate_gt_iou"]
+                            if mode == "oracle_candidate_same_id_memory"
+                            else event["selected_candidate_gt_iou"]
+                        )
+                    )
+                    if applied[mode]
+                    else float("nan")
+                ),
                 "post_recovery_iou": post["iou"],
                 "post_recovery_recall": post["recall"],
                 "post_recovery_visible_frames": post["visible_frames"],
@@ -436,7 +795,7 @@ def _run_instance(
                         "geometry_recovery_no_memory",
                         "geometry_recovery_same_id_memory",
                     }
-                    and aligned["recovery_mask"] is not None
+                    and applied[mode]
                 ),
             }
         )
@@ -457,21 +816,45 @@ def _run_instance(
             if row["mode"] == "geometry_recovery_same_id_memory"
             else 0.0
         )
+        row["aligned_gain_over_reference_map"] = 0.0
+        row["aligned_gain_over_shuffled_geometry"] = 0.0
+        row["oracle_candidate_headroom"] = 0.0
+    by_mode = {row["mode"]: row for row in summary_rows}
+    by_mode["geometry_recovery_same_id_memory"][
+        "aligned_gain_over_reference_map"
+    ] = (
+        by_mode["geometry_recovery_same_id_memory"]["post_recovery_iou"]
+        - by_mode["reference_geometry_same_id_memory"]["post_recovery_iou"]
+    )
+    by_mode["geometry_recovery_same_id_memory"][
+        "aligned_gain_over_shuffled_geometry"
+    ] = (
+        by_mode["geometry_recovery_same_id_memory"]["post_recovery_iou"]
+        - by_mode["shuffled_geometry_same_id_memory"]["post_recovery_iou"]
+    )
+    by_mode["geometry_recovery_same_id_memory"][
+        "oracle_candidate_headroom"
+    ] = (
+        by_mode["oracle_candidate_same_id_memory"]["post_recovery_iou"]
+        - by_mode["geometry_recovery_same_id_memory"]["post_recovery_iou"]
+    )
 
     frame_rows = []
     for mode, tracking in predictions.items():
-        event = shuffled if mode == "shuffled_geometry_same_id_memory" else aligned
+        event = mode_events[mode]
         for index, frame_index in enumerate(sequence.frame_indices):
             frame_rows.append(
                 {
                     "scene_id": sequence.scene_id,
                     "instance_id": int(sequence.instance_id),
                     "instance_label": sequence.label,
+                    "event_policy": event_policy,
                     "mode": mode,
                     "sequence_index": index,
                     "frame_index": frame_index,
                     "gt_visible": int(target_masks[index].any()),
                     "prediction_pixels": int(tracking.masks[index].sum()),
+                    "sam3_score": float(tracking.scores[index]),
                     "target_pixels": int(target_masks[index].sum()),
                     "iou": binary_iou(
                         tracking.masks[index], target_masks[index]
@@ -494,24 +877,289 @@ def _run_instance(
     return {
         "summary_rows": summary_rows,
         "frame_rows": frame_rows,
+        "gate_rows": [
+            *aligned["gate_rows"],
+            *reference_geometry["gate_rows"],
+            *shuffled["gate_rows"],
+        ],
         "candidate_rows": [
             *aligned["candidate_rows"],
+            *reference_geometry["candidate_rows"],
             *shuffled["candidate_rows"],
         ],
         "predictions": predictions,
         "aligned_recovery_index": aligned_index,
         "shuffled_recovery_index": shuffled["recovery_index"],
         "metadata": {
-            "label": sequence.label,
+            "event_policy": event_policy,
             "reference_sequence_index": sequence.reference_frame_idx,
             "reference_frame_index": sequence.frame_indices[
                 sequence.reference_frame_idx
             ],
             "original_obj_id": original.selected_obj_id,
-            "aligned": _event_metadata(aligned),
+            "aligned_joint_reliable": _event_metadata(aligned),
+            "aligned_reference_only": _event_metadata(reference_geometry),
             "shuffled": _event_metadata(shuffled),
         },
     }
+
+
+def _screen_candidate_frames(
+    config: ExperimentConfig,
+    *,
+    sequence,
+    target_masks: torch.Tensor,
+    geometry: GeometrySequence,
+    sam3: SAM3Wrapper,
+    original: TrackingSequence,
+    candidate_cache: dict[int, list[SAM3MaskCandidate]],
+) -> dict[str, list[dict]]:
+    """Cache and diagnose global-text candidates on every post-reference frame."""
+
+    summary_rows = []
+    candidate_rows = []
+    identity = tuple(range(len(sequence.frame_indices)))
+    for sequence_index in range(
+        int(sequence.reference_frame_idx) + 1,
+        len(sequence.frame_indices),
+    ):
+        event = _prepare_recovery(
+            config,
+            sequence=sequence,
+            target_masks=target_masks,
+            original=original,
+            geometry=geometry,
+            geometry_alignment="aligned",
+            geometry_permutation=identity,
+            sam3=sam3,
+            candidate_cache=candidate_cache,
+            map_update_policy="joint_reliable",
+            event_policy="candidate_screening",
+            forced_recovery_index=sequence_index,
+            allow_natural_trigger=False,
+        )
+        candidate_rows.extend(event["candidate_rows"])
+        summary_rows.append(
+            {
+                "scene_id": sequence.scene_id,
+                "instance_id": int(sequence.instance_id),
+                "instance_label": sequence.label,
+                "sequence_index": sequence_index,
+                "frame_index": sequence.frame_indices[sequence_index],
+                "sam3_original_score": float(
+                    original.scores[sequence_index]
+                ),
+                "sam3_original_iou": binary_iou(
+                    original.masks[sequence_index],
+                    target_masks[sequence_index],
+                ),
+                "sam3_original_pixels": int(
+                    original.masks[sequence_index].sum()
+                ),
+                "geometry_candidate_accepted": event[
+                    "geometry_candidate_accepted"
+                ],
+                "geometry_candidate_reason": event[
+                    "geometry_candidate_reason"
+                ],
+                "tracker_geometry_coverage": event[
+                    "tracker_geometry_coverage"
+                ],
+                "natural_gate_would_trigger": event[
+                    "natural_gate_would_trigger"
+                ],
+                "map_updates_before_event": event[
+                    "map_updates_before_event"
+                ],
+                "candidate_count": event["candidate_count"],
+                "selected_support_coverage": event[
+                    "selected_support_coverage"
+                ],
+                "selected_candidate_gt_iou": event[
+                    "selected_candidate_gt_iou"
+                ],
+                "oracle_candidate_gt_iou": event[
+                    "oracle_candidate_gt_iou"
+                ],
+                "geometry_selected_oracle": event[
+                    "geometry_selected_oracle"
+                ],
+                "geometry_recovery_mask_accepted": int(
+                    event["recovery_mask"] is not None
+                ),
+                "reason": event["reason"],
+            }
+        )
+    return {
+        "summary_rows": summary_rows,
+        "candidate_rows": candidate_rows,
+    }
+
+
+def _summarize_threshold_sweep(
+    screening_rows: list[dict],
+) -> list[dict]:
+    """Evaluate gate thresholds posthoc without rerunning either backbone."""
+
+    groups: dict[tuple[str, object], list[dict]] = {}
+    for row in screening_rows:
+        key = (str(row["scene_id"]), int(row["instance_id"]))
+        groups.setdefault(key, []).append(row)
+    if screening_rows:
+        groups[(str(screening_rows[0]["scene_id"]), "all")] = screening_rows
+
+    output = []
+    for (scene_id, instance_id), rows in groups.items():
+        for score_threshold in (0.30, 0.50, 0.70):
+            for geometry_threshold in (0.10, 0.25, 0.50):
+                for candidate_threshold in (0.25, 0.50, 0.75):
+                    failures = [
+                        row
+                        for row in rows
+                        if float(row["sam3_original_iou"]) < 0.50
+                    ]
+                    triggered = []
+                    applied = []
+                    for row in rows:
+                        geometry_accepted = bool(
+                            row["geometry_candidate_accepted"]
+                        )
+                        tracker_weak = (
+                            int(row["sam3_original_pixels"]) == 0
+                            or float(row["sam3_original_score"])
+                            < score_threshold
+                            or (
+                                geometry_accepted
+                                and float(row["tracker_geometry_coverage"])
+                                < geometry_threshold
+                            )
+                        )
+                        if tracker_weak:
+                            triggered.append(row)
+                        support = float(row["selected_support_coverage"])
+                        candidate_available = (
+                            int(row["candidate_count"]) > 0
+                            and np.isfinite(support)
+                        )
+                        if (
+                            tracker_weak
+                            and geometry_accepted
+                            and candidate_available
+                            and support >= candidate_threshold
+                        ):
+                            applied.append(row)
+                    recovered_good = sum(
+                        float(row["selected_candidate_gt_iou"]) >= 0.50
+                        for row in applied
+                    )
+                    beneficial = sum(
+                        float(row["selected_candidate_gt_iou"])
+                        > float(row["sam3_original_iou"])
+                        for row in applied
+                    )
+                    false_interventions = sum(
+                        float(row["sam3_original_iou"]) >= 0.50
+                        for row in applied
+                    )
+                    applied_failures = sum(
+                        float(row["sam3_original_iou"]) < 0.50
+                        for row in applied
+                    )
+                    mean_gain = (
+                        float(
+                            np.mean(
+                                [
+                                    float(row["selected_candidate_gt_iou"])
+                                    - float(row["sam3_original_iou"])
+                                    for row in applied
+                                ]
+                            )
+                        )
+                        if applied
+                        else float("nan")
+                    )
+                    output.append(
+                        {
+                            "scene_id": scene_id,
+                            "instance_id": instance_id,
+                            "diagnostic_frames": len(rows),
+                            "tracker_failure_frames_iou_lt_0_5": len(failures),
+                            "tracker_score_threshold": score_threshold,
+                            "tracker_geometry_coverage_threshold": (
+                                geometry_threshold
+                            ),
+                            "candidate_support_coverage_threshold": (
+                                candidate_threshold
+                            ),
+                            "gate_triggered_frames": len(triggered),
+                            "recovery_applied_frames": len(applied),
+                            "applied_tracker_failure_frames": applied_failures,
+                            "good_recovery_frames_iou_ge_0_5": recovered_good,
+                            "beneficial_recovery_frames": beneficial,
+                            "false_intervention_frames": false_interventions,
+                            "failure_trigger_recall": (
+                                applied_failures / len(failures)
+                                if failures
+                                else 0.0
+                            ),
+                            "applied_trigger_precision": (
+                                applied_failures / len(applied)
+                                if applied
+                                else 0.0
+                            ),
+                            "mean_selected_iou_gain_when_applied": mean_gain,
+                            "gt_role": "posthoc_threshold_diagnostic_only",
+                        }
+                    )
+    return output
+
+
+def _current_only_tracking(
+    original: TrackingSequence,
+    *,
+    recovery_index: int | None,
+    recovery_mask: torch.Tensor | None,
+) -> TrackingSequence:
+    if recovery_index is None or recovery_mask is None:
+        return original
+    masks = original.masks.clone()
+    scores = original.scores.clone()
+    masks[int(recovery_index)] = recovery_mask.detach().cpu().bool()
+    scores[int(recovery_index)] = 1.0
+    return TrackingSequence(
+        masks=masks,
+        scores=scores,
+        selected_obj_id=original.selected_obj_id,
+    )
+
+
+def _writeback_or_original(
+    config: ExperimentConfig,
+    *,
+    sequence,
+    target_masks: torch.Tensor,
+    sam3: SAM3Wrapper,
+    original: TrackingSequence,
+    recovery_index: int | None,
+    recovery_mask: torch.Tensor | None,
+) -> tuple[TrackingSequence, bool]:
+    if recovery_index is None or recovery_mask is None or not recovery_mask.any():
+        return original, False
+    tracking = sam3.track_with_recovery_mask_memory(
+        sequence.image_paths,
+        prompt=sequence.label,
+        output_size=config.output_size,
+        reference_frame_idx=sequence.reference_frame_idx,
+        reference_mask=target_masks[sequence.reference_frame_idx],
+        recovery_frame_idx=int(recovery_index),
+        recovery_mask=recovery_mask,
+    )
+    if tracking.selected_obj_id != original.selected_obj_id:
+        raise RuntimeError(
+            "Same-ID writeback changed the persistent object ID: "
+            f"{original.selected_obj_id} -> {tracking.selected_obj_id}."
+        )
+    return tracking, True
 
 
 def _prepare_recovery(
@@ -525,6 +1173,10 @@ def _prepare_recovery(
     geometry_permutation: tuple[int, ...],
     sam3: SAM3Wrapper,
     candidate_cache: dict[int, list[SAM3MaskCandidate]],
+    map_update_policy: str,
+    event_policy: str,
+    forced_recovery_index: int | None,
+    allow_natural_trigger: bool = True,
 ) -> dict:
     mined = mine_recovery(
         config,
@@ -533,21 +1185,52 @@ def _prepare_recovery(
         original_masks=original.masks,
         original_scores=original.scores,
         geometry=geometry,
+        map_update_policy=map_update_policy,
     )
-    recovery_index = next(
-        (
-            index
-            for index, row in enumerate(mined["rows"])
-            if index > int(sequence.reference_frame_idx)
-            and row["use_correction"]
-            and mined["candidates"][index].supported_mask.any()
-        ),
-        None,
+    if forced_recovery_index is not None:
+        recovery_index = int(forced_recovery_index)
+        if not (
+            int(sequence.reference_frame_idx)
+            < recovery_index
+            < len(sequence.frame_indices)
+        ):
+            raise ValueError(
+                "Forced recovery index must be after the reference and inside "
+                "the selected sequence."
+            )
+    elif allow_natural_trigger:
+        recovery_index = _first_viable_natural_event(
+            config,
+            sequence=sequence,
+            mined=mined,
+            sam3=sam3,
+            candidate_cache=candidate_cache,
+        )
+    else:
+        recovery_index = None
+    natural_gate_request_count = sum(
+        int(row["use_correction"])
+        for index, row in enumerate(mined["rows"])
+        if index > int(sequence.reference_frame_idx)
+        and index < len(sequence.frame_indices) - 1
     )
     base = {
+        "event_policy": event_policy,
+        "map_update_policy": map_update_policy,
+        "scheduled_probe_requested_index": (
+            int(forced_recovery_index)
+            if event_policy == "scheduled_probe"
+            and forced_recovery_index is not None
+            else None
+        ),
+        "scheduled_probe_used_fallback": False,
         "geometry_alignment": geometry_alignment,
         "geometry_permutation": geometry_permutation,
-        "recovery_requested": recovery_index is not None,
+        "recovery_requested": (
+            forced_recovery_index is not None
+            or natural_gate_request_count > 0
+        ),
+        "natural_gate_request_count": natural_gate_request_count,
         "recovery_index": recovery_index,
         "recovery_frame_index": (
             sequence.frame_indices[recovery_index]
@@ -555,13 +1238,64 @@ def _prepare_recovery(
             else None
         ),
         "recovery_mask": None,
+        "oracle_candidate_mask": None,
         "candidate_count": 0,
         "selected_support_coverage": float("nan"),
         "selected_candidate_gt_iou": float("nan"),
         "oracle_candidate_gt_iou": float("nan"),
         "geometry_selected_oracle": 0,
+        "geometry_candidate_accepted": (
+            int(mined["candidates"][recovery_index].accepted)
+            if recovery_index is not None
+            else 0
+        ),
+        "geometry_candidate_reason": (
+            mined["candidates"][recovery_index].reason
+            if recovery_index is not None
+            else "no event"
+        ),
+        "tracker_geometry_coverage": (
+            mined["rows"][recovery_index]["tracker_geometry_coverage"]
+            if recovery_index is not None
+            else float("nan")
+        ),
+        "natural_gate_would_trigger": (
+            int(mined["rows"][recovery_index]["use_correction"])
+            if recovery_index is not None
+            else 0
+        ),
         "candidate_rows": [],
-        "reason": "no weak-tracker frame had an accepted geometry candidate",
+        "gate_rows": [
+            {
+                "scene_id": sequence.scene_id,
+                "instance_id": int(sequence.instance_id),
+                "instance_label": sequence.label,
+                "event_policy": event_policy,
+                "geometry_alignment": geometry_alignment,
+                "geometry_permutation": " ".join(
+                    str(value) for value in geometry_permutation
+                ),
+                **row,
+            }
+            for row in mined["rows"]
+        ],
+        "map_updates_before_event": (
+            sum(
+                int(row["map_updated"])
+                for row in mined["rows"][:recovery_index]
+            )
+            if recovery_index is not None
+            else sum(int(row["map_updated"]) for row in mined["rows"])
+        ),
+        "reason": (
+            (
+                "joint gate requested recovery but no full candidate passed"
+                if natural_gate_request_count > 0
+                else "no joint-gate recovery event"
+            )
+            if allow_natural_trigger
+            else "primary aligned policy produced no event"
+        ),
     }
     if recovery_index is None:
         return base
@@ -580,6 +1314,7 @@ def _prepare_recovery(
         return base
 
     geometry_candidate = mined["candidates"][recovery_index]
+    mining_row = mined["rows"][recovery_index]
     supported = geometry_candidate.supported_mask.bool()
     projected = geometry_candidate.projected_mask.bool()
     coarse_box = geometry_candidate.mask.bool()
@@ -608,6 +1343,8 @@ def _prepare_recovery(
                 "scene_id": sequence.scene_id,
                 "instance_id": int(sequence.instance_id),
                 "instance_label": sequence.label,
+                "event_policy": event_policy,
+                "map_update_policy": map_update_policy,
                 "geometry_alignment": geometry_alignment,
                 "geometry_permutation": " ".join(
                     str(value) for value in geometry_permutation
@@ -621,6 +1358,16 @@ def _prepare_recovery(
                 "support_coverage": support_coverage,
                 "projected_coverage": projected_coverage,
                 "coarse_box_iou": box_iou,
+                "geometry_candidate_accepted": int(
+                    geometry_candidate.accepted
+                ),
+                "geometry_candidate_reason": geometry_candidate.reason,
+                "tracker_geometry_coverage": mining_row[
+                    "tracker_geometry_coverage"
+                ],
+                "natural_gate_would_trigger": int(
+                    mining_row["use_correction"]
+                ),
                 "candidate_gt_iou": gt_iou,
                 "selected": 0,
                 "oracle": 0,
@@ -638,6 +1385,10 @@ def _prepare_recovery(
         rows[index]["oracle"] = 1
     base["candidate_rows"] = rows
     selected = candidates[selected_index]
+    oracle_index = min(oracle_indices)
+    base["oracle_candidate_mask"] = (
+        candidates[oracle_index].mask.detach().cpu().bool()
+    )
     support_coverage = float(rows[selected_index]["support_coverage"])
     base.update(
         {
@@ -650,6 +1401,12 @@ def _prepare_recovery(
     if not selected.mask.any():
         base["reason"] = "selected SAM3 candidate mask is empty"
         return base
+    if not geometry_candidate.accepted or not supported.any():
+        base["reason"] = (
+            "scheduled candidate diagnostic only; geometry rejected: "
+            f"{geometry_candidate.reason}"
+        )
+        return base
     if support_coverage < float(
         config.recovery_min_support_coverage
     ):
@@ -660,12 +1417,64 @@ def _prepare_recovery(
         )
         return base
     base["recovery_mask"] = selected.mask.detach().cpu().bool()
-    base["reason"] = "accepted full SAM3 candidate selected by aligned geometry"
-    if geometry_alignment == "shuffled":
-        base["reason"] = (
-            "accepted full SAM3 candidate selected by shuffled geometry control"
-        )
+    base["reason"] = (
+        f"accepted full SAM3 candidate selected by {geometry_alignment}"
+    )
     return base
+
+
+def _first_viable_natural_event(
+    config: ExperimentConfig,
+    *,
+    sequence,
+    mined: dict,
+    sam3: SAM3Wrapper,
+    candidate_cache: dict[int, list[SAM3MaskCandidate]],
+) -> int | None:
+    """Return the first gate event with a deployable full-mask candidate."""
+
+    for index, row in enumerate(mined["rows"]):
+        geometry_candidate = mined["candidates"][index]
+        if not (
+            index > int(sequence.reference_frame_idx)
+            and index < len(sequence.frame_indices) - 1
+            and row["use_correction"]
+            and geometry_candidate.accepted
+            and geometry_candidate.supported_mask.any()
+        ):
+            continue
+        candidates = candidate_cache.get(index)
+        if candidates is None:
+            candidates = sam3.propose_text_masks(
+                sequence.image_paths[index],
+                prompt=sequence.label,
+                output_size=config.output_size,
+            )
+            candidate_cache[index] = candidates
+        if not candidates:
+            continue
+        supported = geometry_candidate.supported_mask.bool()
+        projected = geometry_candidate.projected_mask.bool()
+        coarse_box = geometry_candidate.mask.bool()
+        ranking = [
+            (
+                _coverage(supported, candidate.mask),
+                _coverage(projected, candidate.mask),
+                binary_iou(candidate.mask, coarse_box),
+                float(candidate.score),
+                -int(candidate.obj_id),
+                candidate_index,
+            )
+            for candidate_index, candidate in enumerate(candidates)
+        ]
+        selected = candidates[int(max(ranking)[-1])]
+        if (
+            selected.mask.any()
+            and _coverage(supported, selected.mask)
+            >= config.recovery_min_support_coverage
+        ):
+            return index
+    return None
 
 
 def _shuffled_permutation(
@@ -731,7 +1540,12 @@ def _event_metadata(event: dict) -> dict:
     return {
         key: value
         for key, value in event.items()
-        if key not in {"recovery_mask", "candidate_rows"}
+        if key not in {
+            "recovery_mask",
+            "oracle_candidate_mask",
+            "candidate_rows",
+            "gate_rows",
+        }
     }
 
 
@@ -760,8 +1574,11 @@ def _save_report(
         "GT": (20, 220, 70),
         "original": (220, 60, 60),
         "geometry_recovery_no_memory": (245, 170, 30),
+        "reference_geometry_same_id_memory": (20, 155, 150),
         "geometry_recovery_same_id_memory": (45, 110, 255),
         "shuffled_geometry_same_id_memory": (170, 70, 210),
+        "oracle_candidate_same_id_memory": (20, 190, 230),
+        "oracle_mask_same_id_memory": (30, 180, 70),
     }
     for row, image_path in enumerate(image_paths):
         with Image.open(image_path) as source:
@@ -872,6 +1689,25 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Use one explicit reference position for every instance. By default "
             "each instance uses its earliest visible selected frame."
+        ),
+    )
+    parser.add_argument(
+        "--event-policies",
+        nargs="+",
+        choices=EVENT_POLICIES,
+        default=list(EVENT_POLICIES),
+        help=(
+            "natural_joint_gate tests the deployable trigger; "
+            "scheduled_probe forces candidate evaluation at one fixed frame."
+        ),
+    )
+    parser.add_argument(
+        "--probe-sequence-index",
+        type=int,
+        default=4,
+        help=(
+            "Selected-sequence position used by scheduled_probe. It must have "
+            "at least one future frame."
         ),
     )
     parser.add_argument("--sam3-device")

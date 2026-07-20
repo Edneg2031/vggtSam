@@ -132,3 +132,33 @@ manifest: data/processed/scannetpp_pinhole_2d/manifest.json
 ~/.codex/sessions/2026/06/23/
 rollout-2026-06-23T14-22-18-019ef324-d8d7-78f3-a234-3df280b150c4.jsonl
 ```
+
+## 2026-07-18 更新：一次性完整消融
+
+直接特征融合与单实例 ICP 路线继续暂停。当前服务器实验已扩展成一次性双向机制
+消融，正式设计见 `docs/ablation_plan.md`，唯一命令见 `commands.txt`。
+
+新增内容：
+
+- `natural_joint_gate` 与固定干预 `scheduled_probe` 同次运行；
+- non-empty/high-score mask 与 3D 支持冲突时也可触发恢复；
+- `reference_only` 对照与 `joint_reliable` 历史 mask 扩图；
+- aligned、shuffled、oracle candidate、oracle mask 七分支；
+- 所有后续帧 global-text candidate 缓存与候选上限诊断；
+- 27 组 gate 阈值的 post-hoc sweep；
+- reference 固定 Sim(3) 下的对象地图 5/10 cm precision、recall、F-score
+  与 Chamfer；GT 几何仅用于评估；
+- 实例点云 PLY 继续保留。
+
+当前运行实例为 `37 68 54`。37/68 是不应误伤的易例，54 bed 是检验
+“高置信跟错”与 geometry-disagreement gate 的压力例。运行结束后优先回传：
+
+```text
+summary.csv
+candidate_screening.csv
+threshold_sweep.csv
+geometry_gate_diagnostics.csv
+map_quality.csv
+metadata.json
+完整日志
+```

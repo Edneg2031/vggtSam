@@ -45,7 +45,16 @@ class ExperimentConfig:
 
     tracker_low_score: float
     fallback_on_missing_mask: bool
+    fallback_on_geometry_disagreement: bool
+    tracker_min_geometry_coverage: float
     recovery_min_support_coverage: float
+    map_update_min_score: float
+    map_update_min_geometry_coverage: float
+
+    point_cloud_confidence_threshold: float
+    point_cloud_max_points: int
+    map_metric_max_points: int
+    map_metric_thresholds: tuple[float, ...]
     output_dir: Path
 
 
@@ -62,6 +71,7 @@ def load_config(
     stream = raw.get("streamvggt", {})
     bridge = raw.get("bridge", {})
     candidate = raw.get("candidate", {})
+    point_cloud = raw.get("point_cloud", {})
 
     frame_indices = overrides.get(
         "frame_indices",
@@ -113,16 +123,71 @@ def load_config(
         fallback_on_missing_mask=bool(
             bridge.get("fallback_on_missing_mask", True)
         ),
+        fallback_on_geometry_disagreement=bool(
+            bridge.get("fallback_on_geometry_disagreement", True)
+        ),
+        tracker_min_geometry_coverage=float(
+            bridge.get("tracker_min_geometry_coverage", 0.25)
+        ),
         recovery_min_support_coverage=float(
             bridge.get("recovery_min_support_coverage", 0.50)
+        ),
+        map_update_min_score=float(
+            bridge.get("map_update_min_score", 0.50)
+        ),
+        map_update_min_geometry_coverage=float(
+            bridge.get("map_update_min_geometry_coverage", 0.50)
+        ),
+        point_cloud_confidence_threshold=float(
+            point_cloud.get("confidence_threshold", 0.30)
+        ),
+        point_cloud_max_points=int(
+            point_cloud.get("max_points", 400_000)
+        ),
+        map_metric_max_points=int(
+            point_cloud.get("metric_max_points", 4096)
+        ),
+        map_metric_thresholds=tuple(
+            float(value)
+            for value in point_cloud.get(
+                "metric_thresholds",
+                [0.05, 0.10],
+            )
         ),
         output_dir=_path(
             overrides.get("output_dir", raw.get("output", {}).get("dir"))
         ),
     )
-    if not 0.0 <= config.recovery_min_support_coverage <= 1.0:
+    for name, value in (
+        (
+            "bridge.tracker_min_geometry_coverage",
+            config.tracker_min_geometry_coverage,
+        ),
+        (
+            "bridge.recovery_min_support_coverage",
+            config.recovery_min_support_coverage,
+        ),
+        ("bridge.map_update_min_score", config.map_update_min_score),
+        (
+            "bridge.map_update_min_geometry_coverage",
+            config.map_update_min_geometry_coverage,
+        ),
+    ):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be in [0, 1].")
+    if not 0.0 <= config.point_cloud_confidence_threshold <= 1.0:
         raise ValueError(
-            "bridge.recovery_min_support_coverage must be in [0, 1]."
+            "point_cloud.confidence_threshold must be in [0, 1]."
+        )
+    if config.point_cloud_max_points < 1:
+        raise ValueError("point_cloud.max_points must be positive.")
+    if config.map_metric_max_points < 1:
+        raise ValueError("point_cloud.metric_max_points must be positive.")
+    if not config.map_metric_thresholds or any(
+        value <= 0.0 for value in config.map_metric_thresholds
+    ):
+        raise ValueError(
+            "point_cloud.metric_thresholds must contain positive distances."
         )
     return config
 

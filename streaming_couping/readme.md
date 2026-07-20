@@ -1,136 +1,148 @@
 # Streaming Coupling
 
-当前目录只保留一个正式实验：验证几何恢复得到的同一张 mask 写入 SAM3
-原 `obj_id` 的 memory 后，是否改善后续跨视角跟踪。
+当前目录保留一条正式主线：冻结 SAM3 与 StreamVGGT，验证可靠性控制的对象级
+2D–3D 双向闭环。
 
-SAM3 和 StreamVGGT 均冻结。实验不训练 adapter，不做相机位姿优化、ICP、
-点云融合或 token 融合。
+```text
+SAM3 persistent obj_id / mask memory
+                 ↕
+ score + geometry coverage + candidate support gate
+                 ↕
+StreamVGGT persistent 3D object map
+```
 
-## 当前测试设置
+实验不训练 adapter，不做 token concat、ICP 或相机修正。
+
+## 当前实验
 
 - 场景：ScanNet++ `00a231a370`
 - 帧：`90 105 119 130 140 210 240`
-- 实例：`37 cabinet`、`68 wardrobe`
-- reference：序列位置 `0`，即帧 `90`
-- 暂不测试 `54 bed`：目标面积过大且首帧只局部可见，容易把实例尺度因素混入
-  memory writeback 消融
+- reference：序列位置 0，即帧 90
+- 实例：37 cabinet、68 wardrobe、54 bed
 
-两个实例共享一次 StreamVGGT 几何提取，但分别使用独立的 SAM3 session、
-persistent `obj_id`、恢复事件和指标。
+37/68 是易例，用于验证闭环不会误伤原始追踪；54 是高置信低 IoU 压力例，用于
+验证 geometry-disagreement gate 能否识别“mask 非空但跟错”。
 
-## 四个分支
-
-1. `original`
-2. `geometry_recovery_no_memory`
-3. `geometry_recovery_same_id_memory`
-4. `shuffled_geometry_same_id_memory`
-
-`geometry_recovery_no_memory` 和 `geometry_recovery_same_id_memory` 在同一恢复帧
-使用逐像素完全相同的 dense mask。唯一变量是该 mask 是否通过 SAM3 原生
-memory encoder 写入原 persistent `obj_id`。
-
-`shuffled_geometry_same_id_memory` 固定 reference 几何，循环打乱其余帧的
-StreamVGGT 输出；RGB、SAM3 文本候选、阈值和 reference mask 均不变。该分支
-用于排除任意几何扰动也能带来改善的可能。
+完整实验设计见
+[`docs/ablation_plan.md`](docs/ablation_plan.md)，服务器命令见
+[`commands.txt`](commands.txt)。
 
 ## 因果数据流
 
 ```text
 reference GT mask
-      |
-      +----> 原始 SAM3 tracker ----------------------> original
-      |
-      +----> reference 实例 pointmap
-                    |
-                    v
-          投影到后续帧并检查当前 pointmap 支持
-                    |
-                    v
-            首个“tracker 弱 + geometry 通过”帧
-                    |
-                    v
-          单帧 global-text SAM3 dense candidates
-                    |
-                    v
-             geometry 选择同一张恢复 mask
-                    |
-              +-----+-----+
-              |           |
-       只替换当前显示   写入原 obj_id memory
-              |           |
-              v           v
-          no-memory     same-ID memory
+  -> 初始化原 SAM3 obj_id 与 reference 3D object map
+  -> SAM3 原始逐帧跟踪
+  -> score 与历史 3D 投影均可靠的 mask 扩充 object map
+  -> mask 缺失 / 低分 / 与对齐几何冲突
+  -> 当前帧全图文本候选
+  -> geometry 只做同类实例选择
+  -> 完整候选 mask 写回原 obj_id
+  -> 继续传播并评估未来帧
 ```
 
-后续帧 GT mask 只用于计算指标和输出 oracle 诊断列，不参与恢复帧触发、候选
-排序或 mask 写回。单帧 text query 产生的临时 ID 只用于读取候选 mask，不会
-替换视频 tracker 的 persistent `obj_id`。
+reference 后的 GT mask 不进入 natural gate、对象地图更新或几何候选排序。GT
+只进入指标和明确命名的 `oracle_candidate` / `oracle_mask` 上限分支。
 
-代码运行时会检查：
+## 一次运行包含的消融
 
-- 因果切分但不写 memory 时，所有原始 SAM3 mask 必须保持不变；
-- aligned 两分支在恢复前必须一致；
-- aligned 两分支在恢复帧必须使用完全相同的 mask；
-- memory 分支写回前后必须保持原 `obj_id`。
+两种事件策略：
 
-任何检查失败都会直接报错，不继续产出可被误解的结果。
+- `natural_joint_gate`：实际可部署触发；
+- `scheduled_probe`：优先在帧 140 做受控干预，保证强 tracker 下仍能验证机制。
+
+七个 tracking 分支：
+
+1. `original`
+2. `geometry_recovery_no_memory`
+3. `reference_geometry_same_id_memory`
+4. `geometry_recovery_same_id_memory`
+5. `shuffled_geometry_same_id_memory`
+6. `oracle_candidate_same_id_memory`
+7. `oracle_mask_same_id_memory`
+
+其中第 2、4 分支使用完全相同的恢复 mask，唯一变量是是否写入 SAM3 memory；
+第 3、4 分支的差异是 object map 是否由可靠历史 tracking masks 扩充；第 5 分支
+只打乱非 reference 几何。
+
+每个 tracking 分支还会比较 `all_frames / score_gate / joint_gate` 三种对象地图
+写入策略，并提供 GT-mask oracle 与 time-shuffled-mask negative control。
 
 ## 运行
 
-服务器完整命令保存在 `commands.txt`：
+在仓库根目录执行：
 
 ```bash
-PYTHONPATH=src:. python -m streaming_couping.scripts.run_recovery_writeback_ablation \
+PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_recovery_writeback_ablation \
   --config streaming_couping/configs/default.yaml \
   --manifest data/processed/scannetpp_pinhole_2d/manifest.json \
   --scene-id 00a231a370 \
-  --instance-ids 37 68 \
+  --instance-ids 37 68 54 \
   --frame-indices 90 105 119 130 140 210 240 \
   --reference-sequence-index 0 \
+  --event-policies natural_joint_gate scheduled_probe \
+  --probe-sequence-index 4 \
   --sam3-device cuda:3 \
   --geometry-device cuda:1 \
-  --output-dir outputs/streaming_couping_recovery_writeback_37_68
+  --output-dir outputs/streaming_couping_complete_ablation_37_68_54
 ```
 
-本地 Mac 没有 PyTorch/GPU，只做静态检查；正式数值结果在服务器环境运行。
+StreamVGGT 只提取一次；每个实例只跑一次原始 SAM3 tracking；每个后续帧的
+global-text candidates 只生成一次并在全部分支复用。memory 分支仍需分别建立
+SAM3 session，因为它们的后续 memory 状态不同。
 
-## 输出
+## 主要输出
 
-输出根目录包含：
+输出根目录：
 
-- `summary.csv`：每个实例、每个分支的总体与 recovery 后指标
-- `frame_metrics.csv`：逐实例、逐分支、逐帧 IoU 和漏检情况
-- `candidate_diagnostics.csv`：候选排序证据及仅供诊断的 GT IoU
-- `metadata.json`：实际分支、几何 permutation、reference 和恢复事件
+- `summary.csv`：实例 × event policy × tracking mode 总指标；
+- `frame_metrics.csv`：逐帧 IoU、score、恢复前后标记；
+- `candidate_screening.csv`：全部后续帧的候选生成/选择上限；
+- `candidate_diagnostics.csv`：每个候选的几何覆盖与 GT 诊断；
+- `geometry_gate_diagnostics.csv`：逐帧 gate、对象地图更新与几何支持；
+- `threshold_sweep.csv`：27 组 gate 阈值的免重跑诊断；
+- `map_quality.csv`：对象地图 5/10 cm precision、recall、F-score 与 Chamfer；
+- `pointcloud_summary.csv` 和 `pointcloud_frame_metrics.csv`；
+- `metadata.json`。
 
-每个 `instance_<id>/` 目录还包含对应的三份 CSV，以及
-`recovery_writeback_report.png` 可视化。
+每个 `instance_<id>/<event_policy>/` 下还有对应 CSV、可视化报告和各分支 PLY。
 
-优先查看以下比较：
+## Map 指标的 GT 使用边界
 
-```text
-geometry_recovery_same_id_memory.post_recovery_iou
-  versus
-geometry_recovery_no_memory.post_recovery_iou
-```
+对象地图质量评估会用 reference 帧全场景对应点拟合一次固定 Sim(3)，随后对所有
+帧和分支保持不变。GT pointmap 只计算 5/10 cm surface metrics，不参与：
 
-同时要求 aligned 优于 shuffled，且 `same_obj_id_as_original=1`。恢复帧本身的
-IoU 不能证明 memory 有效，因为 aligned 两分支在该帧被刻意设为完全相同；
-核心证据必须来自恢复后的可见帧。
+- StreamVGGT 输出；
+- natural gate；
+- candidate ranking；
+- object map 更新；
+- SAM3 memory writeback。
+
+若 manifest 没有 mesh-rasterized GT pointmap，tracking 消融仍会完整运行，
+`metadata.json` 会记录 map evaluation 被禁用的原因。
+
+## 优先判读
+
+1. `candidate_screening.csv` 判断瓶颈在候选生成还是几何选择。
+2. scheduled probe 中比较 full memory 与 no-memory 的
+   `post_recovery_iou`。
+3. 比较 aligned、reference-only 和 shuffled，分别判断 tracking→geometry
+   扩图与时序对齐几何是否有效。
+4. 检查 natural gate 是否救回 54，同时不伤害 37/68。
+5. 在 `map_quality.csv` 比较 `joint_gate` 与 `all_frames` 的 precision/F-score。
+
+本机没有 PyTorch/GPU，只进行静态检查；正式数值需在服务器环境运行。
 
 ## 当前代码结构
 
 ```text
-scripts/run_recovery_writeback_ablation.py  CLI 入口
-src/recovery_writeback_ablation.py          四分支编排、指标和报告
-src/recovery.py                             几何恢复挖掘和 mask 指标
-src/backbones/sam3_wrapper.py               跟踪、文本候选、因果切分、same-ID 写回
-src/backbones/streamvggt_wrapper.py         冻结几何提取
-src/aggregation/                            reference 对象点与重访候选
-src/bridge/gating.py                        弱跟踪门控和 IoU
-src/config.py                               当前实验配置
-src/types.py                                当前实验数据结构
+scripts/run_recovery_writeback_ablation.py  CLI
+src/recovery_writeback_ablation.py          两策略、七分支与汇总
+src/recovery.py                             几何挖掘、联合 gate、可靠地图更新
+src/instance_point_cloud.py                 实例 PLY
+src/instance_map_evaluation.py              evaluation-only 3D map metrics
+src/backbones/sam3_wrapper.py               tracking、候选与 same-ID 写回
+src/backbones/streamvggt_wrapper.py         冻结 StreamVGGT 提取
+src/aggregation/                            persistent object map 与投影
+src/bridge/gating.py                        tracker/geometry 联合触发
 ```
-
-`docs/method.md` 和 `docs/thread_handoff.md` 仅保留研究过程与历史决策，不代表
-当前可运行入口；代码和实验设置以本 README、`commands.txt` 为准。

@@ -1,28 +1,50 @@
-# 当前主实验：几何恢复与 SAM3 same-ID memory writeback 因果消融。
+# 服务器一次性完整消融。
 #
-# 固定 ScanNet++ 场景与 7 帧压力序列，暂不使用面积过大且首帧局部可见的
-# bed(54)。cabinet(37) 和 wardrobe(68) 共享一次 StreamVGGT 几何提取，
-# 但分别维护自己的 SAM3 obj_id、恢复 mask 和评估结果。
+# 实例角色：
+#   37 cabinet、68 wardrobe：SAM3 易例，用来检查几何闭环是否误伤。
+#   54 bed：高置信但 IoU 低的压力例，用来检查 geometry-disagreement gate。
 #
-# 四个分支：
-#   1. original
-#   2. geometry_recovery_no_memory
-#   3. geometry_recovery_same_id_memory
-#   4. shuffled_geometry_same_id_memory
+# 同一进程只提取一次 StreamVGGT；每个实例只跑一次 SAM3 original，并缓存
+# 所有后续帧的 global-text candidates。随后同时执行：
+#   natural_joint_gate：实际可部署的联合触发；
+#   scheduled_probe：优先在序列位置 4（帧 140）做受控干预。
 #
-# 第 2、3 个分支使用逐像素完全相同的完整恢复 mask，唯一变量是是否写入
-# SAM3 memory。第 4 个分支只打乱非 reference 帧的 StreamVGGT 几何对应，
-# RGB、SAM3 全图文本候选和阈值保持不变。
+# 若帧 140 没有可执行的几何候选，scheduled_probe 会在不读取 GT 的条件下
+# 自动选择最早可执行帧。summary.csv 会记录实际使用帧和 fallback 标志。
 #
-# 帧 90 固定为 reference。若某个实例在帧 90 不可见，程序会直接报错，
-# 不会静默使用未来 GT 帧初始化。
-PYTHONPATH=src:. python -m streaming_couping.scripts.run_recovery_writeback_ablation \
+# 分支：
+#   original
+#   geometry_recovery_no_memory
+#   reference_geometry_same_id_memory
+#   geometry_recovery_same_id_memory
+#   shuffled_geometry_same_id_memory
+#   oracle_candidate_same_id_memory       # 仅作为候选上限
+#   oracle_mask_same_id_memory            # 仅作为写回上限
+#
+# GT mask/pointmap 在 reference 后只用于指标和明确命名的 oracle 分支；不会进入
+# natural gate、几何候选排序或可靠对象地图更新。
+mkdir -p outputs
+set -o pipefail
+
+PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_recovery_writeback_ablation \
   --config streaming_couping/configs/default.yaml \
   --manifest data/processed/scannetpp_pinhole_2d/manifest.json \
   --scene-id 00a231a370 \
-  --instance-ids 37 68 \
+  --instance-ids 37 68 54 \
   --frame-indices 90 105 119 130 140 210 240 \
   --reference-sequence-index 0 \
+  --event-policies natural_joint_gate scheduled_probe \
+  --probe-sequence-index 4 \
   --sam3-device cuda:3 \
   --geometry-device cuda:1 \
-  --output-dir outputs/streaming_couping_recovery_writeback_37_68
+  --output-dir outputs/streaming_couping_complete_ablation_37_68_54 \
+  2>&1 | tee outputs/streaming_couping_complete_ablation_37_68_54.log
+
+# 运行结束后优先回传这些小文件；PLY 和 PNG 暂时不用传：
+#   outputs/streaming_couping_complete_ablation_37_68_54/summary.csv
+#   outputs/streaming_couping_complete_ablation_37_68_54/candidate_screening.csv
+#   outputs/streaming_couping_complete_ablation_37_68_54/threshold_sweep.csv
+#   outputs/streaming_couping_complete_ablation_37_68_54/geometry_gate_diagnostics.csv
+#   outputs/streaming_couping_complete_ablation_37_68_54/map_quality.csv
+#   outputs/streaming_couping_complete_ablation_37_68_54/metadata.json
+#   outputs/streaming_couping_complete_ablation_37_68_54.log

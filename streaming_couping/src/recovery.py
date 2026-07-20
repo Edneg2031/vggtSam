@@ -23,9 +23,14 @@ def mine_recovery(
     original_masks: torch.Tensor,
     original_scores: torch.Tensor,
     geometry: GeometrySequence,
+    map_update_policy: str = "reference_only",
 ) -> dict:
     """Find geometry-supported frames where the original tracker is weak."""
 
+    if map_update_policy not in {"reference_only", "joint_reliable"}:
+        raise ValueError(
+            "map_update_policy must be 'reference_only' or 'joint_reliable'."
+        )
     object_map = ObjectPointMap(
         max_points_per_object=config.max_points_per_object
     )
@@ -85,13 +90,55 @@ def mine_recovery(
                     support_relative_distance=config.support_relative_distance,
                 )
         candidates.append(candidate)
+        tracker_geometry_coverage = _coverage(
+            candidate.supported_mask,
+            original_mask,
+        )
         decision = decide_correction(
             tracker_mask=original_mask,
             tracker_score=original_score,
             candidate=candidate,
             tracker_low_score=config.tracker_low_score,
             fallback_on_missing_mask=config.fallback_on_missing_mask,
+            tracker_geometry_coverage=tracker_geometry_coverage,
+            tracker_min_geometry_coverage=(
+                config.tracker_min_geometry_coverage
+            ),
+            fallback_on_geometry_disagreement=(
+                config.fallback_on_geometry_disagreement
+            ),
         )
+        update_map = (
+            map_update_policy == "joint_reliable"
+            and sequence_index != reference
+            and bool(original_mask.any())
+            and original_score >= config.map_update_min_score
+            and candidate.accepted
+            and tracker_geometry_coverage
+            >= config.map_update_min_geometry_coverage
+            and not decision.use_correction
+        )
+        if update_map:
+            update_mask = output_mask_to_stream(
+                original_mask,
+                source_size=geometry.source_sizes[sequence_index],
+                processed_size=geometry.processed_size,
+                image_mode=config.image_mode,
+            )
+            update_points, update_weights = sample_masked_observation(
+                geometry.world_points[sequence_index],
+                geometry.confidence[sequence_index],
+                update_mask,
+                max_points=config.max_points_per_observation,
+            )
+            object_map.update(
+                instance_id=sequence.instance_id,
+                label=sequence.label,
+                points=update_points,
+                weights=update_weights,
+                frame_idx=sequence_index,
+            )
+        entry_after = object_map.get(sequence.instance_id)
         rows.append(
             {
                 "sequence_index": sequence_index,
@@ -116,8 +163,21 @@ def mine_recovery(
                 "supported_points": candidate.supported_points,
                 "projected_fraction": candidate.projected_fraction,
                 "support_ratio": candidate.support_ratio,
+                "tracker_geometry_coverage": tracker_geometry_coverage,
                 "candidate_accepted": int(candidate.accepted),
                 "use_correction": int(decision.use_correction),
+                "map_update_policy": map_update_policy,
+                "map_updated": int(update_map),
+                "map_observations": (
+                    entry_after.observations
+                    if entry_after is not None
+                    else 0
+                ),
+                "map_points": (
+                    int(entry_after.points.shape[0])
+                    if entry_after is not None
+                    else 0
+                ),
                 "gate_reason": decision.reason,
             }
         )
@@ -254,3 +314,12 @@ def centroid_error(
         pred_y.float().mean() - target_y.float().mean()
     ) / max(height, 1)
     return float(torch.sqrt(dx * dx + dy * dy))
+
+
+def _coverage(evidence: torch.Tensor, mask: torch.Tensor) -> float:
+    evidence = evidence.detach().cpu().bool()
+    mask = mask.detach().cpu().bool()
+    denominator = int(evidence.sum())
+    if denominator == 0:
+        return 0.0
+    return float((evidence & mask).sum()) / denominator

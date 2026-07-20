@@ -22,21 +22,40 @@ def decide_correction(
     candidate: RevisitCandidate,
     tracker_low_score: float,
     fallback_on_missing_mask: bool,
+    tracker_geometry_coverage: float = 1.0,
+    tracker_min_geometry_coverage: float = 0.0,
+    fallback_on_geometry_disagreement: bool = False,
 ) -> CorrectionDecision:
     tracker_present = bool(tracker_mask.any())
     tracker_reliable = tracker_present and float(tracker_score) >= float(
         tracker_low_score
     )
     tracker_missing = not tracker_present
-    tracker_weak = tracker_missing or not tracker_reliable
+    geometry_disagreement = (
+        fallback_on_geometry_disagreement
+        and candidate.accepted
+        and bool(candidate.supported_mask.any())
+        and float(tracker_geometry_coverage)
+        < float(tracker_min_geometry_coverage)
+    )
+    tracker_weak = tracker_missing or not tracker_reliable or geometry_disagreement
 
     use_correction = (
         candidate.accepted
         and tracker_weak
-        and (fallback_on_missing_mask or not tracker_missing)
+        and (
+            not tracker_missing
+            or fallback_on_missing_mask
+        )
     )
     if use_correction:
-        reason = "weak/missing tracker mask: refine accepted geometry candidate"
+        if geometry_disagreement and tracker_reliable:
+            reason = (
+                "high-score tracker mask disagrees with aligned geometry: "
+                "refine accepted candidate"
+            )
+        else:
+            reason = "weak/missing tracker mask: refine accepted geometry candidate"
     elif tracker_reliable:
         reason = "reliable SAM3 mask"
     elif not candidate.accepted:
