@@ -3,7 +3,7 @@
 # The recovery thresholds are fixed from the completed post-hoc sweep:
 #   tracker geometry coverage < 0.50 triggers candidate evaluation;
 #   selected candidate support coverage >= 0.25 permits writeback.
-# Keep default.yaml unchanged as the original ablation baseline.
+# This is the only active experiment configuration.
 dataset:
   manifest: data/processed/scannetpp_pinhole_2d/manifest.json
   scene_id: 00a231a370
@@ -59,4 +59,4 @@ point_cloud:
   metric_thresholds: [0.05, 0.10]
 
 output:
-  dir: outputs/streaming_couping_threshold_050_025_probe119_37_68_54
+  dir: outputs/streaming_couping_instance_pose_v2_37_68_54

@@ -1,145 +1,142 @@
-# Causal multi-instance pointmap / camera-pose refinement
+# 多实例 pointmap / 相机位姿修复第二版
 
-## 目标与边界
+## 研究边界
 
-本实验检验已经可靠的 tracking 和 persistent instance geometry 能否进一步修复
-StreamVGGT 的 pointmap translation，并将修复传给 camera pose。它不是新的
-SAM3 消融，也不是单实例相机 ICP：
+当前链路为：
 
 ```text
-geometry -> tracking recovery（已验证）
-tracking -> persistent static-instance maps（已验证实例点云）
-instance maps -> one shared frame pointmap translation（当前待验证）
-corrected pointmap -> all-point ray-center camera translation（已验证算子）
+geometry -> SAM3 tracking recovery（已验证）
+tracking -> persistent static-instance maps
+instance maps -> 一个整帧共享 pointmap translation
+corrected pointmap -> all-point ray-center camera translation
 ```
 
-reference 帧 GT mask 是跟踪 prompt 和地图初始化条件。reference 后的 GT mask、
-GT pointmap 和 GT pose 不参与 deployable gate、ICP、共识、地图更新或 ray fit。
+相机和整帧 pointmap 从不按实例分别修改。reference 后 GT 只用于指标和名称中明确
+标出的 `gt_point_translation_oracle`。
 
-## 可部署计算图
+## 第一版负结果
 
-对静态实例 `k`，reference map 为 `O_0^k`。当前帧 mask 内高置信 point-head 点为
-`P_t^k`。translation-only trimmed nearest-neighbor ICP 迭代：
+第一版把共识平移同时写入所有参与实例的 object map，并使用较宽的
+correspondence/consensus gate。服务器结果：
+
+| mode | fixed-reference ATE | adjacent RPE translation RMSE |
+|---|---:|---:|
+| `ray_only` | 0.175915 m | 0.080938 m |
+| V1 causal a100 | 0.181835 m | 0.090999 m |
+| V1 causal a025 | 0.176317 m | 0.080894 m |
+| GT translation oracle | 0.128355 m | 0.067590 m |
+
+V1 a100 相比 `ray_only` 的 ATE 恶化 3.37%，RPE 恶化 12.43%，因此第一版不能
+作为主方法。它仍在第二版同次实验中以 `v1_shared_map_a100` 复现，便于排除代码
+版本差异。
+
+主要失败原因：
+
+1. shared correction 写进每个实例地图，掩盖实例间 proposal 差异并污染后续配准；
+2. correspondence ratio 0.15、consensus distance 0.05 过宽；
+3. 帧 130 有修正、140 归零，令 130→140 direction error 从 29.63° 增至 75.78°；
+4. bed 的恢复 mask 很好，但跨视角表面与历史地图几乎无几何重叠，无法提供 ICP
+   proposal。这说明 tracking recovery 成功不等于该实例一定能约束 pose。
+
+V1 a050 的 non-reference pointmap RMSE 从 0.132935 m 降到 0.130259 m，证明实例
+几何存在弱有效信号；但它没有转化成 pose 改善。GT translation oracle 的
+non-reference pointmap RMSE 为 0.115600 m，说明仍有可研究空间。
+
+## 第二版计算图
+
+每个实例仍用 translation-only trimmed nearest-neighbor ICP：
 
 ```text
 j(i) = NN(P_t^k[i] + delta, O_<t^k)
-r_i  = O_<t^k[j(i)] - (P_t^k[i] + delta)
-delta <- delta + coordinate_median(r_i in trimmed inliers)
+delta <- delta + coordinate_median(
+  O_<t^k[j(i)] - (P_t^k[i] + delta)
+)
 ```
 
-ICP 同时尝试 zero 与 robust-centroid 两个初始化；centroid 初值超过最大允许平移时
-不会启用。候选先按 inlier fitness、再按 RMSE 选择，最终仍必须经过 magnitude
-和跨实例共识 gate。这避免小幅真实平移被 zero-init 最近邻局部极小吞掉，同时用
-多实例一致性约束 partial-view centroid 偏差。
-
-每个 proposal 必须满足：
-
-- 当前点和地图点均不少于 128；
-- inlier fitness 不低于 0.25；
-- proposal norm 不超过 0.15（StreamVGGT native gauge）；
-- correspondence distance 为
-  `max(0.02, 0.15 * robust_object_scale)`。
-
-通过单实例 gate 的 proposals 再做跨实例共识。至少两个实例距共识中心不超过
-0.05 native，随后实例等权的 coordinate-wise median 形成唯一 `Delta_t`。整帧
-pointmap 只更新一次：
+严格 proposal gate：
 
 ```text
-X'_t = X_t + alpha * Delta_t
+min points              = 128
+min fitness             = 0.25
+max ICP RMSE             = 0.03 native
+correspondence distance  = max(0.02, 0.05 * object scale)
+max translation norm     = 0.15 native
 ```
 
-无共识时 `Delta_t=0`。causal map 只接收参与共识且 tracker score 不低于 0.50
-的 observation：
+至少两个 proposal 围绕最终 coordinate-wise median 的最大残差不超过 0.02，
+才产生多实例共享平移。
+
+第二版将地图与相机职责分开：
 
 ```text
-O_t^k = merge(O_<t^k, P_t^k + Delta_t)
+object map k update:  P_t^k + delta_t^k
+whole-frame update:   X'_t = X_t + alpha * Delta_t
 ```
 
-注意地图始终使用完整 `Delta_t`，alpha 只缩放输出 pointmap correction。因此
-alpha 分支共享完全相同的 ICP proposals 和 map history。
+即每个通过严格 gate 的实例只用自己的 `delta_t^k` 更新自己的地图；相机仍只使用
+一个 `Delta_t`。这不恢复“每实例独立改相机”的旧方案。
 
-最后固定 StreamVGGT predicted `K/R`，用修正后的全点 pointmap 求 camera center：
+## 短期连续机制
+
+多实例共识失败时，只有以下条件全部成立，单实例 proposal 才能产生整帧修正：
+
+- 当前恰好一个 proposal 通过严格 gate；
+- 距最近一次多实例共识的源帧间隔不超过 15；
+- proposal 与最近共享平移的距离不超过 0.02；
+- tracker score 不低于 map update score gate。
+
+接受后可以更新平移值，但 15 帧窗口始终锚定最近一次多实例共识，不能靠连续单实例
+carry 无限向后滚动。平移使用：
 
 ```text
-C'_t = argmin_C sum_i w_i ||(I - d_i d_i^T)(X'_t[i] - C)||^2
-t'_t = -R_t C'_t
+Delta_t = 0.5 * previous_Delta + 0.5 * current_delta
 ```
 
-若 ray 点少于 1024 或法方程条件数超过 `1e8`，回退到
-`raw_center + applied_translation`。
+若多个 proposal 通过但互相冲突，carry 被明确禁止且历史连续状态立即清空。长间隔
+同样清空，因而不会把帧 140 的状态无条件带到 210/240。
 
 ## 同次消融
 
-| mode | 作用 |
+| mode | 唯一变量 |
 |---|---|
-| `raw_camera_head` | StreamVGGT camera-head baseline |
-| `ray_only` | 未修 pointmap + 已验证 all-point ray-center |
-| `original_causal_a100` | 不做 tracking recovery |
-| `recovered_reference_a100` | 只用 reference instance map |
-| `recovered_causal_a025/a050/a075/a100` | 可部署 tracking + causal map，固定 alpha 消融 |
-| `gt_masks_causal_a100` | reference 后 GT-mask oracle |
-| `shuffled_ids_causal_a100` | 当前实例查询错误 ID map 的负对照 |
-| `gt_point_translation_oracle` | paired GT pointmap 的 translation-only oracle |
+| `ray_only` | 无实例修正 |
+| `v1_shared_map_a100` | 第一版复现 |
+| `v2_strict_shared_map_no_carry_a100` | 只收紧 gate |
+| `v2_strict_per_instance_no_carry_a100` | 再加入每实例地图更新 |
+| `v2_strict_per_instance_short_carry_a025/a050/a100` | 再加入短期连续，alpha 消融 |
+| `v2_strict_reference_no_carry_a100` | 只用 reference map |
+| `v2_strict_shuffled_short_carry_a100` | shuffled-ID 负对照 |
+| `gt_point_translation_oracle` | evaluation-only 上限 |
 
-当前 provisional main 是 `recovered_causal_a100`。只有服务器结果支持后才能改为
-“已验证主方法”。
+当前主候选是 `v2_strict_per_instance_short_carry_a100`，在服务器结果回来前只称
+candidate，不称已验证方法。
 
-## 判读顺序
+## 输出与判读
+
+优先检查：
 
 1. `instance_correction_events.csv`
-   - 哪些帧达到至少两个实例共识；
-   - 参与的是哪些实例；
-   - shared translation、applied translation 和 disagreement。
+   - `correction_source`
+   - `temporal_frame_gap`
+   - `temporal_proposal_distance_native`
+   - `map_update_instance_ids`
 2. `instance_icp_diagnostics.csv`
-   - proposal 是否因点数、fitness 或平移过大被拒绝；
-   - 37/68/54 的 proposal 是否同向。
-3. `instance_pointmap_summary.csv`
-   - `recovered_causal_a100` 是否低于 `ray_only` 的 nonreference RMSE；
-   - 帧 240 的 paired RMSE 是否下降。
-4. `instance_pose_summary.csv` 与 `instance_pose_rpe.csv`
-   - 固定 `reference_point_sim3` ATE；
-   - adjacent translation RPE。
-5. `instance_pose_pair_summary.csv`
-   - all-pairs translation-direction mean / @10°；
-   - 逐 pair 文件重点看 `210->240`。
+   - `icp_rmse_native`
+   - `consensus_participant`
+   - `temporal_participant`
+   - `map_updated`
+   - 每实例 `map_update_translation_native_*`
+3. `instance_pose_summary.csv`、`instance_pose_rpe.csv`
+4. `instance_pose_pair_summary.csv` 与 `instance_pose_pair_metrics.csv`
+5. `instance_pointmap_summary.csv`、`instance_pointmap_frame_metrics.csv`
 
-支持方法成立至少需要：
+重点 pairs：105→119、119→130、130→140、210→240。
 
-- recovered causal 优于 `ray_only`；
-- recovered causal 优于 original causal，证明 recovery 对 geometry 有贡献；
-- causal 优于 reference-only，证明历史地图有贡献；
-- shuffled IDs 明显更差或被共识 gate 拒绝；
-- GT oracles 给出合理、但未被 deployable 分支使用的上限。
-
-如果 `ray_only` 更好，先看是否没有共识；若有共识但方向错误，优先收紧
-consensus/fitness 或处理 bed 平面退化，不使用 GT 逐帧挑 alpha。
-
-## 缓存、输出与 PLY
-
-首次运行生成 `tracking_cache.npz`。cache 只缓存 original/recovered masks、
-scores、persistent obj IDs 和 tracking summary；它校验实例、帧、输出大小、
-mask shape 与 tracking 配置签名。改变实例 ICP/ray 参数不使 cache 失效，改变
-tracking 配置会自动重跑 SAM3。
-
-主要 CSV：
-
-- `tracking_summary.csv`
-- `instance_correction_events.csv`
-- `instance_icp_diagnostics.csv`
-- `instance_ray_fit.csv`
-- `instance_pose_summary.csv`
-- `instance_pose_frame_metrics.csv`
-- `instance_pose_rpe.csv`
-- `instance_pose_pair_metrics.csv`
-- `instance_pose_pair_summary.csv`
-- `instance_pointmap_frame_metrics.csv`
-- `instance_pointmap_summary.csv`
-
-实例点云保留在：
+PLY 保留：
 
 ```text
 instance_<id>/pointclouds/ray_only/
-instance_<id>/pointclouds/recovered_causal_a100/
+instance_<id>/pointclouds/v2_strict_per_instance_short_carry_a100/
 ```
 
-唯一服务器命令见 [`../commands.txt`](../commands.txt)。
+唯一服务器入口见 [`../commands.txt`](../commands.txt)。
