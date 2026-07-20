@@ -24,8 +24,8 @@ PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_pose
   --output-dir outputs/streaming_couping_ray_center_00a231a370 \
   2>&1 | tee outputs/streaming_couping_ray_center_00a231a370.log
 
-# 同一次运行包含 raw、可部署 predicted-K、K/R oracle 和 shuffled negative
-# control。运行结束后优先回传以下小文件，不需要回传 PLY：
+# 同一次运行包含 raw、可部署 predicted-K 全点主分支、80% trimming 消融、
+# K/R oracle 和 shuffled negative control。运行结束后优先回传以下小文件：
 #   outputs/streaming_couping_ray_center_00a231a370/ray_pose_summary.csv
 #   outputs/streaming_couping_ray_center_00a231a370/ray_pose_frame_metrics.csv
 #   outputs/streaming_couping_ray_center_00a231a370/ray_pose_rpe.csv

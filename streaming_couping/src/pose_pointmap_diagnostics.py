@@ -444,7 +444,7 @@ def run_diagnostics(
                 "repair camera-head translation from point-head world points "
                 "while keeping the selected rotation and intrinsics fixed"
             ),
-            "deployable_mode": "ray_predicted_k_trimmed",
+            "deployable_mode": "ray_predicted_k_all",
             "fit_objective": (
                 "sum_i w_i ||(I-d_i d_i^T)(X_i-C)||^2"
             ),
@@ -461,10 +461,11 @@ def run_diagnostics(
             "modes": {
                 "raw_camera_head": "unmodified StreamVGGT camera head",
                 "ray_predicted_k_all": (
-                    "all confidence-gated points; predicted K and R"
+                    "deployable main mode; all confidence-gated points with "
+                    "predicted K and R"
                 ),
                 "ray_predicted_k_trimmed": (
-                    "robust residual trimming; predicted K and R"
+                    "robust residual-trimming ablation; predicted K and R"
                 ),
                 "ray_gt_k_trimmed": (
                     "GT processed K oracle; predicted R"
@@ -727,7 +728,7 @@ def _ray_center_ablation(
         },
         {
             "mode": "ray_predicted_k_all",
-            "role": "deployable_untrimmed_ablation",
+            "role": "deployable_main",
             "intrinsics": predicted_intrinsics,
             "rotations": predicted.camera_to_world_rotation,
             "fit": True,
@@ -738,7 +739,7 @@ def _ray_center_ablation(
         },
         {
             "mode": "ray_predicted_k_trimmed",
-            "role": "deployable_main",
+            "role": "robust_trimming_ablation",
             "intrinsics": predicted_intrinsics,
             "rotations": predicted.camera_to_world_rotation,
             "fit": True,

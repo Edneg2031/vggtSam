@@ -67,6 +67,19 @@ tracking 扩充的 object map 与 reference-only map 在本例中选中同一候
 spatially-shuffled pointmap 负对照；设计说明见
 [`pose_pointmap_diagnostics.md`](pose_pointmap_diagnostics.md)。
 
+服务器结果选择 confidence-gated 全点版本 `ray_predicted_k_all` 为当前主方法。
+固定 reference-point Sim(3) 下，ATE RMSE 从 `0.3745` 降到 `0.1759 m`，
+adjacent RPE translation RMSE 从 `0.1522` 降到 `0.0809 m`；all-pairs
+translation direction mean 从 `14.56°` 降到 `11.35°`，10° accuracy 从
+`33.3%` 提高到 `71.4%`。shuffled pointmap ATE 恶化为 `1.4202 m`。这证明
+point-head 世界点确实能无训练修复 camera-head translation。
+
+80% trimming 在所有非 reference 帧均略差，已降级为消融。GT-K oracle ATE
+为 `0.1238 m`，但其 ray residual 高于 predicted K，说明两个预测 head 存在
+“内部更自洽但物理内参更偏”的共同误差，不能直接最小化 ray residual 来学习
+focal。`210->240` 的方向误差仍为 `43.96°`，下一步才引入跨帧 persistent
+static-instance geometry，重点修正 pointmap 自身在帧 240 的退化。
+
 ## 0. 总体框架
 
 ```
