@@ -1,7 +1,9 @@
 # Streaming Coupling
 
-当前目录保留一条已完成阶段性验证的正式主线：冻结 SAM3 与 StreamVGGT，通过
-可靠性控制构建对象级 2D–3D 双向闭环。
+当前目录保留一条冻结 SAM3 与 StreamVGGT 的对象级 2D–3D 双向闭环。tracking
+恢复和实例点云阶段已经完成压力测试；当前实验继续使用可靠实例地图修正
+StreamVGGT pointmap translation，再运行已验证的 ray-center camera translation
+repair。
 
 ```text
 SAM3 persistent obj_id / mask memory
@@ -11,8 +13,9 @@ SAM3 persistent obj_id / mask memory
 StreamVGGT persistent 3D object map
 ```
 
-实验不训练 adapter，不做 token concat、ICP 或相机修正。SAM3 恢复阶段现已
-暂停，下一阶段转向实例点云与相机位姿研究。
+实验不训练 adapter，也不做 token concat。当前只使用 translation-only
+instance ICP，而且多个静态实例必须形成共识后才产生一个整帧共享平移；不会给
+每个实例各自修改相机。
 
 ## 当前实验
 
@@ -26,8 +29,10 @@ StreamVGGT persistent 3D object map
 
 完整恢复实验设计见
 [`docs/ablation_plan.md`](docs/ablation_plan.md)。当前点图/位姿诊断设计见
-[`docs/pose_pointmap_diagnostics.md`](docs/pose_pointmap_diagnostics.md)，服务器
-命令见 [`commands.txt`](commands.txt)。
+[`docs/pose_pointmap_diagnostics.md`](docs/pose_pointmap_diagnostics.md)，当前
+多实例位姿实验见
+[`docs/instance_pose_refinement.md`](docs/instance_pose_refinement.md)，服务器
+唯一命令见 [`commands.txt`](commands.txt)。
 
 最终验证配置为 `configs/recovery_050_025.yaml`：
 
@@ -129,10 +134,9 @@ gate 拒绝；natural 与 scheduled 在 bed 上结果相同。完整结果和解
 所以本例证明的是几何帮助追踪、恢复后的追踪帮助点云；尚未证明历史 tracking
 扩图比 reference-only map 更利于恢复。
 
-## 当前点图/相机位姿修复消融
+## 已验证的 ray-center 位姿修复
 
-当前 `commands.txt` 不再重跑 SAM3 恢复消融，而是只提取一次 frozen
-StreamVGGT，输出：
+上一阶段只提取一次 frozen StreamVGGT，输出：
 
 - 固定 reference-point Sim(3) 下的 pose ATE/RPE；
 - reference-pose 对齐后的相对漂移；
@@ -152,7 +156,31 @@ reference-point Sim(3) ATE `0.3745 -> 0.1759 m`，RPE translation RMSE
 消融；同次还运行 GT K/R oracle 和 spatially-shuffled pointmap 负对照。详见
 [`docs/pose_pointmap_diagnostics.md`](docs/pose_pointmap_diagnostics.md)。
 
-## 主要输出
+## 当前多实例 pointmap/pose 消融
+
+当前 `commands.txt` 已切换到一次完整实验：
+
+```text
+original + natural-recovered SAM3 tracking（首次运行后缓存）
+  -> reference GT prompt 初始化三个独立 static-instance maps
+  -> 当前实例点对历史同 ID map 做 translation-only trimmed NN ICP
+  -> 至少两个实例的 proposal 在阈值内形成共识
+  -> 实例等权 coordinate-wise median 得到一个整帧共享 translation
+  -> 对完整 pointmap 只写入一次
+  -> predicted-K/R all-point ray-center
+  -> 固定 R，以 t=-RC 更新 camera pose
+```
+
+无共识时实例修正严格为零，仍保留 `ray_only` 结果。causal map 只接收共识参与者
+且 tracker score 可靠的 observation。alpha 消融只缩放整帧 pointmap 写回量；
+object map 始终使用完整共享 translation 更新，因此不会混淆地图历史与修正强度。
+
+无 GT 主分支是 `recovered_causal_a100`。`gt_masks_causal_a100` 和
+`gt_point_translation_oracle` 只提供评估上限，`shuffled_ids_causal_a100` 是
+实例身份负对照。主要看主分支相对 `ray_only` 是否继续降低 pointmap RMSE、
+固定 reference-point Sim(3) ATE/RPE，以及能否改善帧 240 和 `210->240`。
+
+## 已完成 tracking 阶段的主要输出
 
 输出根目录：
 
@@ -182,7 +210,7 @@ reference-point Sim(3) ATE `0.3745 -> 0.1759 m`，RPE translation RMSE
 若 manifest 没有 mesh-rasterized GT pointmap，tracking 消融仍会完整运行，
 `metadata.json` 会记录 map evaluation 被禁用的原因。
 
-## 优先判读
+## 已完成 tracking 阶段的判读顺序
 
 1. `candidate_screening.csv` 判断瓶颈在候选生成还是几何选择。
 2. scheduled probe 中比较 full memory 与 no-memory 的
@@ -198,8 +226,10 @@ reference-point Sim(3) ATE `0.3745 -> 0.1759 m`，RPE translation RMSE
 
 ```text
 scripts/run_recovery_writeback_ablation.py  CLI
-scripts/run_pose_pointmap_diagnostics.py     当前 pose/pointmap 诊断 CLI
+scripts/run_pose_pointmap_diagnostics.py     已验证 ray-center 诊断 CLI
+scripts/run_instance_pose_refinement_ablation.py 当前唯一实验 CLI
 src/recovery_writeback_ablation.py          两策略、七分支与汇总
+src/instance_pose_refinement.py             多实例共享平移 + ray pose
 src/recovery.py                             几何挖掘、联合 gate、可靠地图更新
 src/instance_point_cloud.py                 实例 PLY
 src/instance_map_evaluation.py              evaluation-only 3D map metrics

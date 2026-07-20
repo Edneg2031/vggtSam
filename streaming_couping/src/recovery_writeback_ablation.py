@@ -481,6 +481,67 @@ def run_experiment(
     )
 
 
+def run_natural_recovery_tracking(
+    config: ExperimentConfig,
+    *,
+    sequence,
+    target_masks: torch.Tensor,
+    geometry: GeometrySequence,
+    sam3: SAM3Wrapper,
+) -> dict:
+    """Run only the deployable original/recovered tracking pair.
+
+    This lightweight entry point is used by later geometry experiments. It
+    deliberately skips scheduled probes, candidate-screening sweeps, shuffled
+    controls, and GT oracle writeback branches.
+    """
+
+    original = sam3.track(
+        sequence.image_paths,
+        prompt=sequence.label,
+        output_size=config.output_size,
+        reference_frame_idx=sequence.reference_frame_idx,
+        reference_mask=target_masks[sequence.reference_frame_idx],
+    )
+    aligned = _prepare_recovery(
+        config,
+        sequence=sequence,
+        target_masks=target_masks,
+        original=original,
+        geometry=geometry,
+        geometry_alignment="aligned",
+        geometry_permutation=tuple(range(len(sequence.frame_indices))),
+        sam3=sam3,
+        candidate_cache={},
+        map_update_policy="joint_reliable",
+        event_policy="natural_joint_gate",
+        forced_recovery_index=None,
+    )
+    recovered, applied = _writeback_or_original(
+        config,
+        sequence=sequence,
+        target_masks=target_masks,
+        sam3=sam3,
+        original=original,
+        recovery_index=aligned["recovery_index"],
+        recovery_mask=aligned["recovery_mask"],
+    )
+    return {
+        "original": original,
+        "recovered": recovered,
+        "recovery_applied": bool(applied),
+        "recovery_sequence_index": aligned["recovery_index"],
+        "recovery_frame_index": aligned["recovery_frame_index"],
+        "recovery_reason": aligned["reason"],
+        "selected_support_coverage": aligned[
+            "selected_support_coverage"
+        ],
+        "selected_candidate_gt_iou": aligned[
+            "selected_candidate_gt_iou"
+        ],
+    }
+
+
 def _run_instance(
     config: ExperimentConfig,
     *,

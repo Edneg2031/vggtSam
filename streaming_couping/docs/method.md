@@ -80,6 +80,25 @@ point-head 世界点确实能无训练修复 camera-head translation。
 focal。`210->240` 的方向误差仍为 `43.96°`，下一步才引入跨帧 persistent
 static-instance geometry，重点修正 pointmap 自身在帧 240 的退化。
 
+当前待验证实现已经接上这一步：
+
+```text
+natural recovered masks + persistent instance IDs
+  -> 每个静态实例对自身 causal map 提出 translation-only ICP delta
+  -> 至少两个实例通过 fitness / magnitude / consensus gate
+  -> 实例等权 median 得到唯一 shared frame delta
+  -> X'_t = X_t + alpha * delta（整帧 pointmap 只写一次）
+  -> predicted-K/R all-point ray-center
+  -> keep R, replace t with -R C'
+```
+
+三个实例地图始终彼此独立，实例 proposal 只用于估计同一个 frame translation，
+不恢复旧的“每个实例独立修改一次相机”。causal map 使用完整 `delta` 更新，alpha
+只控制整帧 pointmap 写回，因此四个 alpha 分支复用同一 ICP/map 历史。无共识时
+`delta=0`，自然退化为已验证的 `ray_only`。reference 后的 GT 仅存在于
+`gt_masks_causal_a100`、`gt_point_translation_oracle` 和评估指标中。完整设计及
+判读协议见 [`instance_pose_refinement.md`](instance_pose_refinement.md)。
+
 ## 0. 总体框架
 
 ```

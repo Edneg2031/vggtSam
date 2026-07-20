@@ -332,3 +332,48 @@ GT-K+R 和 spatially-shuffled pointmap 分支。GT 分支只诊断 intrinsics/ro
 新输出为 `ray_fit_*.csv` 与 `ray_pose_*.csv`；唯一服务器命令已更新到
 `streaming_couping/commands.txt`。本阶段仍不运行 SAM3；只有 ray-center 被证明
 能改善固定 point-Sim3 下的 ATE/RPE 后，才接可靠多实例点云。
+
+## 2026-07-20 更新：多实例共享 pointmap translation 已实现
+
+当前已经进入下一阶段，唯一入口为
+`scripts/run_instance_pose_refinement_ablation.py`。它首次运行时只执行精简后的
+original/natural-recovered tracking；结果写入 `tracking_cache.npz`，后续在同一
+output directory 调实例 ICP/ray 参数会跳过 SAM3。cache 校验 instance IDs、帧、
+mask shape、output size 和 tracking 配置签名。
+
+部署候选 `recovered_causal_a100` 的因果流程为：
+
+```text
+reference GT prompt
+  -> 37/68/54 各自初始化 persistent static-instance map
+  -> 当前 mask 内 point-head 点对同 ID map 做 translation-only trimmed NN ICP
+  -> 每实例 proposal 通过 points / fitness / magnitude gate
+  -> 至少两个实例在 consensus distance 内
+  -> coordinate-wise median 形成一个 shared frame translation
+  -> 完整当前 pointmap 加一次 translation
+  -> predicted-K/R all-point ray-center
+  -> 固定 rotation，更新 world-to-camera translation
+```
+
+causal map 只更新参与共识且 tracker score 不低于 `0.50` 的实例。地图使用完整
+shared translation 更新；`a025/a050/a075` 只缩放输出 pointmap correction，并
+复用 `a100` 的 ICP/map 历史。这样 alpha 消融只回答“整帧修多少”，不会同时改变
+地图质量。无至少两个实例共识时 correction 为零。
+
+同次模式包括：
+
+- `raw_camera_head`、`ray_only`；
+- `original_causal_a100`；
+- `recovered_reference_a100`；
+- `recovered_causal_a025/a050/a075/a100`；
+- `gt_masks_causal_a100`（tracking-mask oracle）；
+- `shuffled_ids_causal_a100`（identity negative control）；
+- `gt_point_translation_oracle`（translation-only pointmap oracle）。
+
+默认 ICP 在 `cuda:1` 上采样计算；完整 pointmap、指标和实例 PLY 保留原分辨率。
+PLY 导出保留 `ray_only` 与 `recovered_causal_a100`。当前尚无服务器结果，不能
+声称 persistent map 已修复 pose。第一判据是 `recovered_causal_a100` 相对
+`ray_only` 是否改善固定 reference-point Sim(3) 的 ATE/RPE 和 pointmap RMSE；
+重点检查帧 240、`210->240`，并要求优于 original/reference-only 且显著优于
+shuffled。详细协议见 `docs/instance_pose_refinement.md`，服务器命令只保留在
+`streaming_couping/commands.txt`。
