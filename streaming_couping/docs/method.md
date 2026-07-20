@@ -1,8 +1,55 @@
 # 流式几何重建 × 开放词表实例跟踪 耦合系统技术方案细化
 
-> **历史研究方案。** 本文保留已经尝试过的设计、负结果和后续设想，其中多项
-> 实验入口已从代码中删除。当前唯一可运行主线、四分支定义和命令以
+> **研究记录。** 本文后半部分保留已经尝试过的设计、负结果和后续设想，其中
+> 多项实验入口已从代码中删除。当前已验证主线和命令以
 > [`../readme.md`](../readme.md) 与 [`../commands.txt`](../commands.txt) 为准。
+
+## 当前已验证方法（2026-07-20）
+
+当前方法不是 token fusion，也不修改 SAM3 decoder。它使用显式 2D–3D 几何作为
+冻结 SAM3 与冻结 StreamVGGT 之间的桥：
+
+```text
+SAM3 mask + persistent obj_id
+  -> 与历史实例 3D 支持计算 tracker geometry coverage
+  -> coverage < 0.50 时判断可能发生高置信跟错
+  -> SAM3 global-text 生成当前帧完整同类候选
+  -> 时序对齐几何按 support coverage 选择历史实例
+  -> support coverage >= 0.25 时写回原 obj_id memory
+  -> 恢复未来 mask，并用可靠 mask 生成实例点云
+```
+
+对象地图只接收 score 与 geometry coverage 均可靠的 tracking observation；
+`map_update_min_geometry_coverage=0.50`。reference 后的 GT mask/pointmap 只进入
+指标和显式 control，不进入 deployable 方法。
+
+在场景 `00a231a370`、帧 `90 105 119 130 140 210 240` 的 bed(54) 压力测试中：
+
+- 原始帧 119：SAM3 score `0.9844`、IoU `0.0207`；
+- geometry-selected candidate：IoU `0.9323`，等于 candidate oracle；
+- no-memory 后续 4 帧平均 IoU：`0.0002`；
+- same-ID memory 后续 4 帧平均 IoU：`0.7763`；
+- object-map F-score@10cm：`0.0819 -> 0.9443`；
+- GT-mask map oracle F-score@10cm：`0.9481`；
+- shuffled geometry 无恢复；37/68 natural gate 无误触发。
+
+由此已经验证“geometry → tracking recovery → better instance point cloud”。历史
+tracking 扩充的 object map 与 reference-only map 在本例中选中同一候选，因而
+尚不能声称历史扩图进一步改善了恢复选择。
+
+`oracle_mask_same_id_memory` 是 GT 当前可见 mask 写回控制，不是未来传播上限；
+完整 text candidate 的未来追踪和地图结果更好。
+
+本阶段现已暂停，不继续 held-out 或阈值调优。下一阶段研究实例点云与相机位姿：
+
+1. 以 `instance_point_cloud.py` 和 `instance_map_evaluation.py` 为点云基线；
+2. 核对 StreamVGGT `world_to_camera`、pointmap 与 GT pose 的坐标约定；
+3. 建立 raw StreamVGGT pose 的 ATE/RPE 与逐帧点云一致性诊断；
+4. 再判断可靠静态实例是否能形成相机位姿约束；
+5. 旧 translation-only ICP 仅作为历史诊断，不直接恢复为默认方案。
+
+其中第 2、3 项已实现于 `pose_pointmap_diagnostics.py`，设计说明见
+`pose_pointmap_diagnostics.md`；当前等待服务器 raw baseline 结果。
 
 ## 0. 总体框架
 

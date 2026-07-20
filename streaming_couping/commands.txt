@@ -1,38 +1,30 @@
-# 服务器阈值固定后的因果验证。
+# 当前阶段：StreamVGGT 原始点图与相机位姿诊断。
 #
-# 实例角色：
-#   37 cabinet、68 wardrobe：SAM3 易例，用来检查几何闭环是否误伤。
-#   54 bed：高置信但 IoU 低的压力例，用来检查 geometry-disagreement gate。
-#
-# 本轮固定上一轮 threshold sweep 选出的阈值：
-#   tracker_min_geometry_coverage = 0.50
-#   recovery_min_support_coverage = 0.25
-# map update gate 保持 0.50，避免错误追踪污染对象地图。
-#
-# natural_joint_gate 检查实际方法能否在 bed 帧 119 自动触发；
-# scheduled_probe 固定在序列位置 2（帧 119），用于同一事件的受控比较。
-# 默认基线配置 default.yaml 和旧输出目录均保持不变。
+# 不运行 SAM3，不使用实例 mask，不修改 pointmap 或 pose。主指标使用 reference
+# 帧全场景 paired pointmap 拟合的一次固定 Sim(3)，并同时输出：
+#   reference_point_sim3       主评估；检查 pose head 与 point head/GT 的一致性
+#   reference_pose_point_scale 首帧 pose 对齐；检查后续相对漂移
+#   trajectory_sim3            全轨迹拟合；仅作乐观 gauge 参照
 mkdir -p outputs
 set -o pipefail
 
-PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_recovery_writeback_ablation \
+PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_pose_pointmap_diagnostics \
   --config streaming_couping/configs/recovery_050_025.yaml \
   --manifest data/processed/scannetpp_pinhole_2d/manifest.json \
   --scene-id 00a231a370 \
-  --instance-ids 37 68 54 \
   --frame-indices 90 105 119 130 140 210 240 \
   --reference-sequence-index 0 \
-  --event-policies natural_joint_gate scheduled_probe \
-  --probe-sequence-index 2 \
-  --sam3-device cuda:3 \
   --geometry-device cuda:1 \
-  --output-dir outputs/streaming_couping_threshold_050_025_probe119_37_68_54 \
-  2>&1 | tee outputs/streaming_couping_threshold_050_025_probe119_37_68_54.log
+  --output-dir outputs/streaming_couping_pose_pointmap_raw_00a231a370 \
+  2>&1 | tee outputs/streaming_couping_pose_pointmap_raw_00a231a370.log
 
-# 运行结束后优先回传这些小文件；PLY 和 PNG 暂时不用传：
-#   outputs/streaming_couping_threshold_050_025_probe119_37_68_54/summary.csv
-#   outputs/streaming_couping_threshold_050_025_probe119_37_68_54/candidate_screening.csv
-#   outputs/streaming_couping_threshold_050_025_probe119_37_68_54/geometry_gate_diagnostics.csv
-#   outputs/streaming_couping_threshold_050_025_probe119_37_68_54/map_quality.csv
-#   outputs/streaming_couping_threshold_050_025_probe119_37_68_54/metadata.json
-#   outputs/streaming_couping_threshold_050_025_probe119_37_68_54.log
+# 运行结束后回传以下小文件，不需要回传 PLY：
+#   outputs/streaming_couping_pose_pointmap_raw_00a231a370/pose_summary.csv
+#   outputs/streaming_couping_pose_pointmap_raw_00a231a370/pose_frame_metrics.csv
+#   outputs/streaming_couping_pose_pointmap_raw_00a231a370/pose_rpe.csv
+#   outputs/streaming_couping_pose_pointmap_raw_00a231a370/pose_pair_summary.csv
+#   outputs/streaming_couping_pose_pointmap_raw_00a231a370/pointmap_summary.csv
+#   outputs/streaming_couping_pose_pointmap_raw_00a231a370/pointmap_frame_metrics.csv
+#   outputs/streaming_couping_pose_pointmap_raw_00a231a370/intrinsics_summary.csv
+#   outputs/streaming_couping_pose_pointmap_raw_00a231a370/metadata.json
+#   outputs/streaming_couping_pose_pointmap_raw_00a231a370.log

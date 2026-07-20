@@ -5,6 +5,44 @@
 `streaming_couping/docs/method.md`、`streaming_couping/commands.txt` 和当前
 Git 工作区，不要从头重新设计或重复已经完成的实验。
 
+## 当前状态（2026-07-20，最新）
+
+几何辅助 SAM3 实例恢复阶段已经完成。实例 54（bed）在高置信错误追踪压力序列
+上由 `natural_joint_gate` 自动于帧 119 恢复；37（cabinet）和 68（wardrobe）
+两个易例没有被误触发。当前不继续做 held-out 扩展，也不继续调整这条序列的
+阈值。已验证配置保存在：
+
+```text
+streaming_couping/configs/recovery_050_025.yaml
+```
+
+服务器原始结果目录为：
+
+```text
+outputs/streaming_couping_threshold_050_025_probe119_37_68_54/
+```
+
+固定阈值为：
+
+```yaml
+tracker_min_geometry_coverage: 0.50
+recovery_min_support_coverage: 0.25
+map_update_min_geometry_coverage: 0.50
+```
+
+SAM3 恢复路线现标记为“阶段完成/暂停”。下一阶段转向：
+
+1. 实例 mask 条件下的 StreamVGGT 点云生成、融合与质量分析；
+2. StreamVGGT 相机位姿的坐标约定、ATE/RPE 与漂移诊断；
+3. 研究可靠静态实例点云能否为相机位姿提供约束。
+
+第一步 raw baseline 已实现于 `src/pose_pointmap_diagnostics.py`，当前服务器命令
+在 `commands.txt`。该诊断不运行 SAM3，不使用实例 mask，只输出 frozen
+StreamVGGT 的 pose、pointmap 与 intrinsics evaluation。
+
+不要因为后续研究点云/位姿而删除当前 same-ID memory writeback 流程；它是已经
+验证过的可靠实例 mask 来源。
+
 ## 项目目标
 
 研究 SAM3 与 StreamVGGT 的双向协同：
@@ -12,7 +50,8 @@ Git 工作区，不要从头重新设计或重复已经完成的实验。
 - 几何帮助跟踪：解决大视角变化、遮挡后重现和相似外观下的实例恢复。
 - 稳定实例帮助几何：把长期可靠实例作为 object-level factors，约束相机漂移。
 
-当前优先完成第一条，并建立可解释、可消融的 baseline。
+第一条已经完成当前压力测试下的阶段性验证；现在优先进入第二条的点云与相机位姿
+研究。
 
 ## 已形成的核心判断
 
@@ -105,11 +144,11 @@ SAM3 应负责生成完整语义候选，几何只负责实例对应。
 本身没有完整物体，应优先改全图语义候选生成；若候选正确但后续又丢失，应修复
 presence gate、memory 写回或传播。
 
-## 当前用户待办
+## 历史用户待办（已完成）
 
 旧线程最后连续询问：“现在我要运行什么命令来消融实验呢？”
 
-新线程接续后应：
+以下事项已在 2026-07-20 前完成，仅作为历史记录：
 
 1. 先检查当前实现与 `commands.txt`，确认上述四组最小因果消融是否已经完整接线。
 2. 若尚未接线，直接补齐代码、CSV 字段和统一运行入口。
@@ -162,3 +201,82 @@ map_quality.csv
 metadata.json
 完整日志
 ```
+
+## 2026-07-20 更新：恢复阶段最终结果
+
+### 最终方法
+
+```text
+SAM3 原始实例追踪
+  -> 与时序对齐的 StreamVGGT object-map 投影计算 geometry coverage
+  -> coverage < 0.50 时触发全图文本候选
+  -> 按 3D support coverage 选择同类实例
+  -> selected support coverage >= 0.25 时接受
+  -> 完整候选 mask 写回原 SAM3 obj_id memory
+  -> 后续可靠 mask 继续生成实例点云
+```
+
+SAM3 和 StreamVGGT 均冻结。reference 后的 GT 不参与 natural trigger、候选排序、
+memory writeback 或 object-map 更新。
+
+### 2D 跟踪结论
+
+bed 在帧 119 的原始 SAM3 score 为 `0.9844`，但 IoU 只有 `0.0207`，证明仅用
+score 不能识别高置信跟错。几何分支选中的完整文本候选 IoU 为 `0.9323`，且与
+候选 oracle 完全一致。
+
+| bed 分支 | cross-view IoU | 帧 119 IoU | 后续 4 帧平均 IoU |
+|---|---:|---:|---:|
+| original | 0.1292 | 0.0207 | 0.0002 |
+| geometry recovery，无 memory | 0.2812 | 0.9323 | 0.0002 |
+| geometry recovery + same-ID memory | 0.7986 | 0.9323 | 0.7763 |
+| shuffled geometry + memory | 0.1292 | 0.0207 | 0.0002 |
+| GT-visible-mask writeback control | 0.6370 | 1.0000 | 0.5170 |
+
+same-ID memory 相比 no-memory 的 post-recovery IoU 增益为 `+0.7762`。恢复后的
+逐帧 IoU 为：帧 130 `0.8674`、帧 140 `0.9487`、帧 210 `0.6787`、帧 240
+`0.6105`。natural gate 与 scheduled probe 得到完全相同的 bed 结果。
+
+37/68 的 natural gate 均未触发，所有分支逐帧 IoU 与 original 完全相同。
+shuffled geometry 的候选支持覆盖不足而被拒绝，因此提升不能解释为“任意调用一次
+SAM3 文本分割都会改善”。
+
+### 实例点云结论
+
+使用一次固定 reference-frame Sim(3) 进行 evaluation-only 对齐：
+
+| bed map 分支 | Chamfer-L1 ↓ | F-score@5cm ↑ | F-score@10cm ↑ |
+|---|---:|---:|---:|
+| original | 0.5269 | 0.0359 | 0.0819 |
+| recovery，无 memory | 0.2678 | 0.0836 | 0.2167 |
+| recovery + same-ID memory | 0.0416 | 0.7152 | 0.9443 |
+| shuffled geometry | 0.5269 | 0.0359 | 0.0819 |
+| GT-mask map oracle | 0.0403 | 0.7396 | 0.9481 |
+
+完整方法的 F-score@10cm 达到 `0.9443`，接近 GT-mask map oracle 的 `0.9481`；
+Chamfer 从 `0.5269` 降到 `0.0416`。这证明恢复后的可靠追踪能显著改善实例点云。
+
+`reference_geometry_same_id_memory` 与 `geometry_recovery_same_id_memory` 在当前
+序列中结果相同。因此已经证明的是：
+
+- 时序对齐几何帮助追踪恢复；
+- 恢复后的追踪帮助实例点云构建。
+
+尚未证明“可靠历史 tracking 扩充的 3D map 比 reference-only map 更能改善候选
+选择”。该边界必须保留，不能把单例结果写成泛化结论。
+
+恢复帧直接写入 GT 可见 mask 的未来传播和地图结果反而低于完整文本候选，因此
+代码中的 `oracle_mask_same_id_memory` 仅保留为兼容名称；论文表述应使用
+“GT-visible-mask writeback control”，不能称为未来传播上限。
+
+### 阶段决策
+
+本结果被记录为当前压力测试下的阶段性成功，不继续 held-out 扩展。后续不再恢复
+token fusion、descriptor 或旧 translation-only ICP 路线，除非新的点云/位姿
+诊断给出明确需求。下一研究入口为：
+
+- `src/instance_point_cloud.py`：实例点云导出；
+- `src/instance_map_evaluation.py`：固定 Sim(3) 下的 3D 指标；
+- `src/backbones/streamvggt_wrapper.py`：pointmap、world-to-camera、intrinsics；
+- `src/aggregation/point_map_fusion.py`：共享坐标系中的点图融合。
+- `src/pose_pointmap_diagnostics.py`：raw pose ATE/RPE、pointmap 和内参诊断。

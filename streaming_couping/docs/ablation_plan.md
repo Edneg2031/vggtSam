@@ -1,5 +1,23 @@
 # 一次性双向耦合消融设计
 
+## 实验状态（2026-07-20）
+
+本消融已经完成。最终验证使用：
+
+```text
+tracker geometry coverage threshold = 0.50
+candidate support coverage threshold = 0.25
+scheduled probe = sequence index 2 / frame 119
+```
+
+bed(54) 的 natural gate 在帧 119 自动恢复：selected candidate IoU `0.9323`，
+same-ID memory 后续 4 帧平均 IoU `0.7763`，对象地图 F-score@10cm 从 `0.0819`
+提升到 `0.9443`；GT-mask map oracle 为 `0.9481`。37/68 natural gate 无误触发，
+shuffled geometry 无恢复。详细最终结论见 `thread_handoff.md`。
+
+当前不继续 held-out 扩展或阈值调优，研究转向实例点云与相机位姿。以下章节保留
+原始实验问题、设计和判读协议。
+
 ## 1. 本轮要回答的问题
 
 固定场景 `00a231a370` 和时序帧
@@ -41,9 +59,9 @@ SAM3 candidate 覆盖足够多的几何支持点。
 
 ### scheduled_probe
 
-机制探针。优先在序列位置 4，即帧 140，绕过“tracker 是否弱”这一项，但仍保留
-几何有效性与候选覆盖检查。这样即使 37/68 太容易，也能测试 memory writeback
-是否安全。
+原始机制探针设计优先在序列位置 4，即帧 140，绕过“tracker 是否弱”这一项，但
+仍保留几何有效性与候选覆盖检查。这样即使 37/68 太容易，也能测试 memory
+writeback 是否安全。最终阈值固定验证已按本文件顶部说明改为帧 119。
 
 如果帧 140 没有可执行候选，程序会在不读取 GT 的情况下选择最早可执行的后续
 帧。实际帧与 fallback 标志写入 `summary.csv`。
@@ -58,7 +76,7 @@ SAM3 candidate 覆盖足够多的几何支持点。
 | `geometry_recovery_same_id_memory` | 可靠历史 mask 扩图、几何选候选、same-ID 写回 | 完整双向主分支 |
 | `shuffled_geometry_same_id_memory` | 打乱非 reference 几何，其余不变 | 时序对齐几何的负对照 |
 | `oracle_candidate_same_id_memory` | GT 只在候选集合中选最优 mask | 候选选择上限 |
-| `oracle_mask_same_id_memory` | 恢复帧直接写 GT mask | SAM3 memory writeback 上限 |
+| `oracle_mask_same_id_memory` | 恢复帧直接写 GT 可见 mask | GT-visible-mask writeback control |
 
 `geometry_recovery_no_memory` 与
 `geometry_recovery_same_id_memory` 使用逐像素完全相同的恢复 mask；两者恢复后的

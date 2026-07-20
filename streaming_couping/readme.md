@@ -1,7 +1,7 @@
 # Streaming Coupling
 
-当前目录保留一条正式主线：冻结 SAM3 与 StreamVGGT，验证可靠性控制的对象级
-2D–3D 双向闭环。
+当前目录保留一条已完成阶段性验证的正式主线：冻结 SAM3 与 StreamVGGT，通过
+可靠性控制构建对象级 2D–3D 双向闭环。
 
 ```text
 SAM3 persistent obj_id / mask memory
@@ -11,7 +11,8 @@ SAM3 persistent obj_id / mask memory
 StreamVGGT persistent 3D object map
 ```
 
-实验不训练 adapter，不做 token concat、ICP 或相机修正。
+实验不训练 adapter，不做 token concat、ICP 或相机修正。SAM3 恢复阶段现已
+暂停，下一阶段转向实例点云与相机位姿研究。
 
 ## 当前实验
 
@@ -23,9 +24,18 @@ StreamVGGT persistent 3D object map
 37/68 是易例，用于验证闭环不会误伤原始追踪；54 是高置信低 IoU 压力例，用于
 验证 geometry-disagreement gate 能否识别“mask 非空但跟错”。
 
-完整实验设计见
-[`docs/ablation_plan.md`](docs/ablation_plan.md)，服务器命令见
-[`commands.txt`](commands.txt)。
+完整恢复实验设计见
+[`docs/ablation_plan.md`](docs/ablation_plan.md)。当前点图/位姿诊断设计见
+[`docs/pose_pointmap_diagnostics.md`](docs/pose_pointmap_diagnostics.md)，服务器
+命令见 [`commands.txt`](commands.txt)。
+
+最终验证配置为 `configs/recovery_050_025.yaml`：
+
+```yaml
+tracker_min_geometry_coverage: 0.50
+recovery_min_support_coverage: 0.25
+map_update_min_geometry_coverage: 0.50
+```
 
 ## 因果数据流
 
@@ -42,14 +52,14 @@ reference GT mask
 ```
 
 reference 后的 GT mask 不进入 natural gate、对象地图更新或几何候选排序。GT
-只进入指标和明确命名的 `oracle_candidate` / `oracle_mask` 上限分支。
+只进入指标和明确命名的 `oracle_candidate` / `oracle_mask` control 分支。
 
 ## 一次运行包含的消融
 
 两种事件策略：
 
 - `natural_joint_gate`：实际可部署触发；
-- `scheduled_probe`：优先在帧 140 做受控干预，保证强 tracker 下仍能验证机制。
+- `scheduled_probe`：固定在帧 119 做受控干预，与 natural event 做因果对照。
 
 七个 tracking 分支：
 
@@ -59,7 +69,7 @@ reference 后的 GT mask 不进入 natural gate、对象地图更新或几何候
 4. `geometry_recovery_same_id_memory`
 5. `shuffled_geometry_same_id_memory`
 6. `oracle_candidate_same_id_memory`
-7. `oracle_mask_same_id_memory`
+7. `oracle_mask_same_id_memory`（GT-visible-mask writeback control）
 
 其中第 2、4 分支使用完全相同的恢复 mask，唯一变量是是否写入 SAM3 memory；
 第 3、4 分支的差异是 object map 是否由可靠历史 tracking masks 扩充；第 5 分支
@@ -68,28 +78,71 @@ reference 后的 GT mask 不进入 natural gate、对象地图更新或几何候
 每个 tracking 分支还会比较 `all_frames / score_gate / joint_gate` 三种对象地图
 写入策略，并提供 GT-mask oracle 与 time-shuffled-mask negative control。
 
-## 运行
+## 恢复实验复现
 
 在仓库根目录执行：
 
 ```bash
 PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_recovery_writeback_ablation \
-  --config streaming_couping/configs/default.yaml \
+  --config streaming_couping/configs/recovery_050_025.yaml \
   --manifest data/processed/scannetpp_pinhole_2d/manifest.json \
   --scene-id 00a231a370 \
   --instance-ids 37 68 54 \
   --frame-indices 90 105 119 130 140 210 240 \
   --reference-sequence-index 0 \
   --event-policies natural_joint_gate scheduled_probe \
-  --probe-sequence-index 4 \
+  --probe-sequence-index 2 \
   --sam3-device cuda:3 \
   --geometry-device cuda:1 \
-  --output-dir outputs/streaming_couping_complete_ablation_37_68_54
+  --output-dir outputs/streaming_couping_threshold_050_025_probe119_37_68_54
 ```
 
 StreamVGGT 只提取一次；每个实例只跑一次原始 SAM3 tracking；每个后续帧的
 global-text candidates 只生成一次并在全部分支复用。memory 分支仍需分别建立
 SAM3 session，因为它们的后续 memory 状态不同。
+
+## 阶段性最终结果
+
+bed(54) 是高置信错误追踪压力例：帧 119 的 SAM3 score 为 `0.9844`，但原始 IoU
+只有 `0.0207`。natural gate 自动触发后，时序对齐几何选中的完整候选 IoU 为
+`0.9323`。
+
+| bed tracking 分支 | cross-view IoU | 后续 4 帧平均 IoU |
+|---|---:|---:|
+| original | 0.1292 | 0.0002 |
+| recovery，无 memory | 0.2812 | 0.0002 |
+| recovery + same-ID memory | 0.7986 | 0.7763 |
+| shuffled geometry + memory | 0.1292 | 0.0002 |
+
+| bed map 分支 | Chamfer-L1 ↓ | F5 ↑ | F10 ↑ |
+|---|---:|---:|---:|
+| original | 0.5269 | 0.0359 | 0.0819 |
+| recovery，无 memory | 0.2678 | 0.0836 | 0.2167 |
+| recovery + same-ID memory | 0.0416 | 0.7152 | 0.9443 |
+| GT-mask map oracle | 0.0403 | 0.7396 | 0.9481 |
+
+37/68 的 natural gate 未触发且逐帧结果不变；shuffled geometry 被候选 support
+gate 拒绝；natural 与 scheduled 在 bed 上结果相同。完整结果和解释记录在
+[`docs/thread_handoff.md`](docs/thread_handoff.md)。
+
+`reference_geometry_same_id_memory` 与完整 reliable-history map 分支结果相同，
+所以本例证明的是几何帮助追踪、恢复后的追踪帮助点云；尚未证明历史 tracking
+扩图比 reference-only map 更利于恢复。
+
+## 当前点图/相机位姿诊断
+
+当前 `commands.txt` 不再重跑 SAM3 恢复消融，而是只提取一次 frozen
+StreamVGGT，输出：
+
+- 固定 reference-point Sim(3) 下的 pose ATE/RPE；
+- reference-pose 对齐后的相对漂移；
+- 全轨迹 Sim(3) 的乐观 gauge 参照；
+- StreamVGGT 官方风格的 all-pairs rotation/translation-direction accuracy；
+- 逐帧 paired pointmap RMSE；
+- 处理后 GT 与 predicted intrinsics 误差。
+
+该诊断不加载 SAM3、不使用实例 mask，也不修改 pose/pointmap。只有 raw baseline
+显示出可归因的漂移后，才加入可靠静态实例点云约束。
 
 ## 主要输出
 
@@ -137,10 +190,12 @@ SAM3 session，因为它们的后续 memory 状态不同。
 
 ```text
 scripts/run_recovery_writeback_ablation.py  CLI
+scripts/run_pose_pointmap_diagnostics.py     当前 pose/pointmap 诊断 CLI
 src/recovery_writeback_ablation.py          两策略、七分支与汇总
 src/recovery.py                             几何挖掘、联合 gate、可靠地图更新
 src/instance_point_cloud.py                 实例 PLY
 src/instance_map_evaluation.py              evaluation-only 3D map metrics
+src/pose_pointmap_diagnostics.py            raw pose/pointmap/内参诊断
 src/backbones/sam3_wrapper.py               tracking、候选与 same-ID 写回
 src/backbones/streamvggt_wrapper.py         冻结 StreamVGGT 提取
 src/aggregation/                            persistent object map 与投影
