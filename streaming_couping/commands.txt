@@ -1,10 +1,11 @@
-# 当前阶段：StreamVGGT 原始点图与相机位姿诊断。
+# 当前阶段：StreamVGGT pointmap-consistent ray-center 位姿修复消融。
 #
-# 不运行 SAM3，不使用实例 mask，不修改 pointmap 或 pose。主指标使用 reference
-# 帧全场景 paired pointmap 拟合的一次固定 Sim(3)，并同时输出：
+# 不运行 SAM3、不使用实例 mask、不修改 pointmap/rotation。脚本只提取一次
+# StreamVGGT，然后用 point-head 世界点和像素射线重新估计 camera center。
+# 主指标使用 reference 帧全场景 paired pointmap 拟合的一次固定 Sim(3)，并输出：
 #   reference_point_sim3       主评估；检查 pose head 与 point head/GT 的一致性
 #   reference_pose_point_scale 首帧 pose 对齐；检查后续相对漂移
-#   trajectory_sim3            全轨迹拟合；仅作乐观 gauge 参照
+# raw baseline 仍保留 trajectory_sim3；ray 分支不使用全轨迹重新对齐。
 mkdir -p outputs
 set -o pipefail
 
@@ -15,16 +16,21 @@ PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_pose
   --frame-indices 90 105 119 130 140 210 240 \
   --reference-sequence-index 0 \
   --geometry-device cuda:1 \
-  --output-dir outputs/streaming_couping_pose_pointmap_raw_00a231a370 \
-  2>&1 | tee outputs/streaming_couping_pose_pointmap_raw_00a231a370.log
+  --ray-trim-quantile 0.80 \
+  --ray-max-iterations 4 \
+  --ray-min-points 1024 \
+  --ray-max-points 65536 \
+  --ray-max-condition-number 1e8 \
+  --output-dir outputs/streaming_couping_ray_center_00a231a370 \
+  2>&1 | tee outputs/streaming_couping_ray_center_00a231a370.log
 
-# 运行结束后回传以下小文件，不需要回传 PLY：
-#   outputs/streaming_couping_pose_pointmap_raw_00a231a370/pose_summary.csv
-#   outputs/streaming_couping_pose_pointmap_raw_00a231a370/pose_frame_metrics.csv
-#   outputs/streaming_couping_pose_pointmap_raw_00a231a370/pose_rpe.csv
-#   outputs/streaming_couping_pose_pointmap_raw_00a231a370/pose_pair_summary.csv
-#   outputs/streaming_couping_pose_pointmap_raw_00a231a370/pointmap_summary.csv
-#   outputs/streaming_couping_pose_pointmap_raw_00a231a370/pointmap_frame_metrics.csv
-#   outputs/streaming_couping_pose_pointmap_raw_00a231a370/intrinsics_summary.csv
-#   outputs/streaming_couping_pose_pointmap_raw_00a231a370/metadata.json
-#   outputs/streaming_couping_pose_pointmap_raw_00a231a370.log
+# 同一次运行包含 raw、可部署 predicted-K、K/R oracle 和 shuffled negative
+# control。运行结束后优先回传以下小文件，不需要回传 PLY：
+#   outputs/streaming_couping_ray_center_00a231a370/ray_pose_summary.csv
+#   outputs/streaming_couping_ray_center_00a231a370/ray_pose_frame_metrics.csv
+#   outputs/streaming_couping_ray_center_00a231a370/ray_pose_rpe.csv
+#   outputs/streaming_couping_ray_center_00a231a370/ray_pose_pair_summary.csv
+#   outputs/streaming_couping_ray_center_00a231a370/ray_fit_summary.csv
+#   outputs/streaming_couping_ray_center_00a231a370/ray_fit_frame_metrics.csv
+#   outputs/streaming_couping_ray_center_00a231a370/metadata.json
+#   outputs/streaming_couping_ray_center_00a231a370.log

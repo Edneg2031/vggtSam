@@ -51,6 +51,35 @@ class SimilarityAlignment:
     fit_source: str
 
 
+@dataclass(frozen=True)
+class RayFitConfig:
+    trim_quantile: float = 0.80
+    max_iterations: int = 4
+    min_points: int = 1024
+    max_points: int = 65536
+    max_condition_number: float = 1e8
+
+
+@dataclass(frozen=True)
+class RayCenterFit:
+    center: torch.Tensor
+    fit_accepted: bool
+    status: str
+    candidate_points: int
+    sampled_points: int
+    retained_points: int
+    solve_iterations: int
+    condition_number: float
+    all_residual_mean: float
+    all_residual_median: float
+    all_residual_rmse: float
+    all_residual_p90: float
+    retained_residual_mean: float
+    retained_residual_median: float
+    retained_residual_rmse: float
+    retained_residual_p90: float
+
+
 def main() -> None:
     args = _parse_args()
     overrides = {
@@ -68,6 +97,13 @@ def main() -> None:
     run_diagnostics(
         config,
         reference_sequence_index=args.reference_sequence_index,
+        ray_fit_config=RayFitConfig(
+            trim_quantile=args.ray_trim_quantile,
+            max_iterations=args.ray_max_iterations,
+            min_points=args.ray_min_points,
+            max_points=args.ray_max_points,
+            max_condition_number=args.ray_max_condition_number,
+        ),
     )
 
 
@@ -75,6 +111,7 @@ def run_diagnostics(
     config: ExperimentConfig,
     *,
     reference_sequence_index: int,
+    ray_fit_config: RayFitConfig = RayFitConfig(),
 ) -> None:
     """Extract StreamVGGT once and write pose/pointmap evaluation tables."""
 
@@ -85,6 +122,7 @@ def run_diagnostics(
         raise ValueError(
             "reference_sequence_index must select one configured frame."
         )
+    _validate_ray_fit_config(ray_fit_config)
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
     ground_truth = _load_ground_truth_sequence(
@@ -182,6 +220,67 @@ def run_diagnostics(
         frame_indices=config.frame_indices,
     )
     intrinsics_summary_rows = _summarize_intrinsics(intrinsics_frame_rows)
+    processed_gt_intrinsics = _processed_intrinsics_sequence(
+        ground_truth.intrinsics,
+        source_sizes=geometry.source_sizes,
+        processed_size=geometry.processed_size,
+        image_mode=config.image_mode,
+    )
+    ray_sequences, ray_fit_frame_rows = _ray_center_ablation(
+        world_points=geometry.world_points,
+        confidence=geometry.confidence,
+        predicted_intrinsics=geometry.intrinsics,
+        gt_processed_intrinsics=processed_gt_intrinsics,
+        predicted=predicted,
+        target=target,
+        point_alignment=point_alignment,
+        confidence_threshold=config.point_cloud_confidence_threshold,
+        frame_indices=config.frame_indices,
+        fit_config=ray_fit_config,
+    )
+    ray_fit_summary_rows = _summarize_ray_fits(ray_fit_frame_rows)
+    ray_pose_summary_rows = []
+    ray_pose_frame_rows = []
+    ray_pose_rpe_rows = []
+    ray_pose_pair_rows = []
+    ray_pose_pair_summary_rows = []
+    for mode, sequence in ray_sequences.items():
+        ray_alignments = (
+            point_alignment,
+            _reference_pose_alignment(
+                sequence,
+                target,
+                reference_index=reference_sequence_index,
+                scale=point_alignment.scale,
+            ),
+        )
+        for alignment in ray_alignments:
+            summary, frames, rpe = _evaluate_pose_alignment(
+                alignment,
+                predicted=sequence,
+                target=target,
+                frame_indices=config.frame_indices,
+                reference_index=reference_sequence_index,
+            )
+            ray_pose_summary_rows.append({"mode": mode, **summary})
+            ray_pose_frame_rows.extend(
+                {"mode": mode, **row} for row in frames
+            )
+            ray_pose_rpe_rows.extend(
+                {"mode": mode, **row} for row in rpe
+            )
+        pair_rows = _all_pair_pose_metrics(
+            sequence,
+            target,
+            frame_indices=config.frame_indices,
+        )
+        ray_pose_pair_rows.extend(
+            {"mode": mode, **row} for row in pair_rows
+        )
+        ray_pose_pair_summary_rows.extend(
+            {"mode": mode, **row}
+            for row in _summarize_pose_pairs(pair_rows)
+        )
 
     pose_summary_rows = _with_scene(config.scene_id, pose_summary_rows)
     pose_frame_rows = _with_scene(config.scene_id, pose_frame_rows)
@@ -214,6 +313,34 @@ def run_diagnostics(
         config.scene_id,
         intrinsics_summary_rows,
     )
+    ray_fit_frame_rows = _with_scene(
+        config.scene_id,
+        ray_fit_frame_rows,
+    )
+    ray_fit_summary_rows = _with_scene(
+        config.scene_id,
+        ray_fit_summary_rows,
+    )
+    ray_pose_summary_rows = _with_scene(
+        config.scene_id,
+        ray_pose_summary_rows,
+    )
+    ray_pose_frame_rows = _with_scene(
+        config.scene_id,
+        ray_pose_frame_rows,
+    )
+    ray_pose_rpe_rows = _with_scene(
+        config.scene_id,
+        ray_pose_rpe_rows,
+    )
+    ray_pose_pair_rows = _with_scene(
+        config.scene_id,
+        ray_pose_pair_rows,
+    )
+    ray_pose_pair_summary_rows = _with_scene(
+        config.scene_id,
+        ray_pose_pair_summary_rows,
+    )
 
     _write_csv(config.output_dir / "pose_summary.csv", pose_summary_rows)
     _write_csv(config.output_dir / "pose_frame_metrics.csv", pose_frame_rows)
@@ -243,9 +370,37 @@ def run_diagnostics(
         config.output_dir / "intrinsics_summary.csv",
         intrinsics_summary_rows,
     )
+    _write_csv(
+        config.output_dir / "ray_fit_frame_metrics.csv",
+        ray_fit_frame_rows,
+    )
+    _write_csv(
+        config.output_dir / "ray_fit_summary.csv",
+        ray_fit_summary_rows,
+    )
+    _write_csv(
+        config.output_dir / "ray_pose_summary.csv",
+        ray_pose_summary_rows,
+    )
+    _write_csv(
+        config.output_dir / "ray_pose_frame_metrics.csv",
+        ray_pose_frame_rows,
+    )
+    _write_csv(
+        config.output_dir / "ray_pose_rpe.csv",
+        ray_pose_rpe_rows,
+    )
+    _write_csv(
+        config.output_dir / "ray_pose_pair_metrics.csv",
+        ray_pose_pair_rows,
+    )
+    _write_csv(
+        config.output_dir / "ray_pose_pair_summary.csv",
+        ray_pose_pair_summary_rows,
+    )
 
     metadata = {
-        "experiment": "raw_streamvggt_pose_pointmap_diagnostics",
+        "experiment": "streamvggt_pointmap_consistent_ray_center_ablation",
         "evaluation_only": True,
         "sam3_or_instance_masks_used": False,
         "scene_id": config.scene_id,
@@ -284,6 +439,48 @@ def run_diagnostics(
         "point_confidence_threshold": float(
             config.point_cloud_confidence_threshold
         ),
+        "ray_center_ablation": {
+            "purpose": (
+                "repair camera-head translation from point-head world points "
+                "while keeping the selected rotation and intrinsics fixed"
+            ),
+            "deployable_mode": "ray_predicted_k_trimmed",
+            "fit_objective": (
+                "sum_i w_i ||(I-d_i d_i^T)(X_i-C)||^2"
+            ),
+            "world_to_camera_translation": "t_repaired = -R_world_to_camera @ C",
+            "fit_in_native_pointmap_gauge": True,
+            "gt_used_by_deployable_mode": False,
+            "trim_quantile": float(ray_fit_config.trim_quantile),
+            "max_iterations": int(ray_fit_config.max_iterations),
+            "min_points": int(ray_fit_config.min_points),
+            "max_points": int(ray_fit_config.max_points),
+            "max_condition_number": float(
+                ray_fit_config.max_condition_number
+            ),
+            "modes": {
+                "raw_camera_head": "unmodified StreamVGGT camera head",
+                "ray_predicted_k_all": (
+                    "all confidence-gated points; predicted K and R"
+                ),
+                "ray_predicted_k_trimmed": (
+                    "robust residual trimming; predicted K and R"
+                ),
+                "ray_gt_k_trimmed": (
+                    "GT processed K oracle; predicted R"
+                ),
+                "ray_gt_r_trimmed": (
+                    "predicted K; GT R transformed into pointmap gauge"
+                ),
+                "ray_gt_k_gt_r_trimmed": (
+                    "GT processed K and gauge-transformed GT R oracle"
+                ),
+                "ray_shuffled_pointmap_trimmed": (
+                    "negative control with a deterministic horizontal pointmap "
+                    "roll that breaks pixel-to-world-point correspondence"
+                ),
+            },
+        },
         "outputs": [
             "pose_summary.csv",
             "pose_frame_metrics.csv",
@@ -295,6 +492,13 @@ def run_diagnostics(
             "pointmap_summary.csv",
             "intrinsics_frame_metrics.csv",
             "intrinsics_summary.csv",
+            "ray_fit_frame_metrics.csv",
+            "ray_fit_summary.csv",
+            "ray_pose_summary.csv",
+            "ray_pose_frame_metrics.csv",
+            "ray_pose_rpe.csv",
+            "ray_pose_pair_metrics.csv",
+            "ray_pose_pair_summary.csv",
         ],
     }
     with (config.output_dir / "metadata.json").open(
@@ -311,6 +515,10 @@ def run_diagnostics(
     print(
         "intrinsics summary: "
         f"{config.output_dir / 'intrinsics_summary.csv'}"
+    )
+    print(
+        "ray-center pose summary: "
+        f"{config.output_dir / 'ray_pose_summary.csv'}"
     )
 
 
@@ -448,6 +656,639 @@ def _prepare_pose_sequence(
         camera_centers=camera_centers,
         rotation_quality_rows=tuple(quality_rows),
     )
+
+
+def _validate_ray_fit_config(config: RayFitConfig) -> None:
+    if not 0.0 < float(config.trim_quantile) < 1.0:
+        raise ValueError("ray trim_quantile must be strictly between 0 and 1.")
+    if int(config.max_iterations) < 1:
+        raise ValueError("ray max_iterations must be positive.")
+    if int(config.min_points) < 3:
+        raise ValueError("ray min_points must be at least 3.")
+    if int(config.max_points) < int(config.min_points):
+        raise ValueError("ray max_points must be at least ray min_points.")
+    if float(config.max_condition_number) <= 1.0:
+        raise ValueError("ray max_condition_number must be greater than 1.")
+
+
+def _ray_center_ablation(
+    *,
+    world_points: torch.Tensor,
+    confidence: torch.Tensor,
+    predicted_intrinsics: torch.Tensor,
+    gt_processed_intrinsics: torch.Tensor,
+    predicted: PoseSequence,
+    target: PoseSequence,
+    point_alignment: SimilarityAlignment,
+    confidence_threshold: float,
+    frame_indices: Sequence[int],
+    fit_config: RayFitConfig,
+) -> tuple[dict[str, PoseSequence], list[dict]]:
+    """Fit camera centers from point-to-pixel rays in the pointmap gauge."""
+
+    points = world_points.double().cpu()
+    weights = confidence.double().cpu()
+    predicted_intrinsics = predicted_intrinsics.double().cpu()
+    gt_processed_intrinsics = gt_processed_intrinsics.double().cpu()
+    frame_count = len(frame_indices)
+    if points.ndim != 4 or points.shape[-1] != 3:
+        raise ValueError(
+            "Ray-center pointmap must have shape [T,H,W,3], got "
+            f"{tuple(points.shape)}."
+        )
+    if tuple(weights.shape) != tuple(points.shape[:3]):
+        raise ValueError(
+            "Ray-center confidence must match pointmap [T,H,W], got "
+            f"{tuple(weights.shape)} versus {tuple(points.shape[:3])}."
+        )
+    if points.shape[0] != frame_count:
+        raise ValueError("Ray-center pointmap length does not match frames.")
+    if tuple(predicted_intrinsics.shape) != (frame_count, 3, 3):
+        raise ValueError("Predicted ray intrinsics must have shape [T,3,3].")
+    if tuple(gt_processed_intrinsics.shape) != (frame_count, 3, 3):
+        raise ValueError("GT processed ray intrinsics must have shape [T,3,3].")
+
+    gt_rotations_in_pointmap_gauge = torch.einsum(
+        "ij,tjk->tik",
+        point_alignment.rotation.double().T,
+        target.camera_to_world_rotation,
+    )
+    mode_specs = (
+        {
+            "mode": "raw_camera_head",
+            "role": "baseline",
+            "intrinsics": predicted_intrinsics,
+            "rotations": predicted.camera_to_world_rotation,
+            "fit": False,
+            "trim": False,
+            "shuffle": False,
+            "uses_gt_intrinsics": False,
+            "uses_gt_rotation": False,
+        },
+        {
+            "mode": "ray_predicted_k_all",
+            "role": "deployable_untrimmed_ablation",
+            "intrinsics": predicted_intrinsics,
+            "rotations": predicted.camera_to_world_rotation,
+            "fit": True,
+            "trim": False,
+            "shuffle": False,
+            "uses_gt_intrinsics": False,
+            "uses_gt_rotation": False,
+        },
+        {
+            "mode": "ray_predicted_k_trimmed",
+            "role": "deployable_main",
+            "intrinsics": predicted_intrinsics,
+            "rotations": predicted.camera_to_world_rotation,
+            "fit": True,
+            "trim": True,
+            "shuffle": False,
+            "uses_gt_intrinsics": False,
+            "uses_gt_rotation": False,
+        },
+        {
+            "mode": "ray_gt_k_trimmed",
+            "role": "intrinsics_oracle",
+            "intrinsics": gt_processed_intrinsics,
+            "rotations": predicted.camera_to_world_rotation,
+            "fit": True,
+            "trim": True,
+            "shuffle": False,
+            "uses_gt_intrinsics": True,
+            "uses_gt_rotation": False,
+        },
+        {
+            "mode": "ray_gt_r_trimmed",
+            "role": "rotation_oracle",
+            "intrinsics": predicted_intrinsics,
+            "rotations": gt_rotations_in_pointmap_gauge,
+            "fit": True,
+            "trim": True,
+            "shuffle": False,
+            "uses_gt_intrinsics": False,
+            "uses_gt_rotation": True,
+        },
+        {
+            "mode": "ray_gt_k_gt_r_trimmed",
+            "role": "intrinsics_rotation_oracle",
+            "intrinsics": gt_processed_intrinsics,
+            "rotations": gt_rotations_in_pointmap_gauge,
+            "fit": True,
+            "trim": True,
+            "shuffle": False,
+            "uses_gt_intrinsics": True,
+            "uses_gt_rotation": True,
+        },
+        {
+            "mode": "ray_shuffled_pointmap_trimmed",
+            "role": "negative_control",
+            "intrinsics": predicted_intrinsics,
+            "rotations": predicted.camera_to_world_rotation,
+            "fit": True,
+            "trim": True,
+            "shuffle": True,
+            "uses_gt_intrinsics": False,
+            "uses_gt_rotation": False,
+        },
+    )
+
+    sequences: dict[str, PoseSequence] = {}
+    frame_rows = []
+    horizontal_roll = max(1, int(points.shape[2]) // 3)
+    metric_scale = float(point_alignment.scale)
+    for spec in mode_specs:
+        centers = []
+        rotations = spec["rotations"].double().cpu()
+        intrinsics = spec["intrinsics"].double().cpu()
+        for index, frame_index in enumerate(frame_indices):
+            frame_points = points[index]
+            frame_confidence = weights[index]
+            if spec["shuffle"]:
+                frame_points = torch.roll(
+                    frame_points,
+                    shifts=horizontal_roll,
+                    dims=1,
+                )
+                frame_confidence = torch.roll(
+                    frame_confidence,
+                    shifts=horizontal_roll,
+                    dims=1,
+                )
+            (
+                sampled_points,
+                sampled_directions,
+                sampled_weights,
+                candidate_points,
+            ) = _prepare_ray_inputs(
+                frame_points,
+                frame_confidence,
+                intrinsics[index],
+                rotations[index],
+                confidence_threshold=confidence_threshold,
+                max_points=fit_config.max_points,
+            )
+            raw_center = predicted.camera_centers[index]
+            if spec["fit"]:
+                fit = _fit_ray_center(
+                    sampled_points,
+                    sampled_directions,
+                    sampled_weights,
+                    candidate_points=candidate_points,
+                    fallback_center=raw_center,
+                    robust_trim=bool(spec["trim"]),
+                    config=fit_config,
+                )
+            else:
+                fit = _diagnose_fixed_ray_center(
+                    raw_center,
+                    sampled_points,
+                    sampled_directions,
+                    candidate_points=candidate_points,
+                    status="baseline_not_fitted",
+                )
+            centers.append(fit.center)
+            center_shift = torch.linalg.vector_norm(
+                fit.center - raw_center
+            )
+            row = {
+                "mode": spec["mode"],
+                "mode_role": spec["role"],
+                "uses_gt_intrinsics": int(spec["uses_gt_intrinsics"]),
+                "uses_gt_rotation": int(spec["uses_gt_rotation"]),
+                "pointmap_spatially_shuffled": int(spec["shuffle"]),
+                "robust_residual_trim": int(spec["trim"]),
+                "sequence_index": index,
+                "frame_index": int(frame_index),
+                "fit_applied": int(spec["fit"]),
+                "fit_accepted": int(fit.fit_accepted),
+                "fit_status": fit.status,
+                "candidate_points": fit.candidate_points,
+                "sampled_points": fit.sampled_points,
+                "retained_points": fit.retained_points,
+                "retained_fraction": (
+                    fit.retained_points / fit.sampled_points
+                    if fit.sampled_points
+                    else float("nan")
+                ),
+                "solve_iterations": fit.solve_iterations,
+                "condition_number": fit.condition_number,
+                "center_shift_native": float(center_shift),
+                "center_shift_aligned_meters": float(
+                    metric_scale * center_shift
+                ),
+                "all_ray_residual_mean_native": fit.all_residual_mean,
+                "all_ray_residual_median_native": fit.all_residual_median,
+                "all_ray_residual_rmse_native": fit.all_residual_rmse,
+                "all_ray_residual_p90_native": fit.all_residual_p90,
+                "retained_ray_residual_mean_native": (
+                    fit.retained_residual_mean
+                ),
+                "retained_ray_residual_median_native": (
+                    fit.retained_residual_median
+                ),
+                "retained_ray_residual_rmse_native": (
+                    fit.retained_residual_rmse
+                ),
+                "retained_ray_residual_p90_native": (
+                    fit.retained_residual_p90
+                ),
+                "all_ray_residual_rmse_aligned_meters": (
+                    metric_scale * fit.all_residual_rmse
+                ),
+                "retained_ray_residual_rmse_aligned_meters": (
+                    metric_scale * fit.retained_residual_rmse
+                ),
+                "repaired_world_to_camera_rotation": _flatten_matrix(
+                    rotations[index].T
+                ),
+            }
+            _add_vector(row, "raw_camera_center_native", raw_center)
+            _add_vector(row, "ray_camera_center_native", fit.center)
+            repaired_translation = -(rotations[index].T @ fit.center)
+            _add_vector(
+                row,
+                "repaired_world_to_camera_translation",
+                repaired_translation,
+            )
+            frame_rows.append(row)
+        sequences[str(spec["mode"])] = _pose_sequence_from_centers(
+            rotations,
+            torch.stack(centers),
+        )
+    return sequences, frame_rows
+
+
+def _prepare_ray_inputs(
+    world_points: torch.Tensor,
+    confidence: torch.Tensor,
+    intrinsics: torch.Tensor,
+    camera_to_world_rotation: torch.Tensor,
+    *,
+    confidence_threshold: float,
+    max_points: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    height, width = world_points.shape[:2]
+    rows, columns = torch.meshgrid(
+        torch.arange(height, dtype=torch.float64),
+        torch.arange(width, dtype=torch.float64),
+        indexing="ij",
+    )
+    pixels = torch.stack(
+        [columns, rows, torch.ones_like(columns)],
+        dim=-1,
+    )
+    inverse_intrinsics = torch.linalg.inv(intrinsics.double())
+    camera_directions = pixels @ inverse_intrinsics.T
+    world_directions = (
+        camera_directions @ camera_to_world_rotation.double().T
+    )
+    direction_norms = torch.linalg.vector_norm(
+        world_directions,
+        dim=-1,
+    )
+    world_directions = world_directions / direction_norms.clamp_min(1e-12)[
+        ..., None
+    ]
+    valid = (
+        torch.isfinite(world_points).all(dim=-1)
+        & torch.isfinite(confidence)
+        & (confidence >= float(confidence_threshold))
+        & torch.isfinite(world_directions).all(dim=-1)
+        & (direction_norms > 1e-12)
+    )
+    flat_indices = torch.nonzero(valid.reshape(-1), as_tuple=False)[:, 0]
+    candidate_points = int(flat_indices.numel())
+    if candidate_points > int(max_points):
+        positions = torch.linspace(
+            0,
+            candidate_points - 1,
+            steps=int(max_points),
+            dtype=torch.float64,
+        ).round().long()
+        flat_indices = flat_indices.index_select(0, positions)
+    flat_points = world_points.reshape(-1, 3).double()
+    flat_directions = world_directions.reshape(-1, 3)
+    flat_confidence = confidence.reshape(-1).double()
+    sampled_points = flat_points.index_select(0, flat_indices)
+    sampled_directions = flat_directions.index_select(0, flat_indices)
+    sampled_weights = (
+        flat_confidence.index_select(0, flat_indices).clamp_min(1e-6)
+    )
+    if sampled_weights.numel():
+        sampled_weights = sampled_weights / sampled_weights.mean().clamp_min(
+            1e-12
+        )
+    return (
+        sampled_points,
+        sampled_directions,
+        sampled_weights,
+        candidate_points,
+    )
+
+
+def _fit_ray_center(
+    points: torch.Tensor,
+    directions: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    candidate_points: int,
+    fallback_center: torch.Tensor,
+    robust_trim: bool,
+    config: RayFitConfig,
+) -> RayCenterFit:
+    sampled_points = int(points.shape[0])
+    if sampled_points < int(config.min_points):
+        return _fallback_ray_center(
+            fallback_center,
+            points,
+            directions,
+            candidate_points=candidate_points,
+            status=(
+                f"fallback_insufficient_points:{sampled_points}"
+                f"<{int(config.min_points)}"
+            ),
+        )
+
+    active = torch.ones(sampled_points, dtype=torch.bool)
+    center = fallback_center.double().cpu()
+    condition_number = float("nan")
+    solve_iterations = 0
+    try:
+        for solve_index in range(int(config.max_iterations)):
+            center, condition_number = _solve_weighted_ray_center(
+                points[active],
+                directions[active],
+                weights[active],
+            )
+            solve_iterations += 1
+            if (
+                not torch.isfinite(center).all()
+                or not math.isfinite(condition_number)
+                or condition_number > float(config.max_condition_number)
+            ):
+                return _fallback_ray_center(
+                    fallback_center,
+                    points,
+                    directions,
+                    candidate_points=candidate_points,
+                    status=(
+                        "fallback_ill_conditioned:"
+                        f"{condition_number:.6g}"
+                    ),
+                    solve_iterations=solve_iterations,
+                    condition_number=condition_number,
+                )
+            if not robust_trim:
+                break
+            residuals = _ray_residuals(points, directions, center)
+            cutoff = torch.quantile(
+                residuals,
+                float(config.trim_quantile),
+            )
+            new_active = torch.isfinite(residuals) & (residuals <= cutoff)
+            if int(new_active.sum()) < int(config.min_points):
+                break
+            if torch.equal(new_active, active):
+                break
+            if solve_index + 1 >= int(config.max_iterations):
+                break
+            active = new_active
+    except RuntimeError as error:
+        return _fallback_ray_center(
+            fallback_center,
+            points,
+            directions,
+            candidate_points=candidate_points,
+            status=f"fallback_linear_solve:{type(error).__name__}",
+            solve_iterations=solve_iterations,
+            condition_number=condition_number,
+        )
+
+    all_residuals = _ray_residuals(points, directions, center)
+    retained_residuals = all_residuals[active]
+    all_stats = _distance_statistics(all_residuals)
+    retained_stats = _distance_statistics(retained_residuals)
+    return RayCenterFit(
+        center=center,
+        fit_accepted=True,
+        status="accepted_trimmed" if robust_trim else "accepted_all",
+        candidate_points=int(candidate_points),
+        sampled_points=sampled_points,
+        retained_points=int(active.sum()),
+        solve_iterations=solve_iterations,
+        condition_number=condition_number,
+        all_residual_mean=all_stats["mean"],
+        all_residual_median=all_stats["median"],
+        all_residual_rmse=all_stats["rmse"],
+        all_residual_p90=all_stats["p90"],
+        retained_residual_mean=retained_stats["mean"],
+        retained_residual_median=retained_stats["median"],
+        retained_residual_rmse=retained_stats["rmse"],
+        retained_residual_p90=retained_stats["p90"],
+    )
+
+
+def _solve_weighted_ray_center(
+    points: torch.Tensor,
+    directions: torch.Tensor,
+    weights: torch.Tensor,
+) -> tuple[torch.Tensor, float]:
+    identity = torch.eye(3, dtype=torch.float64)
+    projectors = identity[None] - (
+        directions[:, :, None] * directions[:, None, :]
+    )
+    normal_matrix = torch.einsum(
+        "n,nij->ij",
+        weights,
+        projectors,
+    )
+    right_hand_side = torch.einsum(
+        "n,nij,nj->i",
+        weights,
+        projectors,
+        points,
+    )
+    condition_number = float(torch.linalg.cond(normal_matrix))
+    center = torch.linalg.solve(normal_matrix, right_hand_side)
+    return center, condition_number
+
+
+def _ray_residuals(
+    points: torch.Tensor,
+    directions: torch.Tensor,
+    center: torch.Tensor,
+) -> torch.Tensor:
+    offsets = points - center
+    along_ray = (offsets * directions).sum(dim=-1, keepdim=True)
+    perpendicular = offsets - along_ray * directions
+    return torch.linalg.vector_norm(perpendicular, dim=-1)
+
+
+def _diagnose_fixed_ray_center(
+    center: torch.Tensor,
+    points: torch.Tensor,
+    directions: torch.Tensor,
+    *,
+    candidate_points: int,
+    status: str,
+) -> RayCenterFit:
+    residuals = _ray_residuals(points, directions, center)
+    stats = _distance_statistics(residuals)
+    return RayCenterFit(
+        center=center.double().cpu(),
+        fit_accepted=False,
+        status=status,
+        candidate_points=int(candidate_points),
+        sampled_points=int(points.shape[0]),
+        retained_points=int(points.shape[0]),
+        solve_iterations=0,
+        condition_number=float("nan"),
+        all_residual_mean=stats["mean"],
+        all_residual_median=stats["median"],
+        all_residual_rmse=stats["rmse"],
+        all_residual_p90=stats["p90"],
+        retained_residual_mean=stats["mean"],
+        retained_residual_median=stats["median"],
+        retained_residual_rmse=stats["rmse"],
+        retained_residual_p90=stats["p90"],
+    )
+
+
+def _fallback_ray_center(
+    center: torch.Tensor,
+    points: torch.Tensor,
+    directions: torch.Tensor,
+    *,
+    candidate_points: int,
+    status: str,
+    solve_iterations: int = 0,
+    condition_number: float = float("nan"),
+) -> RayCenterFit:
+    diagnosed = _diagnose_fixed_ray_center(
+        center,
+        points,
+        directions,
+        candidate_points=candidate_points,
+        status=status,
+    )
+    return RayCenterFit(
+        center=diagnosed.center,
+        fit_accepted=False,
+        status=status,
+        candidate_points=diagnosed.candidate_points,
+        sampled_points=diagnosed.sampled_points,
+        retained_points=diagnosed.retained_points,
+        solve_iterations=int(solve_iterations),
+        condition_number=float(condition_number),
+        all_residual_mean=diagnosed.all_residual_mean,
+        all_residual_median=diagnosed.all_residual_median,
+        all_residual_rmse=diagnosed.all_residual_rmse,
+        all_residual_p90=diagnosed.all_residual_p90,
+        retained_residual_mean=diagnosed.retained_residual_mean,
+        retained_residual_median=diagnosed.retained_residual_median,
+        retained_residual_rmse=diagnosed.retained_residual_rmse,
+        retained_residual_p90=diagnosed.retained_residual_p90,
+    )
+
+
+def _distance_statistics(values: torch.Tensor) -> dict[str, float]:
+    finite = values[torch.isfinite(values)]
+    if not finite.numel():
+        return {
+            "mean": float("nan"),
+            "median": float("nan"),
+            "rmse": float("nan"),
+            "p90": float("nan"),
+        }
+    return {
+        "mean": float(finite.mean()),
+        "median": float(finite.median()),
+        "rmse": _rmse(finite),
+        "p90": float(torch.quantile(finite, 0.90)),
+    }
+
+
+def _pose_sequence_from_centers(
+    camera_to_world_rotation: torch.Tensor,
+    camera_centers: torch.Tensor,
+) -> PoseSequence:
+    rotations = camera_to_world_rotation.double().cpu()
+    centers = camera_centers.double().cpu()
+    world_to_camera = torch.eye(
+        4,
+        dtype=torch.float64,
+    ).repeat(centers.shape[0], 1, 1)
+    world_to_camera[:, :3, :3] = rotations.transpose(1, 2)
+    world_to_camera[:, :3, 3] = -torch.einsum(
+        "tij,tj->ti",
+        world_to_camera[:, :3, :3],
+        centers,
+    )
+    return PoseSequence(
+        world_to_camera=world_to_camera,
+        camera_to_world_rotation=rotations,
+        camera_centers=centers,
+        rotation_quality_rows=(),
+    )
+
+
+def _summarize_ray_fits(rows: Sequence[dict]) -> list[dict]:
+    modes = list(dict.fromkeys(str(row["mode"]) for row in rows))
+    result = []
+    for mode in modes:
+        selected = [row for row in rows if row["mode"] == mode]
+        requested = [row for row in selected if int(row["fit_applied"])]
+        accepted = [row for row in requested if int(row["fit_accepted"])]
+        result.append(
+            {
+                "mode": mode,
+                "mode_role": selected[0]["mode_role"],
+                "frames": len(selected),
+                "fit_requested_frames": len(requested),
+                "fit_accepted_frames": len(accepted),
+                "fit_acceptance_rate": (
+                    len(accepted) / len(requested)
+                    if requested
+                    else float("nan")
+                ),
+                "mean_candidate_points": _mean_rows(
+                    selected,
+                    "candidate_points",
+                ),
+                "mean_sampled_points": _mean_rows(
+                    selected,
+                    "sampled_points",
+                ),
+                "mean_retained_fraction": _mean_rows(
+                    selected,
+                    "retained_fraction",
+                ),
+                "mean_condition_number": _mean_rows(
+                    accepted,
+                    "condition_number",
+                ),
+                "mean_center_shift_aligned_meters": _mean_rows(
+                    selected,
+                    "center_shift_aligned_meters",
+                ),
+                "max_center_shift_aligned_meters": _max_rows(
+                    selected,
+                    "center_shift_aligned_meters",
+                ),
+                "mean_all_ray_residual_rmse_aligned_meters": _mean_rows(
+                    selected,
+                    "all_ray_residual_rmse_aligned_meters",
+                ),
+                "mean_retained_ray_residual_rmse_aligned_meters": (
+                    _mean_rows(
+                        selected,
+                        "retained_ray_residual_rmse_aligned_meters",
+                    )
+                ),
+            }
+        )
+    return result
 
 
 def _homogeneous(world_to_camera: torch.Tensor) -> torch.Tensor:
@@ -931,19 +1772,19 @@ def _intrinsics_frame_metrics(
     frame_indices: Sequence[int],
 ) -> list[dict]:
     predicted = predicted.double().cpu()
-    target = target.double().cpu()
+    transformed_targets = _processed_intrinsics_sequence(
+        target,
+        source_sizes=source_sizes,
+        processed_size=processed_size,
+        image_mode=image_mode,
+    )
     if tuple(predicted.shape[-2:]) != (3, 3):
         raise ValueError(
             f"Predicted intrinsics must be [T,3,3], got {predicted.shape}."
         )
     rows = []
     for index, frame_index in enumerate(frame_indices):
-        transformed_target = _transform_intrinsics(
-            target[index],
-            source_size=source_sizes[index],
-            processed_size=processed_size,
-            image_mode=image_mode,
-        )
+        transformed_target = transformed_targets[index]
         row = {
             "sequence_index": index,
             "frame_index": int(frame_index),
@@ -972,6 +1813,35 @@ def _intrinsics_frame_metrics(
         }
         rows.append(row)
     return rows
+
+
+def _processed_intrinsics_sequence(
+    intrinsics: torch.Tensor,
+    *,
+    source_sizes: Sequence[tuple[int, int]],
+    processed_size: tuple[int, int],
+    image_mode: str,
+) -> torch.Tensor:
+    intrinsics = intrinsics.double().cpu()
+    if tuple(intrinsics.shape[-2:]) != (3, 3):
+        raise ValueError(
+            f"Intrinsics must have shape [T,3,3], got {intrinsics.shape}."
+        )
+    if intrinsics.shape[0] != len(source_sizes):
+        raise ValueError(
+            "Intrinsics and source_sizes must contain the same frame count."
+        )
+    return torch.stack(
+        [
+            _transform_intrinsics(
+                intrinsics[index],
+                source_size=source_sizes[index],
+                processed_size=processed_size,
+                image_mode=image_mode,
+            )
+            for index in range(intrinsics.shape[0])
+        ]
+    )
 
 
 def _transform_intrinsics(
@@ -1127,6 +1997,36 @@ def _parse_args() -> argparse.Namespace:
         "--reference-sequence-index",
         type=int,
         default=0,
+    )
+    parser.add_argument(
+        "--ray-trim-quantile",
+        type=float,
+        default=0.80,
+        help="Fraction of lowest ray residuals retained by robust modes.",
+    )
+    parser.add_argument(
+        "--ray-max-iterations",
+        type=int,
+        default=4,
+        help="Maximum linear solve/trim iterations per frame.",
+    )
+    parser.add_argument(
+        "--ray-min-points",
+        type=int,
+        default=1024,
+        help="Minimum confidence-gated points required for ray-center repair.",
+    )
+    parser.add_argument(
+        "--ray-max-points",
+        type=int,
+        default=65536,
+        help="Deterministic per-frame point cap for each ray-center branch.",
+    )
+    parser.add_argument(
+        "--ray-max-condition-number",
+        type=float,
+        default=1e8,
+        help="Reject an ill-conditioned ray-center normal equation above this.",
     )
     parser.add_argument("--geometry-device")
     parser.add_argument("--output-dir", type=Path, required=True)

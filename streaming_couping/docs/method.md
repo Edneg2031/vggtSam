@@ -48,8 +48,24 @@ tracking 扩充的 object map 与 reference-only map 在本例中选中同一候
 4. 再判断可靠静态实例是否能形成相机位姿约束；
 5. 旧 translation-only ICP 仅作为历史诊断，不直接恢复为默认方案。
 
-其中第 2、3 项已实现于 `pose_pointmap_diagnostics.py`，设计说明见
-`pose_pointmap_diagnostics.md`；当前等待服务器 raw baseline 结果。
+其中第 2、3 项已实现于 `pose_pointmap_diagnostics.py`。raw baseline 表明：
+
+- reference-pose 对齐后的 ATE RMSE 为 `0.2280 m`；
+- all-pairs rotation mean 为 `2.39°`，rotation@5° 为 `100%`；
+- translation-direction mean 为 `14.56°`，@5° 仅 `19.0%`；
+- `105->119` 方向误差 `34.33°`，GT/预测位移为 `0.260/0.300 m`；
+- `210->240` 方向误差 `44.22°`，GT/预测位移为 `0.123/0.312 m`；
+- non-reference pointmap 平均 frame RMSE 为 `0.1329 m`，帧 240 为
+  `0.1866 m`，低于同帧 camera-center 误差 `0.460 m`；
+- predicted focal 全部偏大，但 focal 误差与逐帧 pointmap RMSE 相关性很低，
+  因而不是 pointmap 漂移的主要解释。
+
+这排除了单一全局 scale 和纯累积漂移解释。当前第一项位姿修复不是旧实例 ICP，
+而是 pointmap-consistent ray-center：固定 `R/K`，由每个世界点和对应像素射线
+线性重估 camera center，再以 `t=-RC` 更新 StreamVGGT world-to-camera。
+同一次服务器运行包含 predicted-K 可部署分支、GT K/R oracle、trimming 消融和
+spatially-shuffled pointmap 负对照；设计说明见
+[`pose_pointmap_diagnostics.md`](pose_pointmap_diagnostics.md)。
 
 ## 0. 总体框架
 

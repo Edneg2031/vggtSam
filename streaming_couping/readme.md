@@ -129,7 +129,7 @@ gate 拒绝；natural 与 scheduled 在 bed 上结果相同。完整结果和解
 所以本例证明的是几何帮助追踪、恢复后的追踪帮助点云；尚未证明历史 tracking
 扩图比 reference-only map 更利于恢复。
 
-## 当前点图/相机位姿诊断
+## 当前点图/相机位姿修复消融
 
 当前 `commands.txt` 不再重跑 SAM3 恢复消融，而是只提取一次 frozen
 StreamVGGT，输出：
@@ -141,8 +141,14 @@ StreamVGGT，输出：
 - 逐帧 paired pointmap RMSE；
 - 处理后 GT 与 predicted intrinsics 误差。
 
-该诊断不加载 SAM3、不使用实例 mask，也不修改 pose/pointmap。只有 raw baseline
-显示出可归因的漂移后，才加入可靠静态实例点云约束。
+raw baseline 已确认 rotation 稳定而局部 translation direction/scale 失败。
+当前脚本在同一次推理中增加 pointmap-consistent ray-center 修复：由 point-head
+世界点与对应像素射线重估 camera center，固定 rotation，以 `t=-RC` 更新
+world-to-camera。它不加载 SAM3、不使用实例 mask，也不修改 pointmap。
+
+`ray_predicted_k_trimmed` 是不使用 GT 的主分支；同次还运行 untrimmed、GT K/R
+oracle 和 spatially-shuffled pointmap 负对照。详见
+[`docs/pose_pointmap_diagnostics.md`](docs/pose_pointmap_diagnostics.md)。
 
 ## 主要输出
 
@@ -195,7 +201,7 @@ src/recovery_writeback_ablation.py          两策略、七分支与汇总
 src/recovery.py                             几何挖掘、联合 gate、可靠地图更新
 src/instance_point_cloud.py                 实例 PLY
 src/instance_map_evaluation.py              evaluation-only 3D map metrics
-src/pose_pointmap_diagnostics.py            raw pose/pointmap/内参诊断
+src/pose_pointmap_diagnostics.py            raw诊断 + ray-center位姿修复消融
 src/backbones/sam3_wrapper.py               tracking、候选与 same-ID 写回
 src/backbones/streamvggt_wrapper.py         冻结 StreamVGGT 提取
 src/aggregation/                            persistent object map 与投影
