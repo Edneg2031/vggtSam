@@ -1,0 +1,62 @@
+# Frozen SAM3 + frozen StreamVGGT recovery/writeback validation.
+#
+# The recovery thresholds are fixed from the completed post-hoc sweep:
+#   tracker geometry coverage < 0.50 triggers candidate evaluation;
+#   selected candidate support coverage >= 0.25 permits writeback.
+# Keep default.yaml unchanged as the original ablation baseline.
+dataset:
+  manifest: data/processed/scannetpp_pinhole_2d/manifest.json
+  scene_id: 00a231a370
+  frame_indices: [90, 105, 119, 130, 140, 210, 240]
+  min_pixels: 128
+  max_area_ratio: 0.25
+  excluded_labels: [object, unknown, wall, floor, ceiling]
+
+sam3:
+  repo: externals/sam3
+  checkpoint: /home/bod/86Nas/95_data_bak/FoundationModels/sam3/sam3.pt
+  device: cuda:3
+  output_threshold: 0.5
+  prompt_with_box: true
+
+streamvggt:
+  repo: externals/streamvggt
+  checkpoint: /home/bod/86Nas/95_data_bak/FoundationModels/StreamVGGT/checkpoints.pth
+  device: cuda:1
+  streaming_cache: true
+  image_mode: crop
+
+bridge:
+  output_size: [256, 384]
+  tracker_low_score: 0.50
+  fallback_on_missing_mask: true
+  # Detect high-score tracking drift through disagreement with aligned geometry.
+  fallback_on_geometry_disagreement: true
+  tracker_min_geometry_coverage: 0.50
+  # Accept the frame-119 bed candidate (measured support coverage: 0.453).
+  recovery_min_support_coverage: 0.25
+  # Do not let an unreliable tracker observation contaminate the object map.
+  map_update_min_score: 0.50
+  map_update_min_geometry_coverage: 0.50
+  max_points_per_observation: 8000
+  max_points_per_object: 20000
+
+candidate:
+  box_quantile: 0.02
+  box_padding_ratio: 0.12
+  min_projected_points: 24
+  min_projected_fraction: 0.005
+  min_supported_points: 8
+  min_support_ratio: 0.02
+  support_abs_distance: 0.15
+  support_relative_distance: 0.10
+
+point_cloud:
+  confidence_threshold: 0.30
+  max_points: 400000
+  # GT geometry remains evaluation-only after a fixed reference-frame Sim(3).
+  metric_max_points: 4096
+  metric_thresholds: [0.05, 0.10]
+
+output:
+  dir: outputs/streaming_couping_threshold_050_025_probe119_37_68_54

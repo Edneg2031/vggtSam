@@ -1,50 +1,38 @@
-# 服务器一次性完整消融。
+# 服务器阈值固定后的因果验证。
 #
 # 实例角色：
 #   37 cabinet、68 wardrobe：SAM3 易例，用来检查几何闭环是否误伤。
 #   54 bed：高置信但 IoU 低的压力例，用来检查 geometry-disagreement gate。
 #
-# 同一进程只提取一次 StreamVGGT；每个实例只跑一次 SAM3 original，并缓存
-# 所有后续帧的 global-text candidates。随后同时执行：
-#   natural_joint_gate：实际可部署的联合触发；
-#   scheduled_probe：优先在序列位置 4（帧 140）做受控干预。
+# 本轮固定上一轮 threshold sweep 选出的阈值：
+#   tracker_min_geometry_coverage = 0.50
+#   recovery_min_support_coverage = 0.25
+# map update gate 保持 0.50，避免错误追踪污染对象地图。
 #
-# 若帧 140 没有可执行的几何候选，scheduled_probe 会在不读取 GT 的条件下
-# 自动选择最早可执行帧。summary.csv 会记录实际使用帧和 fallback 标志。
-#
-# 分支：
-#   original
-#   geometry_recovery_no_memory
-#   reference_geometry_same_id_memory
-#   geometry_recovery_same_id_memory
-#   shuffled_geometry_same_id_memory
-#   oracle_candidate_same_id_memory       # 仅作为候选上限
-#   oracle_mask_same_id_memory            # 仅作为写回上限
-#
-# GT mask/pointmap 在 reference 后只用于指标和明确命名的 oracle 分支；不会进入
-# natural gate、几何候选排序或可靠对象地图更新。
+# natural_joint_gate 检查实际方法能否在 bed 帧 119 自动触发；
+# scheduled_probe 固定在序列位置 2（帧 119），用于同一事件的受控比较。
+# 默认基线配置 default.yaml 和旧输出目录均保持不变。
 mkdir -p outputs
 set -o pipefail
 
 PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_recovery_writeback_ablation \
-  --config streaming_couping/configs/default.yaml \
+  --config streaming_couping/configs/recovery_050_025.yaml \
   --manifest data/processed/scannetpp_pinhole_2d/manifest.json \
   --scene-id 00a231a370 \
   --instance-ids 37 68 54 \
   --frame-indices 90 105 119 130 140 210 240 \
   --reference-sequence-index 0 \
   --event-policies natural_joint_gate scheduled_probe \
-  --probe-sequence-index 4 \
+  --probe-sequence-index 2 \
   --sam3-device cuda:3 \
   --geometry-device cuda:1 \
-  --output-dir outputs/streaming_couping_complete_ablation_37_68_54 \
-  2>&1 | tee outputs/streaming_couping_complete_ablation_37_68_54.log
+  --output-dir outputs/streaming_couping_threshold_050_025_probe119_37_68_54 \
+  2>&1 | tee outputs/streaming_couping_threshold_050_025_probe119_37_68_54.log
 
 # 运行结束后优先回传这些小文件；PLY 和 PNG 暂时不用传：
-#   outputs/streaming_couping_complete_ablation_37_68_54/summary.csv
-#   outputs/streaming_couping_complete_ablation_37_68_54/candidate_screening.csv
-#   outputs/streaming_couping_complete_ablation_37_68_54/threshold_sweep.csv
-#   outputs/streaming_couping_complete_ablation_37_68_54/geometry_gate_diagnostics.csv
-#   outputs/streaming_couping_complete_ablation_37_68_54/map_quality.csv
-#   outputs/streaming_couping_complete_ablation_37_68_54/metadata.json
-#   outputs/streaming_couping_complete_ablation_37_68_54.log
+#   outputs/streaming_couping_threshold_050_025_probe119_37_68_54/summary.csv
+#   outputs/streaming_couping_threshold_050_025_probe119_37_68_54/candidate_screening.csv
+#   outputs/streaming_couping_threshold_050_025_probe119_37_68_54/geometry_gate_diagnostics.csv
+#   outputs/streaming_couping_threshold_050_025_probe119_37_68_54/map_quality.csv
+#   outputs/streaming_couping_threshold_050_025_probe119_37_68_54/metadata.json
+#   outputs/streaming_couping_threshold_050_025_probe119_37_68_54.log
