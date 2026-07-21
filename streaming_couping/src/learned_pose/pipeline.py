@@ -24,6 +24,11 @@ from ..pose_evaluation import (
 )
 from .cache import cache_path, load_feature_cache
 from .config import LearnedPoseConfig
+from .geometry_metrics import (
+    append_geometry_metrics,
+    summarize_depth_metrics,
+    summarize_pointmap_metrics,
+)
 from .losses import compute_training_loss, instance_rigid_losses
 from .model import InstancePoseAdapter
 
@@ -176,6 +181,8 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
     pair_summary_rows = []
     equivalence_rows = []
     diagnostic_rows = []
+    pointmap_frame_rows = []
+    depth_frame_rows = []
 
     # Raw StreamVGGT is evaluated once per clip through the exact same batch
     # CameraHead path used by every adapter.
@@ -202,6 +209,14 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
             pair_summary_rows,
             payload=payload,
             pose_encoding=baseline_outputs["pose_encoding"],
+            mode="baseline",
+            perturbation="module_off",
+        )
+        append_geometry_metrics(
+            pointmap_frame_rows,
+            depth_frame_rows,
+            batch=batch,
+            outputs=baseline_outputs,
             mode="baseline",
             perturbation="module_off",
         )
@@ -236,6 +251,14 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
                     pair_summary_rows,
                     payload=payload,
                     pose_encoding=outputs["pose_encoding"],
+                    mode=mode,
+                    perturbation=perturbation,
+                )
+                append_geometry_metrics(
+                    pointmap_frame_rows,
+                    depth_frame_rows,
+                    batch=batch,
+                    outputs=outputs,
                     mode=mode,
                     perturbation=perturbation,
                 )
@@ -327,6 +350,16 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
     _write_csv(output / "pose_pair_summary.csv", pair_summary_rows)
     _write_csv(output / "instance_diagnostics.csv", diagnostic_rows)
     _write_csv(output / "baseline_equivalence.csv", equivalence_rows)
+    _write_csv(output / "pointmap_frame_metrics.csv", pointmap_frame_rows)
+    _write_csv(
+        output / "pointmap_summary.csv",
+        summarize_pointmap_metrics(pointmap_frame_rows),
+    )
+    _write_csv(output / "depth_frame_metrics.csv", depth_frame_rows)
+    _write_csv(
+        output / "depth_summary.csv",
+        summarize_depth_metrics(depth_frame_rows),
+    )
     metadata = {
         "config": str(config.source_path),
         "causal_control": (
@@ -338,6 +371,11 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
             "no fused token is written into SAM3."
         ),
         "gt_role": "pose/depth/pointmap training supervision and evaluation only",
+        "geometry_evaluation": (
+            "All pointmap modes reuse the baseline reference-frame Sim(3); it is never "
+            "refit after refinement. point_head measures direct DPT point output, while "
+            "depth_pose_backprojection measures the fused cloud produced by depth and pose."
+        ),
     }
     with (output / "metadata.json").open("w", encoding="utf8") as handle:
         json.dump(metadata, handle, indent=2, ensure_ascii=False)
@@ -459,6 +497,8 @@ def _forward_baseline(batch: dict) -> dict[str, torch.Tensor]:
     return {
         "pose_encoding": batch["baseline_pose_encoding"],
         "camera_hidden": batch["camera_hidden"],
+        "depth": batch["baseline_depth"],
+        "world_points": batch["baseline_world_points"],
     }
 
 

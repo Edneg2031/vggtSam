@@ -133,6 +133,36 @@ reference alignment。
 reference 后的 GT mask从不进入 observation/gate/memory；GT pose、pointmap和由其生成
 的 depth只进入训练监督及评估。
 
+## 当前单 clip 压力测试记录
+
+以下结果来自同一个 `00a231a370_90_240_37_68_54` clip上的训练后诊断，不能作为
+held-out泛化结论：
+
+| mode | ATE RMSE | adjacent RPE translation | all-pairs translation direction | joint@5deg |
+|---|---:|---:|---:|---:|
+| baseline | 0.2280 | 0.1522 | 14.56° | 19.0% |
+| camera geometry only | 0.1529 | 0.1023 | 3.60° | 81.0% |
+| camera SAM only | **0.1488** | **0.0744** | **1.34°** | **100%** |
+| camera geometry + SAM | 0.1668 | 0.1081 | 4.62° | 61.9% |
+| all token fusion | 0.1630 | 0.1104 | 4.46° | 61.9% |
+
+当前最佳是 `camera_sam_only`，不是 geometry+SAM，也不是 all-token。same-checkpoint
+因果控制中，SAM-only的 all-pairs translation direction由 aligned `1.34°`退化到
+shuffle-ID `3.98°`、shuffle-time `15.20°`；geometry-only由 `3.60°`退化到
+`11.66°/12.09°`。这与旧 VGGT token写入SAM实验中 aligned与 shuffled近乎相同的
+结果不同。
+
+实例刚体诊断同样支持这一点。相对 module-off，SAM-only将米制 instance Chamfer从
+`0.07639 m`降至`0.06403 m`（16.2%），matched centroid从`0.03032 m`降至
+`0.01548 m`（49.0%）；shuffle-time后分别恶化到`0.09137 m/0.04811 m`。
+geometry-only的对应改善为10.8%/37.3%。
+
+所有 checkpoint的 module-off严格回退检查均通过：camera token、pose、depth和pointmap
+的最大绝对差均为`0.0`，`strict_equal=1`。当前 gate约为`0.500`，说明有效更新主要由
+从零开始学习的 projection承担，sigmoid gate本身几乎没有离开初始化值。geometry相关
+模式只有4/7帧 active，而SAM-only有6/7帧 active；这也是联合模式弱于SAM-only时需要
+与“特征负干扰”分开考虑的覆盖率因素。
+
 ## 运行
 
 从仓库根目录运行一次：
@@ -152,8 +182,36 @@ evaluation/pose_pair_summary.csv
 evaluation/pose_rpe.csv
 evaluation/instance_diagnostics.csv
 evaluation/baseline_equivalence.csv
+evaluation/pointmap_summary.csv
+evaluation/depth_summary.csv
 完整 log
 ```
 
 `baseline_equivalence.csv`中所有 `strict_equal` 必须为 `1`。如果 feature cache已经完整，
 修复代码后可以直接复用，不需要重新运行 SAM3 pooling。
+
+## 点云与深度评估
+
+`--stage eval`还会生成：
+
+```text
+evaluation/pointmap_frame_metrics.csv
+evaluation/pointmap_summary.csv
+evaluation/depth_frame_metrics.csv
+evaluation/depth_summary.csv
+```
+
+`pointmap_summary.csv`区分两种几何来源：
+
+- `point_head`：直接评估 StreamVGGT DPT point head输出；camera-only模式应与 baseline
+  完全相同，只有 `all_token_fusion`会修改它；
+- `depth_pose_backprojection`：使用当前模式的 depth、内参和 refined pose反投影完整
+  点云，因此可以衡量纯位姿修复对最终融合点云的影响。
+
+所有模式严格复用 cache中由 baseline reference frame拟合的一次 Sim(3)，不会用 refined
+结果重新拟合。`depth_summary.csv`同时记录固定 reference scale的米制 MAE/RMSE/AbsRel、
+每帧 median-scale AbsRel与 scale-invariant log RMSE，以区分尺度漂移和深度形状误差。
+
+`instance_diagnostics.csv`中的 instance Chamfer是 frozen depth经过 refined pose后的跨帧
+刚体自一致性，不是 pointmap对GT的精度；它与上述 full-scene paired pointmap指标不能
+互相替代。
