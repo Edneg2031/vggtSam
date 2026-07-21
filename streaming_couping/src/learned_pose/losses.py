@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .config import LossConfig
+from .config import GEOMETRY_MODES, POSE_MODES, LossConfig
 
 
 def compute_training_loss(
@@ -17,30 +17,44 @@ def compute_training_loss(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     predicted_pose = outputs["pose_encoding"].float()
     target_pose = batch["target_pose_encoding"].float()
-    camera = camera_encoding_loss(predicted_pose, target_pose)
-    relative_rotation = relative_rotation_loss(predicted_pose, target_pose)
-    translation_direction = translation_direction_loss(predicted_pose, target_pose)
-    rigid, centroid = instance_rigid_losses(
-        predicted_pose,
-        batch["instance_uvd"].float(),
-        batch["instance_uvd_valid"].bool(),
-        batch["instance_rigid_weight"].float(),
-        image_size=tuple(int(v) for v in batch["image_size"]),
-        scene_scale=float(batch["scene_scale"]),
-        trim_quantile=config.rigid_trim_quantile,
-    )
+    zero = predicted_pose.new_zeros(())
+    camera = zero
+    relative_rotation = zero
+    translation_direction = zero
+    rigid = zero
+    centroid = zero
+    if mode in POSE_MODES:
+        camera = camera_encoding_loss(predicted_pose, target_pose)
+        relative_rotation = relative_rotation_loss(predicted_pose, target_pose)
+        translation_direction = translation_direction_loss(predicted_pose, target_pose)
+        rigid, centroid = instance_rigid_losses(
+            predicted_pose,
+            batch["instance_uvd"].float(),
+            batch["instance_uvd_valid"].bool(),
+            batch["instance_rigid_weight"].float(),
+            image_size=tuple(int(v) for v in batch["image_size"]),
+            scene_scale=float(batch["scene_scale"]),
+            trim_quantile=config.rigid_trim_quantile,
+        )
     residual = outputs.get(
         "residual_mean_square",
         predicted_pose.new_zeros(()),
     ).float()
-    depth = predicted_pose.new_zeros(())
-    pointmap = predicted_pose.new_zeros(())
-    if mode == "all_token_fusion":
+    depth = zero
+    depth_fixed = zero
+    pointmap = zero
+    if mode in GEOMETRY_MODES:
         if "depth" not in outputs or "world_points" not in outputs:
-            raise RuntimeError("all_token_fusion must return depth and world_points.")
+            raise RuntimeError(f"{mode} must return depth and world_points.")
         depth = scale_invariant_depth_loss(
             outputs["depth"].float(),
             batch["target_depth"].float(),
+        )
+        depth_fixed = fixed_reference_depth_loss(
+            outputs["depth"].float(),
+            batch["target_depth"].float(),
+            baseline=batch["baseline_depth"].float(),
+            reference_index=int(batch["reference_sequence_index"]),
         )
         pointmap = aligned_pointmap_loss(
             outputs["world_points"].float(),
@@ -57,6 +71,7 @@ def compute_training_loss(
         "centroid": centroid,
         "residual": residual,
         "depth": depth,
+        "depth_fixed": depth_fixed,
         "pointmap": pointmap,
     }
     total = (
@@ -67,6 +82,7 @@ def compute_training_loss(
         + config.centroid * centroid
         + config.residual * residual
         + config.depth * depth
+        + config.depth_fixed * depth_fixed
         + config.pointmap * pointmap
     )
     return total, {"total": total, **terms}
@@ -223,6 +239,61 @@ def scale_invariant_depth_loss(predicted: torch.Tensor, target: torch.Tensor) ->
     difference = torch.log(predicted[valid].clamp_min(1e-6)) - torch.log(target[valid].clamp_min(1e-6))
     difference = difference - difference.mean()
     return torch.sqrt(difference.square().mean() + 1e-8)
+
+
+def fixed_reference_depth_loss(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    baseline: torch.Tensor,
+    reference_index: int,
+) -> torch.Tensor:
+    """Log-depth loss under one scale fitted to the frozen reference frame."""
+
+    predicted = _squeeze_depth(predicted)
+    target = _squeeze_depth(target)
+    baseline = _squeeze_depth(baseline)
+    reference_predicted = baseline[:, int(reference_index)]
+    reference_target = target[:, int(reference_index)]
+    reference_valid = (
+        torch.isfinite(reference_predicted)
+        & torch.isfinite(reference_target)
+        & (reference_predicted > 1e-6)
+        & (reference_target > 1e-6)
+    )
+    if int(reference_valid.sum()) < 128:
+        return predicted.new_zeros(())
+    fixed_scale = (
+        reference_target[reference_valid]
+        / reference_predicted[reference_valid].clamp_min(1e-6)
+    ).median().detach()
+    valid = (
+        torch.isfinite(predicted)
+        & torch.isfinite(target)
+        & (predicted > 1e-6)
+        & (target > 1e-6)
+    )
+    if not bool(valid.any()):
+        return predicted.new_zeros(())
+    difference = (
+        (predicted[valid] * fixed_scale).clamp_min(1e-6).log()
+        - target[valid].clamp_min(1e-6).log()
+    )
+    if difference.numel() > 32768:
+        indices = torch.linspace(
+            0,
+            difference.numel() - 1,
+            32768,
+            device=difference.device,
+        ).round().long()
+        difference = difference.index_select(0, indices)
+    return F.smooth_l1_loss(difference, torch.zeros_like(difference))
+
+
+def _squeeze_depth(value: torch.Tensor) -> torch.Tensor:
+    if value.ndim == 5 and value.shape[-1] == 1:
+        return value[..., 0]
+    return value
 
 
 def aligned_pointmap_loss(

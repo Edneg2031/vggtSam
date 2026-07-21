@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import csv
+import gc
 import json
 from pathlib import Path
 import random
@@ -23,7 +24,7 @@ from ..pose_evaluation import (
     _summarize_pose_pairs,
 )
 from .cache import cache_path, load_feature_cache
-from .config import LearnedPoseConfig
+from .config import GEOMETRY_MODES, PATCH_MODES, V2_MODES, LearnedPoseConfig
 from .geometry_metrics import (
     append_geometry_metrics,
     summarize_depth_metrics,
@@ -50,9 +51,9 @@ def train_all_modes(config: LearnedPoseConfig) -> None:
     frozen = _load_frozen_streamvggt(config, device=config.training.device)
     config.output_dir.mkdir(parents=True, exist_ok=True)
     for mode in config.training.modes:
-        if mode == "all_token_fusion" and "token_levels" not in first:
+        if mode in GEOMETRY_MODES and "token_levels" not in first:
             raise RuntimeError(
-                "all_token_fusion requires features.cache_all_token_levels=true."
+                f"{mode} requires features.cache_all_token_levels=true."
             )
         print(f"training learned pose mode={mode}")
         _seed_everything(config.training.seed)
@@ -131,8 +132,10 @@ def train_all_modes(config: LearnedPoseConfig) -> None:
                 print(
                     f"mode={mode} epoch={epoch:03d} step={step:03d} "
                     f"loss={row['total']:.6f} pose={row['camera']:.6f} "
+                    f"pointmap={row['pointmap']:.6f} depth={row['depth']:.6f} "
                     f"rigid={row['rigid']:.6f} grad={row['gradient_norm']:.4f}"
                 )
+                del batch, outputs, total, terms, grad_norm
             validation_loss = _validation_loss(
                 frozen,
                 adapter,
@@ -157,6 +160,10 @@ def train_all_modes(config: LearnedPoseConfig) -> None:
                 torch.save(checkpoint, mode_dir / "checkpoint_best.pt")
             _write_csv(mode_dir / "training_history.csv", history)
         print(f"finished mode={mode} best_validation_loss={best_loss:.6f}")
+        del adapter, optimizer, payload_cache, checkpoint
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 @torch.no_grad()
@@ -228,7 +235,7 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
             continue
         checkpoint = _torch_load(checkpoint_path)
         adapter = _new_adapter(first, config).to(config.training.device)
-        adapter.load_state_dict(checkpoint["adapter"], strict=True)
+        _load_adapter_checkpoint(adapter, checkpoint, mode=mode)
         adapter.eval()
         for clip in evaluation_clips:
             payload = load_feature_cache(cache_path(config, clip))
@@ -236,6 +243,11 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
             baseline_outputs = _forward_baseline(batch)
             perturbations = config.evaluation.perturbations
             for perturbation in perturbations:
+                if (
+                    perturbation in {"pose_branch_off", "geometry_branch_off"}
+                    and mode != "decoupled_dual_branch"
+                ):
+                    continue
                 outputs = _forward_mode(
                     frozen,
                     adapter,
@@ -304,7 +316,7 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
                     )
                     depth_difference = 0.0
                     pointmap_difference = 0.0
-                    if mode == "all_token_fusion":
+                    if mode in GEOMETRY_MODES:
                         depth_difference = float(
                             (outputs["depth"] - batch["baseline_depth"]).abs().max().cpu()
                         )
@@ -378,6 +390,10 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
             "reprojecting frozen baseline geometry. Depth uses its own baseline-reference "
             "median scale because the StreamVGGT depth and point heads have different scales."
         ),
+        "decoupled_v2": (
+            "Patch modes preserve every camera/register prefix token. The dual branch uses "
+            "independent pose and geometry tokenizers, attentions, gates, and projections."
+        ),
     }
     with (output / "metadata.json").open("w", encoding="utf8") as handle:
         json.dump(metadata, handle, indent=2, ensure_ascii=False)
@@ -406,6 +422,30 @@ def _new_adapter(payload: dict, config: LearnedPoseConfig) -> InstancePoseAdapte
     )
 
 
+def _load_adapter_checkpoint(
+    adapter: InstancePoseAdapter,
+    checkpoint: dict,
+    *,
+    mode: str,
+) -> None:
+    checkpoint_mode = str(checkpoint.get("mode", mode))
+    if checkpoint_mode in V2_MODES:
+        adapter.load_state_dict(checkpoint["adapter"], strict=True)
+        return
+    incompatible = adapter.load_state_dict(checkpoint["adapter"], strict=False)
+    allowed_missing = ("geometry_tokenizer.", "patch_token_fusions.")
+    bad_missing = [
+        key
+        for key in incompatible.missing_keys
+        if not key.startswith(allowed_missing)
+    ]
+    if bad_missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Checkpoint is incompatible with the instance adapter: "
+            f"missing={bad_missing}, unexpected={incompatible.unexpected_keys}."
+        )
+
+
 def _forward_mode(
     frozen,
     adapter: InstancePoseAdapter,
@@ -415,12 +455,7 @@ def _forward_mode(
     perturbation: str,
 ) -> dict[str, torch.Tensor | dict]:
     if mode == "all_token_fusion":
-        layer_indices = [int(v) for v in batch["dpt_layer_indices"]]
-        level_tensor = batch["token_levels"]
-        token_levels = {
-            layer: level_tensor[:, index]
-            for index, layer in enumerate(layer_indices)
-        }
+        token_levels = _token_level_mapping(batch)
         updated, diagnostics = adapter.forward_all_tokens(
             token_levels,
             appearance=batch["appearance"],
@@ -429,7 +464,7 @@ def _forward_mode(
             observed=batch["observed"],
             perturbation=perturbation,
         )
-        final_layer = max(layer_indices)
+        final_layer = max(updated)
         camera_hidden = updated[final_layer][:, :, 0]
         pose_delta = _decode_streaming_camera_delta(
             frozen.camera_head,
@@ -437,41 +472,83 @@ def _forward_mode(
             updated[final_layer][:, :, 0],
         )
         pose_encoding = batch["baseline_pose_encoding"] + pose_delta
-        aggregated = [None] * (final_layer + 1)
-        for layer, value in updated.items():
-            aggregated[int(layer)] = value
-        depth, depth_confidence = _decode_streaming_dpt_head(
-            frozen.depth_head,
-            aggregated,
-            batch["stream_images"],
+        return _geometry_head_outputs(
+            frozen,
+            batch,
+            updated,
+            pose_encoding=pose_encoding,
+            camera_hidden=camera_hidden,
+            diagnostics=diagnostics,
+        )
+    if mode in PATCH_MODES:
+        token_levels = _token_level_mapping(batch)
+        updated, diagnostics = adapter.forward_patch_tokens(
+            token_levels,
             patch_start_idx=int(batch["patch_start_idx"]),
+            appearance=batch["appearance"],
+            geometry=batch["geometry"],
+            quality=batch["quality"],
+            observed=batch["observed"],
+            mode=mode,
+            perturbation=perturbation,
         )
-        world_points, world_confidence = _decode_streaming_dpt_head(
-            frozen.point_head,
-            aggregated,
-            batch["stream_images"],
+        return _geometry_head_outputs(
+            frozen,
+            batch,
+            updated,
+            pose_encoding=batch["baseline_pose_encoding"],
+            camera_hidden=batch["camera_hidden"],
+            diagnostics=diagnostics,
+        )
+    if mode == "decoupled_dual_branch":
+        pose_perturbation = perturbation
+        geometry_perturbation = perturbation
+        if perturbation == "pose_branch_off":
+            pose_perturbation = "module_off"
+            geometry_perturbation = "aligned"
+        elif perturbation == "geometry_branch_off":
+            pose_perturbation = "aligned"
+            geometry_perturbation = "module_off"
+        camera_hidden, pose_diagnostics = adapter.forward_camera(
+            batch["camera_hidden"],
+            appearance=batch["appearance"],
+            geometry=batch["geometry"],
+            quality=batch["quality"],
+            observed=batch["observed"],
+            mode="camera_sam_only",
+            perturbation=pose_perturbation,
+        )
+        pose_delta = _decode_streaming_camera_delta(
+            frozen.camera_head,
+            batch["camera_hidden"],
+            camera_hidden,
+        )
+        pose_encoding = batch["baseline_pose_encoding"] + pose_delta
+        updated, geometry_diagnostics = adapter.forward_patch_tokens(
+            _token_level_mapping(batch),
             patch_start_idx=int(batch["patch_start_idx"]),
+            appearance=batch["appearance"],
+            geometry=batch["geometry"],
+            quality=batch["quality"],
+            observed=batch["observed"],
+            mode="patch_sam_geometry_tracker_gate",
+            perturbation=geometry_perturbation,
         )
-        residual_square_values = [
-            value
-            for key, value in diagnostics.items()
-            if key.endswith("residual_mean_square")
-        ]
-        residual_mean_square = (
-            torch.stack(residual_square_values).mean()
-            if residual_square_values
-            else pose_encoding.new_zeros(())
-        )
-        return {
-            "pose_encoding": pose_encoding,
-            "camera_hidden": camera_hidden,
-            "depth": depth,
-            "depth_confidence": depth_confidence,
-            "world_points": world_points,
-            "world_confidence": world_confidence,
-            "residual_mean_square": residual_mean_square,
-            "diagnostics": diagnostics,
+        diagnostics = {
+            **{f"pose_{key}": value for key, value in pose_diagnostics.items()},
+            **{
+                f"geometry_{key}": value
+                for key, value in geometry_diagnostics.items()
+            },
         }
+        return _geometry_head_outputs(
+            frozen,
+            batch,
+            updated,
+            pose_encoding=pose_encoding,
+            camera_hidden=camera_hidden,
+            diagnostics=diagnostics,
+        )
     camera_hidden, diagnostics = adapter.forward_camera(
         batch["camera_hidden"],
         appearance=batch["appearance"],
@@ -492,6 +569,62 @@ def _forward_mode(
         "camera_hidden": camera_hidden,
         "residual_mean_square": diagnostics["residual_mean_square"],
         "diagnostics": diagnostics,
+    }
+
+
+def _token_level_mapping(batch: dict) -> dict[int, torch.Tensor]:
+    layers = [int(value) for value in batch["dpt_layer_indices"]]
+    values = batch["token_levels"]
+    return {
+        layer: values[:, index]
+        for index, layer in enumerate(layers)
+    }
+
+
+def _geometry_head_outputs(
+    frozen,
+    batch: dict,
+    updated: Mapping[int, torch.Tensor],
+    *,
+    pose_encoding: torch.Tensor,
+    camera_hidden: torch.Tensor,
+    diagnostics: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor | dict]:
+    final_layer = max(int(layer) for layer in updated)
+    aggregated: list[torch.Tensor | None] = [None] * (final_layer + 1)
+    for layer, value in updated.items():
+        aggregated[int(layer)] = value
+    depth, depth_confidence = _decode_streaming_dpt_head(
+        frozen.depth_head,
+        aggregated,
+        batch["stream_images"],
+        patch_start_idx=int(batch["patch_start_idx"]),
+    )
+    world_points, world_confidence = _decode_streaming_dpt_head(
+        frozen.point_head,
+        aggregated,
+        batch["stream_images"],
+        patch_start_idx=int(batch["patch_start_idx"]),
+    )
+    residual_values = [
+        value
+        for key, value in diagnostics.items()
+        if key.endswith("residual_mean_square")
+    ]
+    residual_mean_square = (
+        torch.stack(residual_values).mean()
+        if residual_values
+        else pose_encoding.new_zeros(())
+    )
+    return {
+        "pose_encoding": pose_encoding,
+        "camera_hidden": camera_hidden,
+        "depth": depth,
+        "depth_confidence": depth_confidence,
+        "world_points": world_points,
+        "world_confidence": world_confidence,
+        "residual_mean_square": residual_mean_square,
+        "diagnostics": dict(diagnostics),
     }
 
 
@@ -638,10 +771,25 @@ def _assert_zero_initialization(
     )
     token_difference = float((output["camera_hidden"] - baseline["camera_hidden"]).abs().max().cpu())
     pose_difference = float((output["pose_encoding"] - baseline["pose_encoding"]).abs().max().cpu())
-    if token_difference != 0.0 or pose_difference != 0.0:
+    depth_difference = 0.0
+    pointmap_difference = 0.0
+    if mode in GEOMETRY_MODES:
+        depth_difference = float(
+            (output["depth"] - baseline["depth"]).abs().max().cpu()
+        )
+        pointmap_difference = float(
+            (output["world_points"] - baseline["world_points"]).abs().max().cpu()
+        )
+    if (
+        token_difference != 0.0
+        or pose_difference != 0.0
+        or depth_difference != 0.0
+        or pointmap_difference != 0.0
+    ):
         raise RuntimeError(
             "Zero-initialized adapter does not exactly reproduce baseline: "
-            f"token={token_difference}, pose={pose_difference}."
+            f"token={token_difference}, pose={pose_difference}, "
+            f"depth={depth_difference}, pointmap={pointmap_difference}."
         )
     print("zero-init baseline equivalence: exact")
     return {
@@ -649,6 +797,8 @@ def _assert_zero_initialization(
         "clip": payload["clip_name"],
         "token_max_abs_diff": token_difference,
         "pose_max_abs_diff": pose_difference,
+        "depth_max_abs_diff": depth_difference,
+        "pointmap_max_abs_diff": pointmap_difference,
         "strict_equal": 1,
     }
 
@@ -730,6 +880,7 @@ def _batch_to_device(payload: dict, device: str) -> dict:
         "baseline_depth",
         "baseline_world_points",
         "stream_images",
+        "tracking_masks_stream",
     }
     output = dict(payload)
     for name in batched_fields:
@@ -753,7 +904,7 @@ def _batch_to_device(payload: dict, device: str) -> dict:
 
 
 def _payload_for_mode(payload: dict, mode: str) -> dict:
-    if mode == "all_token_fusion":
+    if mode in GEOMETRY_MODES:
         return payload
     # Camera-only modes never rerun DPT heads. Keep the common cache on disk,
     # but do not retain its large four-level token tensor in host memory.

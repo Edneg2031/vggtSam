@@ -56,11 +56,16 @@ class CausalInstanceTokenizer(nn.Module):
             "camera_sam_only",
             "camera_token_fusion",
             "all_token_fusion",
+            "patch_sam_only",
+            "patch_sam_geometry_strict",
+            "patch_sam_geometry_tracker_gate",
         }
         use_geometry = mode in {
             "camera_geometry_only",
             "camera_token_fusion",
             "all_token_fusion",
+            "patch_sam_geometry_strict",
+            "patch_sam_geometry_tracker_gate",
         }
         if not use_appearance:
             appearance = torch.zeros_like(appearance)
@@ -73,6 +78,17 @@ class CausalInstanceTokenizer(nn.Module):
                 dim=-1,
             )
             gate_quality = quality
+        elif mode == "patch_sam_geometry_tracker_gate":
+            # Geometry/static confidence remains available as a feature, but
+            # does not hard-reject an otherwise reliable tracked instance.
+            gate_quality = torch.stack(
+                [
+                    gate_quality[..., 0],
+                    torch.ones_like(gate_quality[..., 1]),
+                    torch.ones_like(gate_quality[..., 2]),
+                ],
+                dim=-1,
+            )
 
         batch, sequence, instances = observed.shape
         app_memory = torch.zeros_like(appearance[:, 0])
@@ -239,12 +255,29 @@ class InstancePoseAdapter(nn.Module):
         self.token_dim = int(token_dim)
         self.config = config
         self.tokenizer = CausalInstanceTokenizer(appearance_dim, geometry_dim, config)
+        # V2 deliberately separates learned pose and geometry projections so
+        # their losses cannot fight through a shared persistent-token encoder.
+        self.geometry_tokenizer = CausalInstanceTokenizer(
+            appearance_dim,
+            geometry_dim,
+            config,
+        )
         self.camera_fusion = ZeroInitializedCrossAttention(
             token_dim,
             config.instance_dim,
             config,
         )
         self.all_token_fusions = nn.ModuleDict(
+            {
+                str(layer): ZeroInitializedCrossAttention(
+                    token_dim,
+                    config.instance_dim,
+                    config,
+                )
+                for layer in config.dpt_layer_indices
+            }
+        )
+        self.patch_token_fusions = nn.ModuleDict(
             {
                 str(layer): ZeroInitializedCrossAttention(
                     token_dim,
@@ -321,6 +354,59 @@ class InstancePoseAdapter(nn.Module):
                 continue
             updated, current = self.all_token_fusions[key](tokens, instance_tokens, valid)
             output[int(layer)] = updated
+            logs.update({f"layer_{key}_{name}": value for name, value in current.items()})
+        return output, logs
+
+    def forward_patch_tokens(
+        self,
+        token_levels: Mapping[int, torch.Tensor],
+        *,
+        patch_start_idx: int,
+        appearance: torch.Tensor,
+        geometry: torch.Tensor,
+        quality: torch.Tensor,
+        observed: torch.Tensor,
+        mode: str,
+        perturbation: str = "aligned",
+    ) -> tuple[dict[int, torch.Tensor], dict[str, torch.Tensor]]:
+        """Update DPT patch tokens while preserving camera/register tokens."""
+
+        if perturbation == "module_off":
+            return dict(token_levels), {}
+        if mode not in {
+            "patch_sam_only",
+            "patch_sam_geometry_strict",
+            "patch_sam_geometry_tracker_gate",
+        }:
+            raise ValueError(f"Unsupported patch-token mode: {mode}")
+        instance_tokens, valid, memory_log = self.geometry_tokenizer(
+            appearance,
+            geometry,
+            quality,
+            observed,
+            mode=mode,
+            perturbation=perturbation,
+        )
+        start = int(patch_start_idx)
+        output: dict[int, torch.Tensor] = {}
+        logs: dict[str, torch.Tensor] = dict(memory_log)
+        for layer, tokens in token_levels.items():
+            key = str(int(layer))
+            if start < 0 or start >= tokens.shape[2]:
+                raise ValueError(
+                    f"patch_start_idx={start} is invalid for {tokens.shape[2]} tokens."
+                )
+            if key not in self.patch_token_fusions:
+                output[int(layer)] = tokens
+                continue
+            prefix = tokens[:, :, :start]
+            patches = tokens[:, :, start:]
+            updated, current = self.patch_token_fusions[key](
+                patches,
+                instance_tokens,
+                valid,
+            )
+            output[int(layer)] = torch.cat([prefix, updated], dim=2)
             logs.update({f"layer_{key}_{name}": value for name, value in current.items()})
         return output, logs
 

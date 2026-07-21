@@ -55,6 +55,7 @@ class LossConfig:
     centroid: float = 0.25
     residual: float = 1e-4
     depth: float = 10.0
+    depth_fixed: float = 0.0
     pointmap: float = 5.0
     rigid_trim_quantile: float = 0.70
 
@@ -112,6 +113,10 @@ VALID_MODES = {
     "camera_sam_only",
     "camera_token_fusion",
     "all_token_fusion",
+    "patch_sam_only",
+    "patch_sam_geometry_strict",
+    "patch_sam_geometry_tracker_gate",
+    "decoupled_dual_branch",
 }
 
 VALID_PERTURBATIONS = {
@@ -121,7 +126,37 @@ VALID_PERTURBATIONS = {
     "zero_geometry",
     "shuffle_instance_ids",
     "shuffle_time",
+    "pose_branch_off",
+    "geometry_branch_off",
 }
+
+POSE_MODES = frozenset(
+    {
+        "camera_geometry_only",
+        "camera_sam_only",
+        "camera_token_fusion",
+        "all_token_fusion",
+        "decoupled_dual_branch",
+    }
+)
+
+PATCH_MODES = frozenset(
+    {
+        "patch_sam_only",
+        "patch_sam_geometry_strict",
+        "patch_sam_geometry_tracker_gate",
+    }
+)
+
+GEOMETRY_MODES = frozenset(
+    {
+        "all_token_fusion",
+        "decoupled_dual_branch",
+        *PATCH_MODES,
+    }
+)
+
+V2_MODES = frozenset({"decoupled_dual_branch", *PATCH_MODES})
 
 
 def load_learned_pose_config(path: str | Path) -> LearnedPoseConfig:
@@ -179,6 +214,7 @@ def load_learned_pose_config(path: str | Path) -> LearnedPoseConfig:
             centroid=float(loss.get("centroid", 0.25)),
             residual=float(loss.get("residual", 1e-4)),
             depth=float(loss.get("depth", 10.0)),
+            depth_fixed=float(loss.get("depth_fixed", 0.0)),
             pointmap=float(loss.get("pointmap", 5.0)),
             rigid_trim_quantile=float(loss.get("rigid_trim_quantile", 0.70)),
         ),
@@ -255,6 +291,8 @@ def _validate(config: LearnedPoseConfig) -> None:
             raise ValueError(f"{name} must be in [0, 1].")
     if config.features.sampled_instance_points < 8:
         raise ValueError("features.sampled_instance_points must be at least 8.")
+    if config.training.epochs < 1 or config.training.repeats_per_epoch < 1:
+        raise ValueError("training epochs and repeats_per_epoch must be positive.")
     for clip in config.clips:
         if clip.reference_sequence_index != 0:
             raise ValueError("Learned causal pose refinement requires reference_sequence_index=0.")

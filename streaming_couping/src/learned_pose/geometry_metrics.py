@@ -51,6 +51,7 @@ def append_geometry_metrics(
     }
     frame_indices = [int(value) for value in batch["frame_indices"]]
     reference_index = int(batch["reference_sequence_index"])
+    spatial_masks = _spatial_evaluation_masks(batch, target_world)
 
     for geometry_source, predicted in (
         ("point_head", point_head),
@@ -58,46 +59,52 @@ def append_geometry_metrics(
     ):
         aligned = scale * (predicted @ rotation.transpose(-1, -2)) + translation
         for sequence_index, frame_index in enumerate(frame_indices):
-            current = _paired_point_metrics(
-                aligned[0, sequence_index],
-                target_world[0, sequence_index],
-            )
-            pointmap_frame_rows.append(
-                {
-                    **common_prefix,
-                    "alignment": "fixed_reference_point_sim3",
-                    "alignment_scale": scale,
-                    "evaluation_mask": "all_finite_gt_pairs",
-                    "geometry_source": geometry_source,
-                    "sequence_index": sequence_index,
-                    "frame_index": frame_index,
-                    "is_reference": int(sequence_index == reference_index),
-                    **current,
-                }
-            )
+            for spatial_region, spatial_mask in spatial_masks.items():
+                current = _paired_point_metrics(
+                    aligned[0, sequence_index],
+                    target_world[0, sequence_index],
+                    spatial_mask=spatial_mask[0, sequence_index],
+                )
+                pointmap_frame_rows.append(
+                    {
+                        **common_prefix,
+                        "alignment": "fixed_reference_point_sim3",
+                        "alignment_scale": scale,
+                        "evaluation_mask": "all_finite_gt_pairs",
+                        "spatial_region": spatial_region,
+                        "geometry_source": geometry_source,
+                        "sequence_index": sequence_index,
+                        "frame_index": frame_index,
+                        "is_reference": int(sequence_index == reference_index),
+                        **current,
+                    }
+                )
 
     depth_scale = _reference_depth_scale(
         batch["baseline_depth"].detach().float()[0, reference_index],
         target_depth[0, reference_index],
     )
     for sequence_index, frame_index in enumerate(frame_indices):
-        current = _depth_metrics(
-            depth[0, sequence_index],
-            target_depth[0, sequence_index],
-            fixed_scale=depth_scale,
-        )
-        depth_frame_rows.append(
-            {
-                **common_prefix,
-                "alignment": "fixed_reference_depth_median_scale",
-                "alignment_scale": depth_scale,
-                "evaluation_mask": "finite_positive_depth_pairs",
-                "sequence_index": sequence_index,
-                "frame_index": frame_index,
-                "is_reference": int(sequence_index == reference_index),
-                **current,
-            }
-        )
+        for spatial_region, spatial_mask in spatial_masks.items():
+            current = _depth_metrics(
+                depth[0, sequence_index],
+                target_depth[0, sequence_index],
+                fixed_scale=depth_scale,
+                spatial_mask=spatial_mask[0, sequence_index],
+            )
+            depth_frame_rows.append(
+                {
+                    **common_prefix,
+                    "alignment": "fixed_reference_depth_median_scale",
+                    "alignment_scale": depth_scale,
+                    "evaluation_mask": "finite_positive_depth_pairs",
+                    "spatial_region": spatial_region,
+                    "sequence_index": sequence_index,
+                    "frame_index": frame_index,
+                    "is_reference": int(sequence_index == reference_index),
+                    **current,
+                }
+            )
 
 
 def summarize_pointmap_metrics(rows: Iterable[dict]) -> list[dict]:
@@ -109,6 +116,7 @@ def summarize_pointmap_metrics(rows: Iterable[dict]) -> list[dict]:
         "alignment",
         "alignment_scale",
         "evaluation_mask",
+        "spatial_region",
         "geometry_source",
     )
     return _summarize_frame_rows(
@@ -134,6 +142,7 @@ def summarize_depth_metrics(rows: Iterable[dict]) -> list[dict]:
         "alignment",
         "alignment_scale",
         "evaluation_mask",
+        "spatial_region",
     )
     return _summarize_frame_rows(
         rows,
@@ -151,8 +160,14 @@ def summarize_depth_metrics(rows: Iterable[dict]) -> list[dict]:
     )
 
 
-def _paired_point_metrics(predicted: torch.Tensor, target: torch.Tensor) -> dict:
+def _paired_point_metrics(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    spatial_mask: torch.Tensor,
+) -> dict:
     valid = torch.isfinite(predicted).all(dim=-1) & torch.isfinite(target).all(dim=-1)
+    valid = valid & spatial_mask.bool()
     distances = torch.linalg.vector_norm(predicted[valid] - target[valid], dim=-1)
     if distances.numel() == 0:
         return {
@@ -177,6 +192,7 @@ def _depth_metrics(
     target: torch.Tensor,
     *,
     fixed_scale: float,
+    spatial_mask: torch.Tensor,
 ) -> dict:
     predicted = predicted.squeeze(-1)
     target = target.squeeze(-1)
@@ -185,6 +201,7 @@ def _depth_metrics(
         & torch.isfinite(target)
         & (predicted > 1e-6)
         & (target > 1e-6)
+        & spatial_mask.bool()
     )
     predicted = predicted[valid].float()
     target = target[valid].float()
@@ -270,6 +287,34 @@ def _reference_depth_scale(predicted: torch.Tensor, target: torch.Tensor) -> flo
     if int(valid.sum()) < 128:
         raise ValueError("Reference depth scale requires at least 128 valid pixels.")
     return float((target[valid] / predicted[valid]).median().cpu())
+
+
+def _spatial_evaluation_masks(
+    batch: dict,
+    target_world: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    full = torch.ones(
+        target_world.shape[:-1],
+        dtype=torch.bool,
+        device=target_world.device,
+    )
+    masks = batch.get("tracking_masks_stream")
+    if not torch.is_tensor(masks):
+        return {"full_scene": full}
+    masks = masks.bool()
+    if masks.ndim != 5 or masks.shape[:2] != target_world.shape[:2]:
+        raise ValueError("tracking_masks_stream must have shape [B,S,K,H,W].")
+    union = masks.any(dim=2)
+    if union.shape != full.shape:
+        raise ValueError(
+            "Tracking masks and pointmap resolution disagree: "
+            f"{tuple(union.shape)} vs {tuple(full.shape)}."
+        )
+    return {
+        "full_scene": full,
+        "tracked_instance_union": union,
+        "background": ~union,
+    }
 
 
 def _summarize_frame_rows(

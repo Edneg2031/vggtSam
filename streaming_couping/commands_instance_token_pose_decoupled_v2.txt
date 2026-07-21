@@ -1,0 +1,21 @@
+# Run from the repository root. Existing V1 feature caches are reused, so
+# this trains/evaluates V2 adapters without rerunning SAM3 feature extraction.
+mkdir -p outputs
+set -o pipefail
+
+PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_instance_token_pose \
+  --config streaming_couping/configs/instance_token_pose_decoupled_v2.yaml \
+  --stage all \
+  --sam3-device cuda:3 \
+  --geometry-device cuda:1 \
+  --training-device cuda:1 \
+  2>&1 | tee outputs/streaming_couping_instance_token_pose_decoupled_v2.log
+
+# Return first:
+#   outputs/streaming_couping_instance_token_pose_decoupled_v2/evaluation/pose_summary.csv
+#   outputs/streaming_couping_instance_token_pose_decoupled_v2/evaluation/pose_pair_summary.csv
+#   outputs/streaming_couping_instance_token_pose_decoupled_v2/evaluation/pointmap_summary.csv
+#   outputs/streaming_couping_instance_token_pose_decoupled_v2/evaluation/depth_summary.csv
+#   outputs/streaming_couping_instance_token_pose_decoupled_v2/evaluation/instance_diagnostics.csv
+#   outputs/streaming_couping_instance_token_pose_decoupled_v2/evaluation/baseline_equivalence.csv
+#   outputs/streaming_couping_instance_token_pose_decoupled_v2.log
