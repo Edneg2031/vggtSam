@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run causal multi-instance pointmap and ray-center pose refinement."""
+"""Run final V3 causal instance pointmap and camera-pose refinement."""
 
 from streaming_couping.src.instance_pose_refinement import main
 

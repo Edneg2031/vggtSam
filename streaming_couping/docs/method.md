@@ -134,6 +134,10 @@ X'_t = X_t + 0.5 * Delta_t
 0.5/0.5 blend 接受。carry 后 temporal frame 前移，因此最多形成两步短链；长 gap、
 没有唯一 inlier 或中间拒绝立即 reset。
 
+最终 V3 在固定 7 帧压力序列上将 ATE `0.175915 -> 0.173651 m`，all-pairs
+translation direction mean `11.345° -> 10.780°`、median `7.383° -> 6.942°`，
+adjacent RPE 保持在 `0.08094 m` 左右。V3 因此冻结为当前主方法。
+
 详细消融与输出字段见
 [`instance_pose_refinement.md`](instance_pose_refinement.md)。
 
@@ -152,15 +156,13 @@ X'_t = X_t + 0.5 * Delta_t
 只用 reference 帧 paired full-scene points 拟合一次 Sim(3)，后续固定。报告逐帧
 paired distance mean/median/RMSE/p90，以及 non-reference 汇总。
 
-### Controls
+### 当前运行分支
 
 - `ray_only`
-- V2 a050 reproduction
-- V3 consensus-only（去 temporal）
-- V3 unvalidated-map（去受控写回）
-- V3 temporal + validated-map 主候选
-- V3 shuffled instance IDs
-- GT point translation oracle
+- `v3_temporal_validated_a050`
+
+历史消融已完成并从运行时代码删除，结果保留在
+[`instance_pose_refinement.md`](instance_pose_refinement.md)。
 
 ## 7. 当前服务器入口
 
@@ -170,4 +172,15 @@ paired distance mean/median/RMSE/p90，以及 non-reference 汇总。
 zsh streaming_couping/commands.txt
 ```
 
-同一命令复用 tracking cache、跑完 7 个必要 V3/对照分支并保留实例 PLY。
+同一命令复用 tracking cache，只运行 `ray_only` 与最终 V3，并保留实例 PLY。
+
+## 8. Learned persistent-instance pose adapter
+
+该实验分支保留上述显式 V3，不把 fused token写入 SAM3。可靠 recovered mask和
+persistent ID生成因果 instance memory；current/history center、covariance、ICP
+quality和二者残差经 MLP 编码后，只在 CameraHead前更新最终 hidden camera token。
+
+Camera residual使用 zero-initialized projection，module-off和初始化必须逐元素恢复
+raw StreamVGGT。geometry-only、SAM-only、combined和all-token构成结构消融；zero、
+shuffled ID和shuffled time均在同一个 trained checkpoint推理时测试。详细设计与
+命令见 [`instance_token_pose.md`](instance_token_pose.md)。

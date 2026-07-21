@@ -1,4 +1,4 @@
-# 当前唯一服务器实验（第三版）：
+# 当前唯一服务器流程（最终 V3）：
 # reliable SAM3 tracking -> persistent static-instance maps
 # -> strict ICP + temporal conflict filtering
 # -> 只有共识参与者或唯一 temporal inlier 能更新自己的 map
@@ -6,12 +6,11 @@
 # -> 得到唯一整帧共享 pointmap translation
 # -> predicted-K/R all-point ray-center camera translation repair。
 #
-# reference 后不使用 GT。gt_point_translation_oracle 只是显式上限，
-# shuffled_ids 是负对照。优先复用第一版 tracking_cache，跳过 SAM3。
+# reference 后不使用 GT。优先复用 tracking_cache，跳过 SAM3。
 mkdir -p outputs
 set -o pipefail
 
-PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_instance_pose_refinement_ablation \
+PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_instance_pose_refinement \
   --config streaming_couping/configs/recovery_050_025.yaml \
   --manifest data/processed/scannetpp_pinhole_2d/manifest.json \
   --scene-id 00a231a370 \

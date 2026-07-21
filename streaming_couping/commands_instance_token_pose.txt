@@ -1,0 +1,21 @@
+# One server command: reuse current recovered tracking, cache frozen features,
+# train every required ablation, and evaluate same-checkpoint perturbations.
+mkdir -p outputs
+set -o pipefail
+
+PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_instance_token_pose \
+  --config streaming_couping/configs/instance_token_pose.yaml \
+  --stage all \
+  --sam3-device cuda:3 \
+  --geometry-device cuda:1 \
+  --training-device cuda:1 \
+  2>&1 | tee outputs/streaming_couping_instance_token_pose.log
+
+# Return these files first:
+#   outputs/streaming_couping_instance_token_pose/evaluation/pose_summary.csv
+#   outputs/streaming_couping_instance_token_pose/evaluation/pose_pair_summary.csv
+#   outputs/streaming_couping_instance_token_pose/evaluation/pose_rpe.csv
+#   outputs/streaming_couping_instance_token_pose/evaluation/instance_diagnostics.csv
+#   outputs/streaming_couping_instance_token_pose/evaluation/baseline_equivalence.csv
+#   outputs/streaming_couping_instance_token_pose.log
+# Every strict_equal value in baseline_equivalence.csv must be 1.

@@ -1,4 +1,4 @@
-# 多实例 pointmap / 相机位姿修复第三版
+# 多实例 pointmap / 相机位姿修复最终 V3
 
 ## 研究边界
 
@@ -11,8 +11,8 @@ instance maps -> 一个整帧共享 pointmap translation
 corrected pointmap -> all-point ray-center camera translation
 ```
 
-相机和整帧 pointmap 从不按实例分别修改。reference 后 GT 只用于指标和名称中明确
-标出的 `gt_point_translation_oracle`。实例 PLY 始终保留。
+相机和整帧 pointmap 从不按实例分别修改。reference 后 GT 只用于指标，不参与
+proposal、共识、temporal filtering、map 写回或 ray fit。实例 PLY 始终保留。
 
 ## 已完成的 V1/V2 结论
 
@@ -97,20 +97,31 @@ or unique validated temporal participant
 map 使用各实例未缩放的 `delta_t^k`；整帧 pointmap/相机始终只接收一个共享且乘
 `alpha=0.5` 的 translation，不恢复每实例独立改相机。
 
-## 同次必要消融
+## V3 最终结果
+
+| mode | ATE | adjacent RPE | all-pairs mean | all-pairs median |
+|---|---:|---:|---:|---:|
+| `ray_only` | 0.175915 m | 0.080938 m | 11.345° | 7.383° |
+| V2 a050 | 0.176086 m | 0.078713 m | 11.820° | 7.385° |
+| final V3 | **0.173651 m** | 0.080995 m | **10.780°** | **6.942°** |
+
+V3 相对 `ray_only` 的 ATE 改善 1.29%，all-pairs mean 改善 4.99%，median
+改善 5.98%；RPE 仅变化 +0.07%，视为持平。translation@5° 从 28.57% 提升到
+33.33%，@10°/@30° 不下降。shuffled 负对照与 baseline 完全一致。
+
+状态机按设计运行：130 排除 cabinet、wardrobe carry #1；140 wardrobe carry #2；
+210 因 gap=70 和 carry 上限 reset；240 无历史时拒绝冲突。validated 写回只更新
+最终 participating IDs。
+
+## 当前保留的运行分支
 
 | mode | 用途 |
 |---|---|
-| `ray_only` | 真正 baseline |
-| `v2_strict_per_instance_short_carry_a050` | V2 结果复现 |
-| `v3_consensus_only_validated_a050` | 去掉 temporal filtering/carry |
-| `v3_temporal_unvalidated_map_a050` | 去掉受控 map writeback |
-| `v3_temporal_validated_a050` | V3 可部署主候选 |
-| `v3_temporal_validated_shuffled_a050` | shuffled-ID 负对照 |
-| `gt_point_translation_oracle` | evaluation-only 上限 |
+| `ray_only` | 最小 sanity baseline |
+| `v3_temporal_validated_a050` | 最终 V3 方法 |
 
-V1、多组 alpha、reference-only 和 strict/shared 历史分支已由 V2 实验回答，不再
-重复占用服务器计算。
+V1/V2、consensus-only、unvalidated-map、shuffled、GT oracle 和 alpha sweep 已完成
+研究任务，从运行时代码删除；历史结果保留在本文和 Git 历史。
 
 ## 输出与判读
 
@@ -140,7 +151,6 @@ PLY 输出包含：
 
 ```text
 instance_<id>/pointclouds/ray_only/
-instance_<id>/pointclouds/v2_strict_per_instance_short_carry_a050/
 instance_<id>/pointclouds/v3_temporal_validated_a050/
 ```
 

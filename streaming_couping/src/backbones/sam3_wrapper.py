@@ -25,7 +25,7 @@ from ..types import SAM3MaskCandidate, TrackingSequence
 
 
 class SAM3Wrapper:
-    """Expose only the SAM3 operations used by the active ablation."""
+    """Expose only the SAM3 operations used by the final tracking pipeline."""
 
     def __init__(
         self,
