@@ -18,6 +18,8 @@ class ClipConfig:
     split: str = "train"
     reference_sequence_index: int = 0
     tracking_cache: Path | None = None
+    training_frame_indices: tuple[int, ...] | None = None
+    evaluation_frame_indices: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -260,6 +262,12 @@ def _parse_clip(value: dict[str, Any], base: Path) -> ClipConfig:
         split=str(value.get("split", "train")),
         reference_sequence_index=int(value.get("reference_sequence_index", 0)),
         tracking_cache=(_path(cache_value, base) if cache_value else None),
+        training_frame_indices=_optional_int_tuple(
+            value.get("training_frame_indices")
+        ),
+        evaluation_frame_indices=_optional_int_tuple(
+            value.get("evaluation_frame_indices")
+        ),
     )
 
 
@@ -298,6 +306,61 @@ def _validate(config: LearnedPoseConfig) -> None:
             raise ValueError("Learned causal pose refinement requires reference_sequence_index=0.")
         if any(b <= a for a, b in zip(clip.frame_indices, clip.frame_indices[1:])):
             raise ValueError(f"Clip {clip.name!r} frame_indices must be strictly increasing.")
+        frame_set = set(clip.frame_indices)
+        for field, values in (
+            ("training_frame_indices", clip.training_frame_indices),
+            ("evaluation_frame_indices", clip.evaluation_frame_indices),
+        ):
+            if values is None:
+                continue
+            if not values:
+                raise ValueError(f"Clip {clip.name!r} {field} must not be empty.")
+            if len(set(values)) != len(values):
+                raise ValueError(f"Clip {clip.name!r} {field} contains duplicates.")
+            if any(value not in frame_set for value in values):
+                raise ValueError(
+                    f"Clip {clip.name!r} {field} must be a subset of frame_indices."
+                )
+            ordered = tuple(value for value in clip.frame_indices if value in set(values))
+            if values != ordered:
+                raise ValueError(
+                    f"Clip {clip.name!r} {field} must follow frame_indices order."
+                )
+        if clip.training_frame_indices is not None:
+            reference_frame = clip.frame_indices[clip.reference_sequence_index]
+            if reference_frame not in clip.training_frame_indices:
+                raise ValueError(
+                    f"Clip {clip.name!r} training_frame_indices must include the "
+                    f"reference frame {reference_frame}."
+                )
+        if (
+            clip.split.lower() == "train"
+            and clip.evaluation_frame_indices is not None
+            and clip.training_frame_indices is None
+        ):
+            raise ValueError(
+                f"Clip {clip.name!r} with an evaluation_frame_indices holdout "
+                "must explicitly set training_frame_indices."
+            )
+        if (
+            clip.training_frame_indices is not None
+            and clip.evaluation_frame_indices is not None
+        ):
+            overlap = set(clip.training_frame_indices) & set(
+                clip.evaluation_frame_indices
+            )
+            if overlap:
+                raise ValueError(
+                    f"Clip {clip.name!r} training/evaluation frames overlap: "
+                    f"{sorted(overlap)}."
+                )
+            if max(clip.training_frame_indices) >= min(
+                clip.evaluation_frame_indices
+            ):
+                raise ValueError(
+                    f"Clip {clip.name!r} temporal holdout requires every training "
+                    "frame to precede every evaluation frame."
+                )
 
 
 def _path(value: Any, base: Path) -> Path:
@@ -319,3 +382,9 @@ def _pair(value: Any, field: str) -> tuple[int, int]:
     if len(values) != 2 or min(values) <= 0:
         raise ValueError(f"{field} must contain two positive integers.")
     return values
+
+
+def _optional_int_tuple(value: Any) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    return tuple(int(item) for item in value)

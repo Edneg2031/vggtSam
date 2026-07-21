@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 import numpy as np
 import torch
@@ -17,6 +17,8 @@ def append_geometry_metrics(
     outputs: dict,
     mode: str,
     perturbation: str,
+    sequence_indices: Iterable[int] | None = None,
+    evaluation_metadata: Mapping[str, object] | None = None,
 ) -> None:
     """Evaluate direct point-head output, pose-only reprojection, and depth.
 
@@ -43,13 +45,28 @@ def append_geometry_metrics(
         pose_encoding,
         image_size=tuple(int(value) for value in batch["image_size"]),
     )
+    frame_indices = [int(value) for value in batch["frame_indices"]]
+    default_metadata = {
+        "evaluation_protocol": "all_frames",
+        "context_frame_indices": " ".join(str(value) for value in frame_indices),
+        "training_frame_indices": " ".join(str(value) for value in frame_indices),
+        "evaluated_frame_indices": " ".join(str(value) for value in frame_indices),
+        "alignment_reference_frame_index": frame_indices[
+            int(batch["reference_sequence_index"])
+        ],
+    }
     common_prefix = {
         "clip": batch["clip_name"],
         "scene_id": batch["scene_id"],
         "mode": mode,
         "perturbation": perturbation,
+        **default_metadata,
+        **dict(evaluation_metadata or {}),
     }
-    frame_indices = [int(value) for value in batch["frame_indices"]]
+    selected_indices = _normalize_sequence_indices(
+        sequence_indices,
+        sequence_length=len(frame_indices),
+    )
     reference_index = int(batch["reference_sequence_index"])
     spatial_masks = _spatial_evaluation_masks(batch, target_world)
 
@@ -58,7 +75,8 @@ def append_geometry_metrics(
         ("baseline_point_head_refined_pose", pose_reprojected),
     ):
         aligned = scale * (predicted @ rotation.transpose(-1, -2)) + translation
-        for sequence_index, frame_index in enumerate(frame_indices):
+        for sequence_index in selected_indices:
+            frame_index = frame_indices[sequence_index]
             for spatial_region, spatial_mask in spatial_masks.items():
                 current = _paired_point_metrics(
                     aligned[0, sequence_index],
@@ -84,7 +102,8 @@ def append_geometry_metrics(
         batch["baseline_depth"].detach().float()[0, reference_index],
         target_depth[0, reference_index],
     )
-    for sequence_index, frame_index in enumerate(frame_indices):
+    for sequence_index in selected_indices:
+        frame_index = frame_indices[sequence_index]
         for spatial_region, spatial_mask in spatial_masks.items():
             current = _depth_metrics(
                 depth[0, sequence_index],
@@ -113,6 +132,11 @@ def summarize_pointmap_metrics(rows: Iterable[dict]) -> list[dict]:
         "scene_id",
         "mode",
         "perturbation",
+        "evaluation_protocol",
+        "context_frame_indices",
+        "training_frame_indices",
+        "evaluated_frame_indices",
+        "alignment_reference_frame_index",
         "alignment",
         "alignment_scale",
         "evaluation_mask",
@@ -139,6 +163,11 @@ def summarize_depth_metrics(rows: Iterable[dict]) -> list[dict]:
         "scene_id",
         "mode",
         "perturbation",
+        "evaluation_protocol",
+        "context_frame_indices",
+        "training_frame_indices",
+        "evaluated_frame_indices",
+        "alignment_reference_frame_index",
         "alignment",
         "alignment_scale",
         "evaluation_mask",
@@ -368,3 +397,24 @@ def _require_single_clip_batch(batch: dict) -> None:
     pose = batch["baseline_pose_encoding"]
     if pose.ndim != 3 or pose.shape[0] != 1:
         raise ValueError("Geometry evaluation expects one clip per batch.")
+
+
+def _normalize_sequence_indices(
+    sequence_indices: Iterable[int] | None,
+    *,
+    sequence_length: int,
+) -> list[int]:
+    if sequence_indices is None:
+        return list(range(sequence_length))
+    indices = [int(value) for value in sequence_indices]
+    if not indices:
+        raise ValueError("Evaluation sequence_indices must not be empty.")
+    if len(set(indices)) != len(indices):
+        raise ValueError("Evaluation sequence_indices contain duplicates.")
+    if any(value < 0 or value >= sequence_length for value in indices):
+        raise ValueError(
+            f"Evaluation sequence_indices must be in [0,{sequence_length})."
+        )
+    if indices != sorted(indices):
+        raise ValueError("Evaluation sequence_indices must be increasing.")
+    return indices

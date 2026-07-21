@@ -1,0 +1,86 @@
+# Causal temporal holdout for the decoupled V2 instance-token adapter.
+# Adapter supervision and checkpoint selection use frames 90--140 only.
+# Evaluation replays the full causal context but reports frames 210/240 only.
+recovery_config: streaming_couping/configs/recovery_050_025.yaml
+output_dir: outputs/streaming_couping_instance_token_pose_temporal_holdout_v2
+
+dataset:
+  manifest: data/processed/scannetpp_pinhole_2d/manifest.json
+  clips:
+    - name: 00a231a370_90_240_37_68_54
+      scene_id: 00a231a370
+      frame_indices: [90, 105, 119, 130, 140, 210, 240]
+      training_frame_indices: [90, 105, 119, 130, 140]
+      evaluation_frame_indices: [210, 240]
+      instance_ids: [37, 68, 54]
+      reference_sequence_index: 0
+      split: train
+      tracking_cache: outputs/streaming_couping_instance_pose_37_68_54/tracking_cache.npz
+
+runtime:
+  sam3_device: cuda:3
+  geometry_device: cuda:1
+
+features:
+  # Reuse the seven-frame causal cache. Prefix tensors are physically sliced
+  # before training; the held-out suffix is only read during evaluation.
+  cache_dir: outputs/streaming_couping_instance_token_pose/cache
+  rebuild: false
+  cache_all_token_levels: true
+  sam_source: detector_fpn2
+  sam_resolution: 1008
+  sam_grid: [72, 72]
+  point_confidence_threshold: 0.30
+  min_instance_points: 128
+  sampled_instance_points: 128
+
+fusion:
+  instance_dim: 512
+  attention_dim: 512
+  num_heads: 8
+  dropout: 0.0
+  memory_momentum: 0.90
+  min_track_confidence: 0.50
+  min_geometry_confidence: 0.20
+  min_static_score: 0.20
+  dpt_layer_indices: [4, 11, 17, 23]
+
+loss:
+  camera: 20.0
+  relative_rotation: 2.0
+  translation_direction: 2.0
+  rigid: 1.0
+  centroid: 0.25
+  residual: 0.0001
+  depth: 5.0
+  depth_fixed: 5.0
+  pointmap: 5.0
+  rigid_trim_quantile: 0.70
+
+training:
+  modes:
+    - camera_sam_only
+    - patch_sam_only
+    - patch_sam_geometry_tracker_gate
+    - decoupled_dual_branch
+    - all_token_fusion
+  epochs: 30
+  repeats_per_epoch: 4
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  grad_clip_norm: 1.0
+  seed: 0
+  device: cuda:1
+  amp: false
+
+evaluation:
+  perturbations:
+    - aligned
+    - module_off
+    - zero_appearance
+    - zero_geometry
+    - shuffle_instance_ids
+    - shuffle_time
+    - pose_branch_off
+    - geometry_branch_off
+  strict_equivalence: true

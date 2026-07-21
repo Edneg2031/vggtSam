@@ -17,6 +17,7 @@ from vggtsam.adapters.streamvggt_latent import load_streamvggt_latent_model
 
 from ..config import load_config
 from ..pose_evaluation import (
+    PoseSequence,
     _all_pair_pose_metrics,
     _evaluate_pose_alignment,
     _prepare_pose_sequence,
@@ -24,7 +25,13 @@ from ..pose_evaluation import (
     _summarize_pose_pairs,
 )
 from .cache import cache_path, load_feature_cache
-from .config import GEOMETRY_MODES, PATCH_MODES, V2_MODES, LearnedPoseConfig
+from .config import (
+    GEOMETRY_MODES,
+    PATCH_MODES,
+    V2_MODES,
+    ClipConfig,
+    LearnedPoseConfig,
+)
 from .geometry_metrics import (
     append_geometry_metrics,
     summarize_depth_metrics,
@@ -35,19 +42,22 @@ from .model import InstancePoseAdapter
 
 
 def train_all_modes(config: LearnedPoseConfig) -> None:
-    train_paths = [
-        cache_path(config, clip)
-        for clip in config.clips
-        if clip.split.lower() == "train"
+    train_clips = [
+        clip for clip in config.clips if clip.split.lower() == "train"
     ]
-    validation_paths = [
-        cache_path(config, clip)
+    validation_clips = [
+        clip
         for clip in config.clips
         if clip.split.lower() in {"val", "validation"}
     ]
-    if not train_paths:
+    if not train_clips:
         raise ValueError("At least one dataset clip must use split: train.")
-    first = load_feature_cache(train_paths[0])
+    train_paths = [cache_path(config, clip) for clip in train_clips]
+    validation_paths = [cache_path(config, clip) for clip in validation_clips]
+    first = _slice_training_payload(
+        load_feature_cache(train_paths[0]),
+        train_clips[0],
+    )
     frozen = _load_frozen_streamvggt(config, device=config.training.device)
     config.output_dir.mkdir(parents=True, exist_ok=True)
     for mode in config.training.modes:
@@ -75,10 +85,16 @@ def train_all_modes(config: LearnedPoseConfig) -> None:
         )
         history = []
         best_loss = float("inf")
-        payload_cache = {
-            path: _payload_for_mode(load_feature_cache(path), mode)
-            for path in set(train_paths + validation_paths)
-        }
+        payload_cache = {}
+        for clip, path in zip(train_clips, train_paths):
+            payload = load_feature_cache(path)
+            payload = _slice_training_payload(payload, clip)
+            payload_cache[path] = _payload_for_mode(payload, mode)
+        for clip, path in zip(validation_clips, validation_paths):
+            payload_cache[path] = _payload_for_mode(
+                load_feature_cache(path),
+                mode,
+            )
         for epoch in range(config.training.epochs):
             adapter.train()
             epoch_rows = []
@@ -123,6 +139,9 @@ def train_all_modes(config: LearnedPoseConfig) -> None:
                     "epoch": epoch,
                     "step": step,
                     "clip": batch["clip_name"],
+                    "supervision_frame_indices": " ".join(
+                        str(value) for value in batch["frame_indices"]
+                    ),
                     "gradient_norm": float(grad_norm),
                     **{name: float(value.detach().cpu()) for name, value in terms.items()},
                     **_scalar_logs(outputs.get("diagnostics", {})),
@@ -152,6 +171,15 @@ def train_all_modes(config: LearnedPoseConfig) -> None:
                 "adapter_metadata": adapter.metadata(),
                 "train_loss": train_loss,
                 "validation_loss": validation_loss,
+                "checkpoint_selection": (
+                    "validation_clips"
+                    if validation_paths
+                    else "training_supervision_frames"
+                ),
+                "training_frame_indices": {
+                    clip.name: list(_training_frame_indices(clip))
+                    for clip in train_clips
+                },
                 "config_path": str(config.source_path),
             }
             torch.save(checkpoint, mode_dir / "checkpoint_last.pt")
@@ -172,6 +200,7 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
         clip
         for clip in config.clips
         if clip.split.lower() in {"val", "validation", "test"}
+        or clip.evaluation_frame_indices is not None
     ]
     if not evaluation_clips:
         evaluation_clips = list(config.clips)
@@ -195,8 +224,11 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
     # CameraHead path used by every adapter.
     for clip in evaluation_clips:
         payload = load_feature_cache(cache_path(config, clip))
+        _validate_cached_payload(payload, clip)
         batch = _batch_to_device(payload, config.training.device)
         baseline_outputs = _forward_baseline(batch)
+        evaluation_indices = _evaluation_sequence_indices(clip)
+        evaluation_metadata = _evaluation_metadata(clip)
         equivalence_rows.append(
             {
                 "clip": clip.name,
@@ -206,6 +238,7 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
                 "depth_max_abs_diff": 0.0,
                 "pointmap_max_abs_diff": 0.0,
                 "strict_equal": 1,
+                **evaluation_metadata,
             }
         )
         _append_pose_metrics(
@@ -218,6 +251,8 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
             pose_encoding=baseline_outputs["pose_encoding"],
             mode="baseline",
             perturbation="module_off",
+            sequence_indices=evaluation_indices,
+            evaluation_metadata=evaluation_metadata,
         )
         append_geometry_metrics(
             pointmap_frame_rows,
@@ -226,6 +261,8 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
             outputs=baseline_outputs,
             mode="baseline",
             perturbation="module_off",
+            sequence_indices=evaluation_indices,
+            evaluation_metadata=evaluation_metadata,
         )
 
     for mode in config.training.modes:
@@ -239,8 +276,11 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
         adapter.eval()
         for clip in evaluation_clips:
             payload = load_feature_cache(cache_path(config, clip))
+            _validate_cached_payload(payload, clip)
             batch = _batch_to_device(payload, config.training.device)
             baseline_outputs = _forward_baseline(batch)
+            evaluation_indices = _evaluation_sequence_indices(clip)
+            evaluation_metadata = _evaluation_metadata(clip)
             perturbations = config.evaluation.perturbations
             for perturbation in perturbations:
                 if (
@@ -265,6 +305,8 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
                     pose_encoding=outputs["pose_encoding"],
                     mode=mode,
                     perturbation=perturbation,
+                    sequence_indices=evaluation_indices,
+                    evaluation_metadata=evaluation_metadata,
                 )
                 append_geometry_metrics(
                     pointmap_frame_rows,
@@ -273,6 +315,8 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
                     outputs=outputs,
                     mode=mode,
                     perturbation=perturbation,
+                    sequence_indices=evaluation_indices,
+                    evaluation_metadata=evaluation_metadata,
                 )
                 rigid, centroid = instance_rigid_losses(
                     outputs["pose_encoding"].float(),
@@ -282,6 +326,7 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
                     image_size=tuple(int(v) for v in batch["image_size"]),
                     scene_scale=float(batch["scene_scale"]),
                     trim_quantile=config.loss.rigid_trim_quantile,
+                    sequence_indices=evaluation_indices,
                 )
                 rigid_meters, centroid_meters = instance_rigid_losses(
                     outputs["pose_encoding"].float(),
@@ -293,6 +338,7 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
                         1.0 / max(float(batch["point_alignment_scale"]), 1e-8)
                     ),
                     trim_quantile=config.loss.rigid_trim_quantile,
+                    sequence_indices=evaluation_indices,
                 )
                 diagnostic_rows.append(
                     {
@@ -304,6 +350,9 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
                         "matched_centroid_normalized": float(centroid.cpu()),
                         "instance_chamfer_aligned_meters": float(rigid_meters.cpu()),
                         "matched_centroid_aligned_meters": float(centroid_meters.cpu()),
+                        **evaluation_metadata,
+                        "instance_metric_scope": "evaluated_frames_only",
+                        "adapter_log_scope": "full_causal_context",
                         **_scalar_logs(outputs.get("diagnostics", {})),
                     }
                 )
@@ -344,6 +393,7 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
                             "depth_max_abs_diff": depth_difference,
                             "pointmap_max_abs_diff": pointmap_difference,
                             "strict_equal": int(passed),
+                            **evaluation_metadata,
                         }
                     )
                     if config.evaluation.strict_equivalence and not passed:
@@ -394,6 +444,21 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
             "Patch modes preserve every camera/register prefix token. The dual branch uses "
             "independent pose and geometry tokenizers, attentions, gates, and projections."
         ),
+        "evaluation_splits": [
+            {
+                "clip": clip.name,
+                **_evaluation_metadata(clip),
+                "checkpoint_selection": (
+                    "validation_clips"
+                    if any(
+                        item.split.lower() in {"val", "validation"}
+                        for item in config.clips
+                    )
+                    else "training_supervision_frames"
+                ),
+            }
+            for clip in evaluation_clips
+        ],
     }
     with (output / "metadata.json").open("w", encoding="utf8") as handle:
         json.dump(metadata, handle, indent=2, ensure_ascii=False)
@@ -814,6 +879,8 @@ def _append_pose_metrics(
     pose_encoding: torch.Tensor,
     mode: str,
     perturbation: str,
+    sequence_indices: Iterable[int] | None = None,
+    evaluation_metadata: Mapping[str, object] | None = None,
 ) -> None:
     from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
 
@@ -821,33 +888,52 @@ def _append_pose_metrics(
         pose_encoding.float(),
         image_size_hw=tuple(payload["image_size"]),
     )
-    predicted = _prepare_pose_sequence(
+    predicted_full = _prepare_pose_sequence(
         predicted_w2c[0].detach().double().cpu(),
         frame_indices=payload["frame_indices"],
         source=f"{mode}:{perturbation}",
     )
-    target = _prepare_pose_sequence(
+    target_full = _prepare_pose_sequence(
         payload["target_world_to_camera"].double().cpu(),
         frame_indices=payload["frame_indices"],
         source="scannetpp_colmap",
     )
     alignment = _reference_pose_alignment(
-        predicted,
-        target,
+        predicted_full,
+        target_full,
         reference_index=int(payload["reference_sequence_index"]),
         scale=float(payload["point_alignment_scale"]),
+    )
+    indices = _normalize_sequence_indices(
+        sequence_indices,
+        sequence_length=len(payload["frame_indices"]),
+    )
+    predicted = _slice_pose_sequence(predicted_full, indices)
+    target = _slice_pose_sequence(target_full, indices)
+    evaluated_frames = [int(payload["frame_indices"][index]) for index in indices]
+    original_reference = int(payload["reference_sequence_index"])
+    evaluation_reference = (
+        indices.index(original_reference)
+        if original_reference in indices
+        else -1
     )
     summary, current_frames, current_rpe = _evaluate_pose_alignment(
         alignment,
         predicted=predicted,
         target=target,
-        frame_indices=payload["frame_indices"],
-        reference_index=int(payload["reference_sequence_index"]),
+        frame_indices=evaluated_frames,
+        reference_index=evaluation_reference,
     )
     current_pairs = _all_pair_pose_metrics(
         predicted,
         target,
-        frame_indices=payload["frame_indices"],
+        frame_indices=evaluated_frames,
+    )
+    _restore_source_sequence_indices(
+        current_frames,
+        current_rpe,
+        current_pairs,
+        source_indices=indices,
     )
     current_pair_summary = _summarize_pose_pairs(current_pairs)
     prefix = {
@@ -855,12 +941,199 @@ def _append_pose_metrics(
         "scene_id": payload["scene_id"],
         "mode": mode,
         "perturbation": perturbation,
+        **dict(evaluation_metadata or {}),
     }
     summary_rows.append({**prefix, **summary})
     frame_rows.extend({**prefix, **row} for row in current_frames)
     rpe_rows.extend({**prefix, **row} for row in current_rpe)
     pair_rows.extend({**prefix, **row} for row in current_pairs)
     pair_summary_rows.extend({**prefix, **row} for row in current_pair_summary)
+
+
+def _training_frame_indices(clip: ClipConfig) -> tuple[int, ...]:
+    return clip.training_frame_indices or clip.frame_indices
+
+
+def _sequence_indices_for_frames(
+    clip: ClipConfig,
+    frame_indices: Iterable[int],
+) -> list[int]:
+    lookup = {int(frame): index for index, frame in enumerate(clip.frame_indices)}
+    return [lookup[int(frame)] for frame in frame_indices]
+
+
+def _evaluation_sequence_indices(clip: ClipConfig) -> list[int]:
+    frames = clip.evaluation_frame_indices or clip.frame_indices
+    return _sequence_indices_for_frames(clip, frames)
+
+
+def _evaluation_metadata(clip: ClipConfig) -> dict[str, object]:
+    evaluated = clip.evaluation_frame_indices or clip.frame_indices
+    training = (
+        _training_frame_indices(clip)
+        if clip.split.lower() == "train"
+        else ()
+    )
+    if clip.evaluation_frame_indices is not None:
+        protocol = "causal_temporal_holdout"
+    elif clip.split.lower() in {"val", "validation", "test"}:
+        protocol = "held_out_clip"
+    else:
+        protocol = "in_sample_all_frames"
+    return {
+        "evaluation_protocol": protocol,
+        "context_frames": len(clip.frame_indices),
+        "context_frame_indices": " ".join(str(value) for value in clip.frame_indices),
+        "training_frame_indices": " ".join(str(value) for value in training),
+        "evaluated_frame_indices": " ".join(str(value) for value in evaluated),
+        "alignment_reference_frame_index": clip.frame_indices[
+            clip.reference_sequence_index
+        ],
+    }
+
+
+def _slice_training_payload(payload: dict, clip: ClipConfig) -> dict:
+    _validate_cached_payload(payload, clip)
+    frames = _training_frame_indices(clip)
+    indices = _sequence_indices_for_frames(clip, frames)
+    if len(indices) == len(clip.frame_indices):
+        output = dict(payload)
+        output["cache_context_frame_indices"] = list(clip.frame_indices)
+        output["supervision_frame_indices"] = list(frames)
+        return output
+
+    sequence_length = len(clip.frame_indices)
+    tensor_fields = {
+        "camera_hidden",
+        "appearance",
+        "geometry",
+        "quality",
+        "observed",
+        "target_pose_encoding",
+        "target_world_to_camera",
+        "instance_uvd",
+        "instance_uvd_valid",
+        "instance_rigid_weight",
+        "target_world_points",
+        "target_depth",
+        "baseline_pose_encoding",
+        "baseline_depth",
+        "baseline_world_points",
+        "stream_images",
+        "tracking_masks_output",
+        "tracking_masks_stream",
+        "tracking_scores",
+    }
+    index = torch.tensor(indices, dtype=torch.long)
+    output = dict(payload)
+    for field in tensor_fields:
+        value = payload.get(field)
+        if not torch.is_tensor(value):
+            continue
+        if value.shape[0] != sequence_length:
+            raise ValueError(
+                f"Cannot temporal-slice {field}: expected leading sequence "
+                f"dimension {sequence_length}, got {tuple(value.shape)}."
+            )
+        output[field] = value.index_select(0, index)
+    token_levels = payload.get("token_levels")
+    if torch.is_tensor(token_levels):
+        if token_levels.ndim < 2 or token_levels.shape[1] != sequence_length:
+            raise ValueError(
+                "Cannot temporal-slice token_levels: expected [L,S,...] with "
+                f"S={sequence_length}, got {tuple(token_levels.shape)}."
+            )
+        output["token_levels"] = token_levels.index_select(1, index)
+    image_paths = payload.get("image_paths")
+    if image_paths is not None:
+        output["image_paths"] = [image_paths[item] for item in indices]
+    original_reference = int(payload["reference_sequence_index"])
+    if original_reference not in indices:
+        raise ValueError(
+            f"Training frames for {clip.name!r} do not contain reference index "
+            f"{original_reference}."
+        )
+    output["cache_context_frame_indices"] = list(payload["frame_indices"])
+    output["supervision_frame_indices"] = list(frames)
+    output["frame_indices"] = list(frames)
+    output["reference_sequence_index"] = indices.index(original_reference)
+    return output
+
+
+def _validate_cached_payload(payload: dict, clip: ClipConfig) -> None:
+    if str(payload.get("clip_name")) != clip.name:
+        raise ValueError(
+            f"Cached clip name is {payload.get('clip_name')!r}, expected "
+            f"{clip.name!r}."
+        )
+    cached_frames = tuple(int(value) for value in payload.get("frame_indices", ()))
+    if cached_frames != clip.frame_indices:
+        raise ValueError(
+            f"Cached frames for {clip.name!r} are {cached_frames}, expected "
+            f"{clip.frame_indices}. Rebuild or select the correct cache."
+        )
+    if str(payload.get("scene_id")) != clip.scene_id:
+        raise ValueError(
+            f"Cached scene for {clip.name!r} is {payload.get('scene_id')!r}, "
+            f"expected {clip.scene_id!r}."
+        )
+
+
+def _normalize_sequence_indices(
+    sequence_indices: Iterable[int] | None,
+    *,
+    sequence_length: int,
+) -> list[int]:
+    if sequence_indices is None:
+        return list(range(sequence_length))
+    indices = [int(value) for value in sequence_indices]
+    if not indices:
+        raise ValueError("Evaluation sequence_indices must not be empty.")
+    if len(set(indices)) != len(indices):
+        raise ValueError("Evaluation sequence_indices contain duplicates.")
+    if any(value < 0 or value >= sequence_length for value in indices):
+        raise ValueError(
+            f"Evaluation sequence_indices must be in [0,{sequence_length})."
+        )
+    if indices != sorted(indices):
+        raise ValueError("Evaluation sequence_indices must be increasing.")
+    return indices
+
+
+def _slice_pose_sequence(
+    sequence: PoseSequence,
+    indices: list[int],
+) -> PoseSequence:
+    index = torch.tensor(indices, dtype=torch.long)
+    return PoseSequence(
+        world_to_camera=sequence.world_to_camera.index_select(0, index),
+        camera_to_world_rotation=sequence.camera_to_world_rotation.index_select(
+            0,
+            index,
+        ),
+        camera_centers=sequence.camera_centers.index_select(0, index),
+        rotation_quality_rows=tuple(
+            sequence.rotation_quality_rows[value] for value in indices
+        ),
+    )
+
+
+def _restore_source_sequence_indices(
+    frame_rows: list[dict],
+    rpe_rows: list[dict],
+    pair_rows: list[dict],
+    *,
+    source_indices: list[int],
+) -> None:
+    for row in frame_rows:
+        row["sequence_index"] = source_indices[int(row["sequence_index"])]
+    for row in [*rpe_rows, *pair_rows]:
+        row["first_sequence_index"] = source_indices[
+            int(row["first_sequence_index"])
+        ]
+        row["second_sequence_index"] = source_indices[
+            int(row["second_sequence_index"])
+        ]
 
 
 def _batch_to_device(payload: dict, device: str) -> dict:

@@ -148,6 +148,7 @@ def instance_rigid_losses(
     image_size: tuple[int, int],
     scene_scale: float,
     trim_quantile: float,
+    sequence_indices: list[int] | tuple[int, ...] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     extrinsics, intrinsics = _decode_pose(pose_encoding, image_size=image_size)
     world_points = _uvd_to_world(uvd, extrinsics, intrinsics)
@@ -155,10 +156,23 @@ def instance_rigid_losses(
     centroid_terms = []
     weights = []
     batch, sequence, instances = point_valid.shape[:3]
+    frames = (
+        list(range(sequence))
+        if sequence_indices is None
+        else [int(value) for value in sequence_indices]
+    )
+    if not frames:
+        raise ValueError("sequence_indices must not be empty.")
+    if len(set(frames)) != len(frames):
+        raise ValueError("sequence_indices contain duplicates.")
+    if any(frame < 0 or frame >= sequence for frame in frames):
+        raise ValueError(f"sequence_indices must be in [0,{sequence}).")
+    if frames != sorted(frames):
+        raise ValueError("sequence_indices must be increasing.")
     for batch_index in range(batch):
         for instance in range(instances):
             previous = None
-            for frame in range(sequence):
+            for frame in frames:
                 current_weight = instance_weight[batch_index, frame, instance]
                 if float(current_weight.detach()) <= 0.0:
                     continue
