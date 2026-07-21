@@ -18,7 +18,7 @@ def append_geometry_metrics(
     mode: str,
     perturbation: str,
 ) -> None:
-    """Evaluate direct point-head output and depth+pose reconstruction.
+    """Evaluate direct point-head output, pose-only reprojection, and depth.
 
     The reference-frame Sim(3) cached before adapter training is reused for
     every mode and perturbation.  It is never refit to a refined prediction.
@@ -37,24 +37,24 @@ def append_geometry_metrics(
     rotation = batch["point_alignment_rotation"].detach().float()
     translation = batch["point_alignment_translation"].detach().float()
 
-    reconstructed = _depth_pose_world_points(
+    pose_reprojected = _reproject_baseline_point_head(
+        batch["baseline_world_points"].detach().float(),
+        batch["baseline_pose_encoding"].detach().float(),
         pose_encoding,
-        depth,
         image_size=tuple(int(value) for value in batch["image_size"]),
     )
-    prefix = {
+    common_prefix = {
         "clip": batch["clip_name"],
         "scene_id": batch["scene_id"],
         "mode": mode,
         "perturbation": perturbation,
-        "alignment": "fixed_reference_point_sim3",
     }
     frame_indices = [int(value) for value in batch["frame_indices"]]
     reference_index = int(batch["reference_sequence_index"])
 
     for geometry_source, predicted in (
         ("point_head", point_head),
-        ("depth_pose_backprojection", reconstructed),
+        ("baseline_point_head_refined_pose", pose_reprojected),
     ):
         aligned = scale * (predicted @ rotation.transpose(-1, -2)) + translation
         for sequence_index, frame_index in enumerate(frame_indices):
@@ -64,7 +64,10 @@ def append_geometry_metrics(
             )
             pointmap_frame_rows.append(
                 {
-                    **prefix,
+                    **common_prefix,
+                    "alignment": "fixed_reference_point_sim3",
+                    "alignment_scale": scale,
+                    "evaluation_mask": "all_finite_gt_pairs",
                     "geometry_source": geometry_source,
                     "sequence_index": sequence_index,
                     "frame_index": frame_index,
@@ -73,15 +76,22 @@ def append_geometry_metrics(
                 }
             )
 
+    depth_scale = _reference_depth_scale(
+        batch["baseline_depth"].detach().float()[0, reference_index],
+        target_depth[0, reference_index],
+    )
     for sequence_index, frame_index in enumerate(frame_indices):
         current = _depth_metrics(
             depth[0, sequence_index],
             target_depth[0, sequence_index],
-            fixed_scale=scale,
+            fixed_scale=depth_scale,
         )
         depth_frame_rows.append(
             {
-                **prefix,
+                **common_prefix,
+                "alignment": "fixed_reference_depth_median_scale",
+                "alignment_scale": depth_scale,
+                "evaluation_mask": "finite_positive_depth_pairs",
                 "sequence_index": sequence_index,
                 "frame_index": frame_index,
                 "is_reference": int(sequence_index == reference_index),
@@ -91,7 +101,16 @@ def append_geometry_metrics(
 
 
 def summarize_pointmap_metrics(rows: Iterable[dict]) -> list[dict]:
-    keys = ("clip", "scene_id", "mode", "perturbation", "alignment", "geometry_source")
+    keys = (
+        "clip",
+        "scene_id",
+        "mode",
+        "perturbation",
+        "alignment",
+        "alignment_scale",
+        "evaluation_mask",
+        "geometry_source",
+    )
     return _summarize_frame_rows(
         rows,
         keys=keys,
@@ -107,7 +126,15 @@ def summarize_pointmap_metrics(rows: Iterable[dict]) -> list[dict]:
 
 
 def summarize_depth_metrics(rows: Iterable[dict]) -> list[dict]:
-    keys = ("clip", "scene_id", "mode", "perturbation", "alignment")
+    keys = (
+        "clip",
+        "scene_id",
+        "mode",
+        "perturbation",
+        "alignment",
+        "alignment_scale",
+        "evaluation_mask",
+    )
     return _summarize_frame_rows(
         rows,
         keys=keys,
@@ -196,44 +223,53 @@ def _depth_metrics(
     }
 
 
-def _depth_pose_world_points(
-    pose_encoding: torch.Tensor,
-    depth: torch.Tensor,
+def _reproject_baseline_point_head(
+    baseline_world_points: torch.Tensor,
+    baseline_pose_encoding: torch.Tensor,
+    refined_pose_encoding: torch.Tensor,
     *,
     image_size: tuple[int, int],
 ) -> torch.Tensor:
     from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
 
-    extrinsics, intrinsics = pose_encoding_to_extri_intri(
-        pose_encoding.float(),
+    if torch.equal(baseline_pose_encoding, refined_pose_encoding):
+        return baseline_world_points
+    baseline_extrinsics, _ = pose_encoding_to_extri_intri(
+        baseline_pose_encoding.float(),
         image_size_hw=image_size,
     )
-    depth = depth.squeeze(-1)
-    height, width = depth.shape[-2:]
-    rows, columns = torch.meshgrid(
-        torch.arange(height, dtype=depth.dtype, device=depth.device),
-        torch.arange(width, dtype=depth.dtype, device=depth.device),
-        indexing="ij",
+    refined_extrinsics, _ = pose_encoding_to_extri_intri(
+        refined_pose_encoding.float(),
+        image_size_hw=image_size,
     )
-    fx = intrinsics[..., 0, 0][..., None, None].clamp_min(1e-6)
-    fy = intrinsics[..., 1, 1][..., None, None].clamp_min(1e-6)
-    cx = intrinsics[..., 0, 2][..., None, None]
-    cy = intrinsics[..., 1, 2][..., None, None]
-    camera_points = torch.stack(
-        [
-            (columns - cx) * depth / fx,
-            (rows - cy) * depth / fy,
-            depth,
-        ],
-        dim=-1,
-    )
-    rotation = extrinsics[..., :3, :3]
-    translation = extrinsics[..., :3, 3]
+    baseline_rotation = baseline_extrinsics[..., :3, :3]
+    baseline_translation = baseline_extrinsics[..., :3, 3]
+    camera_points = torch.einsum(
+        "bsij,bshwj->bshwi",
+        baseline_rotation,
+        baseline_world_points,
+    ) + baseline_translation[..., None, None, :]
+    refined_rotation = refined_extrinsics[..., :3, :3]
+    refined_translation = refined_extrinsics[..., :3, 3]
     return torch.einsum(
         "bsji,bshwj->bshwi",
-        rotation,
-        camera_points - translation[..., None, None, :],
+        refined_rotation,
+        camera_points - refined_translation[..., None, None, :],
     )
+
+
+def _reference_depth_scale(predicted: torch.Tensor, target: torch.Tensor) -> float:
+    predicted = predicted.squeeze(-1)
+    target = target.squeeze(-1)
+    valid = (
+        torch.isfinite(predicted)
+        & torch.isfinite(target)
+        & (predicted > 1e-6)
+        & (target > 1e-6)
+    )
+    if int(valid.sum()) < 128:
+        raise ValueError("Reference depth scale requires at least 128 valid pixels.")
+    return float((target[valid] / predicted[valid]).median().cpu())
 
 
 def _summarize_frame_rows(
@@ -287,4 +323,3 @@ def _require_single_clip_batch(batch: dict) -> None:
     pose = batch["baseline_pose_encoding"]
     if pose.ndim != 3 or pose.shape[0] != 1:
         raise ValueError("Geometry evaluation expects one clip per batch.")
-

@@ -372,9 +372,11 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
         ),
         "gt_role": "pose/depth/pointmap training supervision and evaluation only",
         "geometry_evaluation": (
-            "All pointmap modes reuse the baseline reference-frame Sim(3); it is never "
-            "refit after refinement. point_head measures direct DPT point output, while "
-            "depth_pose_backprojection measures the fused cloud produced by depth and pose."
+            "All pointmap modes reuse the baseline point-head reference-frame Sim(3); "
+            "it is never refit after refinement. point_head measures direct DPT point "
+            "output, while baseline_point_head_refined_pose isolates the pose update by "
+            "reprojecting frozen baseline geometry. Depth uses its own baseline-reference "
+            "median scale because the StreamVGGT depth and point heads have different scales."
         ),
     }
     with (output / "metadata.json").open("w", encoding="utf8") as handle:
