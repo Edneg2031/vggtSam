@@ -186,4 +186,4 @@ persistent static-instance geometry 需要处理的边界。
 
 本诊断阶段已经结束，独立 CLI 已删除；结果保留在本文档，仍被当前实验使用的
 ray-center、ATE/RPE 和 all-pairs 算子已整理到 `src/pose_evaluation.py`。当前
-第二版实验命令见 `../commands.txt`。
+第三版实验命令见 `../commands.txt`。

@@ -1,6 +1,6 @@
 # vggtSam 对话接力上下文
 
-更新时间：2026-07-20。新对话先读取本文件、`method.md`、
+更新时间：2026-07-21。新对话先读取本文件、`method.md`、
 `instance_pose_refinement.md`、`commands.txt` 和 Git 工作区。
 
 ## 固定研究约束
@@ -112,42 +112,62 @@ V1 a100 ATE 恶化 3.37%，RPE 恶化 12.43%，不能声称 pose 改善。
 4. correspondence ratio 0.15、consensus 0.05 过宽；
 5. 130 有修正、140 归零，使 130→140 direction 29.63° → 75.78°。
 
-## 当前实现：第二版
+## 第二版最终结果
 
-当前唯一代码入口：
+V2 采用 strict ICP、per-instance map update 和 short carry。最终服务器结果：
+
+| mode | ATE | adjacent RPE translation RMSE | all-pairs direction mean |
+|---|---:|---:|---:|
+| `ray_only` | 0.175915 | 0.080938 | 11.345° |
+| V2 a050 | 0.176086 | 0.078713 | 11.820° |
+| GT oracle | 0.128355 | 0.067590 | 9.588° |
+
+V2 a050 的相邻 RPE 改善 2.75%，但 all-pairs 均值恶化 4.18%，@10° 从 71.43%
+降到 66.67%，所以 V2 不是最终方法。
+
+根因由 `instance_icp_diagnostics.csv` 确认：
+
+- 130 cabinet/wardrobe disagreement `0.0641 > 0.02`；
+- 240 disagreement `0.0468 > 0.02`；
+- 被共识排除或处于冲突中的局部 accepted proposal 仍然写回 object map；
+- V2 冲突时清空状态，short-carry 与 no-carry 完全相同，carry 从未触发；
+- reference-only 仍会出现 cabinet 错配，因此根因不只是 map 污染，也包括 ICP
+  的局部错误盆地。
+
+## 当前实现：第三版
+
+当前唯一代码入口仍为：
 
 ```text
 scripts/run_instance_pose_refinement_ablation.py
 src/instance_pose_refinement.py
 ```
 
-V2 变化：
+V3 变化：
 
 1. correspondence ratio 0.05；
 2. 显式 ICP RMSE ≤ 0.03 native；
 3. final robust-center max residual ≤ 0.02；
-4. 每个严格 proposal 用自己的 translation 更新自己的 object map；
-5. 相机仍只使用一个 shared translation；
-6. 只有恰好一个 proposal、距最近多实例共识 gap ≤ 15、距最近平移 ≤ 0.02
-   时允许 short carry，carry 本身不后移该窗口；
-7. multi-instance conflict 或长 gap 清空 temporal state。
+4. V3 共识前加入 tracker-score eligibility；
+5. 共识失败时，用上一轮共享平移筛所有 proposal，只有唯一 temporal inlier 可用；
+6. carry 后 temporal frame 前移，最多连续两次，gap ≤ 15、distance ≤ 0.02；
+7. 只有普通共识参与者或 validated carry participant 才能写回自己的 object map；
+8. 相机仍只接收一个整帧共享 translation，固定 alpha=0.5。
 
 同次模式：
 
 ```text
 ray_only
-v1_shared_map_a100
-v2_strict_shared_map_no_carry_a100
-v2_strict_per_instance_no_carry_a100
-v2_strict_per_instance_short_carry_a025
 v2_strict_per_instance_short_carry_a050
-v2_strict_per_instance_short_carry_a100
-v2_strict_reference_no_carry_a100
-v2_strict_shuffled_short_carry_a100
+v3_consensus_only_validated_a050
+v3_temporal_unvalidated_map_a050
+v3_temporal_validated_a050
+v3_temporal_validated_shuffled_a050
 gt_point_translation_oracle
 ```
 
-主候选是 `v2_strict_per_instance_short_carry_a100`，尚未经过服务器验证。
+主候选是 `v3_temporal_validated_a050`，尚未经过服务器验证。V1、多 alpha、
+reference-only 和 strict/shared 分支已从当前运行删除，历史结论保留在文档/Git。
 
 ## 精简后的代码边界
 
@@ -200,11 +220,12 @@ metadata.json
 完整 log
 ```
 
-重点确认：
+重点确认 V3 主分支：
 
-- 105 是否被 strict consensus 拒绝；
-- 119/130 是否仍形成多实例共识；
-- 140 是否只通过 bounded short carry 连续修正；
-- 210 是否因长 gap 禁止 carry；
-- per-instance map 是否让 240 的 cabinet/wardrobe proposals 更一致；
-- V2 是否同时优于 `ray_only` 和 `v1_shared_map_a100`。
+- 130 是否把 cabinet 标为 temporal outlier、wardrobe 标为唯一 inlier/carry #1；
+- 140 是否由 wardrobe 形成 carry #2；
+- 210 是否因长 gap/budget reset；
+- 240 是否在无历史状态时拒绝冲突 proposal；
+- map update IDs 是否始终等于最终 participating IDs；
+- V3 是否同时改善 ATE、adjacent RPE 和 all-pairs，至少不能再出现 V2 的
+  “局部 RPE 改善但 all-pairs 退化”。

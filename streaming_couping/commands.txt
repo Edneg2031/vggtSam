@@ -1,7 +1,8 @@
-# 当前唯一服务器实验（第二版）：
+# 当前唯一服务器实验（第三版）：
 # reliable SAM3 tracking -> persistent static-instance maps
-# -> strict ICP + 每实例独立更新自己的 map
-# -> 多实例共识，或短间隔且与最近共识一致的单实例延续
+# -> strict ICP + temporal conflict filtering
+# -> 只有共识参与者或唯一 temporal inlier 能更新自己的 map
+# -> 最多连续两次 bounded carry
 # -> 得到唯一整帧共享 pointmap translation
 # -> predicted-K/R all-point ray-center camera translation repair。
 #
@@ -36,12 +37,12 @@ PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_inst
   --instance-temporal-max-frame-gap 15 \
   --instance-temporal-distance 0.02 \
   --instance-temporal-current-weight 0.50 \
-  --correction-scales 0.25 0.50 1.0 \
+  --instance-temporal-max-carry-frames 2 \
   --ray-min-points 1024 \
   --ray-max-points 65536 \
   --ray-max-condition-number 1e8 \
-  --output-dir outputs/streaming_couping_instance_pose_v2_37_68_54 \
-  2>&1 | tee outputs/streaming_couping_instance_pose_v2_37_68_54.log
+  --output-dir outputs/streaming_couping_instance_pose_v3_37_68_54 \
+  2>&1 | tee outputs/streaming_couping_instance_pose_v3_37_68_54.log
 
 # 跑完后优先回传：
 #   instance_pose_summary.csv
@@ -56,4 +57,4 @@ PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_inst
 #   instance_ray_fit.csv
 #   tracking_summary.csv
 #   metadata.json
-#   outputs/streaming_couping_instance_pose_v2_37_68_54.log
+#   outputs/streaming_couping_instance_pose_v3_37_68_54.log

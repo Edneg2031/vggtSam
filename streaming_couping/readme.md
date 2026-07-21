@@ -20,10 +20,10 @@ SAM3 恢复阶段已经完成并暂停：
 - cabinet/wardrobe 易例没有被 natural gate 误触发；
 - 固定阈值在 `configs/recovery_050_025.yaml`。
 
-相机修复第一版为负结果，已记录在
+相机修复 V1/V2 均未通过完整指标，已记录在
 [`docs/instance_pose_refinement.md`](docs/instance_pose_refinement.md)。当前代码运行
-第二版：严格 ICP/RMSE gate、per-instance map update、受限 short carry，以及
-一次性因果消融。
+第三版：严格 ICP/RMSE gate、temporal conflict filtering、只有验证参与者可写回
+object map，以及最多两次的 bounded carry。
 
 ## 唯一运行入口
 
@@ -42,7 +42,7 @@ fit。GT 只用于评估和明确命名的 translation oracle。
 ```text
 scripts/run_instance_pose_refinement_ablation.py  唯一 CLI
 
-src/instance_pose_refinement.py   第二版主流程、消融与 CSV
+src/instance_pose_refinement.py   第三版主流程、消融与 CSV
 src/tracking_recovery.py          已验证的自然恢复 + same-ID writeback
 src/recovery.py                   geometry gate 与坐标转换
 src/instance_point_cloud.py       实例点云与 PLY 导出
@@ -78,6 +78,6 @@ instance_<id>/pointclouds/<mode>/*.ply
 相关文档：
 
 - [`docs/method.md`](docs/method.md)：完整研究方法
-- [`docs/instance_pose_refinement.md`](docs/instance_pose_refinement.md)：第二版设计与判读
+- [`docs/instance_pose_refinement.md`](docs/instance_pose_refinement.md)：V1/V2 结论与第三版设计
 - [`docs/pose_pointmap_diagnostics.md`](docs/pose_pointmap_diagnostics.md)：已完成的 raw/ray 诊断结果
 - [`docs/thread_handoff.md`](docs/thread_handoff.md)：对话接力与当前待办

@@ -1,4 +1,4 @@
-# 多实例 pointmap / 相机位姿修复第二版
+# 多实例 pointmap / 相机位姿修复第三版
 
 ## 研究边界
 
@@ -12,48 +12,37 @@ corrected pointmap -> all-point ray-center camera translation
 ```
 
 相机和整帧 pointmap 从不按实例分别修改。reference 后 GT 只用于指标和名称中明确
-标出的 `gt_point_translation_oracle`。
+标出的 `gt_point_translation_oracle`。实例 PLY 始终保留。
 
-## 第一版负结果
+## 已完成的 V1/V2 结论
 
-第一版把共识平移同时写入所有参与实例的 object map，并使用较宽的
-correspondence/consensus gate。服务器结果：
+真正的 baseline 是已经修复过 camera center 的 `ray_only`，不是 raw camera head。
 
-| mode | fixed-reference ATE | adjacent RPE translation RMSE |
-|---|---:|---:|
-| `ray_only` | 0.175915 m | 0.080938 m |
-| V1 causal a100 | 0.181835 m | 0.090999 m |
-| V1 causal a025 | 0.176317 m | 0.080894 m |
-| GT translation oracle | 0.128355 m | 0.067590 m |
+| mode | fixed-reference ATE | adjacent RPE translation RMSE | all-pairs direction mean |
+|---|---:|---:|---:|
+| `ray_only` | 0.175915 m | 0.080938 m | 11.345° |
+| V1 shared-map a100 | 0.181835 m | 0.090999 m | 14.393° |
+| V2 per-instance a050 | 0.176086 m | 0.078713 m | 11.820° |
+| GT translation oracle | 0.128355 m | 0.067590 m | 9.588° |
 
-V1 a100 相比 `ray_only` 的 ATE 恶化 3.37%，RPE 恶化 12.43%，因此第一版不能
-作为主方法。它仍在第二版同次实验中以 `v1_shared_map_a100` 复现，便于排除代码
-版本差异。
+V1 明显退化。V2 a050 将 adjacent RPE 改善 2.75%，但 official-style all-pairs
+方向均值恶化 4.18%，translation@10° 从 71.43% 降到 66.67%，因此也不能作为
+最终方法。GT oracle 的 all-pairs 均值改善 15.48%，说明 pointmap translation
+存在可利用信号，当前瓶颈是 proposal 验证而不是方向本身无效。
 
-主要失败原因：
+V2 的具体失败原因：
 
-1. shared correction 写进每个实例地图，掩盖实例间 proposal 差异并污染后续配准；
-2. correspondence ratio 0.15、consensus distance 0.05 过宽；
-3. 帧 130 有修正、140 归零，令 130→140 direction error 从 29.63° 增至 75.78°；
-4. bed 的恢复 mask 很好，但跨视角表面与历史地图几乎无几何重叠，无法提供 ICP
-   proposal。这说明 tracking recovery 成功不等于该实例一定能约束 pose。
+1. ICP fitness/RMSE 很好也可能落入错误的局部匹配盆地；
+2. 帧 130 cabinet/wardrobe proposal disagreement 为 0.0641，大于 0.02；
+3. 帧 240 disagreement 为 0.0468；
+4. V2 会把所有局部 accepted proposal 写回各自 map，即使该实例没有参与共识；
+5. V2 在多 proposal 冲突时清空 temporal state，导致 130/140 无法连续利用可信的
+   wardrobe proposal；
+6. V2 short-carry 与 no-carry 结果相同，说明旧 carry 实际从未触发。
 
-V1 a050 的 non-reference pointmap RMSE 从 0.132935 m 降到 0.130259 m，证明实例
-几何存在弱有效信号；但它没有转化成 pose 改善。GT translation oracle 的
-non-reference pointmap RMSE 为 0.115600 m，说明仍有可研究空间。
+## V3 proposal 与共识
 
-## 第二版计算图
-
-每个实例仍用 translation-only trimmed nearest-neighbor ICP：
-
-```text
-j(i) = NN(P_t^k[i] + delta, O_<t^k)
-delta <- delta + coordinate_median(
-  O_<t^k[j(i)] - (P_t^k[i] + delta)
-)
-```
-
-严格 proposal gate：
+每实例仍使用 translation-only trimmed nearest-neighbor ICP。严格 gate 不变：
 
 ```text
 min points              = 128
@@ -61,55 +50,67 @@ min fitness             = 0.25
 max ICP RMSE             = 0.03 native
 correspondence distance  = max(0.02, 0.05 * object scale)
 max translation norm     = 0.15 native
+consensus max residual   = 0.02 native
 ```
 
-至少两个 proposal 围绕最终 coordinate-wise median 的最大残差不超过 0.02，
-才产生多实例共享平移。
+tracker score 低于 map-update score gate 的 proposal 不参与 V3 共识或 temporal
+筛选。至少两个 eligible proposal 围绕最终 coordinate-wise median 的最大残差不
+超过 0.02，才产生普通多实例共识。
 
-第二版将地图与相机职责分开：
+## V3 temporal conflict filtering
+
+当普通共识失败时，不再因为“有多个 proposal”直接清空历史。将每个 eligible
+proposal 与上一轮共享平移比较：
 
 ```text
-object map k update:  P_t^k + delta_t^k
-whole-frame update:   X'_t = X_t + alpha * Delta_t
+temporal_distance(k) = ||delta_t^k - previous_Delta||
 ```
 
-即每个通过严格 gate 的实例只用自己的 `delta_t^k` 更新自己的地图；相机仍只使用
-一个 `Delta_t`。这不恢复“每实例独立改相机”的旧方案。
+只有以下条件全部成立才接受：
 
-## 短期连续机制
+- 当前恰好一个 temporal inlier，距离不超过 0.02；
+- 与上一轮有效修正的源帧 gap 不超过 15；
+- 连续 single-instance carry 尚未达到 2 次上限。
 
-多实例共识失败时，只有以下条件全部成立，单实例 proposal 才能产生整帧修正：
-
-- 当前恰好一个 proposal 通过严格 gate；
-- 距最近一次多实例共识的源帧间隔不超过 15；
-- proposal 与最近共享平移的距离不超过 0.02；
-- tracker score 不低于 map update score gate。
-
-接受后可以更新平移值，但 15 帧窗口始终锚定最近一次多实例共识，不能靠连续单实例
-carry 无限向后滚动。平移使用：
+接受时：
 
 ```text
-Delta_t = 0.5 * previous_Delta + 0.5 * current_delta
+Delta_t = 0.5 * previous_Delta + 0.5 * delta_t^k
+X'_t = X_t + 0.5 * Delta_t
 ```
 
-若多个 proposal 通过但互相冲突，carry 被明确禁止且历史连续状态立即清空。长间隔
-同样清空，因而不会把帧 140 的状态无条件带到 210/240。
+与 V2 不同，carry 接受后 temporal frame 会前移，因此允许
+`119 consensus -> 130 carry #1 -> 140 carry #2`。连续次数达到 2、长 gap、没有
+唯一 inlier 或中间拒绝都会清空状态；210 的长间隔不能继承到 240。
 
-## 同次消融
+## 受控 object-map 写回
 
-| mode | 唯一变量 |
+V3 主分支只允许最终通过相机决策验证的实例更新自己的 map：
+
+```text
+multi consensus participant
+or unique validated temporal participant
+    -> O_t^k = merge(O_<t^k, P_t^k + delta_t^k)
+```
+
+被共识排除的 proposal、冲突中的 temporal outlier 和最终拒绝帧一律不写回。
+map 使用各实例未缩放的 `delta_t^k`；整帧 pointmap/相机始终只接收一个共享且乘
+`alpha=0.5` 的 translation，不恢复每实例独立改相机。
+
+## 同次必要消融
+
+| mode | 用途 |
 |---|---|
-| `ray_only` | 无实例修正 |
-| `v1_shared_map_a100` | 第一版复现 |
-| `v2_strict_shared_map_no_carry_a100` | 只收紧 gate |
-| `v2_strict_per_instance_no_carry_a100` | 再加入每实例地图更新 |
-| `v2_strict_per_instance_short_carry_a025/a050/a100` | 再加入短期连续，alpha 消融 |
-| `v2_strict_reference_no_carry_a100` | 只用 reference map |
-| `v2_strict_shuffled_short_carry_a100` | shuffled-ID 负对照 |
+| `ray_only` | 真正 baseline |
+| `v2_strict_per_instance_short_carry_a050` | V2 结果复现 |
+| `v3_consensus_only_validated_a050` | 去掉 temporal filtering/carry |
+| `v3_temporal_unvalidated_map_a050` | 去掉受控 map writeback |
+| `v3_temporal_validated_a050` | V3 可部署主候选 |
+| `v3_temporal_validated_shuffled_a050` | shuffled-ID 负对照 |
 | `gt_point_translation_oracle` | evaluation-only 上限 |
 
-当前主候选是 `v2_strict_per_instance_short_carry_a100`，在服务器结果回来前只称
-candidate，不称已验证方法。
+V1、多组 alpha、reference-only 和 strict/shared 历史分支已由 V2 实验回答，不再
+重复占用服务器计算。
 
 ## 输出与判读
 
@@ -117,26 +118,30 @@ candidate，不称已验证方法。
 
 1. `instance_correction_events.csv`
    - `correction_source`
-   - `temporal_frame_gap`
-   - `temporal_proposal_distance_native`
+   - `temporal_reference_frame_index`
+   - `temporal_inlier_instance_ids`
+   - `temporal_carry_count_before/after`
    - `map_update_instance_ids`
 2. `instance_icp_diagnostics.csv`
-   - `icp_rmse_native`
-   - `consensus_participant`
-   - `temporal_participant`
+   - `proposal_score_eligible`
+   - `temporal_distance_native`
+   - `temporal_inlier`
+   - `proposal_validated`
    - `map_updated`
-   - 每实例 `map_update_translation_native_*`
 3. `instance_pose_summary.csv`、`instance_pose_rpe.csv`
 4. `instance_pose_pair_summary.csv` 与 `instance_pose_pair_metrics.csv`
 5. `instance_pointmap_summary.csv`、`instance_pointmap_frame_metrics.csv`
 
-重点 pairs：105→119、119→130、130→140、210→240。
+重点确认帧 130 是否排除 cabinet 并保留 wardrobe、140 是否成为 carry #2、210
+是否因长 gap reset、240 是否在没有有效 temporal history 时拒绝。最终判断必须同时
+看 ATE、adjacent RPE 和 all-pairs，不能只凭 pointmap RMSE 或相邻帧指标。
 
-PLY 保留：
+PLY 输出包含：
 
 ```text
 instance_<id>/pointclouds/ray_only/
-instance_<id>/pointclouds/v2_strict_per_instance_short_carry_a100/
+instance_<id>/pointclouds/v2_strict_per_instance_short_carry_a050/
+instance_<id>/pointclouds/v3_temporal_validated_a050/
 ```
 
 唯一服务器入口见 [`../commands.txt`](../commands.txt)。

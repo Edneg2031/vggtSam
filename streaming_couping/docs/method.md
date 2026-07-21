@@ -85,9 +85,9 @@ X'_t = X_t + alpha * Delta_t
 劣于 `ray_only`；a025 仅打平。主要问题是地图污染、gate 过宽和稀疏修正造成
 130→140 的时间跳变。
 
-该负结果保留为 `v1_shared_map_a100` 对照，不能称为有效 pose 方法。
+该分支已经由服务器实验回答，不再进入当前运行，不能称为有效 pose 方法。
 
-## 5. V2 instance correction
+## 5. V2 result and V3 instance correction
 
 ### 5.1 Strict proposal gate
 
@@ -103,27 +103,36 @@ max translation         0.15 native
 
 多实例共识的最终 robust-center 最大残差必须不超过 0.02 native。
 
-### 5.2 Separate map and camera updates
+### 5.2 V2 final result
 
-每个严格接受的实例只用自己的 proposal 更新自己的 map：
+V2 让每个局部 accepted proposal 用自己的平移更新自己的 map，并加入锚定最近
+多实例共识的 short carry。a050 的 adjacent RPE 改善 2.75%，但 all-pairs direction
+mean 恶化 4.18%，translation@10° 也下降，因此 V2 只保留为复现对照。
+
+根因是局部 ICP accepted 不等于跨实例或时间上可信。被共识排除以及互相冲突的
+proposal 仍然写入 map，且旧 carry 在冲突时直接清空，实际从未触发。
+
+### 5.3 Validated map writeback
+
+V3 只有最终参与普通共识或 temporal carry 的实例才能写回：
 
 ```text
 O_t^k = merge(O_<t^k, P_t^k + delta_t^k)
 ```
 
-整帧 pointmap 和相机仍只使用多实例共享平移：
+其余 accepted-but-unvalidated proposal 不更新 map。整帧 pointmap 和相机仍只使用
+一个共享平移：
 
 ```text
-X'_t = X_t + alpha * Delta_t
+X'_t = X_t + 0.5 * Delta_t
 ```
 
-这防止 shared correction 把实例间不一致写入地图，同时保持相机修正的整帧一致性。
+### 5.4 Temporal conflict filtering
 
-### 5.3 Bounded temporal continuity
-
-若当前恰好只有一个严格 proposal，只有在距最近多实例共识的源帧 gap ≤ 15 且它
-距最近有效平移 ≤ 0.02 时，才用 0.5/0.5 blend 延续修正。窗口锚点不会被单实例
-carry 后移；多实例冲突或长 gap 会清空 temporal state。
+普通共识失败后，V3 计算所有 eligible proposal 到上一轮共享平移的距离。恰好
+一个 proposal 在 0.02 内、相邻有效源帧 gap ≤ 15 且连续 carry 少于 2 次时，用
+0.5/0.5 blend 接受。carry 后 temporal frame 前移，因此最多形成两步短链；长 gap、
+没有唯一 inlier 或中间拒绝立即 reset。
 
 详细消融与输出字段见
 [`instance_pose_refinement.md`](instance_pose_refinement.md)。
@@ -146,12 +155,11 @@ paired distance mean/median/RMSE/p90，以及 non-reference 汇总。
 ### Controls
 
 - `ray_only`
-- V1 reproduction
-- strict-only
-- per-instance map update
-- no-carry versus short-carry
-- reference-only map
-- shuffled instance IDs
+- V2 a050 reproduction
+- V3 consensus-only（去 temporal）
+- V3 unvalidated-map（去受控写回）
+- V3 temporal + validated-map 主候选
+- V3 shuffled instance IDs
 - GT point translation oracle
 
 ## 7. 当前服务器入口
@@ -162,4 +170,4 @@ paired distance mean/median/RMSE/p90，以及 non-reference 汇总。
 zsh streaming_couping/commands.txt
 ```
 
-同一命令复用 tracking cache、跑完全部 V2 消融并保留实例 PLY。
+同一命令复用 tracking cache、跑完 7 个必要 V3/对照分支并保留实例 PLY。

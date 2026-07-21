@@ -1,8 +1,8 @@
-"""V2 causal static-instance pointmap and ray-center pose refinement.
+"""V3 causal static-instance pointmap and ray-center pose refinement.
 
-Strict per-instance proposals update only their own persistent maps. Camera
-and pointmap correction still use exactly one frame-wide translation, obtained
-from multi-instance consensus or a bounded short-term single-instance carry.
+The deployable branch validates instance proposals before object-map writeback.
+Camera and pointmap correction always use exactly one frame-wide translation,
+obtained from multi-instance consensus or bounded temporal conflict filtering.
 """
 
 from __future__ import annotations
@@ -69,7 +69,7 @@ class InstanceRefinementConfig:
     temporal_max_frame_gap: int = 15
     temporal_proposal_distance: float = 0.02
     temporal_current_weight: float = 0.50
-    correction_scales: tuple[float, ...] = (0.25, 0.50, 1.0)
+    temporal_max_carry_frames: int = 2
     compute_device: str = "cpu"
     ray_max_points: int = 65536
     ray_min_points: int = 1024
@@ -139,7 +139,7 @@ def main() -> None:
         temporal_max_frame_gap=args.instance_temporal_max_frame_gap,
         temporal_proposal_distance=args.instance_temporal_distance,
         temporal_current_weight=args.instance_temporal_current_weight,
-        correction_scales=tuple(args.correction_scales),
+        temporal_max_carry_frames=args.instance_temporal_max_carry_frames,
         compute_device=(
             args.instance_icp_device
             if args.instance_icp_device is not None
@@ -334,14 +334,13 @@ def run_experiment(
             for key, value in recovered_tracking.items()
         },
     }
-    modes = _refinement_modes(refinement)
+    modes = _refinement_modes()
     mode_specs = {mode.name: mode for mode in modes}
     corrected_points: dict[str, torch.Tensor] = {
         "raw_camera_head": geometry.world_points.double().cpu(),
     }
     correction_rows = []
     proposal_rows = []
-    v2_short_carry_base = None
     for mode in modes:
         print(
             f"running refinement mode={mode.name} "
@@ -371,22 +370,6 @@ def run_experiment(
                 reason="ray-only baseline; no instance correction",
             )
             proposals = []
-        elif (
-            mode.mask_source == "recovered"
-            and mode.map_policy == "causal"
-            and mode.proposal_profile == "strict"
-            and mode.map_update_policy == "per_instance"
-            and mode.temporal_policy == "short_carry"
-            and not mode.shuffled_instance_ids
-            and v2_short_carry_base is not None
-        ):
-            corrections, events, proposals = _rescale_correction_result(
-                mode,
-                base_corrections=v2_short_carry_base[0],
-                base_events=v2_short_carry_base[1],
-                base_proposals=v2_short_carry_base[2],
-                metric_scale=point_alignment.scale,
-            )
         else:
             corrections, events, proposals = _estimate_causal_corrections(
                 mode,
@@ -402,23 +385,6 @@ def run_experiment(
                 config=refinement,
                 metric_scale=point_alignment.scale,
             )
-            if (
-                mode.mask_source == "recovered"
-                and mode.map_policy == "causal"
-                and mode.proposal_profile == "strict"
-                and mode.map_update_policy == "per_instance"
-                and mode.temporal_policy == "short_carry"
-                and not mode.shuffled_instance_ids
-            ):
-                if abs(float(mode.correction_scale) - 1.0) > 1e-9:
-                    raise RuntimeError(
-                        "The reusable V2 short-carry base must use alpha=1."
-                    )
-                v2_short_carry_base = (
-                    corrections,
-                    events,
-                    proposals,
-                )
         corrected_points[mode.name] = (
             geometry.world_points.double().cpu()
             + corrections[:, None, None, :]
@@ -515,7 +481,8 @@ def run_experiment(
         corrected_points=corrected_points,
         modes=(
             "ray_only",
-            "v2_strict_per_instance_short_carry_a100",
+            "v2_strict_per_instance_short_carry_a050",
+            "v3_temporal_validated_a050",
         ),
     )
     _write_csv(
@@ -523,7 +490,7 @@ def run_experiment(
         point_cloud_rows,
     )
     metadata = {
-        "experiment": "causal_multi_instance_pointmap_ray_pose_refinement_v2",
+        "experiment": "causal_multi_instance_pointmap_ray_pose_refinement_v3",
         "scene_id": config.scene_id,
         "frame_indices": list(config.frame_indices),
         "instance_ids": [int(value) for value in instance_ids],
@@ -538,25 +505,23 @@ def run_experiment(
             "GT prompt and object-map initialization only; all deployable "
             "post-reference decisions use predictions"
         ),
-        "deployable_candidate_mode": (
-            "v2_strict_per_instance_short_carry_a100"
-        ),
-        "v1_result": (
-            "legacy shared-map correction was not better than ray_only; "
-            "it is retained only as an in-run reproduction control"
+        "deployable_candidate_mode": "v3_temporal_validated_a050",
+        "v2_result": (
+            "V2 improved adjacent RPE slightly but degraded official-style "
+            "all-pairs translation direction; it is retained as one control"
         ),
         "correction_order": [
             "tracking masks and persistent IDs",
             "strict per-instance translation-only trimmed alignment",
-            "per-instance proposal updates only its own persistent map",
-            "multi-instance consensus or bounded short-term single-instance carry",
+            "temporal conflict filtering against the last shared translation",
+            "validated consensus/carry participants update only their own maps",
+            "at most two consecutive bounded single-instance carries",
             "translate the whole current pointmap",
             "all-point predicted-K/R ray-center pose repair",
         ],
         "correction_scale_semantics": (
-            "alpha scales only the whole-frame pointmap correction; causal "
-            "maps use unscaled per-instance proposals, so V2 short-carry alpha "
-            "branches reuse identical proposals and map history"
+            "alpha=0.5 scales only the whole-frame pointmap correction; "
+            "validated object maps use unscaled per-instance proposals"
         ),
         "gt_role": (
             "pose/pointmap metrics plus the explicitly named "
@@ -668,12 +633,10 @@ def _load_instance_sequences(
     return sequences, target_masks
 
 
-def _refinement_modes(
-    config: InstanceRefinementConfig,
-) -> tuple[RefinementMode, ...]:
-    """Return a compact causal ablation for the legacy and V2 mechanisms."""
+def _refinement_modes() -> tuple[RefinementMode, ...]:
+    """Return the compact V3 experiment and the controls needed to read it."""
 
-    modes = [
+    modes = (
         RefinementMode(
             name="ray_only",
             role="ray_center_baseline",
@@ -682,154 +645,95 @@ def _refinement_modes(
             correction_scale=0.0,
         ),
         RefinementMode(
-            name="v1_shared_map_a100",
-            role="legacy_reproduction",
+            name="v2_strict_per_instance_short_carry_a050",
+            role="v2_reproduction_control",
             mask_source="recovered",
             map_policy="causal",
-            correction_scale=1.0,
-            proposal_profile="legacy",
-            map_update_policy="shared",
-        ),
-        RefinementMode(
-            name="v2_strict_shared_map_no_carry_a100",
-            role="strict_gate_ablation",
-            mask_source="recovered",
-            map_policy="causal",
-            correction_scale=1.0,
-            map_update_policy="shared",
-        ),
-        RefinementMode(
-            name="v2_strict_per_instance_no_carry_a100",
-            role="per_instance_map_update_ablation",
-            mask_source="recovered",
-            map_policy="causal",
-            correction_scale=1.0,
-            map_update_policy="per_instance",
-        ),
-        RefinementMode(
-            name="v2_strict_reference_no_carry_a100",
-            role="map_history_ablation",
-            mask_source="recovered",
-            map_policy="reference_only",
-            correction_scale=1.0,
-        ),
-    ]
-    ordered_scales = (
-        1.0,
-        *(
-            float(scale)
-            for scale in config.correction_scales
-            if abs(float(scale) - 1.0) > 1e-9
-        ),
-    )
-    modes.extend(
-        RefinementMode(
-            name=(
-                "v2_strict_per_instance_short_carry_"
-                f"a{_scale_tag(scale)}"
-            ),
-            role=(
-                "deployable_v2_candidate"
-                if abs(float(scale) - 1.0) <= 1e-9
-                else "correction_scale_ablation"
-            ),
-            mask_source="recovered",
-            map_policy="causal",
-            correction_scale=float(scale),
+            correction_scale=0.5,
             map_update_policy="per_instance",
             temporal_policy="short_carry",
-        )
-        for scale in ordered_scales
-    )
-    modes.extend(
-        [
-            RefinementMode(
-                name="v2_strict_shuffled_short_carry_a100",
-                role="instance_identity_negative_control",
-                mask_source="recovered",
-                map_policy="causal",
-                correction_scale=1.0,
-                map_update_policy="per_instance",
-                temporal_policy="short_carry",
-                shuffled_instance_ids=True,
-            ),
-            RefinementMode(
-                name="gt_point_translation_oracle",
-                role="translation_only_pointmap_oracle",
-                mask_source="none",
-                map_policy="none",
-                correction_scale=1.0,
-                gt_point_translation_oracle=True,
-            ),
-        ]
+        ),
+        RefinementMode(
+            name="v3_consensus_only_validated_a050",
+            role="temporal_policy_ablation",
+            mask_source="recovered",
+            map_policy="causal",
+            correction_scale=0.5,
+            map_update_policy="validated",
+        ),
+        RefinementMode(
+            name="v3_temporal_unvalidated_map_a050",
+            role="map_writeback_gate_ablation",
+            mask_source="recovered",
+            map_policy="causal",
+            correction_scale=0.5,
+            map_update_policy="per_instance",
+            temporal_policy="validated_carry",
+        ),
+        RefinementMode(
+            name="v3_temporal_validated_a050",
+            role="deployable_v3_candidate",
+            mask_source="recovered",
+            map_policy="causal",
+            correction_scale=0.5,
+            map_update_policy="validated",
+            temporal_policy="validated_carry",
+        ),
+        RefinementMode(
+            name="v3_temporal_validated_shuffled_a050",
+            role="instance_identity_negative_control",
+            mask_source="recovered",
+            map_policy="causal",
+            correction_scale=0.5,
+            map_update_policy="validated",
+            temporal_policy="validated_carry",
+            shuffled_instance_ids=True,
+        ),
+        RefinementMode(
+            name="gt_point_translation_oracle",
+            role="translation_only_pointmap_oracle",
+            mask_source="none",
+            map_policy="none",
+            correction_scale=1.0,
+            gt_point_translation_oracle=True,
+        ),
     )
     names = [mode.name for mode in modes]
     if len(names) != len(set(names)):
-        raise ValueError("Correction scales generated duplicate mode names.")
-    return tuple(modes)
+        raise RuntimeError("Refinement modes must have unique names.")
+    return modes
 
 
-def _rescale_correction_result(
-    mode: RefinementMode,
+def _select_bounded_temporal_inlier(
+    distances: Mapping[int, float],
     *,
-    base_corrections: torch.Tensor,
-    base_events: Sequence[dict],
-    base_proposals: Sequence[dict],
-    metric_scale: float,
-) -> tuple[torch.Tensor, list[dict], list[dict]]:
-    """Reuse identical ICP/map history while varying only frame correction."""
+    frame_gap: int | None,
+    carry_count: int,
+    max_frame_gap: int,
+    max_distance: float,
+    max_carry_frames: int,
+) -> tuple[int | None, tuple[int, ...], bool, bool]:
+    """Select one temporally consistent proposal under a bounded carry."""
 
-    scale = float(mode.correction_scale)
-    corrections = scale * base_corrections
-    events = []
-    for base in base_events:
-        row = dict(base)
-        row.update(
-            {
-                "mode": mode.name,
-                "mode_role": mode.role,
-                "mask_source": mode.mask_source,
-                "map_policy": mode.map_policy,
-                "correction_scale": scale,
-                "proposal_profile": mode.proposal_profile,
-                "map_update_policy": mode.map_update_policy,
-                "temporal_policy": mode.temporal_policy,
-            }
+    inlier_ids = tuple(
+        sorted(
+            int(instance_id)
+            for instance_id, distance in distances.items()
+            if math.isfinite(float(distance))
+            and float(distance) <= float(max_distance)
         )
-        shared = torch.tensor(
-            [
-                row["shared_translation_native_x"],
-                row["shared_translation_native_y"],
-                row["shared_translation_native_z"],
-            ],
-            dtype=torch.float64,
-        )
-        applied = scale * shared
-        _add_vector(row, "applied_translation_native", applied)
-        row["applied_translation_norm_native"] = float(
-            torch.linalg.vector_norm(applied)
-        )
-        row["applied_translation_norm_aligned_meters"] = (
-            float(metric_scale) * row["applied_translation_norm_native"]
-        )
-        events.append(row)
-    proposals = []
-    for base in base_proposals:
-        row = dict(base)
-        row.update(
-            {
-                "mode": mode.name,
-                "mode_role": mode.role,
-                "mask_source": mode.mask_source,
-                "map_policy": mode.map_policy,
-                "correction_scale": scale,
-                "proposal_profile": mode.proposal_profile,
-                "map_update_policy": mode.map_update_policy,
-                "temporal_policy": mode.temporal_policy,
-            }
-        )
-        proposals.append(row)
-    return corrections, events, proposals
+    )
+    gap_ok = (
+        frame_gap is not None
+        and 0 < int(frame_gap) <= int(max_frame_gap)
+    )
+    carry_budget_ok = int(carry_count) < int(max_carry_frames)
+    candidate_id = (
+        inlier_ids[0]
+        if gap_ok and carry_budget_ok and len(inlier_ids) == 1
+        else None
+    )
+    return candidate_id, inlier_ids, gap_ok, carry_budget_ok
 
 
 def _estimate_causal_corrections(
@@ -849,40 +753,31 @@ def _estimate_causal_corrections(
 ) -> tuple[torch.Tensor, list[dict], list[dict]]:
     """Estimate one frame correction while maintaining causal instance maps.
 
-    V2 separates the two responsibilities that V1 coupled together:
-
-    - camera/pointmap correction always uses one shared translation;
-    - a causal object map may use its own accepted instance proposal.
-
-    A single-instance proposal can affect the camera only in the explicit
-    short-carry mode and only when it agrees with a recent multi-instance
-    consensus. Conflicting multi-instance proposals never use temporal carry.
+    V3 lets temporal evidence resolve a conflict only when exactly one strict
+    proposal remains close to the last shared correction. Only proposals that
+    participated in an accepted consensus/carry may update validated maps.
+    The V2 control retains its original unvalidated per-instance writeback.
     """
 
-    if mode.proposal_profile not in {"legacy", "strict"}:
+    if mode.proposal_profile != "strict":
         raise ValueError(f"Unknown proposal profile: {mode.proposal_profile}.")
-    if mode.map_policy not in {"causal", "reference_only"}:
-        raise ValueError(f"Unknown map policy: {mode.map_policy}.")
-    if mode.map_update_policy not in {"none", "shared", "per_instance"}:
+    if mode.map_policy != "causal":
+        raise ValueError(f"Unknown causal map policy: {mode.map_policy}.")
+    if mode.map_update_policy not in {"per_instance", "validated"}:
         raise ValueError(
             f"Unknown map update policy: {mode.map_update_policy}."
         )
-    if mode.temporal_policy not in {"none", "short_carry"}:
+    if mode.temporal_policy not in {
+        "none",
+        "short_carry",
+        "validated_carry",
+    }:
         raise ValueError(
             f"Unknown temporal policy: {mode.temporal_policy}."
         )
     world_points = world_points.double().cpu()
     confidence = confidence.double().cpu()
-    effective_config = (
-        replace(
-            config,
-            max_icp_rmse=float("inf"),
-            correspondence_object_ratio=0.15,
-            consensus_distance=0.05,
-        )
-        if mode.proposal_profile == "legacy"
-        else config
-    )
+    effective_config = config
     corrections = torch.zeros(
         (len(frame_indices), 3),
         dtype=torch.float64,
@@ -921,9 +816,13 @@ def _estimate_causal_corrections(
     event_rows[reference_index]["consensus_distance_native"] = (
         effective_config.consensus_distance
     )
+    event_rows[reference_index]["temporal_max_carry_frames"] = (
+        effective_config.temporal_max_carry_frames
+    )
     proposal_rows = []
     last_temporal_translation: torch.Tensor | None = None
-    last_consensus_frame: int | None = None
+    last_temporal_frame: int | None = None
+    temporal_carry_count = 0
     for sequence_index in range(reference_index + 1, len(frame_indices)):
         proposals = []
         current_by_instance = {}
@@ -951,43 +850,57 @@ def _estimate_causal_corrections(
             )
             proposals.append(proposal)
 
-        consensus_function = (
-            _proposal_consensus_legacy
-            if mode.proposal_profile == "legacy"
-            else _proposal_consensus
+        uses_v3_validation = (
+            mode.map_update_policy == "validated"
+            or mode.temporal_policy == "validated_carry"
         )
-        shared, participating, disagreement = consensus_function(
-            proposals,
+        eligible_proposals = [
+            proposal
+            for proposal in proposals
+            if proposal.accepted
+            and (
+                not uses_v3_validation
+                or float(scores[proposal.instance_id][sequence_index])
+                >= float(map_update_min_score)
+            )
+        ]
+        shared, participating, disagreement = _proposal_consensus(
+            eligible_proposals,
             min_instances=effective_config.min_participating_instances,
             max_distance=effective_config.consensus_distance,
         )
         accepted = shared is not None
         correction_source = "none"
         temporal_candidate_id: int | None = None
-        temporal_frame_gap: int | None = None
+        temporal_reference_frame = last_temporal_frame
+        temporal_frame_gap = (
+            int(frame_indices[sequence_index]) - int(last_temporal_frame)
+            if last_temporal_frame is not None
+            else None
+        )
         temporal_proposal_distance = float("nan")
+        temporal_distances: dict[int, float] = {}
+        temporal_inlier_ids: tuple[int, ...] = ()
+        carry_count_before = temporal_carry_count
         if accepted:
             reason = "accepted multi-instance shared translation"
             correction_source = "multi_instance_consensus"
-            if mode.temporal_policy == "short_carry":
+            if mode.temporal_policy in {
+                "short_carry",
+                "validated_carry",
+            }:
                 last_temporal_translation = shared.clone()
-                last_consensus_frame = int(frame_indices[sequence_index])
+                last_temporal_frame = int(frame_indices[sequence_index])
+                temporal_carry_count = 0
         else:
             reason = "rejected: insufficient cross-instance consensus"
-            accepted_proposals = [
-                proposal for proposal in proposals if proposal.accepted
-            ]
+            accepted_proposals = list(eligible_proposals)
             if (
                 mode.temporal_policy == "short_carry"
                 and len(accepted_proposals) == 1
             ):
                 candidate = accepted_proposals[0]
                 temporal_candidate_id = int(candidate.instance_id)
-                if last_consensus_frame is not None:
-                    temporal_frame_gap = (
-                        int(frame_indices[sequence_index])
-                        - int(last_consensus_frame)
-                    )
                 if last_temporal_translation is not None:
                     temporal_proposal_distance = float(
                         torch.linalg.vector_norm(
@@ -1036,7 +949,8 @@ def _estimate_causal_corrections(
                         f"distance_ok={int(distance_ok)}"
                     )
                     last_temporal_translation = None
-                    last_consensus_frame = None
+                    last_temporal_frame = None
+                    temporal_carry_count = 0
             elif mode.temporal_policy == "short_carry":
                 if len(accepted_proposals) > 1:
                     reason = (
@@ -1044,7 +958,69 @@ def _estimate_causal_corrections(
                         "temporal carry disabled"
                     )
                 last_temporal_translation = None
-                last_consensus_frame = None
+                last_temporal_frame = None
+                temporal_carry_count = 0
+            elif mode.temporal_policy == "validated_carry":
+                if last_temporal_translation is not None:
+                    temporal_distances = {
+                        int(proposal.instance_id): float(
+                            torch.linalg.vector_norm(
+                                proposal.translation
+                                - last_temporal_translation
+                            )
+                        )
+                        for proposal in accepted_proposals
+                    }
+                (
+                    temporal_candidate_id,
+                    temporal_inlier_ids,
+                    gap_ok,
+                    carry_budget_ok,
+                ) = _select_bounded_temporal_inlier(
+                    temporal_distances,
+                    frame_gap=temporal_frame_gap,
+                    carry_count=temporal_carry_count,
+                    max_frame_gap=effective_config.temporal_max_frame_gap,
+                    max_distance=effective_config.temporal_proposal_distance,
+                    max_carry_frames=(
+                        effective_config.temporal_max_carry_frames
+                    ),
+                )
+                if temporal_candidate_id is not None:
+                    candidate = next(
+                        proposal
+                        for proposal in accepted_proposals
+                        if proposal.instance_id == temporal_candidate_id
+                    )
+                    temporal_proposal_distance = temporal_distances[
+                        temporal_candidate_id
+                    ]
+                    weight = float(effective_config.temporal_current_weight)
+                    shared = (
+                        (1.0 - weight) * last_temporal_translation
+                        + weight * candidate.translation
+                    )
+                    participating = (temporal_candidate_id,)
+                    accepted = True
+                    correction_source = "single_instance_validated_carry"
+                    reason = (
+                        "accepted unique temporal inlier after proposal "
+                        "conflict filtering"
+                    )
+                    last_temporal_translation = shared.clone()
+                    last_temporal_frame = int(frame_indices[sequence_index])
+                    temporal_carry_count += 1
+                else:
+                    reason = (
+                        "rejected bounded temporal filtering: "
+                        f"eligible={len(accepted_proposals)} "
+                        f"inliers={len(temporal_inlier_ids)} "
+                        f"gap_ok={int(gap_ok)} "
+                        f"carry_budget_ok={int(carry_budget_ok)}"
+                    )
+                    last_temporal_translation = None
+                    last_temporal_frame = None
+                    temporal_carry_count = 0
 
         if accepted:
             applied = float(mode.correction_scale) * shared
@@ -1055,49 +1031,43 @@ def _estimate_causal_corrections(
         map_updates = 0
         map_update_ids = []
         map_update_translations: dict[int, torch.Tensor] = {}
-        if mode.map_policy == "causal":
-            if mode.map_update_policy == "per_instance":
-                update_proposals = [
-                    proposal
-                    for proposal in proposals
-                    if proposal.accepted
-                ]
-            elif mode.map_update_policy == "shared" and accepted:
-                update_proposals = [
-                    proposal
-                    for proposal in proposals
-                    if proposal.instance_id in participating
-                ]
-            else:
-                update_proposals = []
-            for proposal in update_proposals:
-                instance_id = int(proposal.instance_id)
-                if (
-                    float(scores[instance_id][sequence_index])
-                    < float(map_update_min_score)
-                ):
-                    continue
-                lookup_id = (
-                    permutation[instance_id]
-                    if mode.shuffled_instance_ids
-                    else instance_id
-                )
-                update_translation = (
-                    proposal.translation
-                    if mode.map_update_policy == "per_instance"
-                    else shared
-                )
-                corrected = (
-                    current_by_instance[instance_id] + update_translation
-                )
-                object_maps[lookup_id] = _merge_map_points(
-                    object_maps[lookup_id],
-                    corrected,
-                    max_points=effective_config.map_max_points,
-                )
-                map_updates += 1
-                map_update_ids.append(instance_id)
-                map_update_translations[instance_id] = update_translation
+        if mode.map_update_policy == "per_instance":
+            update_proposals = [
+                proposal
+                for proposal in proposals
+                if proposal.accepted
+            ]
+        elif accepted:
+            update_proposals = [
+                proposal
+                for proposal in proposals
+                if proposal.accepted
+                and proposal.instance_id in participating
+            ]
+        else:
+            update_proposals = []
+        for proposal in update_proposals:
+            instance_id = int(proposal.instance_id)
+            if (
+                float(scores[instance_id][sequence_index])
+                < float(map_update_min_score)
+            ):
+                continue
+            lookup_id = (
+                permutation[instance_id]
+                if mode.shuffled_instance_ids
+                else instance_id
+            )
+            update_translation = proposal.translation
+            corrected = current_by_instance[instance_id] + update_translation
+            object_maps[lookup_id] = _merge_map_points(
+                object_maps[lookup_id],
+                corrected,
+                max_points=effective_config.map_max_points,
+            )
+            map_updates += 1
+            map_update_ids.append(instance_id)
+            map_update_translations[instance_id] = update_translation
 
         for proposal in proposals:
             instance_id = int(proposal.instance_id)
@@ -1123,13 +1093,31 @@ def _estimate_causal_corrections(
                 ),
                 "proposal_accepted": int(proposal.accepted),
                 "proposal_reason": proposal.reason,
+                "proposal_score_eligible": int(
+                    proposal.accepted
+                    and float(scores[instance_id][sequence_index])
+                    >= float(map_update_min_score)
+                ),
                 "consensus_participant": int(
                     correction_source == "multi_instance_consensus"
                     and instance_id in participating
                 ),
                 "temporal_participant": int(
-                    correction_source == "single_instance_short_carry"
+                    correction_source in {
+                        "single_instance_short_carry",
+                        "single_instance_validated_carry",
+                    }
                     and instance_id in participating
+                ),
+                "temporal_distance_native": temporal_distances.get(
+                    instance_id,
+                    float("nan"),
+                ),
+                "temporal_inlier": int(
+                    instance_id in temporal_inlier_ids
+                ),
+                "proposal_validated": int(
+                    accepted and instance_id in participating
                 ),
                 "map_updated": int(instance_id in map_update_ids),
                 "current_points": proposal.current_points,
@@ -1186,6 +1174,7 @@ def _estimate_causal_corrections(
                 "accepted_instance_proposals": sum(
                     int(proposal.accepted) for proposal in proposals
                 ),
+                "eligible_instance_proposals": len(eligible_proposals),
                 "participating_instances": len(participating),
                 "participating_instance_ids": " ".join(
                     str(value) for value in participating
@@ -1198,9 +1187,18 @@ def _estimate_causal_corrections(
                     float(metric_scale) * disagreement
                 ),
                 "temporal_candidate_instance_id": temporal_candidate_id,
+                "temporal_reference_frame_index": temporal_reference_frame,
                 "temporal_frame_gap": temporal_frame_gap,
                 "temporal_proposal_distance_native": (
                     temporal_proposal_distance
+                ),
+                "temporal_inlier_instance_ids": " ".join(
+                    str(value) for value in temporal_inlier_ids
+                ),
+                "temporal_carry_count_before": carry_count_before,
+                "temporal_carry_count_after": temporal_carry_count,
+                "temporal_max_carry_frames": (
+                    effective_config.temporal_max_carry_frames
                 ),
                 "map_updates": map_updates,
                 "map_update_instance_ids": " ".join(
@@ -1462,87 +1460,6 @@ def _proposal_consensus(
     return None, (), disagreement
 
 
-def _proposal_consensus_legacy(
-    proposals: Sequence[TranslationProposal],
-    *,
-    min_instances: int,
-    max_distance: float,
-) -> tuple[torch.Tensor | None, tuple[int, ...], float]:
-    """Preserve V1 seed-radius clustering for exact in-run reproduction."""
-
-    accepted = [proposal for proposal in proposals if proposal.accepted]
-    if len(accepted) < int(min_instances):
-        return None, (), float("nan")
-    best_cluster = []
-    best_spread = float("inf")
-    for seed in accepted:
-        cluster = [
-            proposal
-            for proposal in accepted
-            if float(
-                torch.linalg.vector_norm(
-                    proposal.translation - seed.translation
-                )
-            )
-            <= float(max_distance)
-        ]
-        while cluster:
-            translations = torch.stack(
-                [proposal.translation for proposal in cluster]
-            )
-            center = torch.quantile(translations, 0.50, dim=0)
-            retained = [
-                proposal
-                for proposal in cluster
-                if float(
-                    torch.linalg.vector_norm(
-                        proposal.translation - center
-                    )
-                )
-                <= float(max_distance)
-            ]
-            if len(retained) == len(cluster):
-                break
-            cluster = retained
-        spread = (
-            max(
-                float(
-                    torch.linalg.vector_norm(
-                        proposal.translation - center
-                    )
-                )
-                for proposal in cluster
-            )
-            if cluster
-            else float("inf")
-        )
-        if (
-            len(cluster) > len(best_cluster)
-            or (
-                len(cluster) == len(best_cluster)
-                and spread < best_spread
-            )
-        ):
-            best_cluster = cluster
-            best_spread = spread
-    if len(best_cluster) < int(min_instances):
-        return None, (), best_spread
-    translations = torch.stack(
-        [proposal.translation for proposal in best_cluster]
-    )
-    shared = torch.quantile(translations, 0.50, dim=0)
-    disagreement = max(
-        float(torch.linalg.vector_norm(value - shared))
-        for value in translations
-    )
-    if disagreement > float(max_distance):
-        return None, (), disagreement
-    participating = tuple(
-        sorted(proposal.instance_id for proposal in best_cluster)
-    )
-    return shared, participating, disagreement
-
-
 def _fit_all_point_ray_pose(
     world_points: torch.Tensor,
     *,
@@ -1796,6 +1713,7 @@ def _zero_correction_rows(
             "correction_reason": reason,
             "correction_source": "none",
             "accepted_instance_proposals": 0,
+            "eligible_instance_proposals": 0,
             "participating_instances": 0,
             "participating_instance_ids": "",
             "max_consensus_disagreement_native": float("nan"),
@@ -1805,8 +1723,13 @@ def _zero_correction_rows(
             "map_update_instance_ids": "",
             "map_total_points": 0,
             "temporal_candidate_instance_id": None,
+            "temporal_reference_frame_index": None,
             "temporal_frame_gap": None,
             "temporal_proposal_distance_native": float("nan"),
+            "temporal_inlier_instance_ids": "",
+            "temporal_carry_count_before": 0,
+            "temporal_carry_count_after": 0,
+            "temporal_max_carry_frames": 0,
             "applied_translation_norm_native": 0.0,
             "applied_translation_norm_aligned_meters": 0.0,
         }
@@ -2165,20 +2088,8 @@ def _validate_refinement_config(config: InstanceRefinementConfig) -> None:
         raise ValueError("temporal max frame gap must be positive.")
     if not 0.0 < config.temporal_current_weight <= 1.0:
         raise ValueError("temporal current weight must be in (0,1].")
-    if not config.correction_scales or any(
-        not 0.0 < float(value) <= 1.0
-        for value in config.correction_scales
-    ):
-        raise ValueError("correction scales must be in (0,1].")
-    if not any(
-        abs(float(value) - 1.0) <= 1e-9
-        for value in config.correction_scales
-    ):
-        raise ValueError("correction scales must include 1.0.")
-
-
-def _scale_tag(value: float) -> str:
-    return f"{int(round(100.0 * float(value))):03d}"
+    if config.temporal_max_carry_frames < 1:
+        raise ValueError("temporal max carry frames must be positive.")
 
 
 def _unique_ids(values: Sequence[int]) -> tuple[int, ...]:
@@ -2303,10 +2214,9 @@ def _parse_args() -> argparse.Namespace:
         default=0.50,
     )
     parser.add_argument(
-        "--correction-scales",
-        type=float,
-        nargs="+",
-        default=[0.25, 0.50, 1.0],
+        "--instance-temporal-max-carry-frames",
+        type=int,
+        default=2,
     )
     parser.add_argument("--ray-min-points", type=int, default=1024)
     parser.add_argument("--ray-max-points", type=int, default=65536)
