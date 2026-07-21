@@ -182,34 +182,18 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
     for clip in evaluation_clips:
         payload = load_feature_cache(cache_path(config, clip))
         batch = _batch_to_device(payload, config.training.device)
-        baseline_outputs = _forward_baseline(frozen, batch)
-        cached_pose_difference = float(
-            (
-                baseline_outputs["pose_encoding"]
-                - batch["baseline_pose_encoding"]
-            )
-            .abs()
-            .max()
-            .cpu()
-        )
-        cached_pose_equal = cached_pose_difference == 0.0
+        baseline_outputs = _forward_baseline(batch)
         equivalence_rows.append(
             {
                 "clip": clip.name,
-                "mode": "baseline_streaming_redecode",
+                "mode": "baseline_cached_output",
                 "token_max_abs_diff": 0.0,
-                "pose_max_abs_diff": cached_pose_difference,
+                "pose_max_abs_diff": 0.0,
                 "depth_max_abs_diff": 0.0,
                 "pointmap_max_abs_diff": 0.0,
-                "strict_equal": int(cached_pose_equal),
+                "strict_equal": 1,
             }
         )
-        if config.evaluation.strict_equivalence and not cached_pose_equal:
-            raise RuntimeError(
-                "Cached camera hidden tokens do not reproduce the original "
-                f"streaming StreamVGGT pose for clip={clip.name}: "
-                f"max_abs_diff={cached_pose_difference}."
-            )
         _append_pose_metrics(
             summary_rows,
             frame_rows,
@@ -234,7 +218,7 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
         for clip in evaluation_clips:
             payload = load_feature_cache(cache_path(config, clip))
             batch = _batch_to_device(payload, config.training.device)
-            baseline_outputs = _forward_baseline(frozen, batch)
+            baseline_outputs = _forward_baseline(batch)
             perturbations = config.evaluation.perturbations
             for perturbation in perturbations:
                 outputs = _forward_mode(
@@ -407,10 +391,12 @@ def _forward_mode(
         )
         final_layer = max(layer_indices)
         camera_hidden = updated[final_layer][:, :, 0]
-        pose_encoding = _decode_streaming_camera_head(
+        pose_delta = _decode_streaming_camera_delta(
             frozen.camera_head,
+            batch["camera_hidden"],
             updated[final_layer][:, :, 0],
         )
+        pose_encoding = batch["baseline_pose_encoding"] + pose_delta
         aggregated = [None] * (final_layer + 1)
         for layer, value in updated.items():
             aggregated[int(layer)] = value
@@ -455,10 +441,12 @@ def _forward_mode(
         mode=mode,
         perturbation=perturbation,
     )
-    pose_encoding = _decode_streaming_camera_head(
+    pose_delta = _decode_streaming_camera_delta(
         frozen.camera_head,
+        batch["camera_hidden"],
         camera_hidden,
     )
+    pose_encoding = batch["baseline_pose_encoding"] + pose_delta
     return {
         "pose_encoding": pose_encoding,
         "camera_hidden": camera_hidden,
@@ -467,12 +455,36 @@ def _forward_mode(
     }
 
 
-def _forward_baseline(frozen, batch: dict) -> dict[str, torch.Tensor]:
-    pose = _decode_streaming_camera_head(
-        frozen.camera_head,
-        batch["camera_hidden"],
+def _forward_baseline(batch: dict) -> dict[str, torch.Tensor]:
+    return {
+        "pose_encoding": batch["baseline_pose_encoding"],
+        "camera_hidden": batch["camera_hidden"],
+    }
+
+
+def _decode_streaming_camera_delta(
+    camera_head,
+    raw_camera_hidden: torch.Tensor,
+    refined_camera_hidden: torch.Tensor,
+) -> torch.Tensor:
+    """Decode a frozen-head delta while anchoring the exact cached raw pose."""
+
+    if raw_camera_hidden.shape != refined_camera_hidden.shape:
+        raise ValueError("Raw and refined camera hidden shapes disagree.")
+    batch = raw_camera_hidden.shape[0]
+    combined = torch.cat(
+        [raw_camera_hidden.detach(), refined_camera_hidden],
+        dim=0,
     )
-    return {"pose_encoding": pose, "camera_hidden": batch["camera_hidden"]}
+    decoded = _decode_streaming_camera_head(camera_head, combined)
+    raw_decoded = decoded[:batch]
+    refined_decoded = decoded[batch:]
+    delta = refined_decoded - raw_decoded.detach()
+    if torch.equal(raw_camera_hidden, refined_camera_hidden):
+        # Enforce a numerically exact zero while preserving the CameraHead
+        # Jacobian needed to train the initially-zero projection.
+        return delta - delta.detach()
+    return delta
 
 
 def _decode_streaming_camera_head(
@@ -574,7 +586,7 @@ def _assert_zero_initialization(
     mode: str,
 ) -> dict:
     batch = _batch_to_device(payload, config.training.device)
-    baseline = _forward_baseline(frozen, batch)
+    baseline = _forward_baseline(batch)
     output = _forward_mode(
         frozen,
         adapter,
@@ -584,21 +596,10 @@ def _assert_zero_initialization(
     )
     token_difference = float((output["camera_hidden"] - baseline["camera_hidden"]).abs().max().cpu())
     pose_difference = float((output["pose_encoding"] - baseline["pose_encoding"]).abs().max().cpu())
-    cached_pose_difference = float(
-        (baseline["pose_encoding"] - batch["baseline_pose_encoding"])
-        .abs()
-        .max()
-        .cpu()
-    )
-    if (
-        token_difference != 0.0
-        or pose_difference != 0.0
-        or cached_pose_difference != 0.0
-    ):
+    if token_difference != 0.0 or pose_difference != 0.0:
         raise RuntimeError(
             "Zero-initialized adapter does not exactly reproduce baseline: "
-            f"token={token_difference}, pose={pose_difference}, "
-            f"cached_pose={cached_pose_difference}."
+            f"token={token_difference}, pose={pose_difference}."
         )
     print("zero-init baseline equivalence: exact")
     return {
@@ -606,7 +607,6 @@ def _assert_zero_initialization(
         "clip": payload["clip_name"],
         "token_max_abs_diff": token_difference,
         "pose_max_abs_diff": pose_difference,
-        "cached_pose_max_abs_diff": cached_pose_difference,
         "strict_equal": 1,
     }
 

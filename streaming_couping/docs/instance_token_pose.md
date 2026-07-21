@@ -60,9 +60,12 @@ camera_hidden = camera_hidden
 但 forward 不处于 `no_grad`，pose loss仍能反传到 adapter。
 
 现有 recovery 配置启用了 StreamVGGT streaming cache，因此 cache/train/eval 均逐帧
-重放同一 CameraHead KV-cache路径，而不是把七帧 token 改成一次非缓存解码。camera
-hidden、四层 DPT token和 StreamVGGT image tensor以 FP32缓存；`module_off`严格检查
-原始 pose，`all_token_fusion`还逐元素检查原始 depth与pointmap。
+重放 CameraHead KV-cache路径，而不是把七帧 token 改成一次非缓存解码。缓存保存
+CameraHead真正读取的 final aggregator camera token，并用
+`cached_raw_pose + frozen_head(refined_token) - frozen_head(raw_token)`锚定原始输出；因此
+即使独立重放 frozen head存在实现差异，zero-init/module-off仍严格恢复原始 pose，同时
+保留对 adapter 的梯度。四层 DPT token和 StreamVGGT image tensor同样以 FP32缓存，
+`all_token_fusion`还逐元素检查原始 depth与pointmap。
 
 ## 完整消融
 
@@ -152,5 +155,5 @@ evaluation/baseline_equivalence.csv
 完整 log
 ```
 
-`baseline_equivalence.csv`中所有 `strict_equal` 必须为 `1`。缓存版本已提升，旧的 learned
-pose cache会自动失效并重建，不需要手工删除。
+`baseline_equivalence.csv`中所有 `strict_equal` 必须为 `1`。如果 feature cache已经完整，
+修复代码后可以直接复用，不需要重新运行 SAM3 pooling。

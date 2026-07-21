@@ -93,6 +93,7 @@ class StreamVGGTLatentAdapter:
         dpt_tokens = [
             aggregated_tokens_list[index].float() for index in self.dpt_layer_indices
         ]
+        camera_hidden = aggregated_tokens_list[-1][:, :, 0].float()
         tokens = aggregated_tokens_list[self.layer_index].float()
         patch_tokens = tokens[:, :, patch_start_idx:, :]
         patch_shape = patch_grid_from_images(images, patch_size=self.model.aggregator.patch_size)
@@ -155,6 +156,7 @@ class StreamVGGTLatentAdapter:
                 "dpt_layer_indices": self.dpt_layer_indices,
                 "dense_tokens": dense_tokens.reshape(1, -1, dense_tokens.shape[-1]),
                 "stream_dpt_tokens": dpt_tokens,
+                "stream_camera_hidden": camera_hidden,
                 "stream_images": images,
                 "patch_start_idx": patch_start_idx,
                 "pointmap_dense": pointmap_dense,
@@ -189,6 +191,7 @@ class StreamVGGTLatentAdapter:
         context_chunks = []
         dense_chunks = []
         dpt_layer_chunks = [[] for _ in self.dpt_layer_indices]
+        camera_hidden_chunks = []
         camera_chunks = []
         pointmap_chunks = []
         pointmap_dense_chunks = []
@@ -223,6 +226,11 @@ class StreamVGGTLatentAdapter:
 
             for layer_out, layer_index in zip(dpt_layer_chunks, self.dpt_layer_indices):
                 layer_out.append(aggregated_tokens_list[layer_index].float())
+            # Cache the exact tensor consumed by CameraHead instead of
+            # inferring it later from one of the DPT levels.
+            camera_hidden_chunks.append(
+                aggregated_tokens_list[-1][:, :, 0].float()
+            )
 
             tokens = aggregated_tokens_list[self.layer_index].float()
             patch_tokens = tokens[:, :, patch_start_idx:, :]
@@ -275,6 +283,7 @@ class StreamVGGTLatentAdapter:
         context_tokens = torch.cat(context_chunks, dim=1)
         dense_tokens = torch.cat(dense_chunks, dim=1)
         dpt_tokens = [torch.cat(chunks, dim=1) for chunks in dpt_layer_chunks]
+        camera_hidden = torch.cat(camera_hidden_chunks, dim=1)
         camera_tokens = torch.cat(camera_chunks, dim=1) if camera_chunks else None
         pointmap_grid = torch.cat(pointmap_chunks, dim=0) if pointmap_chunks else None
         pointmap_dense = (
@@ -311,6 +320,7 @@ class StreamVGGTLatentAdapter:
                 "dpt_layer_indices": self.dpt_layer_indices,
                 "dense_tokens": dense_tokens.reshape(1, -1, dense_tokens.shape[-1]),
                 "stream_dpt_tokens": dpt_tokens,
+                "stream_camera_hidden": camera_hidden,
                 "stream_images": images,
                 "patch_start_idx": patch_start_idx,
                 "pointmap_dense": pointmap_dense,

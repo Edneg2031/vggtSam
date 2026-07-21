@@ -279,7 +279,12 @@ def _build_geometry_cache(
         ground_truth.world_to_camera,
     )
     dpt_tokens = output.geometry.aux["stream_dpt_tokens"]
-    final_tokens = dpt_tokens[-1].detach().float().cpu()[0]
+    camera_hidden = output.geometry.aux.get("stream_camera_hidden")
+    if camera_hidden is None:
+        raise RuntimeError(
+            "StreamVGGT adapter did not expose the exact CameraHead input."
+        )
+    camera_hidden = camera_hidden.detach().float().cpu()[0]
     payload: dict[str, Any] = {
         "cache_version": CACHE_VERSION,
         "complete": False,
@@ -295,7 +300,7 @@ def _build_geometry_cache(
         # Keep the frozen-head inputs in fp32.  The module-off control is
         # required to reproduce the actual StreamVGGT outputs, not an fp16
         # cache approximation of them.
-        "camera_hidden": final_tokens[:, 0].float(),
+        "camera_hidden": camera_hidden.float(),
         "baseline_pose_encoding": output.geometry.camera_tokens.detach().float().cpu()[0],
         "baseline_depth": depth.float(),
         "baseline_world_points": geometry_sequence.world_points.float(),
