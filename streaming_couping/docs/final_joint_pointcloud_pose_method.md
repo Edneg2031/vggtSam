@@ -286,6 +286,9 @@ final_instance_ray_pose_v3/<clip>/comparison_gt_world/
   camera_poses.csv
   camera_pose_metrics.csv
   camera_poses.npz
+  pose_comparison.png
+  pose_comparison.pdf
+  pose_comparison.svg  # matplotlib 不可用时的无依赖 fallback
 ```
 
 比较协议：
@@ -297,6 +300,17 @@ final_instance_ray_pose_v3/<clip>/comparison_gt_world/
 - 同一个 Sim(3) 原样应用于 raw 和 ours，禁止分别重新拟合；
 - 所有比较 PLY 均位于 ScanNet++ GT-world；
 - overlay 颜色为 GT=绿色、raw StreamVGGT=红色、ours=蓝色。
+
+`pose_comparison.png/.pdf` 包含四个子图：
+
+- GT/raw/ours 三维相机轨迹及相机前向方向；
+- 自动选择变化最大的两个世界坐标轴生成轨迹投影；
+- 每帧相机中心误差；
+- 每帧旋转误差。
+
+帧 `210、240` 使用黑色外圈/竖线标记为 held-out。三条轨迹使用与点云比较完全相同的
+shared GT-world Sim(3)，不会分别拟合对齐。服务器存在 matplotlib 时输出 PNG 和 PDF；
+否则自动输出不依赖 matplotlib 的 SVG，导出命令不会因此失败。
 
 GT PLY 是选定相机视角下由 ScanNet++ mesh rasterize 得到的可见 GT pointmaps，不是完整扫描
 mesh。这保证了逐像素点图比较公平。
