@@ -1,0 +1,83 @@
+# Cross-sequence test of the frozen final checkpoint.
+# No training frames are declared: every selected frame is evaluated.
+recovery_config: streaming_couping/configs/recovery_050_025.yaml
+output_dir: outputs/streaming_couping_final_test_00a231a370_100_500
+
+dataset:
+  manifest: data/processed/scannetpp_pinhole_2d/manifest.json
+  clips:
+    - name: 00a231a370_100_500_37_68_54
+      scene_id: 00a231a370
+      frame_indices: [100, 200, 300, 400, 500]
+      instance_ids: [37, 68, 54]
+      reference_sequence_index: 0
+      split: test
+
+runtime:
+  sam3_device: cuda:3
+  geometry_device: cuda:1
+
+features:
+  cache_dir: outputs/streaming_couping_final_test_00a231a370_100_500/cache
+  rebuild: false
+  sam_source: detector_fpn2
+  sam_resolution: 1008
+  sam_grid: [72, 72]
+  point_confidence_threshold: 0.30
+  min_instance_points: 128
+  sampled_instance_points: 128
+
+fusion:
+  instance_dim: 512
+  attention_dim: 512
+  num_heads: 8
+  dropout: 0.0
+  memory_momentum: 0.90
+  min_track_confidence: 0.50
+  min_geometry_confidence: 0.20
+  min_static_score: 0.20
+  dpt_layer_indices: [4, 11, 17, 23]
+
+loss:
+  camera: 20.0
+  relative_rotation: 2.0
+  translation_direction: 2.0
+  rigid: 1.0
+  centroid: 0.25
+  residual: 0.0001
+  depth: 5.0
+  depth_fixed: 5.0
+  pointmap: 5.0
+  rigid_trim_quantile: 0.70
+
+# Kept for model construction only. This test command never runs --stage train.
+training:
+  epochs: 30
+  repeats_per_epoch: 4
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  grad_clip_norm: 1.0
+  seed: 0
+  device: cuda:1
+  amp: false
+
+evaluation:
+  perturbations:
+    - aligned
+    - module_off
+  strict_equivalence: true
+  ray_pose:
+    confidence_threshold: 0.30
+    min_points: 1024
+    max_points: 65536
+    max_iterations: 6
+    max_condition_number: 100000000.0
+    max_center_shift: 0.75
+    max_residual_rmse: 0.20
+    blend: 1.0
+    angular_huber_delta: 0.02
+    angular_min_range: 0.05
+    export_confidence_threshold: 0.30
+    export_max_full_scene_points: 1000000
+    export_max_instance_points: 250000
+    preserve_reference: false

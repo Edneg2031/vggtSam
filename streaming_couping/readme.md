@@ -72,3 +72,9 @@ evaluation/ray_pose_compact_summary.csv
 final_instance_ray_pose_v3/<clip>/comparison_gt_world/pointcloud_metrics.csv
 final_instance_ray_pose_v3/<clip>/comparison_gt_world/camera_pose_metrics.csv
 ```
+
+场景 `00a231a370` 的五帧示例 `100 200 300 400 500` 已配置好，可直接运行：
+
+```bash
+zsh streaming_couping/commands_final_joint_pointcloud_pose_test.txt
+```
