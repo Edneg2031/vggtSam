@@ -4,6 +4,7 @@ from streaming_couping.src.learned_pose.export import (
     _align_camera_pose,
     _world_confidence,
 )
+from vggtsam.utils.imports import maybe_add_repo_to_path
 
 
 def test_align_camera_pose_matches_pointmap_similarity() -> None:
@@ -36,3 +37,16 @@ def test_world_confidence_preserves_single_frame_axis() -> None:
     normalized = _world_confidence(confidence, points)
 
     assert normalized.shape == (1, 2, 3)
+
+
+def test_repo_path_registration_adds_src_layout(tmp_path, monkeypatch) -> None:
+    repo = tmp_path / "streamvggt"
+    source = repo / "src"
+    source.mkdir(parents=True)
+    monkeypatch.setattr("sys.path", [])
+
+    resolved = maybe_add_repo_to_path(repo)
+
+    assert resolved == repo.resolve()
+    assert str(source.resolve()) in __import__("sys").path
+    assert str(repo.resolve()) in __import__("sys").path

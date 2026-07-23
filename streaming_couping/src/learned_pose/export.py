@@ -9,6 +9,7 @@ from typing import Iterable
 
 import numpy as np
 import torch
+from vggtsam.utils.imports import maybe_add_repo_to_path
 
 from ..config import load_config
 from ..instance_point_cloud import (
@@ -53,6 +54,10 @@ def export_final_ray_pose_outputs(
     )
     root.mkdir(parents=True, exist_ok=True)
     recovery = load_config(config.recovery_config)
+    # The training/evaluation paths add the external repository while loading
+    # the StreamVGGT model.  Export intentionally loads no model, so register
+    # the repository explicitly before importing its lightweight pose codec.
+    maybe_add_repo_to_path(recovery.streamvggt_repo)
     all_pose_rows: list[dict] = []
     all_cloud_rows: list[dict] = []
     all_frame_rows: list[dict] = []
