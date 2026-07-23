@@ -1,5 +1,81 @@
 # 实例引导的点云与相机位姿联合优化：当前最终方法
 
+## 先用直白的话说明方法
+
+### 系统到底输出什么
+
+对一组按指定顺序输入的 RGB 图像，系统输出三类结果：
+
+1. 每帧、每个 persistent instance 的 SAM3 分割/追踪 mask；
+2. 原始 StreamVGGT 点云和修正后的点云；
+3. 原始 StreamVGGT 相机位姿和修正后的相机位姿。
+
+最终推理可以概括成：
+
+```text
+RGB 序列
+  ├─ SAM3：从参考帧 mask 出发，追踪同一个物体
+  └─ StreamVGGT：预测初始点云、相机旋转和平移
+             ↓
+固定的 learned adapter
+  ├─ 根据跨帧实例信息，小幅修正 pointmap token → 新点云
+  └─ 根据跨帧实例信息，小幅修正 camera token → 新旋转
+             ↓
+无需训练的几何求解器
+  └─ 用“mask 内世界点必须落在对应相机射线上”重新求相机平移
+             ↓
+mask + refined pointmap + refined camera pose
+```
+
+### 为什么方法里需要训练
+
+“训练”和“每个新序列上的优化”是两件不同的事。
+
+需要训练的是一个很小的残差 adapter。输入实例外观、mask、跨帧 ID 和三维统计量后，究竟
+应该怎样改 StreamVGGT 的 patch/camera token，没有一个能够直接写出的闭式公式。因此在
+原训练帧上利用 GT pointmap/pose loss，学习这部分映射：
+
+```text
+实例证据 → pointmap token 应改多少
+实例证据 → camera token 应改多少
+```
+
+SAM3 和 StreamVGGT 主干始终冻结，并不是重新训练两个大模型。只训练新加入的 instance
+encoder、cross-attention、gate 和 zero projection。zero projection 保证开始训练前输出与
+原始 StreamVGGT 完全相同，adapter 只能学习残差。
+
+不需要训练的是最后的相机平移求解。给定 pointmap、rotation、内参和实例 mask 后，相机
+中心只有三个未知数，可以通过 point-to-ray 几何约束直接求解。
+
+### 训练一次还是每个序列重新训练
+
+当前协议是训练一次、测试时固定权重：
+
+| 模块 | 原序列训练阶段 | 新序列测试阶段 |
+|---|---|---|
+| SAM3 / StreamVGGT 主干 | 冻结 | 冻结 |
+| learned pointmap/rotation adapter | 训练 | 固定 checkpoint，不训练 |
+| SAM3 tracking/cache | 为训练序列计算 | 为新序列重新计算 |
+| ray translation solver | 按帧求解 | 按帧重新求解，无梯度 |
+| GT | 训练 loss 和评估 | 只做最终评估 |
+
+因此新序列上的位姿提升不是“拿新序列 GT 再训练”得到的。它使用原先固定 checkpoint，
+只针对当前图像重新计算实例追踪和几何平移。
+
+### 当前已知效果边界
+
+原序列 held-out 帧上，learned pointmap 分支和最终位姿都明显提升。新的
+`105 109 113 122 254` 序列使用固定权重后：
+
+- ATE RMSE 从 `0.1414 m` 降到 `0.0771 m`；
+- translation RPE 从 `0.1220 m` 降到 `0.0576 m`；
+- 5/5 ray fits accepted；
+- 全场景点云 mean 只从 `0.0957 m` 降到 `0.0936 m`；
+- bed 点云改善，但 cabinet 和 wardrobe 退化。
+
+所以当前可以得出的结论是：位姿方法已经表现出跨序列价值；learned pointmap 分支只在原
+训练视角上稳定，新视角下需要加入几何可靠性门控或无 GT 自适应，不能声称已经稳定泛化。
+
 ## 1. 研究目标
 
 本项目的目标不是只改善 SAM3 跟踪，也不是只修复 StreamVGGT 位姿，而是同时得到：
@@ -269,6 +345,27 @@ final_instance_ray_pose_v3/<clip>/deployable_native/
 ```
 
 这里没有 GT。V2 refined pointmap 和 V3 pose 使用同一个 StreamVGGT native gauge。
+
+分割/追踪 mask 单独导出到：
+
+```text
+final_instance_ray_pose_v3/<clip>/segmentation_masks/
+  sequence_overview.png
+  overlays/
+    seq_000_frame_<frame>.png
+    ...
+  binary/
+    instance_37/
+    instance_68/
+    instance_54/
+    union/
+  mask_summary.csv
+  legend.csv
+```
+
+`overlays/` 是 RGB 与彩色实例 mask 的叠加图；`binary/instance_<id>/` 是每实例 0/255
+二值 PNG；`binary/union/` 是实例几何求解使用的 mask 并集。参考帧是初始化 prompt mask，
+后续帧是方法实际消费的 SAM3 persistent tracking/recovery mask。
 
 ### 7.2 GT / raw StreamVGGT / ours 公平比较
 

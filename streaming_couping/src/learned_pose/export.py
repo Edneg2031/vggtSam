@@ -9,6 +9,7 @@ from typing import Iterable
 
 import numpy as np
 import torch
+from PIL import Image, ImageDraw
 from vggtsam.utils.imports import maybe_add_repo_to_path
 
 from ..config import load_config
@@ -192,6 +193,15 @@ def export_final_ray_pose_outputs(
         )
 
         clip_root = root / clip.name
+        _export_tracking_mask_visualizations(
+            clip_root / "segmentation_masks",
+            frame_indices=clip.frame_indices,
+            instance_ids=clip.instance_ids,
+            image_paths=payload["image_paths"],
+            masks=payload["tracking_masks_output"],
+            scores=payload.get("tracking_scores"),
+            reference_sequence_index=clip.reference_sequence_index,
+        )
         deployable_root = clip_root / "deployable_native"
         deployable_root.mkdir(parents=True, exist_ok=True)
         _write_csv(deployable_root / "camera_poses.csv", native_pose_rows)
@@ -973,6 +983,243 @@ def _selection_frame_rows(
             }
         )
     return rows
+
+
+_MASK_COLORS = (
+    (230, 57, 70),
+    (42, 157, 143),
+    (69, 123, 157),
+    (255, 183, 3),
+    (131, 56, 236),
+    (0, 160, 220),
+)
+_PIL_RESAMPLING = getattr(Image, "Resampling", Image)
+
+
+def _export_tracking_mask_visualizations(
+    root: Path,
+    *,
+    frame_indices: Iterable[int],
+    instance_ids: Iterable[int],
+    image_paths: Iterable[str | Path],
+    masks: torch.Tensor,
+    scores: torch.Tensor | None,
+    reference_sequence_index: int,
+) -> None:
+    """Export the exact persistent-instance masks consumed by the method."""
+
+    frame_indices = tuple(int(value) for value in frame_indices)
+    instance_ids = tuple(int(value) for value in instance_ids)
+    image_paths = tuple(Path(value) for value in image_paths)
+    mask_tensor = torch.as_tensor(masks).detach().bool().cpu()
+    expected_prefix = (len(frame_indices), len(instance_ids))
+    if mask_tensor.ndim != 4 or tuple(mask_tensor.shape[:2]) != expected_prefix:
+        raise ValueError(
+            "Expected output-space tracking masks [S,I,H,W] with prefix "
+            f"{expected_prefix}, got {tuple(mask_tensor.shape)}."
+        )
+    if len(image_paths) != len(frame_indices):
+        raise ValueError(
+            f"Mask export image/frame mismatch: {len(image_paths)} versus "
+            f"{len(frame_indices)}."
+        )
+    if scores is None:
+        score_tensor = torch.full(expected_prefix, float("nan"))
+    else:
+        score_tensor = torch.as_tensor(scores).detach().float().cpu()
+        if tuple(score_tensor.shape) != expected_prefix:
+            raise ValueError(
+                f"Tracking scores must have shape {expected_prefix}, got "
+                f"{tuple(score_tensor.shape)}."
+            )
+
+    overlay_root = root / "overlays"
+    binary_root = root / "binary"
+    union_root = binary_root / "union"
+    overlay_root.mkdir(parents=True, exist_ok=True)
+    union_root.mkdir(parents=True, exist_ok=True)
+    for instance_id in instance_ids:
+        (binary_root / f"instance_{instance_id}").mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+    rows: list[dict] = []
+    overview_panels: list[Image.Image] = []
+    for sequence_index, (frame_index, image_path) in enumerate(
+        zip(frame_indices, image_paths)
+    ):
+        with Image.open(image_path) as source:
+            rgb = source.convert("RGB")
+        width, height = rgb.size
+        overlay = np.asarray(rgb, dtype=np.float32).copy()
+        resized_masks: list[np.ndarray] = []
+        for instance_index, instance_id in enumerate(instance_ids):
+            source_mask = mask_tensor[sequence_index, instance_index].numpy()
+            resized = _resize_binary_mask(source_mask, size=(width, height))
+            resized_masks.append(resized)
+            color = np.asarray(
+                _MASK_COLORS[instance_index % len(_MASK_COLORS)],
+                dtype=np.float32,
+            )
+            if resized.any():
+                overlay[resized] = 0.52 * overlay[resized] + 0.48 * color
+                overlay[_binary_boundary(resized)] = color
+
+            stem = f"seq_{sequence_index:03d}_frame_{frame_index:06d}.png"
+            binary_path = binary_root / f"instance_{instance_id}" / stem
+            Image.fromarray(resized.astype(np.uint8) * 255, mode="L").save(
+                binary_path
+            )
+            rows.append(
+                {
+                    "sequence_index": sequence_index,
+                    "frame_index": frame_index,
+                    "is_reference": int(
+                        sequence_index == int(reference_sequence_index)
+                    ),
+                    "instance_id": instance_id,
+                    "tracking_score": float(
+                        score_tensor[sequence_index, instance_index]
+                    ),
+                    "source_mask_pixels": int(source_mask.sum()),
+                    "source_mask_fraction": float(source_mask.mean()),
+                    "visualization_mask_pixels": int(resized.sum()),
+                    "present": int(resized.any()),
+                    "binary_mask_path": str(binary_path),
+                }
+            )
+
+        union = np.logical_or.reduce(resized_masks)
+        stem = f"seq_{sequence_index:03d}_frame_{frame_index:06d}.png"
+        Image.fromarray(union.astype(np.uint8) * 255, mode="L").save(
+            union_root / stem
+        )
+        annotated = _annotate_mask_overlay(
+            Image.fromarray(np.clip(overlay, 0, 255).astype(np.uint8)),
+            sequence_index=sequence_index,
+            frame_index=frame_index,
+            instance_ids=instance_ids,
+            scores=score_tensor[sequence_index],
+            present=tuple(bool(value.any()) for value in resized_masks),
+            is_reference=sequence_index == int(reference_sequence_index),
+        )
+        overlay_path = overlay_root / stem
+        annotated.save(overlay_path)
+        overview_panels.append(annotated)
+
+    _write_csv(root / "mask_summary.csv", rows)
+    _write_csv(
+        root / "legend.csv",
+        [
+            {
+                "instance_id": instance_id,
+                "red": _MASK_COLORS[index % len(_MASK_COLORS)][0],
+                "green": _MASK_COLORS[index % len(_MASK_COLORS)][1],
+                "blue": _MASK_COLORS[index % len(_MASK_COLORS)][2],
+            }
+            for index, instance_id in enumerate(instance_ids)
+        ],
+    )
+    _save_mask_overview(overview_panels, root / "sequence_overview.png")
+    (root / "README.txt").write_text(
+        "Persistent-instance segmentation masks\n"
+        "======================================\n\n"
+        "overlays/ contains RGB frames with every tracked instance in a "
+        "distinct color. binary/instance_<id>/ contains exact per-instance "
+        "binary masks, resized to source RGB resolution with nearest-neighbor "
+        "sampling. binary/union/ is the union used by the instance-restricted "
+        "geometry solver. sequence_overview.png shows the configured input "
+        "order. mask_summary.csv records tracking score, visibility, and mask "
+        "area.\n\n"
+        "The reference-frame mask is the initialization/prompt mask. Later "
+        "frames are the persistent SAM3 tracking/recovery masks consumed by "
+        "the learned adapter and ray solver.\n",
+        encoding="utf8",
+    )
+
+
+def _resize_binary_mask(mask: np.ndarray, *, size: tuple[int, int]) -> np.ndarray:
+    image = Image.fromarray(np.asarray(mask, dtype=np.uint8) * 255, mode="L")
+    image = image.resize(size, resample=_PIL_RESAMPLING.NEAREST)
+    return np.asarray(image, dtype=np.uint8) > 0
+
+
+def _binary_boundary(mask: np.ndarray) -> np.ndarray:
+    mask = np.asarray(mask, dtype=bool)
+    interior = np.zeros_like(mask)
+    if mask.shape[0] > 2 and mask.shape[1] > 2:
+        interior[1:-1, 1:-1] = (
+            mask[1:-1, 1:-1]
+            & mask[:-2, 1:-1]
+            & mask[2:, 1:-1]
+            & mask[1:-1, :-2]
+            & mask[1:-1, 2:]
+        )
+    return mask & ~interior
+
+
+def _annotate_mask_overlay(
+    image: Image.Image,
+    *,
+    sequence_index: int,
+    frame_index: int,
+    instance_ids: tuple[int, ...],
+    scores: torch.Tensor,
+    present: tuple[bool, ...],
+    is_reference: bool,
+) -> Image.Image:
+    banner_height = 48
+    output = Image.new(
+        "RGB",
+        (image.width, image.height + banner_height),
+        (22, 24, 29),
+    )
+    output.paste(image, (0, banner_height))
+    draw = ImageDraw.Draw(output)
+    role = "reference prompt" if is_reference else "tracked"
+    draw.text(
+        (8, 5),
+        f"seq={sequence_index}  frame={frame_index}  {role}",
+        fill=(245, 245, 245),
+    )
+    x = 8
+    for index, (instance_id, visible) in enumerate(zip(instance_ids, present)):
+        color = _MASK_COLORS[index % len(_MASK_COLORS)]
+        draw.rectangle((x, 26, x + 10, 36), fill=color)
+        score = float(scores[index])
+        score_text = f"{score:.3f}" if np.isfinite(score) else "nan"
+        label = f"id={instance_id} s={score_text}"
+        if not visible:
+            label += " absent"
+        draw.text((x + 15, 24), label, fill=(235, 235, 235))
+        x += 125
+    return output
+
+
+def _save_mask_overview(panels: list[Image.Image], path: Path) -> None:
+    if not panels:
+        return
+    thumbnails = []
+    for panel in panels:
+        thumbnail = panel.copy()
+        thumbnail.thumbnail((640, 420), resample=_PIL_RESAMPLING.LANCZOS)
+        thumbnails.append(thumbnail)
+    columns = min(2, len(thumbnails))
+    rows = (len(thumbnails) + columns - 1) // columns
+    cell_width = max(image.width for image in thumbnails)
+    cell_height = max(image.height for image in thumbnails)
+    canvas = Image.new(
+        "RGB",
+        (columns * cell_width, rows * cell_height),
+        (15, 17, 21),
+    )
+    for index, image in enumerate(thumbnails):
+        x = (index % columns) * cell_width
+        y = (index // columns) * cell_height
+        canvas.paste(image, (x, y))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path)
 
 
 def _world_points(value: torch.Tensor) -> torch.Tensor:

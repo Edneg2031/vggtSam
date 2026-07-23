@@ -15,7 +15,7 @@ StreamVGGT geometry
 最终输出是同一 StreamVGGT native gauge 中的：
 
 ```text
-refined world pointmap + refined camera pose
+persistent instance masks + refined world pointmap + refined camera pose
 ```
 
 ## 保留的代码
@@ -57,7 +57,7 @@ PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_inst
 
 ## 测试另一序列
 
-复制最终 YAML，替换 clip 的 `scene_id`、递增 `frame_indices`、第一帧可见的静态
+复制最终 YAML，替换 clip 的 `scene_id`、按实际输入顺序填写 `frame_indices`、第一帧可见的静态
 `instance_ids`，并设 `split: test`。为保持真正的跨序列测试，不在新序列上训练：
 
 1. 将现有 `checkpoints/decoupled_dual_branch` 复制到新 `output_dir`；
@@ -71,6 +71,7 @@ PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_inst
 evaluation/ray_pose_compact_summary.csv
 final_instance_ray_pose_v3/<clip>/comparison_gt_world/pointcloud_metrics.csv
 final_instance_ray_pose_v3/<clip>/comparison_gt_world/camera_pose_metrics.csv
+final_instance_ray_pose_v3/<clip>/segmentation_masks/sequence_overview.png
 ```
 
 场景 `00a231a370` 的五帧示例 `100 200 300 400 500` 已配置好，可直接运行：

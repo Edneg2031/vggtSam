@@ -1,8 +1,13 @@
+import csv
+
+import numpy as np
 import torch
+from PIL import Image
 
 from streaming_couping.src.learned_pose.export import (
     _align_camera_pose,
     _camera_matrices_from_world_to_camera,
+    _export_tracking_mask_visualizations,
     _paired_distance_statistics,
     _world_confidence,
 )
@@ -81,3 +86,43 @@ def test_paired_distance_statistics_are_metric() -> None:
         torch.tensor(statistics["paired_distance_rmse"]),
         torch.sqrt(torch.tensor(2.0)),
     )
+
+
+def test_tracking_masks_are_exported_as_binary_and_overlay_images(tmp_path) -> None:
+    image_paths = []
+    for index in range(2):
+        path = tmp_path / f"rgb_{index}.png"
+        Image.new("RGB", (6, 4), color=(20 + index, 30, 40)).save(path)
+        image_paths.append(path)
+    masks = torch.zeros(2, 2, 2, 3, dtype=torch.bool)
+    masks[0, 0, 0, 0] = True
+    masks[0, 1, 1, 2] = True
+    masks[1, 0, :, 1] = True
+    scores = torch.tensor([[1.0, 0.9], [0.8, 0.0]])
+    root = tmp_path / "segmentation_masks"
+
+    _export_tracking_mask_visualizations(
+        root,
+        frame_indices=(105, 254),
+        instance_ids=(37, 68),
+        image_paths=image_paths,
+        masks=masks,
+        scores=scores,
+        reference_sequence_index=0,
+    )
+
+    first = "seq_000_frame_000105.png"
+    second = "seq_001_frame_000254.png"
+    assert (root / "overlays" / first).is_file()
+    assert (root / "binary/instance_37" / first).is_file()
+    assert (root / "binary/instance_68" / second).is_file()
+    assert (root / "binary/union" / first).is_file()
+    assert (root / "sequence_overview.png").is_file()
+    binary = np.asarray(Image.open(root / "binary/instance_37" / first))
+    assert binary.shape == (4, 6)
+    assert set(np.unique(binary)).issubset({0, 255})
+    with (root / "mask_summary.csv").open(newline="", encoding="utf8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 4
+    assert rows[0]["frame_index"] == "105"
+    assert rows[0]["instance_id"] == "37"
