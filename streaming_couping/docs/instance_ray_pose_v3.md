@@ -267,12 +267,23 @@ training, or ray fitting:
 zsh streaming_couping/commands_instance_ray_pose_v3_export.txt
 ```
 
-This writes `camera_poses.csv`, `camera_poses.npz`, a full-scene colored PLY,
-one PLY per persistent instance, and point-selection diagnostics under
-`final_instance_ray_pose_v3/`.  Every object is exported in two explicitly
-named coordinate systems:
+This writes `camera_poses.csv`, `camera_poses.npz`, full-scene colored PLYs,
+one set of PLYs per persistent instance, and point-selection diagnostics under
+`final_instance_ray_pose_v3/`.  The export now includes the rasterized
+ScanNet++ GT pointmaps and GT camera poses rather than prediction-only files.
+Every prediction is exported in two explicitly named coordinate systems:
 
 - `streamvggt_point_head_native`: deployable but arbitrary-scale;
 - `fixed_reference_point_sim3_metric_evaluation_only`: metric visualization
   using the cached GT-fitted reference-frame Sim(3), never presented as a
   deployable inference output.
+
+Native prediction and GT must not be overlaid because they use different
+gauges.  For an actual same-coordinate comparison, open
+`*_overlay_metric_gt_world.ply`: prediction is red, GT is cyan, and both use
+the exact same paired pixels in the ScanNet++ GT world.  The unpaired visible
+GT is also exported as `*_gt_visible_all_finite_metric_gt_world.ply`.
+`pointcloud_gt_comparison.csv` reports the paired metric distances, while
+`camera_comparison_pointmap_sim3.csv` compares predicted and GT cameras after
+the same pointmap Sim(3).  This joint reconstruction alignment is intentionally
+distinguished from the reference-pose alignment used for the reported ATE.
