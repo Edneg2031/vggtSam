@@ -39,6 +39,8 @@ def main() -> None:
         train_all_modes(config)
     if args.stage in {"all", "eval"}:
         evaluate_all_modes(config)
+    if args.stage == "ray":
+        evaluate_all_modes(config, ray_pose_only=True)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -49,7 +51,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--stage",
-        choices=("all", "cache", "train", "eval"),
+        choices=("all", "cache", "train", "eval", "ray"),
         default="all",
     )
     parser.add_argument("--sam3-device")

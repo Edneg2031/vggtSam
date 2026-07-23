@@ -81,6 +81,39 @@ class TrainingConfig:
 
 
 @dataclass(frozen=True)
+class RayPoseConfig:
+    """Deployable pointmap-to-camera translation recovery at evaluation time."""
+
+    enabled: bool = False
+    source_mode: str = "decoupled_dual_branch"
+    source_perturbation: str = "aligned"
+    variants: tuple[str, ...] = (
+        "ray_baseline_pointmap",
+        "ray_refined_pointmap_baseline_rotation",
+        "ray_refined_pointmap_refined_rotation",
+        "ray_refined_pointmap_refined_rk",
+        "ray_refined_pointmap_refined_rotation_reference_k",
+        "ray_refined_pointmap_refined_rotation_reference_k_trimmed",
+        "ray_refined_pointmap_refined_rotation_reference_k_angular_huber",
+        "ray_refined_pointmap_refined_rotation_reference_k_background",
+        "ray_refined_pointmap_refined_rotation_reference_k_instances",
+        "ray_refined_pointmap_refined_rotation_gt_k_oracle",
+    )
+    confidence_threshold: float = 0.30
+    min_points: int = 1024
+    max_points: int = 65536
+    trim_quantile: float = 0.80
+    max_iterations: int = 6
+    max_condition_number: float = 1e8
+    max_center_shift: float = 0.75
+    max_residual_rmse: float = 0.20
+    blend: float = 1.0
+    angular_huber_delta: float = 0.02
+    angular_min_range: float = 0.05
+    preserve_reference: bool = True
+
+
+@dataclass(frozen=True)
 class EvaluationConfig:
     perturbations: tuple[str, ...] = (
         "aligned",
@@ -91,6 +124,7 @@ class EvaluationConfig:
         "shuffle_time",
     )
     strict_equivalence: bool = True
+    ray_pose: RayPoseConfig = RayPoseConfig()
 
 
 @dataclass(frozen=True)
@@ -161,6 +195,22 @@ GEOMETRY_MODES = frozenset(
 V2_MODES = frozenset({"decoupled_dual_branch", *PATCH_MODES})
 
 
+RAY_POSE_VARIANTS = frozenset(
+    {
+        "ray_baseline_pointmap",
+        "ray_refined_pointmap_baseline_rotation",
+        "ray_refined_pointmap_refined_rotation",
+        "ray_refined_pointmap_refined_rk",
+        "ray_refined_pointmap_refined_rotation_reference_k",
+        "ray_refined_pointmap_refined_rotation_reference_k_trimmed",
+        "ray_refined_pointmap_refined_rotation_reference_k_angular_huber",
+        "ray_refined_pointmap_refined_rotation_reference_k_background",
+        "ray_refined_pointmap_refined_rotation_reference_k_instances",
+        "ray_refined_pointmap_refined_rotation_gt_k_oracle",
+    }
+)
+
+
 def load_learned_pose_config(path: str | Path) -> LearnedPoseConfig:
     source = Path(path).expanduser().resolve()
     with source.open("r", encoding="utf8") as handle:
@@ -172,6 +222,7 @@ def load_learned_pose_config(path: str | Path) -> LearnedPoseConfig:
     loss = raw.get("loss", {})
     training = raw.get("training", {})
     evaluation = raw.get("evaluation", {})
+    ray_pose = evaluation.get("ray_pose", {})
     runtime = raw.get("runtime", {})
 
     clips = tuple(_parse_clip(value, source.parent) for value in dataset.get("clips", []))
@@ -240,6 +291,48 @@ def load_learned_pose_config(path: str | Path) -> LearnedPoseConfig:
                 )
             ),
             strict_equivalence=bool(evaluation.get("strict_equivalence", True)),
+            ray_pose=RayPoseConfig(
+                enabled=bool(ray_pose.get("enabled", False)),
+                source_mode=str(
+                    ray_pose.get("source_mode", "decoupled_dual_branch")
+                ),
+                source_perturbation=str(
+                    ray_pose.get("source_perturbation", "aligned")
+                ),
+                variants=tuple(
+                    str(value)
+                    for value in ray_pose.get(
+                        "variants",
+                        list(RayPoseConfig().variants),
+                    )
+                ),
+                confidence_threshold=float(
+                    ray_pose.get("confidence_threshold", 0.30)
+                ),
+                min_points=int(ray_pose.get("min_points", 1024)),
+                max_points=int(ray_pose.get("max_points", 65536)),
+                trim_quantile=float(ray_pose.get("trim_quantile", 0.80)),
+                max_iterations=int(ray_pose.get("max_iterations", 6)),
+                max_condition_number=float(
+                    ray_pose.get("max_condition_number", 1e8)
+                ),
+                max_center_shift=float(
+                    ray_pose.get("max_center_shift", 0.75)
+                ),
+                max_residual_rmse=float(
+                    ray_pose.get("max_residual_rmse", 0.20)
+                ),
+                blend=float(ray_pose.get("blend", 1.0)),
+                angular_huber_delta=float(
+                    ray_pose.get("angular_huber_delta", 0.02)
+                ),
+                angular_min_range=float(
+                    ray_pose.get("angular_min_range", 0.05)
+                ),
+                preserve_reference=bool(
+                    ray_pose.get("preserve_reference", True)
+                ),
+            ),
         ),
     )
     _validate(config)
@@ -280,6 +373,34 @@ def _validate(config: LearnedPoseConfig) -> None:
     bad_perturbations = sorted(set(config.evaluation.perturbations) - VALID_PERTURBATIONS)
     if bad_perturbations:
         raise ValueError(f"Unknown evaluation perturbations: {bad_perturbations}")
+    ray_pose = config.evaluation.ray_pose
+    bad_ray_variants = sorted(set(ray_pose.variants) - RAY_POSE_VARIANTS)
+    if bad_ray_variants:
+        raise ValueError(f"Unknown ray-pose variants: {bad_ray_variants}")
+    if ray_pose.enabled and ray_pose.source_mode not in config.training.modes:
+        raise ValueError(
+            "evaluation.ray_pose.source_mode must be present in training.modes."
+        )
+    if ray_pose.source_perturbation not in VALID_PERTURBATIONS:
+        raise ValueError(
+            "evaluation.ray_pose.source_perturbation is not a valid perturbation."
+        )
+    if not 0.0 <= ray_pose.confidence_threshold:
+        raise ValueError("ray_pose.confidence_threshold must be non-negative.")
+    if ray_pose.min_points < 3 or ray_pose.max_points < ray_pose.min_points:
+        raise ValueError("ray_pose point limits are invalid.")
+    if not 0.0 < ray_pose.trim_quantile < 1.0:
+        raise ValueError("ray_pose.trim_quantile must be in (0,1).")
+    if ray_pose.max_iterations < 1:
+        raise ValueError("ray_pose.max_iterations must be positive.")
+    if ray_pose.max_condition_number <= 1.0:
+        raise ValueError("ray_pose.max_condition_number must be greater than 1.")
+    if ray_pose.max_center_shift <= 0.0 or ray_pose.max_residual_rmse <= 0.0:
+        raise ValueError("ray_pose shift/residual limits must be positive.")
+    if not 0.0 <= ray_pose.blend <= 1.0:
+        raise ValueError("ray_pose.blend must be in [0,1].")
+    if ray_pose.angular_huber_delta <= 0.0 or ray_pose.angular_min_range <= 0.0:
+        raise ValueError("ray_pose angular robust-fit values must be positive.")
     if config.fusion.attention_dim % config.fusion.num_heads:
         raise ValueError("fusion.attention_dim must be divisible by fusion.num_heads.")
     if config.fusion.dpt_layer_indices != (4, 11, 17, 23):

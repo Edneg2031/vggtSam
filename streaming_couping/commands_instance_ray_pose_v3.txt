@@ -1,0 +1,12 @@
+set -euo pipefail
+
+PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_instance_token_pose \
+  --config streaming_couping/configs/instance_token_pose_temporal_holdout_v2.yaml \
+  --stage ray \
+  --sam3-device cuda:3 \
+  --geometry-device cuda:1 \
+  --training-device cuda:1 \
+  2>&1 | tee outputs/streaming_couping_instance_ray_pose_v3.log
+
+sed -n '1,80p' \
+  outputs/streaming_couping_instance_token_pose_temporal_holdout_v2/evaluation/ray_pose_compact_summary.csv

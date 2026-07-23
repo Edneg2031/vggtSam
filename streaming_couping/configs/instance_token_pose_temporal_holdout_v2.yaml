@@ -84,3 +84,35 @@ evaluation:
     - pose_branch_off
     - geometry_branch_off
   strict_equivalence: true
+  ray_pose:
+    enabled: true
+    source_mode: decoupled_dual_branch
+    source_perturbation: aligned
+    # All deployable variants use only causal StreamVGGT/SAM3 outputs.  The
+    # explicitly named GT-K row is an intrinsics ceiling, never the method.
+    variants:
+      - ray_baseline_pointmap
+      - ray_refined_pointmap_baseline_rotation
+      - ray_refined_pointmap_refined_rotation
+      - ray_refined_pointmap_refined_rk
+      - ray_refined_pointmap_refined_rotation_reference_k
+      - ray_refined_pointmap_refined_rotation_reference_k_trimmed
+      - ray_refined_pointmap_refined_rotation_reference_k_angular_huber
+      - ray_refined_pointmap_refined_rotation_reference_k_background
+      - ray_refined_pointmap_refined_rotation_reference_k_instances
+      - ray_refined_pointmap_refined_rotation_gt_k_oracle
+    confidence_threshold: 0.30
+    min_points: 1024
+    max_points: 65536
+    trim_quantile: 0.80
+    max_iterations: 6
+    max_condition_number: 100000000.0
+    max_center_shift: 0.75
+    max_residual_rmse: 0.20
+    blend: 1.0
+    angular_huber_delta: 0.02
+    angular_min_range: 0.05
+    # Fit frame 90 from its own causal pointmap as well. This reproduces the
+    # previously successful ray baseline and defines the pose in pointmap gauge;
+    # the evaluation Sim(3) remains the original fixed-reference protocol.
+    preserve_reference: false

@@ -39,6 +39,7 @@ from .geometry_metrics import (
 )
 from .losses import compute_training_loss, instance_rigid_losses
 from .model import InstancePoseAdapter
+from .ray_pose import recover_ray_pose_variants
 
 
 def train_all_modes(config: LearnedPoseConfig) -> None:
@@ -195,7 +196,15 @@ def train_all_modes(config: LearnedPoseConfig) -> None:
 
 
 @torch.no_grad()
-def evaluate_all_modes(config: LearnedPoseConfig) -> None:
+def evaluate_all_modes(
+    config: LearnedPoseConfig,
+    *,
+    ray_pose_only: bool = False,
+) -> None:
+    if ray_pose_only and not config.evaluation.ray_pose.enabled:
+        raise ValueError(
+            "--stage ray requires evaluation.ray_pose.enabled=true."
+        )
     evaluation_clips = [
         clip
         for clip in config.clips
@@ -219,6 +228,14 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
     diagnostic_rows = []
     pointmap_frame_rows = []
     depth_frame_rows = []
+    ray_summary_rows = []
+    ray_frame_rows = []
+    ray_rpe_rows = []
+    ray_pair_rows = []
+    ray_pair_summary_rows = []
+    ray_fit_rows = []
+    ray_completed_clips: set[str] = set()
+    ray_pose_predictions: dict[str, dict] = {}
 
     # Raw StreamVGGT is evaluated once per clip through the exact same batch
     # CameraHead path used by every adapter.
@@ -265,7 +282,12 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
             evaluation_metadata=evaluation_metadata,
         )
 
-    for mode in config.training.modes:
+    evaluation_modes = (
+        (config.evaluation.ray_pose.source_mode,)
+        if ray_pose_only
+        else config.training.modes
+    )
+    for mode in evaluation_modes:
         checkpoint_path = config.output_dir / "checkpoints" / mode / "checkpoint_best.pt"
         if not checkpoint_path.exists():
             print(f"skipping missing checkpoint: {checkpoint_path}")
@@ -281,7 +303,11 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
             baseline_outputs = _forward_baseline(batch)
             evaluation_indices = _evaluation_sequence_indices(clip)
             evaluation_metadata = _evaluation_metadata(clip)
-            perturbations = config.evaluation.perturbations
+            perturbations = (
+                (config.evaluation.ray_pose.source_perturbation,)
+                if ray_pose_only
+                else config.evaluation.perturbations
+            )
             for perturbation in perturbations:
                 if (
                     perturbation in {"pose_branch_off", "geometry_branch_off"}
@@ -318,6 +344,113 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
                     sequence_indices=evaluation_indices,
                     evaluation_metadata=evaluation_metadata,
                 )
+                ray_config = config.evaluation.ray_pose
+                if (
+                    ray_config.enabled
+                    and mode == ray_config.source_mode
+                    and perturbation == ray_config.source_perturbation
+                ):
+                    baseline_world_confidence = _decode_baseline_world_confidence(
+                        frozen,
+                        batch,
+                    )
+                    control_metadata = {
+                        **evaluation_metadata,
+                        "ray_pose_role": "raw_baseline_control",
+                    }
+                    _append_pose_metrics(
+                        ray_summary_rows,
+                        ray_frame_rows,
+                        ray_rpe_rows,
+                        ray_pair_rows,
+                        ray_pair_summary_rows,
+                        payload=payload,
+                        pose_encoding=baseline_outputs["pose_encoding"],
+                        mode="instance_ray_pose_v3",
+                        perturbation="raw_baseline_control",
+                        sequence_indices=evaluation_indices,
+                        evaluation_metadata=control_metadata,
+                    )
+                    _append_pose_metrics(
+                        ray_summary_rows,
+                        ray_frame_rows,
+                        ray_rpe_rows,
+                        ray_pair_rows,
+                        ray_pair_summary_rows,
+                        payload=payload,
+                        pose_encoding=outputs["pose_encoding"],
+                        mode="instance_ray_pose_v3",
+                        perturbation="v2_learned_pose_control",
+                        sequence_indices=evaluation_indices,
+                        evaluation_metadata={
+                            **evaluation_metadata,
+                            "ray_pose_role": "learned_pose_control",
+                        },
+                    )
+                    ray_results = recover_ray_pose_variants(
+                        batch=batch,
+                        baseline_outputs=baseline_outputs,
+                        refined_outputs=outputs,
+                        baseline_world_confidence=baseline_world_confidence,
+                        config=ray_config,
+                    )
+                    clip_predictions = {
+                        "raw_baseline_control": baseline_outputs[
+                            "pose_encoding"
+                        ].detach().float().cpu(),
+                        "v2_learned_pose_control": outputs[
+                            "pose_encoding"
+                        ].detach().float().cpu(),
+                    }
+                    for result in ray_results:
+                        clip_predictions[result.name] = (
+                            result.pose_encoding.detach().float().cpu()
+                        )
+                        result_metadata = {
+                            **evaluation_metadata,
+                            "ray_pose_role": result.role,
+                        }
+                        _append_pose_metrics(
+                            ray_summary_rows,
+                            ray_frame_rows,
+                            ray_rpe_rows,
+                            ray_pair_rows,
+                            ray_pair_summary_rows,
+                            payload=payload,
+                            pose_encoding=result.pose_encoding,
+                            mode="instance_ray_pose_v3",
+                            perturbation=result.name,
+                            sequence_indices=evaluation_indices,
+                            evaluation_metadata=result_metadata,
+                        )
+                        ray_fit_rows.extend(
+                            {
+                                "clip": clip.name,
+                                "scene_id": clip.scene_id,
+                                "mode": "instance_ray_pose_v3",
+                                "perturbation": result.name,
+                                **result_metadata,
+                                **row,
+                            }
+                            for row in result.diagnostics
+                        )
+                    ray_pose_predictions[clip.name] = {
+                        "scene_id": clip.scene_id,
+                        "frame_indices": list(clip.frame_indices),
+                        "instance_ids": list(clip.instance_ids),
+                        "image_paths": list(payload["image_paths"]),
+                        "pose_encodings": clip_predictions,
+                        "refined_world_points": outputs[
+                            "world_points"
+                        ].detach().float().cpu(),
+                        "refined_world_confidence": outputs[
+                            "world_confidence"
+                        ].detach().float().cpu(),
+                        "tracking_masks_stream": batch[
+                            "tracking_masks_stream"
+                        ].detach().bool().cpu(),
+                    }
+                    ray_completed_clips.add(clip.name)
                 rigid, centroid = instance_rigid_losses(
                     outputs["pose_encoding"].float(),
                     batch["instance_uvd"].float(),
@@ -405,23 +538,57 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
 
     output = config.output_dir / "evaluation"
     output.mkdir(parents=True, exist_ok=True)
-    _write_csv(output / "pose_summary.csv", summary_rows)
-    _write_csv(output / "pose_frame_metrics.csv", frame_rows)
-    _write_csv(output / "pose_rpe.csv", rpe_rows)
-    _write_csv(output / "pose_pair_metrics.csv", pair_rows)
-    _write_csv(output / "pose_pair_summary.csv", pair_summary_rows)
-    _write_csv(output / "instance_diagnostics.csv", diagnostic_rows)
-    _write_csv(output / "baseline_equivalence.csv", equivalence_rows)
-    _write_csv(output / "pointmap_frame_metrics.csv", pointmap_frame_rows)
-    _write_csv(
-        output / "pointmap_summary.csv",
-        summarize_pointmap_metrics(pointmap_frame_rows),
-    )
-    _write_csv(output / "depth_frame_metrics.csv", depth_frame_rows)
-    _write_csv(
-        output / "depth_summary.csv",
-        summarize_depth_metrics(depth_frame_rows),
-    )
+    if not ray_pose_only:
+        _write_csv(output / "pose_summary.csv", summary_rows)
+        _write_csv(output / "pose_frame_metrics.csv", frame_rows)
+        _write_csv(output / "pose_rpe.csv", rpe_rows)
+        _write_csv(output / "pose_pair_metrics.csv", pair_rows)
+        _write_csv(output / "pose_pair_summary.csv", pair_summary_rows)
+        _write_csv(output / "instance_diagnostics.csv", diagnostic_rows)
+        _write_csv(output / "baseline_equivalence.csv", equivalence_rows)
+        _write_csv(output / "pointmap_frame_metrics.csv", pointmap_frame_rows)
+        _write_csv(
+            output / "pointmap_summary.csv",
+            summarize_pointmap_metrics(pointmap_frame_rows),
+        )
+        _write_csv(output / "depth_frame_metrics.csv", depth_frame_rows)
+        _write_csv(
+            output / "depth_summary.csv",
+            summarize_depth_metrics(depth_frame_rows),
+        )
+    if config.evaluation.ray_pose.enabled:
+        expected_clips = {clip.name for clip in evaluation_clips}
+        missing_clips = sorted(expected_clips - ray_completed_clips)
+        if missing_clips:
+            raise RuntimeError(
+                "Ray-pose evaluation did not run for clips: "
+                f"{missing_clips}. Check the configured source checkpoint/mode."
+            )
+        _write_csv(output / "ray_pose_summary.csv", ray_summary_rows)
+        _write_csv(output / "ray_pose_frame_metrics.csv", ray_frame_rows)
+        _write_csv(output / "ray_pose_rpe.csv", ray_rpe_rows)
+        _write_csv(output / "ray_pose_pair_metrics.csv", ray_pair_rows)
+        _write_csv(output / "ray_pose_pair_summary.csv", ray_pair_summary_rows)
+        _write_csv(output / "ray_pose_fit_diagnostics.csv", ray_fit_rows)
+        _write_csv(
+            output / "ray_pose_compact_summary.csv",
+            _compact_ray_pose_summary(
+                ray_summary_rows,
+                ray_pair_summary_rows,
+                ray_fit_rows,
+            ),
+        )
+        torch.save(
+            {
+                "config": str(config.source_path),
+                "source_mode": config.evaluation.ray_pose.source_mode,
+                "source_perturbation": (
+                    config.evaluation.ray_pose.source_perturbation
+                ),
+                "predictions": ray_pose_predictions,
+            },
+            output / "ray_pose_predictions.pt",
+        )
     metadata = {
         "config": str(config.source_path),
         "causal_control": (
@@ -432,7 +599,10 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
             "SAM3 supplies recovered masks, persistent IDs, scores, and frozen pooled appearance; "
             "no fused token is written into SAM3."
         ),
-        "gt_role": "pose/depth/pointmap training supervision and evaluation only",
+        "gt_role": (
+            "pose/depth/pointmap training supervision and evaluation only; target "
+            "intrinsics are additionally read by the explicitly named GT-K oracle row"
+        ),
         "geometry_evaluation": (
             "All pointmap modes reuse the baseline point-head reference-frame Sim(3); "
             "it is never refit after refinement. point_head measures direct DPT point "
@@ -444,6 +614,20 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
             "Patch modes preserve every camera/register prefix token. The dual branch uses "
             "independent pose and geometry tokenizers, attentions, gates, and projections."
         ),
+        "instance_ray_pose_v3": {
+            "enabled": config.evaluation.ray_pose.enabled,
+            "source_mode": config.evaluation.ray_pose.source_mode,
+            "source_perturbation": config.evaluation.ray_pose.source_perturbation,
+            "variants": list(config.evaluation.ray_pose.variants),
+            "causal_constraint": (
+                "Each requested camera center is solved from its current causal pointmap "
+                "and rays. Reference-frame predicted intrinsics are the only cross-frame "
+                "camera calibration used; no evaluation GT enters a deployable variant."
+            ),
+            "oracle_constraint": (
+                "Only the explicitly named gt_k_oracle variant reads target intrinsics."
+            ),
+        },
         "evaluation_splits": [
             {
                 "clip": clip.name,
@@ -460,9 +644,11 @@ def evaluate_all_modes(config: LearnedPoseConfig) -> None:
             for clip in evaluation_clips
         ],
     }
-    with (output / "metadata.json").open("w", encoding="utf8") as handle:
+    metadata_name = "ray_pose_metadata.json" if ray_pose_only else "metadata.json"
+    with (output / metadata_name).open("w", encoding="utf8") as handle:
         json.dump(metadata, handle, indent=2, ensure_ascii=False)
-    print(f"learned-pose evaluation written to {output}")
+    label = "ray-pose" if ray_pose_only else "learned-pose"
+    print(f"{label} evaluation written to {output}")
 
 
 def _load_frozen_streamvggt(config: LearnedPoseConfig, *, device: str):
@@ -691,6 +877,31 @@ def _geometry_head_outputs(
         "residual_mean_square": residual_mean_square,
         "diagnostics": dict(diagnostics),
     }
+
+
+def _decode_baseline_world_confidence(frozen, batch: dict) -> torch.Tensor:
+    """Replay only the frozen point head to recover its uncached confidence."""
+
+    token_levels = _token_level_mapping(batch)
+    final_layer = max(int(layer) for layer in token_levels)
+    aggregated: list[torch.Tensor | None] = [None] * (final_layer + 1)
+    for layer, value in token_levels.items():
+        aggregated[int(layer)] = value
+    decoded_points, confidence = _decode_streaming_dpt_head(
+        frozen.point_head,
+        aggregated,
+        batch["stream_images"],
+        patch_start_idx=int(batch["patch_start_idx"]),
+    )
+    difference = float(
+        (decoded_points - batch["baseline_world_points"]).abs().max().cpu()
+    )
+    if difference != 0.0:
+        raise RuntimeError(
+            "Frozen point-head replay does not reproduce the cached baseline: "
+            f"max_abs_diff={difference}."
+        )
+    return confidence
 
 
 def _forward_baseline(batch: dict) -> dict[str, torch.Tensor]:
@@ -1208,6 +1419,110 @@ def _scalar_logs(values: Mapping[str, torch.Tensor]) -> dict[str, float]:
         if torch.is_tensor(value):
             output[name] = float(value.detach().float().mean().cpu())
     return output
+
+
+def _compact_ray_pose_summary(
+    pose_rows: list[dict],
+    pair_rows: list[dict],
+    fit_rows: list[dict],
+) -> list[dict]:
+    """Join primary pose/pair/fit values into one copy-friendly CSV."""
+
+    pair_by_variant = {
+        (str(row["clip"]), str(row["perturbation"])): row
+        for row in pair_rows
+    }
+    fits_by_variant: dict[tuple[str, str], list[dict]] = {}
+    for row in fit_rows:
+        evaluated = {
+            int(value)
+            for value in str(row.get("evaluated_frame_indices", "")).split()
+        }
+        if evaluated and int(row["frame_index"]) not in evaluated:
+            continue
+        key = (str(row["clip"]), str(row["perturbation"]))
+        fits_by_variant.setdefault(key, []).append(row)
+    output = []
+    for pose in pose_rows:
+        variant = str(pose["perturbation"])
+        key = (str(pose["clip"]), variant)
+        pair = pair_by_variant.get(key, {})
+        fits = fits_by_variant.get(key, [])
+        output.append(
+            {
+                "clip": pose["clip"],
+                "variant": variant,
+                "variant_role": pose.get("ray_pose_role", ""),
+                "evaluation_protocol": pose.get("evaluation_protocol", ""),
+                "training_frame_indices": pose.get("training_frame_indices", ""),
+                "evaluated_frame_indices": pose.get("evaluated_frame_indices", ""),
+                "evaluated_frames": pose["evaluated_frames"],
+                "ate_rmse": pose["ate_rmse"],
+                "translation_error_mean": pose["translation_error_mean"],
+                "rotation_error_mean_degrees": pose[
+                    "rotation_error_mean_degrees"
+                ],
+                "rpe_translation_rmse": pose["rpe_translation_rmse"],
+                "rpe_rotation_mean_degrees": pose[
+                    "rpe_rotation_mean_degrees"
+                ],
+                "pair_rotation_error_mean_degrees": pair.get(
+                    "rotation_error_mean_degrees",
+                    float("nan"),
+                ),
+                "pair_translation_direction_error_mean_degrees": pair.get(
+                    "translation_direction_error_mean_degrees",
+                    float("nan"),
+                ),
+                "fit_frames": len(fits),
+                "fit_accepted_frames": sum(
+                    int(row["fit_accepted"]) for row in fits
+                ),
+                "mean_initial_point_ray_rmse_native": _finite_row_mean(
+                    fits,
+                    "initial_point_ray_rmse_native",
+                ),
+                "mean_fitted_point_ray_rmse_native": _finite_row_mean(
+                    fits,
+                    "fitted_point_ray_rmse_native",
+                ),
+                "mean_initial_angular_rmse": _finite_row_mean(
+                    fits,
+                    "initial_angular_rmse",
+                ),
+                "mean_fitted_angular_rmse": _finite_row_mean(
+                    fits,
+                    "fitted_angular_rmse",
+                ),
+                "mean_applied_center_shift_native": _finite_row_mean(
+                    fits,
+                    "applied_center_shift_native",
+                ),
+                "max_condition_number": _finite_row_max(
+                    fits,
+                    "condition_number",
+                ),
+            }
+        )
+    return output
+
+
+def _finite_row_mean(rows: list[dict], field: str) -> float:
+    values = [
+        float(row[field])
+        for row in rows
+        if np.isfinite(float(row[field]))
+    ]
+    return float(np.mean(values)) if values else float("nan")
+
+
+def _finite_row_max(rows: list[dict], field: str) -> float:
+    values = [
+        float(row[field])
+        for row in rows
+        if np.isfinite(float(row[field]))
+    ]
+    return float(np.max(values)) if values else float("nan")
 
 
 def _seed_everything(seed: int) -> None:
