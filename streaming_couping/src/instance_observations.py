@@ -37,6 +37,10 @@ class InstanceRefinementConfig:
     max_proposal_translation: float = 0.15
     min_participating_instances: int = 2
     consensus_distance: float = 0.02
+    # Normalization scale for the source-frame distance feature consumed by
+    # the frozen learned adapter.  Keep the value used when its checkpoint was
+    # trained, including for deliberately non-monotonic view sequences.
+    temporal_max_frame_gap: int = 15
     compute_device: str = "cpu"
 
 

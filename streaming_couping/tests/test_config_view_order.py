@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from streaming_couping.src.instance_observations import InstanceRefinementConfig
 from streaming_couping.src.learned_pose.config import (
     _validate,
     load_learned_pose_config,
@@ -11,6 +12,10 @@ from streaming_couping.src.learned_pose.config import (
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "streaming_couping/configs/final_joint_pointcloud_pose_test.yaml"
+
+
+def test_final_observation_config_keeps_checkpoint_temporal_scale() -> None:
+    assert InstanceRefinementConfig().temporal_max_frame_gap == 15
 
 
 def test_configured_view_order_may_be_non_monotonic() -> None:
