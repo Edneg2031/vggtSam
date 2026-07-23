@@ -261,7 +261,7 @@ def build_geometry_observations(
                 if frame == int(reference_index)
                 else min(
                     1.0,
-                    max(0, int(frame_indices[frame]) - previous_frame)
+                    abs(int(frame_indices[frame]) - previous_frame)
                     / max(1, refinement.temporal_max_frame_gap),
                 )
             )

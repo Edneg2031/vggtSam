@@ -603,7 +603,7 @@ def _evaluate_pose_alignment(
                 "first_frame_index": int(frame_indices[first]),
                 "second_frame_index": int(frame_indices[second]),
                 "source_frame_gap": int(
-                    frame_indices[second] - frame_indices[first]
+                    abs(frame_indices[second] - frame_indices[first])
                 ),
                 "translation_error": float(
                     torch.linalg.vector_norm(error[:3, 3])
@@ -726,7 +726,7 @@ def _all_pair_pose_metrics(
                     "first_frame_index": int(frame_indices[first]),
                     "second_frame_index": int(frame_indices[second]),
                     "source_frame_gap": int(
-                        frame_indices[second] - frame_indices[first]
+                        abs(frame_indices[second] - frame_indices[first])
                     ),
                     "rotation_error_degrees": rotation_error,
                     "translation_direction_error_degrees": translation_error,

@@ -51,7 +51,7 @@ def build_feature_caches(config: LearnedPoseConfig) -> list[Path]:
     pending = [
         (clip, path)
         for clip, path in zip(config.clips, paths)
-        if config.features.rebuild or not _cache_complete(path)
+        if config.features.rebuild or not _cache_complete(path, clip=clip)
     ]
     if not pending:
         print("learned-pose feature caches are complete")
@@ -458,13 +458,27 @@ def _target_depth(
     return torch.where(torch.isfinite(world_points).all(dim=-1, keepdim=True), depth, torch.nan)
 
 
-def _cache_complete(path: Path) -> bool:
+def _cache_complete(path: Path, *, clip: ClipConfig | None = None) -> bool:
     if not path.exists():
         return False
     try:
-        return bool(load_feature_cache(path, require_complete=False).get("complete", False))
+        payload = load_feature_cache(path, require_complete=False)
     except (OSError, RuntimeError, TypeError, ValueError):
         return False
+    if not bool(payload.get("complete", False)):
+        return False
+    if clip is None:
+        return True
+    return (
+        str(payload.get("clip_name")) == clip.name
+        and str(payload.get("scene_id")) == clip.scene_id
+        and tuple(int(value) for value in payload.get("frame_indices", ()))
+        == clip.frame_indices
+        and tuple(int(value) for value in payload.get("instance_ids", ()))
+        == clip.instance_ids
+        and int(payload.get("reference_sequence_index", -1))
+        == clip.reference_sequence_index
+    )
 
 
 def _empty_cuda_cache() -> None:

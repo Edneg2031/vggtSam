@@ -321,8 +321,13 @@ def _validate(config: LearnedPoseConfig) -> None:
     for clip in config.clips:
         if clip.reference_sequence_index != 0:
             raise ValueError("Learned causal pose refinement requires reference_sequence_index=0.")
-        if any(b <= a for a, b in zip(clip.frame_indices, clip.frame_indices[1:])):
-            raise ValueError(f"Clip {clip.name!r} frame_indices must be strictly increasing.")
+        # ``frame_indices`` defines the model's observation order.  A
+        # deliberately hard view sequence may jump forwards and backwards in
+        # the source video, so numeric frame order is not a validity
+        # requirement.  Repeated frames remain invalid because they make
+        # sequence-level metrics and tracking-cache identity ambiguous.
+        if len(set(clip.frame_indices)) != len(clip.frame_indices):
+            raise ValueError(f"Clip {clip.name!r} frame_indices contains duplicates.")
         frame_set = set(clip.frame_indices)
         for field, values in (
             ("training_frame_indices", clip.training_frame_indices),
@@ -371,12 +376,17 @@ def _validate(config: LearnedPoseConfig) -> None:
                     f"Clip {clip.name!r} training/evaluation frames overlap: "
                     f"{sorted(overlap)}."
                 )
-            if max(clip.training_frame_indices) >= min(
-                clip.evaluation_frame_indices
+            position = {
+                frame_index: sequence_index
+                for sequence_index, frame_index in enumerate(clip.frame_indices)
+            }
+            if max(position[value] for value in clip.training_frame_indices) >= min(
+                position[value] for value in clip.evaluation_frame_indices
             ):
                 raise ValueError(
                     f"Clip {clip.name!r} temporal holdout requires every training "
-                    "frame to precede every evaluation frame."
+                    "observation to precede every evaluation observation in "
+                    "frame_indices order."
                 )
 
 
