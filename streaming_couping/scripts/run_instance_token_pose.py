@@ -12,6 +12,7 @@ from streaming_couping.src.learned_pose.pipeline import (
     evaluate_all_modes,
     train_all_modes,
 )
+from streaming_couping.src.learned_pose.export import export_final_ray_pose_outputs
 
 
 def main() -> None:
@@ -41,6 +42,13 @@ def main() -> None:
         evaluate_all_modes(config)
     if args.stage == "ray":
         evaluate_all_modes(config, ray_pose_only=True)
+    if args.stage == "export":
+        path = export_final_ray_pose_outputs(
+            config,
+            variant=args.ray_variant,
+            output_dir=args.export_output_dir,
+        )
+        print(f"exported final instance-ray pose and point clouds to {path}")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -51,13 +59,21 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--stage",
-        choices=("all", "cache", "train", "eval", "ray"),
+        choices=("all", "cache", "train", "eval", "ray", "export"),
         default="all",
     )
     parser.add_argument("--sam3-device")
     parser.add_argument("--geometry-device")
     parser.add_argument("--training-device")
     parser.add_argument("--rebuild-cache", action="store_true")
+    parser.add_argument(
+        "--ray-variant",
+        help="Override evaluation.ray_pose.final_variant for export.",
+    )
+    parser.add_argument(
+        "--export-output-dir",
+        help="Override the final pose/PLY output directory.",
+    )
     return parser.parse_args()
 
 

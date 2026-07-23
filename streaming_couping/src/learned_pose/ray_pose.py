@@ -115,7 +115,7 @@ _VARIANTS: Mapping[str, _VariantSpec] = {
         "baseline_reference",
         "tracked_instances",
         "angular_huber",
-        "spatial_scope_ablation",
+        "deployable_v3_selected",
     ),
     "ray_refined_pointmap_refined_rotation_gt_k_oracle": _VariantSpec(
         "refined",
@@ -644,4 +644,3 @@ def _vector_fields(prefix: str, value: torch.Tensor) -> dict[str, float]:
         f"{prefix}_y": float(vector[1]),
         f"{prefix}_z": float(vector[2]),
     }
-

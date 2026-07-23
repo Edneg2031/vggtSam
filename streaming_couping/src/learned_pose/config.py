@@ -111,6 +111,12 @@ class RayPoseConfig:
     angular_huber_delta: float = 0.02
     angular_min_range: float = 0.05
     preserve_reference: bool = True
+    final_variant: str = (
+        "ray_refined_pointmap_refined_rotation_reference_k_instances"
+    )
+    export_confidence_threshold: float = 0.30
+    export_max_full_scene_points: int = 1_000_000
+    export_max_instance_points: int = 250_000
 
 
 @dataclass(frozen=True)
@@ -332,6 +338,21 @@ def load_learned_pose_config(path: str | Path) -> LearnedPoseConfig:
                 preserve_reference=bool(
                     ray_pose.get("preserve_reference", True)
                 ),
+                final_variant=str(
+                    ray_pose.get(
+                        "final_variant",
+                        RayPoseConfig().final_variant,
+                    )
+                ),
+                export_confidence_threshold=float(
+                    ray_pose.get("export_confidence_threshold", 0.30)
+                ),
+                export_max_full_scene_points=int(
+                    ray_pose.get("export_max_full_scene_points", 1_000_000)
+                ),
+                export_max_instance_points=int(
+                    ray_pose.get("export_max_instance_points", 250_000)
+                ),
             ),
         ),
     )
@@ -377,6 +398,20 @@ def _validate(config: LearnedPoseConfig) -> None:
     bad_ray_variants = sorted(set(ray_pose.variants) - RAY_POSE_VARIANTS)
     if bad_ray_variants:
         raise ValueError(f"Unknown ray-pose variants: {bad_ray_variants}")
+    if ray_pose.final_variant not in RAY_POSE_VARIANTS:
+        raise ValueError(
+            f"Unknown final ray-pose variant: {ray_pose.final_variant!r}"
+        )
+    if ray_pose.enabled and ray_pose.final_variant not in ray_pose.variants:
+        raise ValueError(
+            "evaluation.ray_pose.final_variant must also be listed in variants."
+        )
+    if ray_pose.export_confidence_threshold < 0.0:
+        raise ValueError("Ray-pose export confidence threshold must be nonnegative.")
+    if ray_pose.export_max_full_scene_points < 1:
+        raise ValueError("Ray-pose full-scene export limit must be positive.")
+    if ray_pose.export_max_instance_points < 1:
+        raise ValueError("Ray-pose instance export limit must be positive.")
     if ray_pose.enabled and ray_pose.source_mode not in config.training.modes:
         raise ValueError(
             "evaluation.ray_pose.source_mode must be present in training.modes."

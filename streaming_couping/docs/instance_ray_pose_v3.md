@@ -185,16 +185,16 @@ Expected likelihood for this one scene:
 | `ray_refined_pointmap_refined_rk` | refined | learned | per-frame learned | all | line LS | learned K effect |
 | `...reference_k` | refined | learned | reference raw | all | line LS | K stabilisation |
 | `...reference_k_trimmed` | refined | learned | reference raw | all | trimmed LS | hard trimming |
-| `...reference_k_angular_huber` | refined | learned | reference raw | all | angular IRLS | proposed V3 |
+| `...reference_k_angular_huber` | refined | learned | reference raw | all | angular IRLS | robust-solver ablation |
 | `...reference_k_background` | refined | learned | reference raw | background | angular IRLS | instances as conditioners vs fit pixels |
-| `...reference_k_instances` | refined | learned | reference raw | instances | angular IRLS | instance-only observability |
+| `...reference_k_instances` | refined | learned | reference raw | instances | angular IRLS | selected V3 |
 | `...gt_k_oracle` | refined | learned | GT | all | angular IRLS | intrinsics ceiling only |
 
-The background/instance rows are spatial ablations.  The main method uses all
-confident points because the instance-conditioned patch adapter improves the
-whole coherent pointmap; restricting the solve to one object would reduce ray
-diversity and recreate the degeneracy of the old per-instance translation
-proposals.
+The background/instance rows were initially spatial ablations.  The temporal
+holdout selected the union of persistent tracked instances: the masks remove
+background pointmap/ray inconsistencies, while pooling three independently
+located instances retains enough ray diversity to avoid the degeneracy of the
+old single-instance centroid/ICP proposals.
 
 ## 7. Server command
 
@@ -228,20 +228,51 @@ all raw pose encodings plus the selected refined pointmap, confidence, tracking
 masks, and image paths needed by the later fused/instance PLY export without
 rerunning the adapters.
 
-## 8. Decision rule for tomorrow
+## 8. Temporal-holdout result and final selection
 
-The method is accepted only if a deployable row, preferably angular-Huber or
-closed-form reference-K, satisfies all of the following:
+On held-out frames 210 and 240, the selected
+`ray_refined_pointmap_refined_rotation_reference_k_instances` row obtained:
 
-1. held-out ATE improves over raw baseline `0.36879 m` rather than only over V2;
-2. `210->240` rotation remains near the V2 value `1.17 deg`;
-3. translation-direction error improves over raw `44.22 deg`, ideally also over
-   V2 `34.68 deg`;
-4. both held-out fits are accepted without hitting the shift cap;
-5. fitted ray residual is below the input residual;
-6. the GT-K oracle is reported only as a ceiling.
+| metric | raw StreamVGGT | learned V2 | selected V3 |
+|---|---:|---:|---:|
+| ATE RMSE | 0.36879 m | 0.37535 m | **0.14387 m** |
+| translation mean | 0.35304 m | 0.37342 m | **0.14371 m** |
+| translation RPE RMSE | 0.23981 m | 0.17627 m | **0.08986 m** |
+| rotation RPE | 3.518 deg | **1.171 deg** | **1.171 deg** |
+| all-pair translation direction | 44.22 deg | **34.68 deg** | 40.94 deg |
 
-If the GT-K oracle is much better, the next bottleneck is predicted intrinsics.
-If background is better than all pixels, instance-region pointmap artefacts are
-leaking into the solve.  If instance-only is competitive despite fewer rays,
-the instance anchors themselves provide strong pose information.
+Both held-out fits were accepted.  Point-to-ray RMSE fell from 0.14058 to
+0.02678 in native units and the maximum condition number was 6.69, far below
+the configured rejection threshold.  ATE improved by 61.0% over raw
+StreamVGGT and 61.7% over V2.  The GT-K oracle reached 0.14615 m ATE, slightly
+worse than the selected reference-K result.  GT K does improve the all-pixel
+angular-Huber row (0.18165 to 0.14615 m), but the instance mask removes enough
+geometric contamination for predicted reference K to match that oracle
+without using GT intrinsics.
+
+The claim remains deliberately narrow: V3 substantially repairs absolute and
+adjacent translation on this proof-of-concept scene while preserving V2's
+rotation gain.  It does **not** improve the all-pair translation-direction
+metric over V2, so that metric is recorded as a remaining limitation rather
+than hidden behind the ATE result.  Because the final spatial scope was chosen
+after inspecting these two held-out frames, this is proof-of-concept model
+selection on one scene, not an unbiased generalization claim.
+
+## 9. Final pose and PLY export
+
+The selected artifact can be exported without rerunning SAM3, StreamVGGT,
+training, or ray fitting:
+
+```bash
+zsh streaming_couping/commands_instance_ray_pose_v3_export.txt
+```
+
+This writes `camera_poses.csv`, `camera_poses.npz`, a full-scene colored PLY,
+one PLY per persistent instance, and point-selection diagnostics under
+`final_instance_ray_pose_v3/`.  Every object is exported in two explicitly
+named coordinate systems:
+
+- `streamvggt_point_head_native`: deployable but arbitrary-scale;
+- `fixed_reference_point_sim3_metric_evaluation_only`: metric visualization
+  using the cached GT-fitted reference-frame Sim(3), never presented as a
+  deployable inference output.

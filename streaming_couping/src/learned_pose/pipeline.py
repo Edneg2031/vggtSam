@@ -585,6 +585,7 @@ def evaluate_all_modes(
                 "source_perturbation": (
                     config.evaluation.ray_pose.source_perturbation
                 ),
+                "final_variant": config.evaluation.ray_pose.final_variant,
                 "predictions": ray_pose_predictions,
             },
             output / "ray_pose_predictions.pt",
@@ -618,6 +619,7 @@ def evaluate_all_modes(
             "enabled": config.evaluation.ray_pose.enabled,
             "source_mode": config.evaluation.ray_pose.source_mode,
             "source_perturbation": config.evaluation.ray_pose.source_perturbation,
+            "final_variant": config.evaluation.ray_pose.final_variant,
             "variants": list(config.evaluation.ray_pose.variants),
             "causal_constraint": (
                 "Each requested camera center is solved from its current causal pointmap "

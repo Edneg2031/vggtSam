@@ -1,0 +1,10 @@
+set -euo pipefail
+
+# No SAM3, StreamVGGT forward, cache rebuild, or training is performed here.
+# This reads the existing ray_pose_predictions.pt and learned-pose cache.
+PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_instance_token_pose \
+  --config streaming_couping/configs/instance_token_pose_temporal_holdout_v2.yaml \
+  --stage export
+
+sed -n '1,40p' \
+  outputs/streaming_couping_instance_token_pose_temporal_holdout_v2/final_instance_ray_pose_v3/pointcloud_summary.csv

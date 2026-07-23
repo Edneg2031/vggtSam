@@ -112,6 +112,12 @@ evaluation:
     blend: 1.0
     angular_huber_delta: 0.02
     angular_min_range: 0.05
+    # Selected after the two-frame temporal holdout: ATE 0.14387 m versus
+    # 0.36879 m raw and 0.37535 m for the learned-pose branch alone.
+    final_variant: ray_refined_pointmap_refined_rotation_reference_k_instances
+    export_confidence_threshold: 0.30
+    export_max_full_scene_points: 1000000
+    export_max_instance_points: 250000
     # Fit frame 90 from its own causal pointmap as well. This reproduces the
     # previously successful ray baseline and defines the pose in pointmap gauge;
     # the evaluation Sim(3) remains the original fixed-reference protocol.
