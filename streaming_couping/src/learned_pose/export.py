@@ -111,11 +111,26 @@ def export_final_ray_pose_outputs(
             image_size=processed_size,
             frame_indices=clip.frame_indices,
         )
+        raw_pose_encoding = pose_encodings.get(
+            "raw_baseline_control",
+            payload["baseline_pose_encoding"],
+        )
+        raw_c2w, raw_w2c, raw_intrinsics = _decode_pose(
+            raw_pose_encoding,
+            image_size=processed_size,
+            frame_indices=clip.frame_indices,
+        )
         scale = float(payload["point_alignment_scale"])
         rotation = payload["point_alignment_rotation"].detach().double().cpu()
         translation = payload["point_alignment_translation"].detach().double().cpu()
         metric_c2w, metric_w2c = _align_camera_pose(
             native_c2w,
+            scale=scale,
+            rotation=rotation,
+            translation=translation,
+        )
+        raw_metric_c2w, raw_metric_w2c = _align_camera_pose(
+            raw_c2w,
             scale=scale,
             rotation=rotation,
             translation=translation,
@@ -211,6 +226,34 @@ def export_final_ray_pose_outputs(
             point_alignment_scale=np.asarray(scale, dtype=np.float64),
             point_alignment_rotation=rotation.numpy(),
             point_alignment_translation=translation.numpy(),
+        )
+        _export_three_way_comparison(
+            clip_root / "comparison_gt_world",
+            clip_name=clip.name,
+            scene_id=clip.scene_id,
+            variant=selected,
+            frame_indices=clip.frame_indices,
+            reference_sequence_index=clip.reference_sequence_index,
+            instance_ids=clip.instance_ids,
+            raw_points=_world_points(payload["baseline_world_points"]),
+            refined_points=points,
+            target_points=target_points,
+            masks=masks,
+            colors=colors,
+            scale=scale,
+            rotation=rotation,
+            translation=translation,
+            raw_c2w_metric=raw_metric_c2w,
+            raw_w2c_metric=raw_metric_w2c,
+            raw_intrinsics=raw_intrinsics,
+            refined_c2w_metric=metric_c2w,
+            refined_w2c_metric=metric_w2c,
+            refined_intrinsics=intrinsics,
+            target_c2w=target_c2w,
+            target_w2c=target_w2c,
+            target_intrinsics=target_intrinsics,
+            max_full_scene_points=int(ray_config.export_max_full_scene_points),
+            max_instance_points=int(ray_config.export_max_instance_points),
         )
 
         valid = (
@@ -511,6 +554,260 @@ def export_final_ray_pose_outputs(
     return root
 
 
+def _export_three_way_comparison(
+    root: Path,
+    *,
+    clip_name: str,
+    scene_id: str,
+    variant: str,
+    frame_indices: Iterable[int],
+    reference_sequence_index: int,
+    instance_ids: Iterable[int],
+    raw_points: torch.Tensor,
+    refined_points: torch.Tensor,
+    target_points: torch.Tensor,
+    masks: torch.Tensor,
+    colors: torch.Tensor,
+    scale: float,
+    rotation: torch.Tensor,
+    translation: torch.Tensor,
+    raw_c2w_metric: torch.Tensor,
+    raw_w2c_metric: torch.Tensor,
+    raw_intrinsics: torch.Tensor,
+    refined_c2w_metric: torch.Tensor,
+    refined_w2c_metric: torch.Tensor,
+    refined_intrinsics: torch.Tensor,
+    target_c2w: torch.Tensor,
+    target_w2c: torch.Tensor,
+    target_intrinsics: torch.Tensor,
+    max_full_scene_points: int,
+    max_instance_points: int,
+) -> None:
+    """Export a fair GT/raw/ours comparison in one fixed GT-world gauge."""
+
+    frame_indices = tuple(int(value) for value in frame_indices)
+    instance_ids = tuple(int(value) for value in instance_ids)
+    expected = tuple(target_points.shape)
+    if tuple(raw_points.shape) != expected or tuple(refined_points.shape) != expected:
+        raise ValueError(
+            "GT/raw/ours pointmaps must have identical [S,H,W,3] shapes for "
+            "the three-way comparison."
+        )
+    if tuple(colors.shape[:3]) != expected[:3]:
+        raise ValueError("RGB and comparison pointmaps use different grids.")
+
+    root.mkdir(parents=True, exist_ok=True)
+    aligned_raw = float(scale) * (
+        raw_points.float() @ rotation.T.float()
+    ) + translation.float()
+    aligned_ours = float(scale) * (
+        refined_points.float() @ rotation.T.float()
+    ) + translation.float()
+    common_valid = (
+        torch.isfinite(aligned_raw).all(dim=-1)
+        & torch.isfinite(aligned_ours).all(dim=-1)
+        & torch.isfinite(target_points).all(dim=-1)
+    )
+    scopes: list[tuple[str, int | None, torch.Tensor, int]] = [
+        (
+            "full_scene",
+            None,
+            torch.ones_like(common_valid),
+            int(max_full_scene_points),
+        )
+    ]
+    scopes.extend(
+        (
+            "tracked_instance",
+            instance_id,
+            masks[:, instance_index],
+            int(max_instance_points),
+        )
+        for instance_index, instance_id in enumerate(instance_ids)
+    )
+
+    point_rows: list[dict] = []
+    artifact_rows: list[dict] = []
+    for scope, instance_id, spatial_mask, max_points in scopes:
+        selection = common_valid & spatial_mask
+        raw = aligned_raw[selection].detach().float().cpu()
+        ours = aligned_ours[selection].detach().float().cpu()
+        target = target_points[selection].detach().float().cpu()
+        rgb = colors[selection].detach().to(torch.uint8).cpu()
+        paired_points = int(raw.shape[0])
+        for method, predicted in (
+            ("streamvggt_raw", raw),
+            ("ours_v2_pointmap_v3_pose", ours),
+        ):
+            point_rows.append(
+                {
+                    "clip": clip_name,
+                    "scene_id": scene_id,
+                    "method": method,
+                    "alignment": "shared_fixed_reference_point_sim3",
+                    "alignment_fit_source": (
+                        "raw StreamVGGT reference-frame pointmap only"
+                    ),
+                    "coordinate_system": "scannetpp_gt_world",
+                    "evaluation_mask": "common_finite_gt_raw_ours_pixels",
+                    "spatial_scope": scope,
+                    "instance_id": "" if instance_id is None else instance_id,
+                    "paired_points": paired_points,
+                    **_paired_distance_statistics(predicted, target),
+                }
+            )
+
+        raw, ours, target, rgb = _limit_comparison_points(
+            raw,
+            ours,
+            target,
+            rgb,
+            max_points=max_points,
+        )
+        scope_root = root / (
+            "full_scene" if instance_id is None else f"instance_{instance_id}"
+        )
+        scope_root.mkdir(parents=True, exist_ok=True)
+        paths = {
+            "ground_truth": scope_root / "ground_truth.ply",
+            "streamvggt_raw": scope_root / "streamvggt_raw.ply",
+            "ours_v2_pointmap_v3_pose": scope_root / "ours.ply",
+            "overlay_gt_green_raw_red_ours_blue": scope_root / "overlay.ply",
+        }
+        _write_binary_ply(paths["ground_truth"], target, rgb)
+        _write_binary_ply(paths["streamvggt_raw"], raw, rgb)
+        _write_binary_ply(paths["ours_v2_pointmap_v3_pose"], ours, rgb)
+        overlay_points = torch.cat([target, raw, ours], dim=0)
+        overlay_colors = torch.cat(
+            [
+                _solid_colors(len(target), (64, 255, 64)),
+                _solid_colors(len(raw), (255, 64, 64)),
+                _solid_colors(len(ours), (64, 128, 255)),
+            ],
+            dim=0,
+        )
+        _write_binary_ply(
+            paths["overlay_gt_green_raw_red_ours_blue"],
+            overlay_points,
+            overlay_colors,
+        )
+        for method, path, count in (
+            ("ground_truth", paths["ground_truth"], len(target)),
+            ("streamvggt_raw", paths["streamvggt_raw"], len(raw)),
+            ("ours_v2_pointmap_v3_pose", paths["ours_v2_pointmap_v3_pose"], len(ours)),
+            (
+                "overlay_gt_green_raw_red_ours_blue",
+                paths["overlay_gt_green_raw_red_ours_blue"],
+                len(overlay_points),
+            ),
+        ):
+            artifact_rows.append(
+                {
+                    "clip": clip_name,
+                    "scene_id": scene_id,
+                    "method": method,
+                    "coordinate_system": "scannetpp_gt_world",
+                    "evaluation_mask": "common_finite_gt_raw_ours_pixels",
+                    "spatial_scope": scope,
+                    "instance_id": "" if instance_id is None else instance_id,
+                    "paired_points_before_limit": paired_points,
+                    "exported_points": int(count),
+                    "ply_path": str(path),
+                }
+            )
+
+    pose_rows = []
+    pose_rows.extend(
+        _pose_rows(
+            clip_name=clip_name,
+            scene_id=scene_id,
+            variant="ground_truth",
+            frame_indices=frame_indices,
+            reference_sequence_index=reference_sequence_index,
+            coordinate_system="scannetpp_gt_world",
+            c2w=target_c2w,
+            w2c=target_w2c,
+            intrinsics=target_intrinsics,
+        )
+    )
+    pose_rows.extend(
+        _pose_rows(
+            clip_name=clip_name,
+            scene_id=scene_id,
+            variant="streamvggt_raw",
+            frame_indices=frame_indices,
+            reference_sequence_index=reference_sequence_index,
+            coordinate_system="scannetpp_gt_world_shared_point_sim3",
+            c2w=raw_c2w_metric,
+            w2c=raw_w2c_metric,
+            intrinsics=raw_intrinsics,
+        )
+    )
+    pose_rows.extend(
+        _pose_rows(
+            clip_name=clip_name,
+            scene_id=scene_id,
+            variant="ours_v2_pointmap_v3_pose",
+            frame_indices=frame_indices,
+            reference_sequence_index=reference_sequence_index,
+            coordinate_system="scannetpp_gt_world_shared_point_sim3",
+            c2w=refined_c2w_metric,
+            w2c=refined_w2c_metric,
+            intrinsics=refined_intrinsics,
+        )
+    )
+    pose_metric_rows: list[dict] = []
+    for method, c2w in (
+        ("streamvggt_raw", raw_c2w_metric),
+        ("ours_v2_pointmap_v3_pose", refined_c2w_metric),
+    ):
+        current = _camera_comparison_rows(
+            clip_name=clip_name,
+            scene_id=scene_id,
+            variant=method,
+            frame_indices=frame_indices,
+            predicted_c2w=c2w,
+            target_c2w=target_c2w,
+        )
+        pose_metric_rows.extend(current)
+
+    np.savez_compressed(
+        root / "camera_poses.npz",
+        frame_indices=np.asarray(frame_indices, dtype=np.int64),
+        gt_c2w=target_c2w.numpy(),
+        gt_w2c=target_w2c.numpy(),
+        gt_intrinsics=target_intrinsics.numpy(),
+        streamvggt_raw_c2w=raw_c2w_metric.numpy(),
+        streamvggt_raw_w2c=raw_w2c_metric.numpy(),
+        streamvggt_raw_intrinsics=raw_intrinsics.numpy(),
+        ours_c2w=refined_c2w_metric.numpy(),
+        ours_w2c=refined_w2c_metric.numpy(),
+        ours_intrinsics=refined_intrinsics.numpy(),
+        shared_alignment_scale=np.asarray(scale, dtype=np.float64),
+        shared_alignment_rotation=rotation.numpy(),
+        shared_alignment_translation=translation.numpy(),
+    )
+    _write_csv(root / "pointcloud_metrics.csv", point_rows)
+    _write_csv(root / "pointcloud_artifacts.csv", artifact_rows)
+    _write_csv(root / "camera_poses.csv", pose_rows)
+    _write_csv(root / "camera_pose_metrics.csv", pose_metric_rows)
+    (root / "README.txt").write_text(
+        "Fair three-way comparison: GT / raw StreamVGGT / ours\n"
+        "=====================================================\n\n"
+        "All PLYs use the same ScanNet++ GT-world coordinate system, the same "
+        "frames, the same common finite pixels, and the same deterministic "
+        "point limit. One fixed Sim(3), fitted from the raw StreamVGGT "
+        "reference-frame pointmap, is applied unchanged to raw and ours.\n\n"
+        "Open full_scene/overlay.ply or instance_*/overlay.ply. Colors: "
+        "GT=green, raw StreamVGGT=red, ours=blue. Separate RGB-colored PLYs "
+        "are ground_truth.ply, streamvggt_raw.ply, and ours.ply.\n\n"
+        "pointcloud_metrics.csv and camera_pose_metrics.csv contain the direct "
+        "numerical comparison. This folder is evaluation-only because the "
+        "shared Sim(3) uses GT reference-frame correspondences.\n",
+        encoding="utf8",
+    )
+
+
 def _decode_pose(
     pose_encoding: torch.Tensor,
     *,
@@ -744,6 +1041,35 @@ def _limit_paired_points(
     ).long()
     return (
         predicted.index_select(0, indices),
+        target.index_select(0, indices),
+        colors.index_select(0, indices),
+    )
+
+
+def _limit_comparison_points(
+    raw: torch.Tensor,
+    ours: torch.Tensor,
+    target: torch.Tensor,
+    colors: torch.Tensor,
+    *,
+    max_points: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not (
+        raw.shape == ours.shape == target.shape == colors.shape
+        and raw.ndim == 2
+        and raw.shape[1:] == (3,)
+    ):
+        raise ValueError("GT/raw/ours/RGB comparison arrays must share [N,3].")
+    if raw.shape[0] <= int(max_points):
+        return raw, ours, target, colors
+    indices = torch.linspace(
+        0,
+        raw.shape[0] - 1,
+        steps=int(max_points),
+    ).long()
+    return (
+        raw.index_select(0, indices),
+        ours.index_select(0, indices),
         target.index_select(0, indices),
         colors.index_select(0, indices),
     )

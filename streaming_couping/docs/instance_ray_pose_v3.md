@@ -295,3 +295,12 @@ native gauge: the point clouds are the improved V2 world pointmaps and V3
 recovers its camera centers directly from those same pointmaps.  The GT-world
 files outside this directory are evaluation artifacts, not additional method
 outputs.
+
+For the requested fair visual comparison, `comparison_gt_world/` contains
+exactly three reconstructions: ScanNet++ GT, raw StreamVGGT, and the complete
+V2-pointmap/V3-pose method.  A single Sim(3), fitted once from the raw
+StreamVGGT reference-frame pointmap, is applied unchanged to both predictions.
+Every PLY uses the intersection of finite GT/raw/ours pixels and identical
+subsampling.  `full_scene/overlay.ply` and each `instance_*/overlay.ply` use
+GT=green, raw=red, and ours=blue; the separate RGB PLYs and unified point/pose
+metric CSVs are stored alongside them.
