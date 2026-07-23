@@ -287,3 +287,11 @@ GT is also exported as `*_gt_visible_all_finite_metric_gt_world.ply`.
 `camera_comparison_pointmap_sim3.csv` compares predicted and GT cameras after
 the same pointmap Sim(3).  This joint reconstruction alignment is intentionally
 distinguished from the reference-pose alignment used for the reported ATE.
+
+The canonical no-GT result is isolated under each clip's
+`deployable_native/` directory.  It contains only `full_scene.ply`, the three
+`instance_*.ply` files, and V3 `camera_poses.csv/.npz`.  These files share one
+native gauge: the point clouds are the improved V2 world pointmaps and V3
+recovers its camera centers directly from those same pointmaps.  The GT-world
+files outside this directory are evaluation artifacts, not additional method
+outputs.

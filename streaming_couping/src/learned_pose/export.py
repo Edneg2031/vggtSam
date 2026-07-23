@@ -139,19 +139,18 @@ def export_final_ray_pose_outputs(
                 target_c2w=target_c2w,
             )
         )
-        all_pose_rows.extend(
-            _pose_rows(
-                clip_name=clip.name,
-                scene_id=clip.scene_id,
-                variant=selected,
-                frame_indices=clip.frame_indices,
-                reference_sequence_index=clip.reference_sequence_index,
-                coordinate_system="streamvggt_point_head_native",
-                c2w=native_c2w,
-                w2c=native_w2c,
-                intrinsics=intrinsics,
-            )
+        native_pose_rows = _pose_rows(
+            clip_name=clip.name,
+            scene_id=clip.scene_id,
+            variant=selected,
+            frame_indices=clip.frame_indices,
+            reference_sequence_index=clip.reference_sequence_index,
+            coordinate_system="streamvggt_point_head_native",
+            c2w=native_c2w,
+            w2c=native_w2c,
+            intrinsics=intrinsics,
         )
+        all_pose_rows.extend(native_pose_rows)
         all_pose_rows.extend(
             _pose_rows(
                 clip_name=clip.name,
@@ -182,6 +181,16 @@ def export_final_ray_pose_outputs(
         )
 
         clip_root = root / clip.name
+        deployable_root = clip_root / "deployable_native"
+        deployable_root.mkdir(parents=True, exist_ok=True)
+        _write_csv(deployable_root / "camera_poses.csv", native_pose_rows)
+        np.savez_compressed(
+            deployable_root / "camera_poses.npz",
+            frame_indices=np.asarray(clip.frame_indices, dtype=np.int64),
+            intrinsics=intrinsics.numpy(),
+            c2w=native_c2w.numpy(),
+            w2c=native_w2c.numpy(),
+        )
         cloud_root = clip_root / "pointclouds"
         cloud_root.mkdir(parents=True, exist_ok=True)
         _remove_legacy_pointclouds(
@@ -243,6 +252,11 @@ def export_final_ray_pose_outputs(
                 translation.float()
             )
             _write_binary_ply(native_path, selected_points, selected_colors)
+            _write_binary_ply(
+                deployable_root / f"{name}.ply",
+                selected_points,
+                selected_colors,
+            )
             _write_binary_ply(metric_path, metric_points, selected_colors)
             for coordinate_system, path, evaluation_mask in (
                 (
@@ -423,6 +437,16 @@ def export_final_ray_pose_outputs(
                 ],
                 dim=0,
             ),
+        )
+        (deployable_root / "README.txt").write_text(
+            "Final deployable V3 reconstruction\n"
+            "==================================\n\n"
+            "full_scene.ply and instance_*.ply are the V2 refined world "
+            "pointmaps. camera_poses.csv/.npz contain the selected V3 camera "
+            "poses recovered directly from those same pointmaps. All files "
+            "use one internally consistent StreamVGGT native gauge. No GT "
+            "alignment or GT value is used in this directory.\n",
+            encoding="utf8",
         )
 
     _write_csv(root / "camera_poses.csv", all_pose_rows)
