@@ -1,0 +1,28 @@
+set -euo pipefail
+
+CONFIG=streaming_couping/configs/final_joint_pointcloud_pose.yaml
+OUTPUT=outputs/streaming_couping_instance_token_pose_temporal_holdout_v2
+CLIP=00a231a370_90_240_37_68_54
+
+# Reuse the completed feature cache and final decoupled checkpoint.
+PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_instance_token_pose \
+  --config "$CONFIG" \
+  --stage ray \
+  --sam3-device cuda:3 \
+  --geometry-device cuda:1 \
+  --training-device cuda:1 \
+  2>&1 | tee "$OUTPUT/final_joint_method.log"
+
+PYTHONPATH=src:. python -m streaming_couping.scripts.run_instance_token_pose \
+  --config "$CONFIG" \
+  --stage export
+
+PYTHONPATH=src:. python -m streaming_couping.scripts.plot_pose_comparison \
+  --comparison-dir "$OUTPUT/final_instance_ray_pose_v3/$CLIP/comparison_gt_world" \
+  --heldout-frame-indices 210 240
+
+sed -n '1,20p' "$OUTPUT/evaluation/ray_pose_compact_summary.csv"
+sed -n '1,20p' \
+  "$OUTPUT/final_instance_ray_pose_v3/$CLIP/comparison_gt_world/pointcloud_metrics.csv"
+sed -n '1,24p' \
+  "$OUTPUT/final_instance_ray_pose_v3/$CLIP/comparison_gt_world/camera_pose_metrics.csv"

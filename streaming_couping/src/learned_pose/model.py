@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Mapping
 
 import torch
 import torch.nn as nn
@@ -41,54 +40,36 @@ class CausalInstanceTokenizer(nn.Module):
         quality: torch.Tensor,
         observed: torch.Tensor,
         *,
-        mode: str,
-        perturbation: str = "aligned",
+        branch: str,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         _validate_observation_shapes(appearance, geometry, quality, observed)
-        appearance, geometry, quality, observed, gate_quality = _perturb_observations(
-            appearance,
-            geometry,
-            quality,
-            observed,
-            perturbation=perturbation,
-        )
-        use_appearance = mode in {
-            "camera_sam_only",
-            "camera_token_fusion",
-            "all_token_fusion",
-            "patch_sam_only",
-            "patch_sam_geometry_strict",
-            "patch_sam_geometry_tracker_gate",
-        }
-        use_geometry = mode in {
-            "camera_geometry_only",
-            "camera_token_fusion",
-            "all_token_fusion",
-            "patch_sam_geometry_strict",
-            "patch_sam_geometry_tracker_gate",
-        }
-        if not use_appearance:
-            appearance = torch.zeros_like(appearance)
-        if not use_geometry:
+        if branch == "pose":
+            # The selected pose branch uses persistent SAM appearance and
+            # tracker confidence only. Geometry cannot leak through features
+            # or through the validity gate.
             geometry = torch.zeros_like(geometry)
-            # A real SAM-only control must not receive geometry/static scores
-            # through a side channel. Only tracker confidence remains active.
             quality = torch.stack(
-                [quality[..., 0], torch.ones_like(quality[..., 1]), torch.ones_like(quality[..., 2])],
-                dim=-1,
-            )
-            gate_quality = quality
-        elif mode == "patch_sam_geometry_tracker_gate":
-            # Geometry/static confidence remains available as a feature, but
-            # does not hard-reject an otherwise reliable tracked instance.
-            gate_quality = torch.stack(
                 [
-                    gate_quality[..., 0],
-                    torch.ones_like(gate_quality[..., 1]),
-                    torch.ones_like(gate_quality[..., 2]),
+                    quality[..., 0],
+                    torch.ones_like(quality[..., 1]),
+                    torch.ones_like(quality[..., 2]),
                 ],
                 dim=-1,
             )
+            gate_quality = quality
+        elif branch == "geometry":
+            # The selected geometry branch keeps geometry/static quality as
+            # token features but hard-gates only on tracker confidence.
+            gate_quality = torch.stack(
+                [
+                    quality[..., 0],
+                    torch.ones_like(quality[..., 1]),
+                    torch.ones_like(quality[..., 2]),
+                ],
+                dim=-1,
+            )
+        else:
+            raise ValueError(f"Unknown final adapter branch: {branch!r}")
 
         batch, sequence, instances = observed.shape
         app_memory = torch.zeros_like(appearance[:, 0])
@@ -267,16 +248,6 @@ class InstancePoseAdapter(nn.Module):
             config.instance_dim,
             config,
         )
-        self.all_token_fusions = nn.ModuleDict(
-            {
-                str(layer): ZeroInitializedCrossAttention(
-                    token_dim,
-                    config.instance_dim,
-                    config,
-                )
-                for layer in config.dpt_layer_indices
-            }
-        )
         self.patch_token_fusions = nn.ModuleDict(
             {
                 str(layer): ZeroInitializedCrossAttention(
@@ -296,10 +267,9 @@ class InstancePoseAdapter(nn.Module):
         geometry: torch.Tensor,
         quality: torch.Tensor,
         observed: torch.Tensor,
-        mode: str,
-        perturbation: str = "aligned",
+        module_off: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        if perturbation == "module_off" or mode == "baseline":
+        if module_off:
             zero = camera_hidden.new_zeros(())
             return camera_hidden, {
                 "gate": zero,
@@ -315,8 +285,7 @@ class InstancePoseAdapter(nn.Module):
             geometry,
             quality,
             observed,
-            mode=mode,
-            perturbation=perturbation,
+            branch="pose",
         )
         refined, log = self.camera_fusion(
             camera_hidden.unsqueeze(2),
@@ -325,67 +294,27 @@ class InstancePoseAdapter(nn.Module):
         )
         return refined[:, :, 0], {**memory_log, **log}
 
-    def forward_all_tokens(
-        self,
-        token_levels: Mapping[int, torch.Tensor],
-        *,
-        appearance: torch.Tensor,
-        geometry: torch.Tensor,
-        quality: torch.Tensor,
-        observed: torch.Tensor,
-        perturbation: str = "aligned",
-    ) -> tuple[dict[int, torch.Tensor], dict[str, torch.Tensor]]:
-        if perturbation == "module_off":
-            return dict(token_levels), {}
-        instance_tokens, valid, memory_log = self.tokenizer(
-            appearance,
-            geometry,
-            quality,
-            observed,
-            mode="all_token_fusion",
-            perturbation=perturbation,
-        )
-        output: dict[int, torch.Tensor] = {}
-        logs: dict[str, torch.Tensor] = dict(memory_log)
-        for layer, tokens in token_levels.items():
-            key = str(int(layer))
-            if key not in self.all_token_fusions:
-                output[int(layer)] = tokens
-                continue
-            updated, current = self.all_token_fusions[key](tokens, instance_tokens, valid)
-            output[int(layer)] = updated
-            logs.update({f"layer_{key}_{name}": value for name, value in current.items()})
-        return output, logs
-
     def forward_patch_tokens(
         self,
-        token_levels: Mapping[int, torch.Tensor],
+        token_levels: dict[int, torch.Tensor],
         *,
         patch_start_idx: int,
         appearance: torch.Tensor,
         geometry: torch.Tensor,
         quality: torch.Tensor,
         observed: torch.Tensor,
-        mode: str,
-        perturbation: str = "aligned",
+        module_off: bool = False,
     ) -> tuple[dict[int, torch.Tensor], dict[str, torch.Tensor]]:
         """Update DPT patch tokens while preserving camera/register tokens."""
 
-        if perturbation == "module_off":
+        if module_off:
             return dict(token_levels), {}
-        if mode not in {
-            "patch_sam_only",
-            "patch_sam_geometry_strict",
-            "patch_sam_geometry_tracker_gate",
-        }:
-            raise ValueError(f"Unsupported patch-token mode: {mode}")
         instance_tokens, valid, memory_log = self.geometry_tokenizer(
             appearance,
             geometry,
             quality,
             observed,
-            mode=mode,
-            perturbation=perturbation,
+            branch="geometry",
         )
         start = int(patch_start_idx)
         output: dict[int, torch.Tensor] = {}
@@ -417,63 +346,6 @@ class InstancePoseAdapter(nn.Module):
             "token_dim": self.token_dim,
             "fusion_config": asdict(self.config),
         }
-
-
-def _perturb_observations(
-    appearance: torch.Tensor,
-    geometry: torch.Tensor,
-    quality: torch.Tensor,
-    observed: torch.Tensor,
-    *,
-    perturbation: str,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
-    if perturbation in {"aligned", "module_off"}:
-        return appearance, geometry, quality, observed, quality
-    if perturbation == "zero_appearance":
-        return torch.zeros_like(appearance), geometry, quality, observed, quality
-    if perturbation == "zero_geometry":
-        gate_quality = quality
-        geometry = torch.zeros_like(geometry)
-        quality = quality.clone()
-        # Preserve the aligned checkpoint's trusted-instance mask while
-        # removing geometry/static scores from the token itself.  This keeps
-        # zero-geometry distinct from module-off without admitting observations
-        # that the aligned branch rejected.
-        quality[..., 1:] = 0.0
-        return appearance, geometry, quality, observed, gate_quality
-    if perturbation == "shuffle_instance_ids":
-        if appearance.shape[2] <= 1 or appearance.shape[1] <= 1:
-            return appearance, geometry, quality, observed, quality
-        appearance = appearance.clone()
-        geometry = geometry.clone()
-        quality = quality.clone()
-        observed = observed.clone()
-        appearance[:, 1:] = torch.roll(appearance[:, 1:], shifts=1, dims=2)
-        geometry[:, 1:] = torch.roll(geometry[:, 1:], shifts=1, dims=2)
-        quality[:, 1:] = torch.roll(quality[:, 1:], shifts=1, dims=2)
-        observed[:, 1:] = torch.roll(observed[:, 1:], shifts=1, dims=2)
-        return appearance, geometry, quality, observed, quality
-    if perturbation == "shuffle_time":
-        if appearance.shape[1] <= 2:
-            return appearance, geometry, quality, observed, quality
-        appearance = appearance.clone()
-        geometry = geometry.clone()
-        quality = quality.clone()
-        observed = observed.clone()
-        appearance[:, 1:] = torch.roll(appearance[:, 1:], shifts=1, dims=1)
-        geometry[:, 1:] = torch.roll(geometry[:, 1:], shifts=1, dims=1)
-        quality[:, 1:] = torch.roll(quality[:, 1:], shifts=1, dims=1)
-        observed[:, 1:] = torch.roll(observed[:, 1:], shifts=1, dims=1)
-        return appearance, geometry, quality, observed, quality
-    raise ValueError(f"Unknown instance perturbation: {perturbation}")
-
-
 def _validate_observation_shapes(
     appearance: torch.Tensor,
     geometry: torch.Tensor,

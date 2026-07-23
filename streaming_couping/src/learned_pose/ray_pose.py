@@ -10,14 +10,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Mapping
 
 import torch
 
 from ..pose_evaluation import (
-    RayFitConfig,
     _distance_statistics,
-    _fit_ray_center,
     _prepare_pose_sequence,
     _prepare_ray_inputs,
     _ray_residuals,
@@ -44,100 +41,28 @@ class _VariantSpec:
     role: str
 
 
-_VARIANTS: Mapping[str, _VariantSpec] = {
-    "ray_baseline_pointmap": _VariantSpec(
-        "baseline",
-        "baseline",
-        "baseline_per_frame",
-        "all",
-        "point_to_ray_all",
-        "ray_geometry_baseline",
-    ),
-    "ray_refined_pointmap_baseline_rotation": _VariantSpec(
-        "refined",
-        "baseline",
-        "baseline_per_frame",
-        "all",
-        "point_to_ray_all",
-        "pointmap_source_ablation",
-    ),
-    "ray_refined_pointmap_refined_rotation": _VariantSpec(
-        "refined",
-        "refined",
-        "baseline_per_frame",
-        "all",
-        "point_to_ray_all",
-        "rotation_source_ablation",
-    ),
-    "ray_refined_pointmap_refined_rk": _VariantSpec(
-        "refined",
-        "refined",
-        "refined_per_frame",
-        "all",
-        "point_to_ray_all",
-        "per_frame_intrinsics_ablation",
-    ),
-    "ray_refined_pointmap_refined_rotation_reference_k": _VariantSpec(
-        "refined",
-        "refined",
-        "baseline_reference",
-        "all",
-        "point_to_ray_all",
-        "closed_form_strong_baseline",
-    ),
-    "ray_refined_pointmap_refined_rotation_reference_k_trimmed": _VariantSpec(
-        "refined",
-        "refined",
-        "baseline_reference",
-        "all",
-        "point_to_ray_trimmed",
-        "hard_trim_robustness_ablation",
-    ),
-    "ray_refined_pointmap_refined_rotation_reference_k_angular_huber": _VariantSpec(
-        "refined",
-        "refined",
-        "baseline_reference",
-        "all",
-        "angular_huber",
-        "deployable_v3_candidate",
-    ),
-    "ray_refined_pointmap_refined_rotation_reference_k_background": _VariantSpec(
-        "refined",
-        "refined",
-        "baseline_reference",
-        "background",
-        "angular_huber",
-        "spatial_scope_ablation",
-    ),
-    "ray_refined_pointmap_refined_rotation_reference_k_instances": _VariantSpec(
-        "refined",
-        "refined",
-        "baseline_reference",
-        "tracked_instances",
-        "angular_huber",
-        "deployable_v3_selected",
-    ),
-    "ray_refined_pointmap_refined_rotation_gt_k_oracle": _VariantSpec(
-        "refined",
-        "refined",
-        "gt_per_frame",
-        "all",
-        "angular_huber",
-        "intrinsics_oracle",
-    ),
-}
+FINAL_RAY_POSE_NAME = (
+    "ray_refined_pointmap_refined_rotation_reference_k_instances"
+)
+_FINAL_SPEC = _VariantSpec(
+    "refined",
+    "refined",
+    "baseline_reference",
+    "tracked_instances",
+    "angular_huber",
+    "deployable_v3_selected",
+)
 
 
 @torch.no_grad()
-def recover_ray_pose_variants(
+def recover_final_ray_pose(
     *,
     batch: dict,
     baseline_outputs: dict,
     refined_outputs: dict,
-    baseline_world_confidence: torch.Tensor,
     config: RayPoseConfig,
 ) -> list[RayPoseResult]:
-    """Run all configured analytic translation-recovery ablations."""
+    """Recover final camera translation from refined instance-region rays."""
 
     if int(baseline_outputs["pose_encoding"].shape[0]) != 1:
         raise ValueError("Ray-pose recovery currently requires a single-clip batch.")
@@ -152,22 +77,13 @@ def recover_ray_pose_variants(
     image_size = tuple(int(value) for value in batch["image_size"])
     frame_indices = [int(value) for value in batch["frame_indices"]]
     reference_index = int(batch["reference_sequence_index"])
-    baseline_w2c, baseline_intrinsics = pose_encoding_to_extri_intri(
+    _, baseline_intrinsics = pose_encoding_to_extri_intri(
         baseline_outputs["pose_encoding"].float(),
         image_size_hw=image_size,
     )
-    refined_w2c, refined_intrinsics = pose_encoding_to_extri_intri(
+    refined_w2c, _ = pose_encoding_to_extri_intri(
         refined_outputs["pose_encoding"].float(),
         image_size_hw=image_size,
-    )
-    _, target_intrinsics = pose_encoding_to_extri_intri(
-        batch["target_pose_encoding"].float(),
-        image_size_hw=image_size,
-    )
-    baseline_sequence = _prepare_pose_sequence(
-        baseline_w2c[0].detach().double().cpu(),
-        frame_indices=frame_indices,
-        source="baseline_camera_head",
     )
     refined_sequence = _prepare_pose_sequence(
         refined_w2c[0].detach().double().cpu(),
@@ -177,207 +93,170 @@ def recover_ray_pose_variants(
 
     baseline_points = _normalize_points(batch["baseline_world_points"])
     refined_points = _normalize_points(refined_outputs["world_points"])
-    baseline_confidence = _normalize_confidence(
-        baseline_world_confidence,
-        baseline_points,
-        name="baseline_world_confidence",
-    )
     refined_confidence = _normalize_confidence(
         refined_outputs["world_confidence"],
         refined_points,
         name="refined_world_confidence",
     )
-    spatial_masks = _ray_spatial_masks(batch, baseline_points)
-    ray_config = RayFitConfig(
-        trim_quantile=float(config.trim_quantile),
-        max_iterations=int(config.max_iterations),
-        min_points=int(config.min_points),
-        max_points=int(config.max_points),
-        max_condition_number=float(config.max_condition_number),
+    # Preserve the selected experiment's exact common-finite support: the
+    # instance mask is intersected with the frozen baseline pointmap validity,
+    # while the fitted coordinates come from the refined pointmap.
+    instance_mask = _tracked_instance_mask(batch, baseline_points)
+    intrinsics = (
+        baseline_intrinsics[0, reference_index]
+        .detach()
+        .double()
+        .cpu()[None]
+        .expand(len(frame_indices), -1, -1)
+        .clone()
     )
 
-    results = []
-    for name in config.variants:
-        spec = _VARIANTS[name]
-        points = baseline_points if spec.pointmap_source == "baseline" else refined_points
-        confidence = (
-            baseline_confidence
-            if spec.pointmap_source == "baseline"
-            else refined_confidence
-        )
-        pose_sequence = (
-            baseline_sequence if spec.pose_source == "baseline" else refined_sequence
-        )
-        intrinsics = _select_intrinsics(
-            spec.intrinsics_source,
-            baseline_intrinsics=baseline_intrinsics,
-            refined_intrinsics=refined_intrinsics,
-            target_intrinsics=target_intrinsics,
-            reference_index=reference_index,
-        )
-        centers = []
-        diagnostic_rows = []
-        for sequence_index, frame_index in enumerate(frame_indices):
-            fallback_center = pose_sequence.camera_centers[sequence_index]
-            rotation = pose_sequence.camera_to_world_rotation[sequence_index]
-            if config.preserve_reference and sequence_index == reference_index:
-                centers.append(fallback_center)
-                diagnostic_rows.append(
-                    _preserved_reference_row(
-                        name=name,
-                        spec=spec,
-                        sequence_index=sequence_index,
-                        frame_index=frame_index,
-                        center=fallback_center,
-                        intrinsics=intrinsics[sequence_index],
-                    )
-                )
-                continue
-
-            current_confidence = confidence[sequence_index].clone()
-            current_mask = spatial_masks[spec.spatial_scope][sequence_index]
-            current_confidence = torch.where(
-                current_mask,
-                current_confidence,
-                torch.full_like(current_confidence, float("-inf")),
-            )
-            sampled_points, directions, weights, candidate_points = _prepare_ray_inputs(
-                points[sequence_index],
-                current_confidence,
-                intrinsics[sequence_index],
-                rotation,
-                confidence_threshold=float(config.confidence_threshold),
-                max_points=int(config.max_points),
-            )
-            initial_point_stats = _distance_statistics(
-                _ray_residuals(sampled_points, directions, fallback_center)
-            )
-            initial_angular_stats = _distance_statistics(
-                _angular_residuals(sampled_points, directions, fallback_center)
-            )
-            if spec.fit_method == "angular_huber":
-                fit = _fit_angular_huber_center(
-                    sampled_points,
-                    directions,
-                    weights,
-                    candidate_points=candidate_points,
-                    fallback_center=fallback_center,
-                    config=config,
-                )
-            else:
-                raw_fit = _fit_ray_center(
-                    sampled_points,
-                    directions,
-                    weights,
-                    candidate_points=candidate_points,
-                    fallback_center=fallback_center,
-                    robust_trim=(spec.fit_method == "point_to_ray_trimmed"),
-                    config=ray_config,
-                )
-                fit = _fit_dict_from_ray_center(
-                    raw_fit,
-                    sampled_points,
-                    directions,
-                )
-
-            proposed_shift = float(
-                torch.linalg.vector_norm(fit["center"] - fallback_center)
-            )
-            accepted = bool(fit["solver_accepted"])
-            rejection_reasons = []
-            if not accepted:
-                rejection_reasons.append(str(fit["status"]))
-            if not math.isfinite(float(fit["point_residual_rmse"])):
-                accepted = False
-                rejection_reasons.append("non_finite_residual")
-            elif float(fit["point_residual_rmse"]) > float(config.max_residual_rmse):
-                accepted = False
-                rejection_reasons.append("ray_residual_above_limit")
-            if proposed_shift > float(config.max_center_shift):
-                accepted = False
-                rejection_reasons.append("center_shift_above_limit")
-            if accepted:
-                applied_center = fallback_center + float(config.blend) * (
-                    fit["center"] - fallback_center
-                )
-                policy_status = "accepted"
-            else:
-                applied_center = fallback_center
-                policy_status = ";".join(dict.fromkeys(rejection_reasons))
-            centers.append(applied_center)
+    name = FINAL_RAY_POSE_NAME
+    spec = _FINAL_SPEC
+    centers = []
+    diagnostic_rows = []
+    for sequence_index, frame_index in enumerate(frame_indices):
+        fallback_center = refined_sequence.camera_centers[sequence_index]
+        rotation = refined_sequence.camera_to_world_rotation[sequence_index]
+        if config.preserve_reference and sequence_index == reference_index:
+            centers.append(fallback_center)
             diagnostic_rows.append(
-                {
-                    "variant": name,
-                    "variant_role": spec.role,
-                    "pointmap_source": spec.pointmap_source,
-                    "pose_source": spec.pose_source,
-                    "intrinsics_source": spec.intrinsics_source,
-                    "spatial_scope": spec.spatial_scope,
-                    "fit_method": spec.fit_method,
-                    "sequence_index": sequence_index,
-                    "frame_index": frame_index,
-                    "is_reference": 0,
-                    "solver_accepted": int(bool(fit["solver_accepted"])),
-                    "fit_accepted": int(accepted),
-                    "fit_status": policy_status,
-                    "solver_status": fit["status"],
-                    "candidate_points": int(candidate_points),
-                    "sampled_points": int(sampled_points.shape[0]),
-                    "retained_points": int(fit["retained_points"]),
-                    "solve_iterations": int(fit["solve_iterations"]),
-                    "condition_number": float(fit["condition_number"]),
-                    "initial_point_ray_rmse_native": initial_point_stats["rmse"],
-                    "fitted_point_ray_rmse_native": float(fit["point_residual_rmse"]),
-                    "initial_angular_rmse": initial_angular_stats["rmse"],
-                    "fitted_angular_rmse": float(fit["angular_residual_rmse"]),
-                    "proposed_center_shift_native": proposed_shift,
-                    "applied_center_shift_native": float(
-                        torch.linalg.vector_norm(applied_center - fallback_center)
-                    ),
-                    "blend": float(config.blend),
-                    "fx": float(intrinsics[sequence_index, 0, 0]),
-                    "fy": float(intrinsics[sequence_index, 1, 1]),
-                    "cx": float(intrinsics[sequence_index, 0, 2]),
-                    "cy": float(intrinsics[sequence_index, 1, 2]),
-                    **_vector_fields("input_center_native", fallback_center),
-                    **_vector_fields("fitted_center_native", fit["center"]),
-                    **_vector_fields("applied_center_native", applied_center),
-                }
+                _preserved_reference_row(
+                    name=name,
+                    spec=spec,
+                    sequence_index=sequence_index,
+                    frame_index=frame_index,
+                    center=fallback_center,
+                    intrinsics=intrinsics[sequence_index],
+                )
             )
+            continue
 
-        centers_tensor = torch.stack(centers)
-        c2w_rotation = pose_sequence.camera_to_world_rotation
-        w2c_rotation = c2w_rotation.transpose(-1, -2)
-        w2c_translation = -torch.einsum(
-            "sij,sj->si",
-            w2c_rotation,
-            centers_tensor,
+        current_confidence = torch.where(
+            instance_mask[sequence_index],
+            refined_confidence[sequence_index],
+            torch.full_like(refined_confidence[sequence_index], float("-inf")),
         )
-        extrinsics = torch.cat(
-            [w2c_rotation, w2c_translation[..., None]],
-            dim=-1,
-        )[None].to(
-            device=refined_outputs["pose_encoding"].device,
-            dtype=torch.float32,
+        sampled_points, directions, weights, candidate_points = _prepare_ray_inputs(
+            refined_points[sequence_index],
+            current_confidence,
+            intrinsics[sequence_index],
+            rotation,
+            confidence_threshold=float(config.confidence_threshold),
+            max_points=int(config.max_points),
         )
-        encoded_intrinsics = intrinsics[None].to(
-            device=extrinsics.device,
-            dtype=torch.float32,
+        initial_point_stats = _distance_statistics(
+            _ray_residuals(sampled_points, directions, fallback_center)
         )
-        pose_encoding = extri_intri_to_pose_encoding(
-            extrinsics,
-            encoded_intrinsics,
-            image_size_hw=image_size,
+        initial_angular_stats = _distance_statistics(
+            _angular_residuals(sampled_points, directions, fallback_center)
         )
-        results.append(
-            RayPoseResult(
-                name=name,
-                role=spec.role,
-                pose_encoding=pose_encoding,
-                diagnostics=tuple(diagnostic_rows),
+        fit = _fit_angular_huber_center(
+            sampled_points,
+            directions,
+            weights,
+            candidate_points=candidate_points,
+            fallback_center=fallback_center,
+            config=config,
+        )
+
+        proposed_shift = float(
+            torch.linalg.vector_norm(fit["center"] - fallback_center)
+        )
+        accepted = bool(fit["solver_accepted"])
+        rejection_reasons = []
+        if not accepted:
+            rejection_reasons.append(str(fit["status"]))
+        if not math.isfinite(float(fit["point_residual_rmse"])):
+            accepted = False
+            rejection_reasons.append("non_finite_residual")
+        elif float(fit["point_residual_rmse"]) > float(config.max_residual_rmse):
+            accepted = False
+            rejection_reasons.append("ray_residual_above_limit")
+        if proposed_shift > float(config.max_center_shift):
+            accepted = False
+            rejection_reasons.append("center_shift_above_limit")
+        if accepted:
+            applied_center = fallback_center + float(config.blend) * (
+                fit["center"] - fallback_center
             )
+            policy_status = "accepted"
+        else:
+            applied_center = fallback_center
+            policy_status = ";".join(dict.fromkeys(rejection_reasons))
+        centers.append(applied_center)
+        diagnostic_rows.append(
+            {
+                "variant": name,
+                "variant_role": spec.role,
+                "pointmap_source": spec.pointmap_source,
+                "pose_source": spec.pose_source,
+                "intrinsics_source": spec.intrinsics_source,
+                "spatial_scope": spec.spatial_scope,
+                "fit_method": spec.fit_method,
+                "sequence_index": sequence_index,
+                "frame_index": frame_index,
+                "is_reference": 0,
+                "solver_accepted": int(bool(fit["solver_accepted"])),
+                "fit_accepted": int(accepted),
+                "fit_status": policy_status,
+                "solver_status": fit["status"],
+                "candidate_points": int(candidate_points),
+                "sampled_points": int(sampled_points.shape[0]),
+                "retained_points": int(fit["retained_points"]),
+                "solve_iterations": int(fit["solve_iterations"]),
+                "condition_number": float(fit["condition_number"]),
+                "initial_point_ray_rmse_native": initial_point_stats["rmse"],
+                "fitted_point_ray_rmse_native": float(fit["point_residual_rmse"]),
+                "initial_angular_rmse": initial_angular_stats["rmse"],
+                "fitted_angular_rmse": float(fit["angular_residual_rmse"]),
+                "proposed_center_shift_native": proposed_shift,
+                "applied_center_shift_native": float(
+                    torch.linalg.vector_norm(applied_center - fallback_center)
+                ),
+                "blend": float(config.blend),
+                "fx": float(intrinsics[sequence_index, 0, 0]),
+                "fy": float(intrinsics[sequence_index, 1, 1]),
+                "cx": float(intrinsics[sequence_index, 0, 2]),
+                "cy": float(intrinsics[sequence_index, 1, 2]),
+                **_vector_fields("input_center_native", fallback_center),
+                **_vector_fields("fitted_center_native", fit["center"]),
+                **_vector_fields("applied_center_native", applied_center),
+            }
         )
-    return results
+
+    centers_tensor = torch.stack(centers)
+    c2w_rotation = refined_sequence.camera_to_world_rotation
+    w2c_rotation = c2w_rotation.transpose(-1, -2)
+    w2c_translation = -torch.einsum(
+        "sij,sj->si",
+        w2c_rotation,
+        centers_tensor,
+    )
+    extrinsics = torch.cat(
+        [w2c_rotation, w2c_translation[..., None]],
+        dim=-1,
+    )[None].to(
+        device=refined_outputs["pose_encoding"].device,
+        dtype=torch.float32,
+    )
+    encoded_intrinsics = intrinsics[None].to(
+        device=extrinsics.device,
+        dtype=torch.float32,
+    )
+    pose_encoding = extri_intri_to_pose_encoding(
+        extrinsics,
+        encoded_intrinsics,
+        image_size_hw=image_size,
+    )
+    return [
+        RayPoseResult(
+            name=name,
+            role=spec.role,
+            pose_encoding=pose_encoding,
+            diagnostics=tuple(diagnostic_rows),
+        )
+    ]
 
 
 def _normalize_points(value: torch.Tensor) -> torch.Tensor:
@@ -410,7 +289,7 @@ def _normalize_confidence(
     return confidence
 
 
-def _ray_spatial_masks(batch: dict, points: torch.Tensor) -> dict[str, torch.Tensor]:
+def _tracked_instance_mask(batch: dict, points: torch.Tensor) -> torch.Tensor:
     finite = torch.isfinite(points).all(dim=-1)
     masks = batch.get("tracking_masks_stream")
     if masks is None:
@@ -425,51 +304,7 @@ def _ray_spatial_masks(batch: dict, points: torch.Tensor) -> dict[str, torch.Ten
                 "Tracking masks and ray pointmap resolution disagree: "
                 f"{tuple(instance_union.shape)} vs {tuple(finite.shape)}."
             )
-    return {
-        "all": finite,
-        "background": finite & ~instance_union,
-        "tracked_instances": finite & instance_union,
-    }
-
-
-def _select_intrinsics(
-    source: str,
-    *,
-    baseline_intrinsics: torch.Tensor,
-    refined_intrinsics: torch.Tensor,
-    target_intrinsics: torch.Tensor,
-    reference_index: int,
-) -> torch.Tensor:
-    baseline = baseline_intrinsics[0].detach().double().cpu()
-    refined = refined_intrinsics[0].detach().double().cpu()
-    target = target_intrinsics[0].detach().double().cpu()
-    if source == "baseline_per_frame":
-        return baseline
-    if source == "refined_per_frame":
-        return refined
-    if source == "baseline_reference":
-        return baseline[int(reference_index)][None].expand_as(baseline).clone()
-    if source == "gt_per_frame":
-        return target
-    raise ValueError(f"Unknown intrinsics source: {source}")
-
-
-def _fit_dict_from_ray_center(
-    fit,
-    points: torch.Tensor,
-    directions: torch.Tensor,
-) -> dict:
-    angular = _distance_statistics(_angular_residuals(points, directions, fit.center))
-    return {
-        "center": fit.center,
-        "solver_accepted": bool(fit.fit_accepted),
-        "status": fit.status,
-        "retained_points": int(fit.retained_points),
-        "solve_iterations": int(fit.solve_iterations),
-        "condition_number": float(fit.condition_number),
-        "point_residual_rmse": float(fit.all_residual_rmse),
-        "angular_residual_rmse": angular["rmse"],
-    }
+    return finite & instance_union
 
 
 def _fit_angular_huber_center(

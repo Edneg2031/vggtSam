@@ -20,13 +20,13 @@ from ..instance_point_cloud import (
 from ..pose_evaluation import _prepare_pose_sequence
 from .cache import cache_path, load_feature_cache
 from .config import LearnedPoseConfig
+from .ray_pose import FINAL_RAY_POSE_NAME
 
 
 @torch.no_grad()
 def export_final_ray_pose_outputs(
     config: LearnedPoseConfig,
     *,
-    variant: str | None = None,
     output_dir: str | Path | None = None,
 ) -> Path:
     """Export native/development-metric poses and colored PLY files.
@@ -38,11 +38,7 @@ def export_final_ray_pose_outputs(
     """
 
     ray_config = config.evaluation.ray_pose
-    selected = str(variant or ray_config.final_variant)
-    if selected not in ray_config.variants:
-        raise ValueError(
-            f"Export variant {selected!r} is not present in ray_pose.variants."
-        )
+    selected = FINAL_RAY_POSE_NAME
     predictions_path = config.output_dir / "evaluation" / "ray_pose_predictions.pt"
     artifact = _torch_load(predictions_path)
     predictions = artifact.get("predictions")

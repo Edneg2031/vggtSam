@@ -78,7 +78,7 @@ def _parse_args() -> argparse.Namespace:
 def _read_pose_series(path: Path) -> dict[str, PoseSeries]:
     if not path.exists():
         raise FileNotFoundError(
-            f"Missing {path}. Run commands_instance_ray_pose_v3_export.txt first."
+            f"Missing {path}. Run commands_final_joint_pointcloud_pose.txt first."
         )
     grouped: dict[str, list[tuple[int, int, np.ndarray]]] = {
         method: [] for method in SERIES

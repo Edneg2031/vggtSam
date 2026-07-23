@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cache, train, and evaluate persistent-instance StreamVGGT pose fusion."""
+"""Run the final persistent-instance pointcloud and camera-pose method."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ from dataclasses import replace
 from streaming_couping.src.learned_pose.cache import build_feature_caches
 from streaming_couping.src.learned_pose.config import load_learned_pose_config
 from streaming_couping.src.learned_pose.pipeline import (
-    evaluate_all_modes,
-    train_all_modes,
+    evaluate_final_method,
+    train_final_adapter,
 )
 from streaming_couping.src.learned_pose.export import export_final_ray_pose_outputs
 
@@ -37,15 +37,14 @@ def main() -> None:
     if args.stage in {"all", "cache"}:
         build_feature_caches(config)
     if args.stage in {"all", "train"}:
-        train_all_modes(config)
+        train_final_adapter(config)
     if args.stage in {"all", "eval"}:
-        evaluate_all_modes(config)
+        evaluate_final_method(config)
     if args.stage == "ray":
-        evaluate_all_modes(config, ray_pose_only=True)
+        evaluate_final_method(config, ray_pose_only=True)
     if args.stage == "export":
         path = export_final_ray_pose_outputs(
             config,
-            variant=args.ray_variant,
             output_dir=args.export_output_dir,
         )
         print(f"exported final instance-ray pose and point clouds to {path}")
@@ -55,7 +54,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
-        default="streaming_couping/configs/instance_token_pose.yaml",
+        default="streaming_couping/configs/final_joint_pointcloud_pose.yaml",
     )
     parser.add_argument(
         "--stage",
@@ -66,10 +65,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--geometry-device")
     parser.add_argument("--training-device")
     parser.add_argument("--rebuild-cache", action="store_true")
-    parser.add_argument(
-        "--ray-variant",
-        help="Override evaluation.ray_pose.final_variant for export.",
-    )
     parser.add_argument(
         "--export-output-dir",
         help="Override the final pose/PLY output directory.",

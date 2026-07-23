@@ -26,7 +26,6 @@ class ClipConfig:
 class FeatureConfig:
     cache_dir: Path
     rebuild: bool = False
-    cache_all_token_levels: bool = True
     sam_source: str = "detector_fpn2"
     sam_resolution: int = 1008
     sam_grid: tuple[int, int] = (72, 72)
@@ -64,12 +63,6 @@ class LossConfig:
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    modes: tuple[str, ...] = (
-        "camera_geometry_only",
-        "camera_sam_only",
-        "camera_token_fusion",
-        "all_token_fusion",
-    )
     epochs: int = 20
     repeats_per_epoch: int = 8
     learning_rate: float = 1e-4
@@ -84,25 +77,9 @@ class TrainingConfig:
 class RayPoseConfig:
     """Deployable pointmap-to-camera translation recovery at evaluation time."""
 
-    enabled: bool = False
-    source_mode: str = "decoupled_dual_branch"
-    source_perturbation: str = "aligned"
-    variants: tuple[str, ...] = (
-        "ray_baseline_pointmap",
-        "ray_refined_pointmap_baseline_rotation",
-        "ray_refined_pointmap_refined_rotation",
-        "ray_refined_pointmap_refined_rk",
-        "ray_refined_pointmap_refined_rotation_reference_k",
-        "ray_refined_pointmap_refined_rotation_reference_k_trimmed",
-        "ray_refined_pointmap_refined_rotation_reference_k_angular_huber",
-        "ray_refined_pointmap_refined_rotation_reference_k_background",
-        "ray_refined_pointmap_refined_rotation_reference_k_instances",
-        "ray_refined_pointmap_refined_rotation_gt_k_oracle",
-    )
     confidence_threshold: float = 0.30
     min_points: int = 1024
     max_points: int = 65536
-    trim_quantile: float = 0.80
     max_iterations: int = 6
     max_condition_number: float = 1e8
     max_center_shift: float = 0.75
@@ -111,9 +88,6 @@ class RayPoseConfig:
     angular_huber_delta: float = 0.02
     angular_min_range: float = 0.05
     preserve_reference: bool = True
-    final_variant: str = (
-        "ray_refined_pointmap_refined_rotation_reference_k_instances"
-    )
     export_confidence_threshold: float = 0.30
     export_max_full_scene_points: int = 1_000_000
     export_max_instance_points: int = 250_000
@@ -124,10 +98,6 @@ class EvaluationConfig:
     perturbations: tuple[str, ...] = (
         "aligned",
         "module_off",
-        "zero_appearance",
-        "zero_geometry",
-        "shuffle_instance_ids",
-        "shuffle_time",
     )
     strict_equivalence: bool = True
     ray_pose: RayPoseConfig = RayPoseConfig()
@@ -149,72 +119,12 @@ class LearnedPoseConfig:
     evaluation: EvaluationConfig
 
 
-VALID_MODES = {
-    "baseline",
-    "camera_geometry_only",
-    "camera_sam_only",
-    "camera_token_fusion",
-    "all_token_fusion",
-    "patch_sam_only",
-    "patch_sam_geometry_strict",
-    "patch_sam_geometry_tracker_gate",
-    "decoupled_dual_branch",
-}
+FINAL_MODE = "decoupled_dual_branch"
 
 VALID_PERTURBATIONS = {
     "aligned",
     "module_off",
-    "zero_appearance",
-    "zero_geometry",
-    "shuffle_instance_ids",
-    "shuffle_time",
-    "pose_branch_off",
-    "geometry_branch_off",
 }
-
-POSE_MODES = frozenset(
-    {
-        "camera_geometry_only",
-        "camera_sam_only",
-        "camera_token_fusion",
-        "all_token_fusion",
-        "decoupled_dual_branch",
-    }
-)
-
-PATCH_MODES = frozenset(
-    {
-        "patch_sam_only",
-        "patch_sam_geometry_strict",
-        "patch_sam_geometry_tracker_gate",
-    }
-)
-
-GEOMETRY_MODES = frozenset(
-    {
-        "all_token_fusion",
-        "decoupled_dual_branch",
-        *PATCH_MODES,
-    }
-)
-
-V2_MODES = frozenset({"decoupled_dual_branch", *PATCH_MODES})
-
-
-RAY_POSE_VARIANTS = frozenset(
-    {
-        "ray_baseline_pointmap",
-        "ray_refined_pointmap_baseline_rotation",
-        "ray_refined_pointmap_refined_rotation",
-        "ray_refined_pointmap_refined_rk",
-        "ray_refined_pointmap_refined_rotation_reference_k",
-        "ray_refined_pointmap_refined_rotation_reference_k_trimmed",
-        "ray_refined_pointmap_refined_rotation_reference_k_angular_huber",
-        "ray_refined_pointmap_refined_rotation_reference_k_background",
-        "ray_refined_pointmap_refined_rotation_reference_k_instances",
-        "ray_refined_pointmap_refined_rotation_gt_k_oracle",
-    }
-)
 
 
 def load_learned_pose_config(path: str | Path) -> LearnedPoseConfig:
@@ -246,7 +156,6 @@ def load_learned_pose_config(path: str | Path) -> LearnedPoseConfig:
         features=FeatureConfig(
             cache_dir=_path(features.get("cache_dir"), source.parent),
             rebuild=bool(features.get("rebuild", False)),
-            cache_all_token_levels=bool(features.get("cache_all_token_levels", True)),
             sam_source=str(features.get("sam_source", "detector_fpn2")),
             sam_resolution=int(features.get("sam_resolution", 1008)),
             sam_grid=_pair(features.get("sam_grid", [72, 72]), "features.sam_grid"),
@@ -278,7 +187,6 @@ def load_learned_pose_config(path: str | Path) -> LearnedPoseConfig:
             rigid_trim_quantile=float(loss.get("rigid_trim_quantile", 0.70)),
         ),
         training=TrainingConfig(
-            modes=tuple(str(v) for v in training.get("modes", list(TrainingConfig().modes))),
             epochs=int(training.get("epochs", 20)),
             repeats_per_epoch=int(training.get("repeats_per_epoch", 8)),
             learning_rate=float(training.get("learning_rate", 1e-4)),
@@ -298,26 +206,11 @@ def load_learned_pose_config(path: str | Path) -> LearnedPoseConfig:
             ),
             strict_equivalence=bool(evaluation.get("strict_equivalence", True)),
             ray_pose=RayPoseConfig(
-                enabled=bool(ray_pose.get("enabled", False)),
-                source_mode=str(
-                    ray_pose.get("source_mode", "decoupled_dual_branch")
-                ),
-                source_perturbation=str(
-                    ray_pose.get("source_perturbation", "aligned")
-                ),
-                variants=tuple(
-                    str(value)
-                    for value in ray_pose.get(
-                        "variants",
-                        list(RayPoseConfig().variants),
-                    )
-                ),
                 confidence_threshold=float(
                     ray_pose.get("confidence_threshold", 0.30)
                 ),
                 min_points=int(ray_pose.get("min_points", 1024)),
                 max_points=int(ray_pose.get("max_points", 65536)),
-                trim_quantile=float(ray_pose.get("trim_quantile", 0.80)),
                 max_iterations=int(ray_pose.get("max_iterations", 6)),
                 max_condition_number=float(
                     ray_pose.get("max_condition_number", 1e8)
@@ -337,12 +230,6 @@ def load_learned_pose_config(path: str | Path) -> LearnedPoseConfig:
                 ),
                 preserve_reference=bool(
                     ray_pose.get("preserve_reference", True)
-                ),
-                final_variant=str(
-                    ray_pose.get(
-                        "final_variant",
-                        RayPoseConfig().final_variant,
-                    )
                 ),
                 export_confidence_threshold=float(
                     ray_pose.get("export_confidence_threshold", 0.30)
@@ -386,46 +273,20 @@ def _parse_clip(value: dict[str, Any], base: Path) -> ClipConfig:
 
 
 def _validate(config: LearnedPoseConfig) -> None:
-    bad_modes = sorted(set(config.training.modes) - VALID_MODES)
-    if bad_modes:
-        raise ValueError(f"Unknown training modes: {bad_modes}")
-    if "baseline" in config.training.modes:
-        raise ValueError("baseline has no trainable parameters and must not be in training.modes.")
     bad_perturbations = sorted(set(config.evaluation.perturbations) - VALID_PERTURBATIONS)
     if bad_perturbations:
         raise ValueError(f"Unknown evaluation perturbations: {bad_perturbations}")
     ray_pose = config.evaluation.ray_pose
-    bad_ray_variants = sorted(set(ray_pose.variants) - RAY_POSE_VARIANTS)
-    if bad_ray_variants:
-        raise ValueError(f"Unknown ray-pose variants: {bad_ray_variants}")
-    if ray_pose.final_variant not in RAY_POSE_VARIANTS:
-        raise ValueError(
-            f"Unknown final ray-pose variant: {ray_pose.final_variant!r}"
-        )
-    if ray_pose.enabled and ray_pose.final_variant not in ray_pose.variants:
-        raise ValueError(
-            "evaluation.ray_pose.final_variant must also be listed in variants."
-        )
     if ray_pose.export_confidence_threshold < 0.0:
         raise ValueError("Ray-pose export confidence threshold must be nonnegative.")
     if ray_pose.export_max_full_scene_points < 1:
         raise ValueError("Ray-pose full-scene export limit must be positive.")
     if ray_pose.export_max_instance_points < 1:
         raise ValueError("Ray-pose instance export limit must be positive.")
-    if ray_pose.enabled and ray_pose.source_mode not in config.training.modes:
-        raise ValueError(
-            "evaluation.ray_pose.source_mode must be present in training.modes."
-        )
-    if ray_pose.source_perturbation not in VALID_PERTURBATIONS:
-        raise ValueError(
-            "evaluation.ray_pose.source_perturbation is not a valid perturbation."
-        )
     if not 0.0 <= ray_pose.confidence_threshold:
         raise ValueError("ray_pose.confidence_threshold must be non-negative.")
     if ray_pose.min_points < 3 or ray_pose.max_points < ray_pose.min_points:
         raise ValueError("ray_pose point limits are invalid.")
-    if not 0.0 < ray_pose.trim_quantile < 1.0:
-        raise ValueError("ray_pose.trim_quantile must be in (0,1).")
     if ray_pose.max_iterations < 1:
         raise ValueError("ray_pose.max_iterations must be positive.")
     if ray_pose.max_condition_number <= 1.0:

@@ -26,9 +26,7 @@ from ..pose_evaluation import (
 )
 from .cache import cache_path, load_feature_cache
 from .config import (
-    GEOMETRY_MODES,
-    PATCH_MODES,
-    V2_MODES,
+    FINAL_MODE,
     ClipConfig,
     LearnedPoseConfig,
 )
@@ -39,10 +37,10 @@ from .geometry_metrics import (
 )
 from .losses import compute_training_loss, instance_rigid_losses
 from .model import InstancePoseAdapter
-from .ray_pose import recover_ray_pose_variants
+from .ray_pose import FINAL_RAY_POSE_NAME, recover_final_ray_pose
 
 
-def train_all_modes(config: LearnedPoseConfig) -> None:
+def train_final_adapter(config: LearnedPoseConfig) -> None:
     train_clips = [
         clip for clip in config.clips if clip.split.lower() == "train"
     ]
@@ -61,10 +59,10 @@ def train_all_modes(config: LearnedPoseConfig) -> None:
     )
     frozen = _load_frozen_streamvggt(config, device=config.training.device)
     config.output_dir.mkdir(parents=True, exist_ok=True)
-    for mode in config.training.modes:
-        if mode in GEOMETRY_MODES and "token_levels" not in first:
+    for mode in (FINAL_MODE,):
+        if "token_levels" not in first:
             raise RuntimeError(
-                f"{mode} requires features.cache_all_token_levels=true."
+                f"{mode} requires a complete final-method feature cache."
             )
         print(f"training learned pose mode={mode}")
         _seed_everything(config.training.seed)
@@ -196,15 +194,11 @@ def train_all_modes(config: LearnedPoseConfig) -> None:
 
 
 @torch.no_grad()
-def evaluate_all_modes(
+def evaluate_final_method(
     config: LearnedPoseConfig,
     *,
     ray_pose_only: bool = False,
 ) -> None:
-    if ray_pose_only and not config.evaluation.ray_pose.enabled:
-        raise ValueError(
-            "--stage ray requires evaluation.ray_pose.enabled=true."
-        )
     evaluation_clips = [
         clip
         for clip in config.clips
@@ -282,11 +276,7 @@ def evaluate_all_modes(
             evaluation_metadata=evaluation_metadata,
         )
 
-    evaluation_modes = (
-        (config.evaluation.ray_pose.source_mode,)
-        if ray_pose_only
-        else config.training.modes
-    )
+    evaluation_modes = (FINAL_MODE,)
     for mode in evaluation_modes:
         checkpoint_path = config.output_dir / "checkpoints" / mode / "checkpoint_best.pt"
         if not checkpoint_path.exists():
@@ -304,16 +294,11 @@ def evaluate_all_modes(
             evaluation_indices = _evaluation_sequence_indices(clip)
             evaluation_metadata = _evaluation_metadata(clip)
             perturbations = (
-                (config.evaluation.ray_pose.source_perturbation,)
+                ("aligned",)
                 if ray_pose_only
                 else config.evaluation.perturbations
             )
             for perturbation in perturbations:
-                if (
-                    perturbation in {"pose_branch_off", "geometry_branch_off"}
-                    and mode != "decoupled_dual_branch"
-                ):
-                    continue
                 outputs = _forward_mode(
                     frozen,
                     adapter,
@@ -345,15 +330,7 @@ def evaluate_all_modes(
                     evaluation_metadata=evaluation_metadata,
                 )
                 ray_config = config.evaluation.ray_pose
-                if (
-                    ray_config.enabled
-                    and mode == ray_config.source_mode
-                    and perturbation == ray_config.source_perturbation
-                ):
-                    baseline_world_confidence = _decode_baseline_world_confidence(
-                        frozen,
-                        batch,
-                    )
+                if mode == FINAL_MODE and perturbation == "aligned":
                     control_metadata = {
                         **evaluation_metadata,
                         "ray_pose_role": "raw_baseline_control",
@@ -387,11 +364,10 @@ def evaluate_all_modes(
                             "ray_pose_role": "learned_pose_control",
                         },
                     )
-                    ray_results = recover_ray_pose_variants(
+                    ray_results = recover_final_ray_pose(
                         batch=batch,
                         baseline_outputs=baseline_outputs,
                         refined_outputs=outputs,
-                        baseline_world_confidence=baseline_world_confidence,
                         config=ray_config,
                     )
                     clip_predictions = {
@@ -498,19 +474,18 @@ def evaluate_all_modes(
                     )
                     depth_difference = 0.0
                     pointmap_difference = 0.0
-                    if mode in GEOMETRY_MODES:
-                        depth_difference = float(
-                            (outputs["depth"] - batch["baseline_depth"]).abs().max().cpu()
+                    depth_difference = float(
+                        (outputs["depth"] - batch["baseline_depth"]).abs().max().cpu()
+                    )
+                    pointmap_difference = float(
+                        (
+                            outputs["world_points"]
+                            - batch["baseline_world_points"]
                         )
-                        pointmap_difference = float(
-                            (
-                                outputs["world_points"]
-                                - batch["baseline_world_points"]
-                            )
-                            .abs()
-                            .max()
-                            .cpu()
-                        )
+                        .abs()
+                        .max()
+                        .cpu()
+                    )
                     passed = (
                         token_difference == 0.0
                         and pose_difference == 0.0
@@ -556,53 +531,47 @@ def evaluate_all_modes(
             output / "depth_summary.csv",
             summarize_depth_metrics(depth_frame_rows),
         )
-    if config.evaluation.ray_pose.enabled:
-        expected_clips = {clip.name for clip in evaluation_clips}
-        missing_clips = sorted(expected_clips - ray_completed_clips)
-        if missing_clips:
-            raise RuntimeError(
-                "Ray-pose evaluation did not run for clips: "
-                f"{missing_clips}. Check the configured source checkpoint/mode."
-            )
-        _write_csv(output / "ray_pose_summary.csv", ray_summary_rows)
-        _write_csv(output / "ray_pose_frame_metrics.csv", ray_frame_rows)
-        _write_csv(output / "ray_pose_rpe.csv", ray_rpe_rows)
-        _write_csv(output / "ray_pose_pair_metrics.csv", ray_pair_rows)
-        _write_csv(output / "ray_pose_pair_summary.csv", ray_pair_summary_rows)
-        _write_csv(output / "ray_pose_fit_diagnostics.csv", ray_fit_rows)
-        _write_csv(
-            output / "ray_pose_compact_summary.csv",
-            _compact_ray_pose_summary(
-                ray_summary_rows,
-                ray_pair_summary_rows,
-                ray_fit_rows,
-            ),
+    expected_clips = {clip.name for clip in evaluation_clips}
+    missing_clips = sorted(expected_clips - ray_completed_clips)
+    if missing_clips:
+        raise RuntimeError(
+            "Final ray-pose evaluation did not run for clips: "
+            f"{missing_clips}. Check the final checkpoint."
         )
-        torch.save(
-            {
-                "config": str(config.source_path),
-                "source_mode": config.evaluation.ray_pose.source_mode,
-                "source_perturbation": (
-                    config.evaluation.ray_pose.source_perturbation
-                ),
-                "final_variant": config.evaluation.ray_pose.final_variant,
-                "predictions": ray_pose_predictions,
-            },
-            output / "ray_pose_predictions.pt",
-        )
+    _write_csv(output / "ray_pose_summary.csv", ray_summary_rows)
+    _write_csv(output / "ray_pose_frame_metrics.csv", ray_frame_rows)
+    _write_csv(output / "ray_pose_rpe.csv", ray_rpe_rows)
+    _write_csv(output / "ray_pose_pair_metrics.csv", ray_pair_rows)
+    _write_csv(output / "ray_pose_pair_summary.csv", ray_pair_summary_rows)
+    _write_csv(output / "ray_pose_fit_diagnostics.csv", ray_fit_rows)
+    _write_csv(
+        output / "ray_pose_compact_summary.csv",
+        _compact_ray_pose_summary(
+            ray_summary_rows,
+            ray_pair_summary_rows,
+            ray_fit_rows,
+        ),
+    )
+    torch.save(
+        {
+            "config": str(config.source_path),
+            "source_mode": "decoupled_dual_branch",
+            "source_perturbation": "aligned",
+            "final_variant": FINAL_RAY_POSE_NAME,
+            "predictions": ray_pose_predictions,
+        },
+        output / "ray_pose_predictions.pt",
+    )
     metadata = {
         "config": str(config.source_path),
-        "causal_control": (
-            "All zero/shuffle perturbations are inference-time tests of one aligned checkpoint; "
-            "they are not separately trained shuffled models."
-        ),
+        "causal_control": "module_off must exactly reproduce frozen StreamVGGT.",
         "sam_role": (
             "SAM3 supplies recovered masks, persistent IDs, scores, and frozen pooled appearance; "
             "no fused token is written into SAM3."
         ),
         "gt_role": (
-            "pose/depth/pointmap training supervision and evaluation only; target "
-            "intrinsics are additionally read by the explicitly named GT-K oracle row"
+            "pose/depth/pointmap training supervision and evaluation only; "
+            "the deployable final solver never reads target intrinsics"
         ),
         "geometry_evaluation": (
             "All pointmap modes reuse the baseline point-head reference-frame Sim(3); "
@@ -616,18 +585,13 @@ def evaluate_all_modes(
             "independent pose and geometry tokenizers, attentions, gates, and projections."
         ),
         "instance_ray_pose_v3": {
-            "enabled": config.evaluation.ray_pose.enabled,
-            "source_mode": config.evaluation.ray_pose.source_mode,
-            "source_perturbation": config.evaluation.ray_pose.source_perturbation,
-            "final_variant": config.evaluation.ray_pose.final_variant,
-            "variants": list(config.evaluation.ray_pose.variants),
+            "source_mode": "decoupled_dual_branch",
+            "source_perturbation": "aligned",
+            "final_variant": FINAL_RAY_POSE_NAME,
             "causal_constraint": (
                 "Each requested camera center is solved from its current causal pointmap "
                 "and rays. Reference-frame predicted intrinsics are the only cross-frame "
                 "camera calibration used; no evaluation GT enters a deployable variant."
-            ),
-            "oracle_constraint": (
-                "Only the explicitly named gt_k_oracle variant reads target intrinsics."
             ),
         },
         "evaluation_splits": [
@@ -682,20 +646,23 @@ def _load_adapter_checkpoint(
     mode: str,
 ) -> None:
     checkpoint_mode = str(checkpoint.get("mode", mode))
-    if checkpoint_mode in V2_MODES:
-        adapter.load_state_dict(checkpoint["adapter"], strict=True)
-        return
+    if checkpoint_mode != FINAL_MODE:
+        raise RuntimeError(
+            f"Checkpoint mode {checkpoint_mode!r} is not the final "
+            "decoupled_dual_branch method."
+        )
     incompatible = adapter.load_state_dict(checkpoint["adapter"], strict=False)
-    allowed_missing = ("geometry_tokenizer.", "patch_token_fusions.")
-    bad_missing = [
+    # Existing best checkpoints were written before code cleanup and contain
+    # the retired all-token ablation. Ignore only those legacy extra weights.
+    bad_unexpected = [
         key
-        for key in incompatible.missing_keys
-        if not key.startswith(allowed_missing)
+        for key in incompatible.unexpected_keys
+        if not key.startswith("all_token_fusions.")
     ]
-    if bad_missing or incompatible.unexpected_keys:
+    if incompatible.missing_keys or bad_unexpected:
         raise RuntimeError(
             "Checkpoint is incompatible with the instance adapter: "
-            f"missing={bad_missing}, unexpected={incompatible.unexpected_keys}."
+            f"missing={incompatible.missing_keys}, unexpected={bad_unexpected}."
         )
 
 
@@ -707,109 +674,20 @@ def _forward_mode(
     mode: str,
     perturbation: str,
 ) -> dict[str, torch.Tensor | dict]:
-    if mode == "all_token_fusion":
-        token_levels = _token_level_mapping(batch)
-        updated, diagnostics = adapter.forward_all_tokens(
-            token_levels,
-            appearance=batch["appearance"],
-            geometry=batch["geometry"],
-            quality=batch["quality"],
-            observed=batch["observed"],
-            perturbation=perturbation,
+    if mode != FINAL_MODE:
+        raise ValueError(f"Only the final decoupled method is supported, got {mode!r}.")
+    if perturbation not in {"aligned", "module_off"}:
+        raise ValueError(
+            f"Only aligned/module_off execution is supported, got {perturbation!r}."
         )
-        final_layer = max(updated)
-        camera_hidden = updated[final_layer][:, :, 0]
-        pose_delta = _decode_streaming_camera_delta(
-            frozen.camera_head,
-            batch["camera_hidden"],
-            updated[final_layer][:, :, 0],
-        )
-        pose_encoding = batch["baseline_pose_encoding"] + pose_delta
-        return _geometry_head_outputs(
-            frozen,
-            batch,
-            updated,
-            pose_encoding=pose_encoding,
-            camera_hidden=camera_hidden,
-            diagnostics=diagnostics,
-        )
-    if mode in PATCH_MODES:
-        token_levels = _token_level_mapping(batch)
-        updated, diagnostics = adapter.forward_patch_tokens(
-            token_levels,
-            patch_start_idx=int(batch["patch_start_idx"]),
-            appearance=batch["appearance"],
-            geometry=batch["geometry"],
-            quality=batch["quality"],
-            observed=batch["observed"],
-            mode=mode,
-            perturbation=perturbation,
-        )
-        return _geometry_head_outputs(
-            frozen,
-            batch,
-            updated,
-            pose_encoding=batch["baseline_pose_encoding"],
-            camera_hidden=batch["camera_hidden"],
-            diagnostics=diagnostics,
-        )
-    if mode == "decoupled_dual_branch":
-        pose_perturbation = perturbation
-        geometry_perturbation = perturbation
-        if perturbation == "pose_branch_off":
-            pose_perturbation = "module_off"
-            geometry_perturbation = "aligned"
-        elif perturbation == "geometry_branch_off":
-            pose_perturbation = "aligned"
-            geometry_perturbation = "module_off"
-        camera_hidden, pose_diagnostics = adapter.forward_camera(
-            batch["camera_hidden"],
-            appearance=batch["appearance"],
-            geometry=batch["geometry"],
-            quality=batch["quality"],
-            observed=batch["observed"],
-            mode="camera_sam_only",
-            perturbation=pose_perturbation,
-        )
-        pose_delta = _decode_streaming_camera_delta(
-            frozen.camera_head,
-            batch["camera_hidden"],
-            camera_hidden,
-        )
-        pose_encoding = batch["baseline_pose_encoding"] + pose_delta
-        updated, geometry_diagnostics = adapter.forward_patch_tokens(
-            _token_level_mapping(batch),
-            patch_start_idx=int(batch["patch_start_idx"]),
-            appearance=batch["appearance"],
-            geometry=batch["geometry"],
-            quality=batch["quality"],
-            observed=batch["observed"],
-            mode="patch_sam_geometry_tracker_gate",
-            perturbation=geometry_perturbation,
-        )
-        diagnostics = {
-            **{f"pose_{key}": value for key, value in pose_diagnostics.items()},
-            **{
-                f"geometry_{key}": value
-                for key, value in geometry_diagnostics.items()
-            },
-        }
-        return _geometry_head_outputs(
-            frozen,
-            batch,
-            updated,
-            pose_encoding=pose_encoding,
-            camera_hidden=camera_hidden,
-            diagnostics=diagnostics,
-        )
-    camera_hidden, diagnostics = adapter.forward_camera(
+    module_off = perturbation == "module_off"
+    camera_hidden, pose_diagnostics = adapter.forward_camera(
         batch["camera_hidden"],
         appearance=batch["appearance"],
         geometry=batch["geometry"],
         quality=batch["quality"],
         observed=batch["observed"],
-        mode=mode,
-        perturbation=perturbation,
+        module_off=module_off,
     )
     pose_delta = _decode_streaming_camera_delta(
         frozen.camera_head,
@@ -817,12 +695,30 @@ def _forward_mode(
         camera_hidden,
     )
     pose_encoding = batch["baseline_pose_encoding"] + pose_delta
-    return {
-        "pose_encoding": pose_encoding,
-        "camera_hidden": camera_hidden,
-        "residual_mean_square": diagnostics["residual_mean_square"],
-        "diagnostics": diagnostics,
+    updated, geometry_diagnostics = adapter.forward_patch_tokens(
+        _token_level_mapping(batch),
+        patch_start_idx=int(batch["patch_start_idx"]),
+        appearance=batch["appearance"],
+        geometry=batch["geometry"],
+        quality=batch["quality"],
+        observed=batch["observed"],
+        module_off=module_off,
+    )
+    diagnostics = {
+        **{f"pose_{key}": value for key, value in pose_diagnostics.items()},
+        **{
+            f"geometry_{key}": value
+            for key, value in geometry_diagnostics.items()
+        },
     }
+    return _geometry_head_outputs(
+        frozen,
+        batch,
+        updated,
+        pose_encoding=pose_encoding,
+        camera_hidden=camera_hidden,
+        diagnostics=diagnostics,
+    )
 
 
 def _token_level_mapping(batch: dict) -> dict[int, torch.Tensor]:
@@ -879,31 +775,6 @@ def _geometry_head_outputs(
         "residual_mean_square": residual_mean_square,
         "diagnostics": dict(diagnostics),
     }
-
-
-def _decode_baseline_world_confidence(frozen, batch: dict) -> torch.Tensor:
-    """Replay only the frozen point head to recover its uncached confidence."""
-
-    token_levels = _token_level_mapping(batch)
-    final_layer = max(int(layer) for layer in token_levels)
-    aggregated: list[torch.Tensor | None] = [None] * (final_layer + 1)
-    for layer, value in token_levels.items():
-        aggregated[int(layer)] = value
-    decoded_points, confidence = _decode_streaming_dpt_head(
-        frozen.point_head,
-        aggregated,
-        batch["stream_images"],
-        patch_start_idx=int(batch["patch_start_idx"]),
-    )
-    difference = float(
-        (decoded_points - batch["baseline_world_points"]).abs().max().cpu()
-    )
-    if difference != 0.0:
-        raise RuntimeError(
-            "Frozen point-head replay does not reproduce the cached baseline: "
-            f"max_abs_diff={difference}."
-        )
-    return confidence
 
 
 def _forward_baseline(batch: dict) -> dict[str, torch.Tensor]:
@@ -1051,13 +922,12 @@ def _assert_zero_initialization(
     pose_difference = float((output["pose_encoding"] - baseline["pose_encoding"]).abs().max().cpu())
     depth_difference = 0.0
     pointmap_difference = 0.0
-    if mode in GEOMETRY_MODES:
-        depth_difference = float(
-            (output["depth"] - baseline["depth"]).abs().max().cpu()
-        )
-        pointmap_difference = float(
-            (output["world_points"] - baseline["world_points"]).abs().max().cpu()
-        )
+    depth_difference = float(
+        (output["depth"] - baseline["depth"]).abs().max().cpu()
+    )
+    pointmap_difference = float(
+        (output["world_points"] - baseline["world_points"]).abs().max().cpu()
+    )
     if (
         token_difference != 0.0
         or pose_difference != 0.0
@@ -1390,23 +1260,9 @@ def _batch_to_device(payload: dict, device: str) -> dict:
 
 
 def _payload_for_mode(payload: dict, mode: str) -> dict:
-    if mode in GEOMETRY_MODES:
-        return payload
-    # Camera-only modes never rerun DPT heads. Keep the common cache on disk,
-    # but do not retain its large four-level token tensor in host memory.
-    return {
-        key: value
-        for key, value in payload.items()
-        if key
-        not in {
-            "token_levels",
-            "stream_images",
-            "target_world_points",
-            "target_depth",
-            "baseline_depth",
-            "baseline_world_points",
-        }
-    }
+    if mode != FINAL_MODE:
+        raise ValueError(f"Only the final method is supported, got {mode!r}.")
+    return payload
 
 
 def _autocast_context(config: LearnedPoseConfig):

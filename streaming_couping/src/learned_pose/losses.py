@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .config import GEOMETRY_MODES, POSE_MODES, LossConfig
+from .config import FINAL_MODE, LossConfig
 
 
 def compute_training_loss(
@@ -15,54 +15,45 @@ def compute_training_loss(
     *,
     mode: str,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if mode != FINAL_MODE:
+        raise ValueError(f"Only the final joint loss is supported, got {mode!r}.")
     predicted_pose = outputs["pose_encoding"].float()
     target_pose = batch["target_pose_encoding"].float()
-    zero = predicted_pose.new_zeros(())
-    camera = zero
-    relative_rotation = zero
-    translation_direction = zero
-    rigid = zero
-    centroid = zero
-    if mode in POSE_MODES:
-        camera = camera_encoding_loss(predicted_pose, target_pose)
-        relative_rotation = relative_rotation_loss(predicted_pose, target_pose)
-        translation_direction = translation_direction_loss(predicted_pose, target_pose)
-        rigid, centroid = instance_rigid_losses(
-            predicted_pose,
-            batch["instance_uvd"].float(),
-            batch["instance_uvd_valid"].bool(),
-            batch["instance_rigid_weight"].float(),
-            image_size=tuple(int(v) for v in batch["image_size"]),
-            scene_scale=float(batch["scene_scale"]),
-            trim_quantile=config.rigid_trim_quantile,
-        )
+    camera = camera_encoding_loss(predicted_pose, target_pose)
+    relative_rotation = relative_rotation_loss(predicted_pose, target_pose)
+    translation_direction = translation_direction_loss(predicted_pose, target_pose)
+    rigid, centroid = instance_rigid_losses(
+        predicted_pose,
+        batch["instance_uvd"].float(),
+        batch["instance_uvd_valid"].bool(),
+        batch["instance_rigid_weight"].float(),
+        image_size=tuple(int(v) for v in batch["image_size"]),
+        scene_scale=float(batch["scene_scale"]),
+        trim_quantile=config.rigid_trim_quantile,
+    )
     residual = outputs.get(
         "residual_mean_square",
         predicted_pose.new_zeros(()),
     ).float()
-    depth = zero
-    depth_fixed = zero
-    pointmap = zero
-    if mode in GEOMETRY_MODES:
-        if "depth" not in outputs or "world_points" not in outputs:
-            raise RuntimeError(f"{mode} must return depth and world_points.")
-        depth = scale_invariant_depth_loss(
-            outputs["depth"].float(),
-            batch["target_depth"].float(),
-        )
-        depth_fixed = fixed_reference_depth_loss(
-            outputs["depth"].float(),
-            batch["target_depth"].float(),
-            baseline=batch["baseline_depth"].float(),
-            reference_index=int(batch["reference_sequence_index"]),
-        )
-        pointmap = aligned_pointmap_loss(
-            outputs["world_points"].float(),
-            batch["target_world_points"].float(),
-            scale=float(batch["point_alignment_scale"]),
-            rotation=batch["point_alignment_rotation"].float(),
-            translation=batch["point_alignment_translation"].float(),
-        )
+    if "depth" not in outputs or "world_points" not in outputs:
+        raise RuntimeError("Final joint adapter must return depth and world_points.")
+    depth = scale_invariant_depth_loss(
+        outputs["depth"].float(),
+        batch["target_depth"].float(),
+    )
+    depth_fixed = fixed_reference_depth_loss(
+        outputs["depth"].float(),
+        batch["target_depth"].float(),
+        baseline=batch["baseline_depth"].float(),
+        reference_index=int(batch["reference_sequence_index"]),
+    )
+    pointmap = aligned_pointmap_loss(
+        outputs["world_points"].float(),
+        batch["target_world_points"].float(),
+        scale=float(batch["point_alignment_scale"]),
+        rotation=batch["point_alignment_rotation"].float(),
+        translation=batch["point_alignment_translation"].float(),
+    )
     terms = {
         "camera": camera,
         "relative_rotation": relative_rotation,

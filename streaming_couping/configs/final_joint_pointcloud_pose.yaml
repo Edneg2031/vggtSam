@@ -1,7 +1,7 @@
-# Decoupled persistent-instance pose and geometry refinement.
-# Reuses the complete V1 feature cache; only trainable adapters are new.
+# Final causal persistent-instance pointcloud and camera-pose method.
+# Training uses frames 90--140; evaluation reports the held-out suffix 210/240.
 recovery_config: streaming_couping/configs/recovery_050_025.yaml
-output_dir: outputs/streaming_couping_instance_token_pose_decoupled_v2
+output_dir: outputs/streaming_couping_instance_token_pose_temporal_holdout_v2
 
 dataset:
   manifest: data/processed/scannetpp_pinhole_2d/manifest.json
@@ -9,6 +9,8 @@ dataset:
     - name: 00a231a370_90_240_37_68_54
       scene_id: 00a231a370
       frame_indices: [90, 105, 119, 130, 140, 210, 240]
+      training_frame_indices: [90, 105, 119, 130, 140]
+      evaluation_frame_indices: [210, 240]
       instance_ids: [37, 68, 54]
       reference_sequence_index: 0
       split: train
@@ -19,11 +21,10 @@ runtime:
   geometry_device: cuda:1
 
 features:
-  # This is intentionally the V1 cache directory. --stage all will report
-  # that caches are complete and will not rerun StreamVGGT or SAM3 extraction.
+  # Reuse the seven-frame causal cache. Prefix tensors are physically sliced
+  # before training; the held-out suffix is only read during evaluation.
   cache_dir: outputs/streaming_couping_instance_token_pose/cache
   rebuild: false
-  cache_all_token_levels: true
   sam_source: detector_fpn2
   sam_resolution: 1008
   sam_grid: [72, 72]
@@ -49,21 +50,12 @@ loss:
   rigid: 1.0
   centroid: 0.25
   residual: 0.0001
-  # Geometry modes use both terms. The fixed-reference term prevents the
-  # scale drift observed when only scale-invariant depth was optimized.
   depth: 5.0
   depth_fixed: 5.0
   pointmap: 5.0
   rigid_trim_quantile: 0.70
 
 training:
-  modes:
-    - camera_sam_only
-    - patch_sam_only
-    - patch_sam_geometry_strict
-    - patch_sam_geometry_tracker_gate
-    - decoupled_dual_branch
-    - all_token_fusion
   epochs: 30
   repeats_per_epoch: 4
   learning_rate: 0.0001
@@ -77,11 +69,22 @@ evaluation:
   perturbations:
     - aligned
     - module_off
-    - zero_appearance
-    - zero_geometry
-    - shuffle_instance_ids
-    - shuffle_time
-    - pose_branch_off
-    - geometry_branch_off
   strict_equivalence: true
-
+  ray_pose:
+    confidence_threshold: 0.30
+    min_points: 1024
+    max_points: 65536
+    max_iterations: 6
+    max_condition_number: 100000000.0
+    max_center_shift: 0.75
+    max_residual_rmse: 0.20
+    blend: 1.0
+    angular_huber_delta: 0.02
+    angular_min_range: 0.05
+    export_confidence_threshold: 0.30
+    export_max_full_scene_points: 1000000
+    export_max_instance_points: 250000
+    # Fit frame 90 from its own causal pointmap as well. This reproduces the
+    # previously successful ray baseline and defines the pose in pointmap gauge;
+    # the evaluation Sim(3) remains the original fixed-reference protocol.
+    preserve_reference: false

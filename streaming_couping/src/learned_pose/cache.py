@@ -20,12 +20,12 @@ from vggtsam.adapters.streamvggt_latent import (
 from ..backbones.sam3_wrapper import SAM3Wrapper
 from ..backbones.streamvggt_wrapper import StreamVGGTWrapper
 from ..config import load_config
-from ..instance_pose_refinement import (
+from ..instance_observations import (
     InstanceRefinementConfig,
-    _load_instance_sequences,
-    _load_tracking_cache,
-    _save_tracking_cache,
-    _tracking_masks_to_geometry_grid,
+    load_instance_sequences,
+    load_tracking_cache,
+    save_tracking_cache,
+    tracking_masks_to_geometry_grid,
 )
 from ..pointmap_alignment import prepare_map_evaluation
 from ..pose_evaluation import _load_ground_truth_sequence
@@ -167,7 +167,7 @@ def _build_geometry_cache(
             "output_dir": config.features.cache_dir / clip.name,
         },
     )
-    sequences, target_masks = _load_instance_sequences(
+    sequences, target_masks = load_instance_sequences(
         recovery,
         instance_ids=clip.instance_ids,
         reference_sequence_index=clip.reference_sequence_index,
@@ -190,7 +190,7 @@ def _build_geometry_cache(
         geometry=geometry_sequence,
         sam_video_holder=sam_video_holder,
     )
-    grid_masks_by_id = _tracking_masks_to_geometry_grid(
+    grid_masks_by_id = tracking_masks_to_geometry_grid(
         recovered,
         geometry=geometry_sequence,
         image_mode=recovery.image_mode,
@@ -326,13 +326,12 @@ def _build_geometry_cache(
         "point_alignment_rotation": point_alignment.sim3_rotation.float(),
         "point_alignment_translation": point_alignment.sim3_translation.float(),
     }
-    if config.features.cache_all_token_levels:
-        payload["dpt_layer_indices"] = list(config.fusion.dpt_layer_indices)
-        payload["token_levels"] = torch.stack(
-            [value.detach().float().cpu()[0] for value in dpt_tokens],
-            dim=0,
-        )
-        payload["stream_images"] = output.geometry.aux["stream_images"].detach().float().cpu()
+    payload["dpt_layer_indices"] = list(config.fusion.dpt_layer_indices)
+    payload["token_levels"] = torch.stack(
+        [value.detach().float().cpu()[0] for value in dpt_tokens],
+        dim=0,
+    )
+    payload["stream_images"] = output.geometry.aux["stream_images"].detach().float().cpu()
     return payload
 
 
@@ -346,7 +345,7 @@ def _load_or_run_tracking(
     sam_video_holder: dict[str, SAM3Wrapper],
 ) -> dict[int, TrackingSequence]:
     path = clip.tracking_cache or (recovery.output_dir / "tracking_cache.npz")
-    cached = _load_tracking_cache(
+    cached = load_tracking_cache(
         path,
         config=recovery,
         instance_ids=clip.instance_ids,
@@ -387,7 +386,7 @@ def _load_or_run_tracking(
                 "selected_candidate_gt_iou": result["selected_candidate_gt_iou"],
             }
         )
-    _save_tracking_cache(
+    save_tracking_cache(
         path,
         config=recovery,
         instance_ids=clip.instance_ids,

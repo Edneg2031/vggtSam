@@ -8,13 +8,13 @@ from typing import Sequence
 import torch
 import torch.nn.functional as F
 
-from ..instance_pose_refinement import (
+from ..instance_observations import (
     InstanceRefinementConfig,
     TranslationProposal,
-    _deterministic_limit,
-    _merge_map_points,
-    _proposal_consensus,
-    _translation_icp,
+    deterministic_limit,
+    merge_map_points,
+    proposal_consensus,
+    translation_icp,
 )
 
 
@@ -184,7 +184,7 @@ def build_geometry_observations(
                 current = selected_points[frame][slot]
                 if int(instance_id) not in object_maps:
                     continue
-                proposal = _translation_icp(
+                proposal = translation_icp(
                     current,
                     object_maps[int(instance_id)],
                     instance_id=int(instance_id),
@@ -198,7 +198,7 @@ def build_geometry_observations(
             if proposal.accepted
             and float(scores[frame, list(instance_ids).index(proposal.instance_id)]) >= 0.5
         ]
-        shared, participating, _ = _proposal_consensus(
+        shared, participating, _ = proposal_consensus(
             eligible,
             min_instances=min(refinement.min_participating_instances, instances),
             max_distance=refinement.consensus_distance,
@@ -302,7 +302,7 @@ def build_geometry_observations(
                 if proposal is None:
                     continue
                 corrected = selected_points[frame][slot] + proposal.translation.float()
-                object_maps[int(instance_id)] = _merge_map_points(
+                object_maps[int(instance_id)] = merge_map_points(
                     object_maps[int(instance_id)],
                     corrected,
                     max_points=refinement.map_max_points,
@@ -350,7 +350,7 @@ def sample_instance_uvd(
             indices = torch.nonzero(masks[frame, slot] & finite, as_tuple=False)
             if indices.shape[0] == 0:
                 continue
-            indices = _deterministic_limit(indices, max_points).long()
+            indices = deterministic_limit(indices, max_points).long()
             count = indices.shape[0]
             y, x = indices[:, 0], indices[:, 1]
             uvd[frame, slot, :count, 0] = x.float()
@@ -377,7 +377,7 @@ def _reference_normalization(
         selected = points[torch.isfinite(points).all(dim=-1)]
     if selected.shape[0] == 0:
         return torch.zeros(3), 1.0
-    selected = _deterministic_limit(selected, 32768)
+    selected = deterministic_limit(selected, 32768)
     origin = torch.quantile(selected, 0.50, dim=0)
     radius = torch.linalg.vector_norm(selected - origin, dim=-1)
     scale = float(torch.quantile(radius, 0.75).clamp_min(1e-3))
