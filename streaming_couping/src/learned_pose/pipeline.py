@@ -812,7 +812,12 @@ def _apply_strict_spatial_fallback(
         baseline = batch.get(baseline_name)
         if not torch.is_tensor(refined) or not torch.is_tensor(baseline):
             continue
-        if baseline.ndim + 1 == refined.ndim:
+        while (
+            baseline.ndim > refined.ndim
+            and baseline.shape[-1] == 1
+        ):
+            baseline = baseline.squeeze(-1)
+        while baseline.ndim < refined.ndim:
             baseline = baseline.unsqueeze(-1)
         if baseline.shape != refined.shape:
             raise ValueError(

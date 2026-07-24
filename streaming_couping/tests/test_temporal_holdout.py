@@ -4,6 +4,7 @@ import torch
 
 from streaming_couping.src.learned_pose.config import ClipConfig
 from streaming_couping.src.learned_pose.pipeline import (
+    _apply_strict_spatial_fallback,
     _evaluation_metadata,
     _evaluation_sequence_indices,
     _slice_training_payload,
@@ -60,3 +61,24 @@ def test_temporal_evaluation_uses_suffix_with_full_context_metadata() -> None:
         "evaluated_frame_indices": "210 240",
         "alignment_reference_frame_index": 90,
     }
+
+
+def test_strict_spatial_fallback_accepts_optional_confidence_channel() -> None:
+    mask = torch.tensor([[[[True, False], [False, True]]]])
+    outputs = {
+        "depth_confidence": torch.full((1, 1, 2, 2), 9.0),
+        "world_confidence": torch.full((1, 1, 2, 2, 1), 8.0),
+    }
+    batch = {
+        "baseline_depth_confidence": torch.ones(1, 1, 2, 2, 1),
+        "baseline_world_confidence": torch.full((1, 1, 2, 2), 2.0),
+    }
+
+    _apply_strict_spatial_fallback(outputs, batch, mask)
+
+    assert outputs["depth_confidence"].shape == (1, 1, 2, 2)
+    assert outputs["world_confidence"].shape == (1, 1, 2, 2, 1)
+    assert float(outputs["depth_confidence"][0, 0, 0, 0]) == 9.0
+    assert float(outputs["depth_confidence"][0, 0, 0, 1]) == 1.0
+    assert float(outputs["world_confidence"][0, 0, 0, 0, 0]) == 8.0
+    assert float(outputs["world_confidence"][0, 0, 0, 1, 0]) == 2.0

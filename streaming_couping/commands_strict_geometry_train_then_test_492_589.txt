@@ -12,7 +12,6 @@ mkdir -p "$TRAIN_OUTPUT" "$TEST_OUTPUT"
 PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_instance_token_pose \
   --config "$TRAIN_CONFIG" \
   --stage all \
-  --rebuild-cache \
   --sam3-device cuda:3 \
   --geometry-device cuda:1 \
   --training-device cuda:1 \
