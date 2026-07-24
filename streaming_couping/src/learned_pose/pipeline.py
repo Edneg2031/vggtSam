@@ -228,6 +228,7 @@ def evaluate_final_method(
     ray_pair_rows = []
     ray_pair_summary_rows = []
     ray_fit_rows = []
+    identity_gate_rows = []
     ray_completed_clips: set[str] = set()
     ray_pose_predictions: dict[str, dict] = {}
 
@@ -236,6 +237,14 @@ def evaluate_final_method(
     for clip in evaluation_clips:
         payload = load_feature_cache(cache_path(config, clip))
         _validate_cached_payload(payload, clip)
+        identity_gate_rows.extend(
+            {
+                "clip": clip.name,
+                "scene_id": clip.scene_id,
+                **row,
+            }
+            for row in payload.get("identity_diagnostics", ())
+        )
         batch = _batch_to_device(payload, config.training.device)
         baseline_outputs = _forward_baseline(batch)
         evaluation_indices = _evaluation_sequence_indices(clip)
@@ -331,6 +340,16 @@ def evaluate_final_method(
                 )
                 ray_config = config.evaluation.ray_pose
                 if mode == FINAL_MODE and perturbation == "aligned":
+                    ray_mode = (
+                        "instance_ray_pose_v4"
+                        if config.fusion.strict_identity_gate
+                        else "instance_ray_pose_v3"
+                    )
+                    learned_control = (
+                        "v4_strict_geometry_learned_pose_control"
+                        if config.fusion.strict_identity_gate
+                        else "v2_learned_pose_control"
+                    )
                     control_metadata = {
                         **evaluation_metadata,
                         "ray_pose_role": "raw_baseline_control",
@@ -343,7 +362,7 @@ def evaluate_final_method(
                         ray_pair_summary_rows,
                         payload=payload,
                         pose_encoding=baseline_outputs["pose_encoding"],
-                        mode="instance_ray_pose_v3",
+                        mode=ray_mode,
                         perturbation="raw_baseline_control",
                         sequence_indices=evaluation_indices,
                         evaluation_metadata=control_metadata,
@@ -356,8 +375,8 @@ def evaluate_final_method(
                         ray_pair_summary_rows,
                         payload=payload,
                         pose_encoding=outputs["pose_encoding"],
-                        mode="instance_ray_pose_v3",
-                        perturbation="v2_learned_pose_control",
+                        mode=ray_mode,
+                        perturbation=learned_control,
                         sequence_indices=evaluation_indices,
                         evaluation_metadata={
                             **evaluation_metadata,
@@ -374,7 +393,7 @@ def evaluate_final_method(
                         "raw_baseline_control": baseline_outputs[
                             "pose_encoding"
                         ].detach().float().cpu(),
-                        "v2_learned_pose_control": outputs[
+                        learned_control: outputs[
                             "pose_encoding"
                         ].detach().float().cpu(),
                     }
@@ -394,7 +413,7 @@ def evaluate_final_method(
                             ray_pair_summary_rows,
                             payload=payload,
                             pose_encoding=result.pose_encoding,
-                            mode="instance_ray_pose_v3",
+                            mode=ray_mode,
                             perturbation=result.name,
                             sequence_indices=evaluation_indices,
                             evaluation_metadata=result_metadata,
@@ -403,7 +422,7 @@ def evaluate_final_method(
                             {
                                 "clip": clip.name,
                                 "scene_id": clip.scene_id,
-                                "mode": "instance_ray_pose_v3",
+                                "mode": ray_mode,
                                 "perturbation": result.name,
                                 **result_metadata,
                                 **row,
@@ -422,9 +441,24 @@ def evaluate_final_method(
                         "refined_world_confidence": outputs[
                             "world_confidence"
                         ].detach().float().cpu(),
-                        "tracking_masks_stream": batch[
+                        "tracking_masks_stream": (
+                            batch["trusted_tracking_masks_stream"]
+                            if config.fusion.strict_identity_gate
+                            else batch["tracking_masks_stream"]
+                        ).detach().bool().cpu(),
+                        "raw_tracking_masks_stream": batch[
                             "tracking_masks_stream"
                         ].detach().bool().cpu(),
+                        "trusted_instance_valid": (
+                            batch["trusted_instance_valid"]
+                            .detach()
+                            .bool()
+                            .cpu()
+                            if torch.is_tensor(
+                                batch.get("trusted_instance_valid")
+                            )
+                            else None
+                        ),
                     }
                     ray_completed_clips.add(clip.name)
                 rigid, centroid = instance_rigid_losses(
@@ -544,6 +578,7 @@ def evaluate_final_method(
     _write_csv(output / "ray_pose_pair_metrics.csv", ray_pair_rows)
     _write_csv(output / "ray_pose_pair_summary.csv", ray_pair_summary_rows)
     _write_csv(output / "ray_pose_fit_diagnostics.csv", ray_fit_rows)
+    _write_csv(output / "identity_gate_diagnostics.csv", identity_gate_rows)
     _write_csv(
         output / "ray_pose_compact_summary.csv",
         _compact_ray_pose_summary(
@@ -584,7 +619,26 @@ def evaluate_final_method(
             "Patch modes preserve every camera/register prefix token. The dual branch uses "
             "independent pose and geometry tokenizers, attentions, gates, and projections."
         ),
-        "instance_ray_pose_v3": {
+        "strict_geometry_v4": {
+            "enabled": bool(config.fusion.strict_identity_gate),
+            "identity_gate": (
+                "Each current mask point cloud must pass bounded 3D registration "
+                "against its causal same-ID object map before token/ray use."
+            ),
+            "memory_gate": (
+                "Long-term token memory additionally requires configured "
+                "geometry-confidence and static-score thresholds."
+            ),
+            "spatial_fallback": (
+                "Learned DPT residuals are mask-local; decoded geometry outside "
+                "validated masks is copied exactly from frozen StreamVGGT."
+            ),
+        },
+        (
+            "instance_ray_pose_v4"
+            if config.fusion.strict_identity_gate
+            else "instance_ray_pose_v3"
+        ): {
             "source_mode": "decoupled_dual_branch",
             "source_perturbation": "aligned",
             "final_variant": FINAL_RAY_POSE_NAME,
@@ -687,6 +741,7 @@ def _forward_mode(
         geometry=batch["geometry"],
         quality=batch["quality"],
         observed=batch["observed"],
+        identity_valid=batch.get("identity_valid"),
         module_off=module_off,
     )
     pose_delta = _decode_streaming_camera_delta(
@@ -702,6 +757,17 @@ def _forward_mode(
         geometry=batch["geometry"],
         quality=batch["quality"],
         observed=batch["observed"],
+        identity_valid=batch.get("identity_valid"),
+        spatial_mask=(
+            batch["trusted_tracking_masks_stream"].any(dim=2)
+            if adapter.config.strict_identity_gate
+            else None
+        ),
+        patch_shape=(
+            tuple(int(value) for value in batch["patch_shape"])
+            if adapter.config.strict_identity_gate
+            else None
+        ),
         module_off=module_off,
     )
     diagnostics = {
@@ -711,7 +777,7 @@ def _forward_mode(
             for key, value in geometry_diagnostics.items()
         },
     }
-    return _geometry_head_outputs(
+    outputs = _geometry_head_outputs(
         frozen,
         batch,
         updated,
@@ -719,6 +785,44 @@ def _forward_mode(
         camera_hidden=camera_hidden,
         diagnostics=diagnostics,
     )
+    if adapter.config.strict_identity_gate and not module_off:
+        _apply_strict_spatial_fallback(
+            outputs,
+            batch,
+            batch["trusted_tracking_masks_stream"].any(dim=2),
+        )
+    return outputs
+
+
+def _apply_strict_spatial_fallback(
+    outputs: dict[str, torch.Tensor | dict],
+    batch: dict,
+    trusted_mask: torch.Tensor,
+) -> None:
+    """Keep frozen StreamVGGT outputs outside validated instance pixels."""
+
+    pairs = (
+        ("world_points", "baseline_world_points"),
+        ("world_confidence", "baseline_world_confidence"),
+        ("depth", "baseline_depth"),
+        ("depth_confidence", "baseline_depth_confidence"),
+    )
+    for output_name, baseline_name in pairs:
+        refined = outputs.get(output_name)
+        baseline = batch.get(baseline_name)
+        if not torch.is_tensor(refined) or not torch.is_tensor(baseline):
+            continue
+        if baseline.ndim + 1 == refined.ndim:
+            baseline = baseline.unsqueeze(-1)
+        if baseline.shape != refined.shape:
+            raise ValueError(
+                f"Strict spatial fallback shape mismatch for {output_name}: "
+                f"{tuple(refined.shape)} vs {tuple(baseline.shape)}."
+            )
+        mask = trusted_mask
+        while mask.ndim < refined.ndim:
+            mask = mask.unsqueeze(-1)
+        outputs[output_name] = torch.where(mask, refined, baseline)
 
 
 def _token_level_mapping(batch: dict) -> dict[int, torch.Tensor]:
@@ -1092,6 +1196,8 @@ def _slice_training_payload(payload: dict, clip: ClipConfig) -> dict:
         "geometry",
         "quality",
         "observed",
+        "identity_valid",
+        "trusted_instance_valid",
         "target_pose_encoding",
         "target_world_to_camera",
         "instance_uvd",
@@ -1101,10 +1207,14 @@ def _slice_training_payload(payload: dict, clip: ClipConfig) -> dict:
         "target_depth",
         "baseline_pose_encoding",
         "baseline_depth",
+        "baseline_depth_confidence",
         "baseline_world_points",
+        "baseline_world_confidence",
         "stream_images",
         "tracking_masks_output",
         "tracking_masks_stream",
+        "trusted_tracking_masks_output",
+        "trusted_tracking_masks_stream",
         "tracking_scores",
     }
     index = torch.tensor(indices, dtype=torch.long)
@@ -1226,6 +1336,8 @@ def _batch_to_device(payload: dict, device: str) -> dict:
         "geometry",
         "quality",
         "observed",
+        "identity_valid",
+        "trusted_instance_valid",
         "target_pose_encoding",
         "instance_uvd",
         "instance_uvd_valid",
@@ -1234,9 +1346,14 @@ def _batch_to_device(payload: dict, device: str) -> dict:
         "target_depth",
         "baseline_pose_encoding",
         "baseline_depth",
+        "baseline_depth_confidence",
         "baseline_world_points",
+        "baseline_world_confidence",
         "stream_images",
         "tracking_masks_stream",
+        "trusted_tracking_masks_output",
+        "trusted_tracking_masks_stream",
+        "tracking_scores",
     }
     output = dict(payload)
     for name in batched_fields:

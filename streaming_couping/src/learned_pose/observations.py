@@ -107,7 +107,7 @@ def build_geometry_observations(
     confidence_threshold: float,
     refinement: InstanceRefinementConfig,
     sampled_instance_points: int,
-) -> dict[str, torch.Tensor | float | list[str]]:
+) -> dict[str, object]:
     """Create geometry descriptors and camera-local samples without GT gates.
 
     Geometry/static scores are deterministic and detached. They can weight a
@@ -132,7 +132,9 @@ def build_geometry_observations(
     geometry = torch.zeros(sequence, instances, len(GEOMETRY_FEATURE_NAMES))
     quality = torch.zeros(sequence, instances, len(QUALITY_NAMES))
     observed = torch.zeros(sequence, instances, dtype=torch.bool)
+    identity_valid = torch.zeros(sequence, instances, dtype=torch.bool)
     point_counts = torch.zeros(sequence, instances, dtype=torch.long)
+    identity_rows: list[dict[str, object]] = []
 
     selected_points: list[list[torch.Tensor]] = [
         [torch.empty(0, 3) for _ in range(instances)]
@@ -222,6 +224,24 @@ def build_geometry_observations(
             geometry_confidence = 0.0
             static_score = 0.0
             if frame == int(reference_index):
+                current_identity_valid = int(instance_id) in object_maps
+                identity_reason = (
+                    "accepted_reference"
+                    if current_identity_valid
+                    else "rejected_reference_insufficient_points"
+                )
+            elif proposal is None:
+                current_identity_valid = False
+                identity_reason = "rejected_missing_persistent_map"
+            else:
+                current_identity_valid = bool(proposal.accepted)
+                identity_reason = (
+                    "accepted_bounded_3d_registration"
+                    if proposal.accepted
+                    else f"rejected_{proposal.reason.replace('; ', '_').replace(' ', '_')}"
+                )
+            identity_valid[frame, slot] = current_identity_valid
+            if frame == int(reference_index):
                 geometry_confidence = 1.0
                 static_score = 1.0
                 rmse_ratio = 0.0
@@ -293,6 +313,43 @@ def build_geometry_observations(
                     min(max(static_score, 0.0), 1.0),
                 ]
             )
+            identity_rows.append(
+                {
+                    "sequence_index": frame,
+                    "frame_index": int(frame_indices[frame]),
+                    "instance_id": int(instance_id),
+                    "is_reference": int(frame == int(reference_index)),
+                    "mask_observed": int(observed[frame, slot]),
+                    "track_confidence": float(scores[frame, slot]),
+                    "point_count": int(point_counts[frame, slot]),
+                    "identity_valid": int(current_identity_valid),
+                    "identity_reason": identity_reason,
+                    "registration_accepted": int(
+                        proposal.accepted if proposal is not None else current_identity_valid
+                    ),
+                    "registration_fitness": (
+                        float(proposal.fitness)
+                        if proposal is not None
+                        else (1.0 if current_identity_valid else 0.0)
+                    ),
+                    "registration_rmse_native": (
+                        float(proposal.rmse)
+                        if proposal is not None
+                        else (0.0 if current_identity_valid else float("nan"))
+                    ),
+                    "registration_translation_native": (
+                        float(torch.linalg.vector_norm(proposal.translation))
+                        if proposal is not None
+                        else 0.0
+                    ),
+                    "shape_similarity": float(shape_similarity),
+                    "geometry_confidence": float(geometry_confidence),
+                    "static_score": float(static_score),
+                    "participates_in_consensus": int(
+                        int(instance_id) in participating_set
+                    ),
+                }
+            )
 
         if shared is not None:
             for slot, instance_id in enumerate(instance_ids):
@@ -313,6 +370,8 @@ def build_geometry_observations(
         "geometry": geometry,
         "quality": quality,
         "observed": observed,
+        "identity_valid": identity_valid,
+        "identity_diagnostics": identity_rows,
         "point_counts": point_counts,
         "scene_origin": origin,
         "scene_scale": float(scene_scale),

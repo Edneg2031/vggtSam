@@ -6,6 +6,7 @@ from dataclasses import asdict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .config import FusionConfig
 
@@ -39,10 +40,16 @@ class CausalInstanceTokenizer(nn.Module):
         geometry: torch.Tensor,
         quality: torch.Tensor,
         observed: torch.Tensor,
+        identity_valid: torch.Tensor | None = None,
         *,
         branch: str,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         _validate_observation_shapes(appearance, geometry, quality, observed)
+        if identity_valid is None:
+            identity_valid = torch.ones_like(observed, dtype=torch.bool)
+        if identity_valid.shape != observed.shape:
+            raise ValueError("identity_valid must have shape [B,S,K].")
+        memory_quality = quality
         if branch == "pose":
             # The selected pose branch uses persistent SAM appearance and
             # tracker confidence only. Geometry cannot leak through features
@@ -85,12 +92,34 @@ class CausalInstanceTokenizer(nn.Module):
             current_geo = geometry[:, frame]
             current_quality = quality[:, frame]
             current_observed = observed[:, frame].bool()
-            trusted = (
-                current_observed
-                & (gate_quality[:, frame, :, 0] >= self.config.min_track_confidence)
-                & (gate_quality[:, frame, :, 1] >= self.config.min_geometry_confidence)
-                & (gate_quality[:, frame, :, 2] >= self.config.min_static_score)
-            )
+            if self.config.strict_identity_gate:
+                trusted = (
+                    current_observed
+                    & identity_valid[:, frame].bool()
+                    & (
+                        gate_quality[:, frame, :, 0]
+                        >= self.config.min_track_confidence
+                    )
+                )
+                memory_trusted = (
+                    trusted
+                    & (
+                        memory_quality[:, frame, :, 1]
+                        >= self.config.min_geometry_confidence
+                    )
+                    & (
+                        memory_quality[:, frame, :, 2]
+                        >= self.config.min_static_score
+                    )
+                )
+            else:
+                trusted = (
+                    current_observed
+                    & (gate_quality[:, frame, :, 0] >= self.config.min_track_confidence)
+                    & (gate_quality[:, frame, :, 1] >= self.config.min_geometry_confidence)
+                    & (gate_quality[:, frame, :, 2] >= self.config.min_static_score)
+                )
+                memory_trusted = trusted
             token_valid = trusted & has_memory
             features = torch.cat(
                 [
@@ -108,15 +137,15 @@ class CausalInstanceTokenizer(nn.Module):
             token = self.encoder(features)
             token_rows.append(token)
             valid_rows.append(token_valid)
-            update_rows.append(trusted)
+            update_rows.append(memory_trusted)
 
-            update = trusted[..., None]
+            update = memory_trusted[..., None]
             first = update & (~has_memory)[..., None]
             app_candidate = momentum * app_memory + (1.0 - momentum) * current_app
             geo_candidate = momentum * geo_memory + (1.0 - momentum) * current_geo
             app_memory = torch.where(first, current_app, torch.where(update, app_candidate, app_memory))
             geo_memory = torch.where(first, current_geo, torch.where(update, geo_candidate, geo_memory))
-            has_memory = has_memory | trusted
+            has_memory = has_memory | memory_trusted
             age = torch.where(has_memory, age + 1.0, age)
 
         tokens = torch.stack(token_rows, dim=1)
@@ -267,6 +296,7 @@ class InstancePoseAdapter(nn.Module):
         geometry: torch.Tensor,
         quality: torch.Tensor,
         observed: torch.Tensor,
+        identity_valid: torch.Tensor | None = None,
         module_off: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if module_off:
@@ -285,6 +315,7 @@ class InstancePoseAdapter(nn.Module):
             geometry,
             quality,
             observed,
+            identity_valid,
             branch="pose",
         )
         refined, log = self.camera_fusion(
@@ -303,6 +334,9 @@ class InstancePoseAdapter(nn.Module):
         geometry: torch.Tensor,
         quality: torch.Tensor,
         observed: torch.Tensor,
+        identity_valid: torch.Tensor | None = None,
+        spatial_mask: torch.Tensor | None = None,
+        patch_shape: tuple[int, int] | None = None,
         module_off: bool = False,
     ) -> tuple[dict[int, torch.Tensor], dict[str, torch.Tensor]]:
         """Update DPT patch tokens while preserving camera/register tokens."""
@@ -314,11 +348,41 @@ class InstancePoseAdapter(nn.Module):
             geometry,
             quality,
             observed,
+            identity_valid,
             branch="geometry",
         )
         start = int(patch_start_idx)
         output: dict[int, torch.Tensor] = {}
         logs: dict[str, torch.Tensor] = dict(memory_log)
+        patch_gate = None
+        if self.config.strict_identity_gate:
+            if spatial_mask is None or patch_shape is None:
+                raise ValueError(
+                    "Strict identity fusion requires a spatial mask and patch_shape."
+                )
+            if spatial_mask.ndim != 4:
+                raise ValueError("spatial_mask must have shape [B,S,H,W].")
+            batch, sequence, height, width = spatial_mask.shape
+            patch_h, patch_w = (int(value) for value in patch_shape)
+            resized = F.interpolate(
+                spatial_mask.float().reshape(batch * sequence, 1, height, width),
+                size=(patch_h, patch_w),
+                mode="nearest",
+            )
+            dilation = int(self.config.patch_mask_dilation)
+            if dilation:
+                kernel = 2 * dilation + 1
+                resized = F.max_pool2d(
+                    resized,
+                    kernel_size=kernel,
+                    stride=1,
+                    padding=dilation,
+                )
+            patch_gate = resized.reshape(
+                batch,
+                sequence,
+                patch_h * patch_w,
+            ).bool()
         for layer, tokens in token_levels.items():
             key = str(int(layer))
             if start < 0 or start >= tokens.shape[2]:
@@ -335,6 +399,17 @@ class InstancePoseAdapter(nn.Module):
                 instance_tokens,
                 valid,
             )
+            if patch_gate is not None:
+                if patch_gate.shape != patches.shape[:3]:
+                    raise ValueError(
+                        "Patch mask/token shape mismatch: "
+                        f"{tuple(patch_gate.shape)} vs {tuple(patches.shape[:3])}."
+                    )
+                updated = torch.where(
+                    patch_gate[..., None],
+                    updated,
+                    patches,
+                )
             output[int(layer)] = torch.cat([prefix, updated], dim=2)
             logs.update({f"layer_{key}_{name}": value for name, value in current.items()})
         return output, logs

@@ -47,7 +47,12 @@ def export_final_ray_pose_outputs(
         raise ValueError(f"Missing predictions mapping in {predictions_path}.")
 
     root = Path(output_dir) if output_dir is not None else (
-        config.output_dir / "final_instance_ray_pose_v3"
+        config.output_dir
+        / (
+            "final_instance_ray_pose_v4"
+            if config.fusion.strict_identity_gate
+            else "final_instance_ray_pose_v3"
+        )
     )
     root.mkdir(parents=True, exist_ok=True)
     recovery = load_config(config.recovery_config)
@@ -193,15 +198,39 @@ def export_final_ray_pose_outputs(
         )
 
         clip_root = root / clip.name
+        exported_masks = (
+            payload["trusted_tracking_masks_output"]
+            if config.fusion.strict_identity_gate
+            else payload["tracking_masks_output"]
+        )
         _export_tracking_mask_visualizations(
             clip_root / "segmentation_masks",
             frame_indices=clip.frame_indices,
             instance_ids=clip.instance_ids,
             image_paths=payload["image_paths"],
-            masks=payload["tracking_masks_output"],
+            masks=exported_masks,
             scores=payload.get("tracking_scores"),
+            identity_valid=payload.get("trusted_instance_valid"),
             reference_sequence_index=clip.reference_sequence_index,
         )
+        if config.fusion.strict_identity_gate:
+            _export_tracking_mask_visualizations(
+                clip_root / "raw_tracking_masks",
+                frame_indices=clip.frame_indices,
+                instance_ids=clip.instance_ids,
+                image_paths=payload["image_paths"],
+                masks=payload["tracking_masks_output"],
+                scores=payload.get("tracking_scores"),
+                identity_valid=payload.get("trusted_instance_valid"),
+                reference_sequence_index=clip.reference_sequence_index,
+                mask_role="raw_diagnostic",
+            )
+            _write_csv(
+                clip_root
+                / "segmentation_masks"
+                / "identity_gate_diagnostics.csv",
+                list(payload.get("identity_diagnostics", ())),
+            )
         deployable_root = clip_root / "deployable_native"
         deployable_root.mkdir(parents=True, exist_ok=True)
         _write_csv(deployable_root / "camera_poses.csv", native_pose_rows)
@@ -1005,6 +1034,8 @@ def _export_tracking_mask_visualizations(
     masks: torch.Tensor,
     scores: torch.Tensor | None,
     reference_sequence_index: int,
+    identity_valid: torch.Tensor | None = None,
+    mask_role: str = "consumed",
 ) -> None:
     """Export the exact persistent-instance masks consumed by the method."""
 
@@ -1031,6 +1062,17 @@ def _export_tracking_mask_visualizations(
             raise ValueError(
                 f"Tracking scores must have shape {expected_prefix}, got "
                 f"{tuple(score_tensor.shape)}."
+            )
+    if identity_valid is None:
+        identity_tensor = torch.ones(expected_prefix, dtype=torch.bool)
+    else:
+        identity_tensor = torch.as_tensor(
+            identity_valid
+        ).detach().bool().cpu()
+        if tuple(identity_tensor.shape) != expected_prefix:
+            raise ValueError(
+                "Identity validity must have shape "
+                f"{expected_prefix}, got {tuple(identity_tensor.shape)}."
             )
 
     overlay_root = root / "overlays"
@@ -1082,6 +1124,9 @@ def _export_tracking_mask_visualizations(
                     "tracking_score": float(
                         score_tensor[sequence_index, instance_index]
                     ),
+                    "geometry_identity_valid": int(
+                        identity_tensor[sequence_index, instance_index]
+                    ),
                     "source_mask_pixels": int(source_mask.sum()),
                     "source_mask_fraction": float(source_mask.mean()),
                     "visualization_mask_pixels": int(resized.sum()),
@@ -1101,6 +1146,7 @@ def _export_tracking_mask_visualizations(
             frame_index=frame_index,
             instance_ids=instance_ids,
             scores=score_tensor[sequence_index],
+            identity_valid=identity_tensor[sequence_index],
             present=tuple(bool(value.any()) for value in resized_masks),
             is_reference=sequence_index == int(reference_sequence_index),
         )
@@ -1122,19 +1168,26 @@ def _export_tracking_mask_visualizations(
         ],
     )
     _save_mask_overview(overview_panels, root / "sequence_overview.png")
+    role_text = (
+        "These are raw SAM3 masks for diagnosis only; GEO-REJECT masks are "
+        "not consumed by the strict adapter or ray solver."
+        if mask_role == "raw_diagnostic"
+        else
+        "These are the geometry-validated masks consumed by the strict "
+        "adapter and ray solver."
+    )
     (root / "README.txt").write_text(
         "Persistent-instance segmentation masks\n"
         "======================================\n\n"
         "overlays/ contains RGB frames with every tracked instance in a "
         "distinct color. binary/instance_<id>/ contains exact per-instance "
         "binary masks, resized to source RGB resolution with nearest-neighbor "
-        "sampling. binary/union/ is the union used by the instance-restricted "
-        "geometry solver. sequence_overview.png shows the configured input "
-        "order. mask_summary.csv records tracking score, visibility, and mask "
-        "area.\n\n"
-        "The reference-frame mask is the initialization/prompt mask. Later "
-        "frames are the persistent SAM3 tracking/recovery masks consumed by "
-        "the learned adapter and ray solver.\n",
+        "sampling. binary/union/ is the union shown in this directory. "
+        "sequence_overview.png shows the "
+        "configured input order. mask_summary.csv records tracking score, "
+        "geometry identity validity, visibility, and mask area.\n\n"
+        "The reference-frame mask is the initialization/prompt mask. "
+        f"{role_text}\n",
         encoding="utf8",
     )
 
@@ -1166,6 +1219,7 @@ def _annotate_mask_overlay(
     frame_index: int,
     instance_ids: tuple[int, ...],
     scores: torch.Tensor,
+    identity_valid: torch.Tensor,
     present: tuple[bool, ...],
     is_reference: bool,
 ) -> Image.Image:
@@ -1190,6 +1244,8 @@ def _annotate_mask_overlay(
         score = float(scores[index])
         score_text = f"{score:.3f}" if np.isfinite(score) else "nan"
         label = f"id={instance_id} s={score_text}"
+        if not bool(identity_valid[index]):
+            label += " GEO-REJECT"
         if not visible:
             label += " absent"
         draw.text((x + 15, 24), label, fill=(235, 235, 235))

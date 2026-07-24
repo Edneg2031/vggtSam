@@ -50,6 +50,14 @@ _FINAL_SPEC = _VariantSpec(
     "baseline_reference",
     "tracked_instances",
     "angular_huber",
+    "deployable_v4_strict_geometry",
+)
+_LEGACY_SPEC = _VariantSpec(
+    "refined",
+    "refined",
+    "baseline_reference",
+    "tracked_instances",
+    "angular_huber",
     "deployable_v3_selected",
 )
 
@@ -102,6 +110,8 @@ def recover_final_ray_pose(
     # instance mask is intersected with the frozen baseline pointmap validity,
     # while the fitted coordinates come from the refined pointmap.
     instance_mask = _tracked_instance_mask(batch, baseline_points)
+    trusted_instance_valid = _trusted_instance_valid(batch)
+    instance_ids = tuple(int(value) for value in batch.get("instance_ids", ()))
     intrinsics = (
         baseline_intrinsics[0, reference_index]
         .detach()
@@ -112,7 +122,11 @@ def recover_final_ray_pose(
     )
 
     name = FINAL_RAY_POSE_NAME
-    spec = _FINAL_SPEC
+    spec = (
+        _FINAL_SPEC
+        if bool(batch.get("strict_identity_gate", False))
+        else _LEGACY_SPEC
+    )
     centers = []
     diagnostic_rows = []
     for sequence_index, frame_index in enumerate(frame_indices):
@@ -215,6 +229,19 @@ def recover_final_ray_pose(
                     torch.linalg.vector_norm(applied_center - fallback_center)
                 ),
                 "blend": float(config.blend),
+                "trusted_instance_ids": _instance_id_text(
+                    instance_ids,
+                    trusted_instance_valid[sequence_index],
+                    selected=True,
+                ),
+                "rejected_instance_ids": _instance_id_text(
+                    instance_ids,
+                    trusted_instance_valid[sequence_index],
+                    selected=False,
+                ),
+                "trusted_instance_count": int(
+                    trusted_instance_valid[sequence_index].sum()
+                ),
                 "fx": float(intrinsics[sequence_index, 0, 0]),
                 "fy": float(intrinsics[sequence_index, 1, 1]),
                 "cx": float(intrinsics[sequence_index, 0, 2]),
@@ -291,7 +318,13 @@ def _normalize_confidence(
 
 def _tracked_instance_mask(batch: dict, points: torch.Tensor) -> torch.Tensor:
     finite = torch.isfinite(points).all(dim=-1)
-    masks = batch.get("tracking_masks_stream")
+    masks = (
+        batch.get("trusted_tracking_masks_stream")
+        if bool(batch.get("strict_identity_gate", False))
+        else None
+    )
+    if masks is None:
+        masks = batch.get("tracking_masks_stream")
     if masks is None:
         instance_union = torch.zeros_like(finite)
     else:
@@ -305,6 +338,41 @@ def _tracked_instance_mask(batch: dict, points: torch.Tensor) -> torch.Tensor:
                 f"{tuple(instance_union.shape)} vs {tuple(finite.shape)}."
             )
     return finite & instance_union
+
+
+def _trusted_instance_valid(batch: dict) -> torch.Tensor:
+    valid = batch.get("trusted_instance_valid")
+    if valid is not None:
+        valid = valid.detach().bool().cpu()
+        if valid.ndim != 3 or valid.shape[0] != 1:
+            raise ValueError(
+                "trusted_instance_valid must have shape [1,S,K]."
+            )
+        return valid[0]
+    masks = batch.get("tracking_masks_stream")
+    if masks is None:
+        return torch.zeros(
+            len(batch["frame_indices"]),
+            len(batch.get("instance_ids", ())),
+            dtype=torch.bool,
+        )
+    masks = masks.detach().bool().cpu()
+    return masks[0].flatten(start_dim=2).any(dim=-1)
+
+
+def _instance_id_text(
+    instance_ids: tuple[int, ...],
+    valid: torch.Tensor,
+    *,
+    selected: bool,
+) -> str:
+    if len(instance_ids) != int(valid.numel()):
+        return ""
+    return " ".join(
+        str(instance_id)
+        for instance_id, keep in zip(instance_ids, valid.tolist())
+        if bool(keep) is selected
+    )
 
 
 def _fit_angular_huber_center(

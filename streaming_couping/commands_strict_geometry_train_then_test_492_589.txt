@@ -1,0 +1,57 @@
+set -euo pipefail
+
+TRAIN_CONFIG=streaming_couping/configs/final_joint_pointcloud_pose_strict_geometry.yaml
+TEST_CONFIG=streaming_couping/configs/final_joint_pointcloud_pose_test_492_589_strict_geometry.yaml
+TRAIN_OUTPUT=outputs/streaming_couping_instance_token_pose_v4_strict_geometry
+TEST_OUTPUT=outputs/streaming_couping_final_test_00a231a370_492_589_v4_strict_geometry
+CLIP=00a231a370_492_589_37_68_54
+
+mkdir -p "$TRAIN_OUTPUT" "$TEST_OUTPUT"
+
+# Rebuild V4 observations, then train on 90/105/119/130/140 and evaluate 210/240.
+PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_instance_token_pose \
+  --config "$TRAIN_CONFIG" \
+  --stage all \
+  --rebuild-cache \
+  --sam3-device cuda:3 \
+  --geometry-device cuda:1 \
+  --training-device cuda:1 \
+  2>&1 | tee "$TRAIN_OUTPUT/train_and_holdout.log"
+
+# Transfer only the checkpoint learned on the original training prefix.
+mkdir -p "$TEST_OUTPUT/checkpoints/decoupled_dual_branch"
+cp -a \
+  "$TRAIN_OUTPUT/checkpoints/decoupled_dual_branch/." \
+  "$TEST_OUTPUT/checkpoints/decoupled_dual_branch/"
+
+# Recompute geometry and SAM3 observations for the new views.
+PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_instance_token_pose \
+  --config "$TEST_CONFIG" \
+  --stage cache \
+  --rebuild-cache \
+  --sam3-device cuda:3 \
+  --geometry-device cuda:1 \
+  --training-device cuda:1 \
+  2>&1 | tee "$TEST_OUTPUT/cache.log"
+
+# Frozen-checkpoint evaluation: no training occurs on frames 492--589.
+PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_instance_token_pose \
+  --config "$TEST_CONFIG" \
+  --stage ray \
+  --geometry-device cuda:1 \
+  --training-device cuda:1 \
+  2>&1 | tee "$TEST_OUTPUT/final_method.log"
+
+PYTHONPATH=src:. python -m streaming_couping.scripts.run_instance_token_pose \
+  --config "$TEST_CONFIG" \
+  --stage export
+
+PYTHONPATH=src:. python -m streaming_couping.scripts.plot_pose_comparison \
+  --comparison-dir "$TEST_OUTPUT/final_instance_ray_pose_v4/$CLIP/comparison_gt_world"
+
+sed -n '1,20p' "$TEST_OUTPUT/evaluation/ray_pose_compact_summary.csv"
+sed -n '1,32p' "$TEST_OUTPUT/evaluation/identity_gate_diagnostics.csv"
+sed -n '1,20p' \
+  "$TEST_OUTPUT/final_instance_ray_pose_v4/$CLIP/comparison_gt_world/pointcloud_metrics.csv"
+sed -n '1,24p' \
+  "$TEST_OUTPUT/final_instance_ray_pose_v4/$CLIP/comparison_gt_world/camera_pose_metrics.csv"

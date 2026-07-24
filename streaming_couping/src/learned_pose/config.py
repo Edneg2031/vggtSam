@@ -44,6 +44,12 @@ class FusionConfig:
     min_track_confidence: float = 0.50
     min_geometry_confidence: float = 0.20
     min_static_score: float = 0.20
+    # V4: require a bounded 3D registration to the causal instance map before
+    # a tracked mask may condition the learned adapter or the ray solver.
+    strict_identity_gate: bool = False
+    # Geometry memory writes are intentionally stricter than one-frame use.
+    # The existing geometry/static thresholds above control those writes.
+    patch_mask_dilation: int = 0
     dpt_layer_indices: tuple[int, ...] = (4, 11, 17, 23)
 
 
@@ -172,6 +178,8 @@ def load_learned_pose_config(path: str | Path) -> LearnedPoseConfig:
             min_track_confidence=float(fusion.get("min_track_confidence", 0.50)),
             min_geometry_confidence=float(fusion.get("min_geometry_confidence", 0.20)),
             min_static_score=float(fusion.get("min_static_score", 0.20)),
+            strict_identity_gate=bool(fusion.get("strict_identity_gate", False)),
+            patch_mask_dilation=int(fusion.get("patch_mask_dilation", 0)),
             dpt_layer_indices=tuple(int(v) for v in fusion.get("dpt_layer_indices", [4, 11, 17, 23])),
         ),
         loss=LossConfig(
@@ -299,6 +307,8 @@ def _validate(config: LearnedPoseConfig) -> None:
         raise ValueError("ray_pose angular robust-fit values must be positive.")
     if config.fusion.attention_dim % config.fusion.num_heads:
         raise ValueError("fusion.attention_dim must be divisible by fusion.num_heads.")
+    if config.fusion.patch_mask_dilation < 0:
+        raise ValueError("fusion.patch_mask_dilation must be non-negative.")
     if config.fusion.dpt_layer_indices != (4, 11, 17, 23):
         raise ValueError(
             "Current StreamVGGT DPT heads require fusion.dpt_layer_indices "

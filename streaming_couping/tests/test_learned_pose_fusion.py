@@ -149,3 +149,76 @@ def test_patch_prefix_is_preserved_at_zero_initialization():
     for layer in levels:
         assert torch.equal(updated[layer], levels[layer])
         assert float(logs[f"layer_{layer}_residual_rms"]) == 0.0
+
+
+def test_strict_identity_rejection_neither_uses_nor_updates_memory():
+    values = _inputs()
+    config = FusionConfig(
+        instance_dim=8,
+        attention_dim=8,
+        num_heads=2,
+        strict_identity_gate=True,
+        dpt_layer_indices=(4, 11, 17, 23),
+    )
+    adapter = InstancePoseAdapter(
+        appearance_dim=4,
+        geometry_dim=5,
+        token_dim=16,
+        config=config,
+    )
+    identity_valid = torch.ones_like(values["observed"])
+    identity_valid[:, 1] = False
+
+    _, valid, logs = adapter.tokenizer(
+        values["appearance"],
+        values["geometry"],
+        values["quality"],
+        values["observed"],
+        identity_valid,
+        branch="geometry",
+    )
+
+    assert not bool(valid[:, 0].any())
+    assert not bool(valid[:, 1].any())
+    assert bool(valid[:, 2:].all())
+    assert float(logs["memory_updates"][:, 1].sum()) == 0.0
+
+
+def test_strict_patch_fusion_writes_only_inside_validated_spatial_mask():
+    values = _inputs()
+    config = FusionConfig(
+        instance_dim=8,
+        attention_dim=8,
+        num_heads=2,
+        strict_identity_gate=True,
+        patch_mask_dilation=0,
+        dpt_layer_indices=(4, 11, 17, 23),
+    )
+    adapter = InstancePoseAdapter(
+        appearance_dim=4,
+        geometry_dim=5,
+        token_dim=16,
+        config=config,
+    )
+    with torch.no_grad():
+        for fusion in adapter.patch_token_fusions.values():
+            fusion.zero_proj.weight.normal_()
+    levels = {layer: torch.randn(1, 4, 6, 16) for layer in (4, 11, 17, 23)}
+    spatial_mask = torch.zeros(1, 4, 1, 4, dtype=torch.bool)
+    spatial_mask[:, :, :, 2:] = True
+
+    updated, _ = adapter.forward_patch_tokens(
+        levels,
+        patch_start_idx=2,
+        appearance=values["appearance"],
+        geometry=values["geometry"],
+        quality=values["quality"],
+        observed=values["observed"],
+        identity_valid=torch.ones_like(values["observed"]),
+        spatial_mask=spatial_mask,
+        patch_shape=(1, 4),
+    )
+
+    for layer in levels:
+        assert torch.equal(updated[layer][:, :, :4], levels[layer][:, :, :4])
+        assert not torch.equal(updated[layer][:, 1:, 4:], levels[layer][:, 1:, 4:])

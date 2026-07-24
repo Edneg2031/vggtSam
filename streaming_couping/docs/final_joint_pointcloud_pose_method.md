@@ -18,6 +18,9 @@ RGB 序列 + 参考帧实例 mask
   └─ SAM3 tracking
        └─ 几何不一致时，用历史实例点云筛选 recovery mask 并写回 memory
                   ↓
+       当前 mask 点云与因果实例点云做 bounded 3D registration
+       不通过：隔离 token / memory / pointmap / ray
+                  ↓
           persistent instance observations
                   ↓
        ┌──────────┴──────────┐
@@ -59,6 +62,14 @@ tracker geometry coverage < 0.50
 
 每段序列最多接受第一个自然恢复事件。没有触发、候选为空或 support 不足时，直接保留原始
 SAM3 tracking。候选选择不使用后续帧 GT。
+
+V4 不再把 recovery 的单向投影覆盖率当成最终身份判定。无论 SAM3 是否触发 recovery，
+每帧每个 mask 内的当前三维点都必须与由参考帧和历史可靠观测构成的实例点云完成有界
+translation-only registration。注册要求足够多的对应点、足够高的 fitness、足够低的 RMSE，
+且中心平移不超过上限。这个检验使用 StreamVGGT 当前 pointmap，不读取当前帧 GT。
+
+因此，一个外观类似但位于错误空间位置的 mask 即使 SAM3 分数很高，也会被标记为
+`GEO-REJECT`。
 
 ## 3. Persistent instance token
 
@@ -103,17 +114,26 @@ instance_token_t =
 ```
 
 因此它不等于一个 mask-pooled SAM3 token，而是“当前实例证据 + 同一实例历史”的对象级表示。
-memory 在每个可靠观测后更新，开始一个新 clip 时重新初始化。
+memory 在每个可靠观测后更新，开始一个新 clip 时重新初始化。V4 将“本帧临时使用”和
+“写入长期 memory”分开：
+
+```text
+本帧 token 可用 =
+    SAM3 score 通过 && bounded 3D identity registration 通过
+
+memory 可写 =
+    本帧 token 可用 && geometry confidence 通过 && static score 通过
+```
 
 第一次可靠观测只建立 memory，不修改 StreamVGGT；从下一个可靠观测开始 token 才能参与
 融合。当前 mask 不可靠时，该帧不写 memory，也不修改 StreamVGGT。
 
 点云和相机使用两个独立 tokenizer：
 
-- geometry tokenizer 使用 appearance、geometry 和质量特征，但只用 tracker confidence
-  做硬门控；
+- geometry tokenizer 使用 appearance、geometry 和质量特征，并经过统一的 3D identity
+  硬门控；
 - pose tokenizer 将 geometry 输入置零，只使用 persistent SAM3 appearance、tracker
-  confidence 和 memory，避免错误点云直接拖动相机。
+  confidence 和 memory；它不读取几何描述符，但仍必须通过外部 3D identity 硬门控。
 
 ## 4. 实例如何修正 pointmap
 
@@ -142,6 +162,11 @@ key/value = 当前帧有效 persistent instance tokens
 update_l = CrossAttention_l(query, key, value)
 patch_l' = patch_l + sigmoid(gate_l) × zero_proj_l(update_l)
 ```
+
+V4 将上述残差限制在通过 3D 身份验证的实例 mask 对应 patch（外扩一个 patch）内。DPT
+解码后再进行一次像素级回退：验证区域外的 pointmap、depth 和 confidence 直接取原始
+StreamVGGT 输出。因此错误 mask 被拒绝时不会修改该区域，也不会让全局 patch 残差污染
+背景。
 
 这一步发生在 frozen aggregator 运行之后、DPT head 融合之前。四层被独立修正，再一起送进
 冻结的 DPT point/depth head，由该 head 完成多层融合并输出 refined world pointmap、depth
@@ -297,7 +322,7 @@ pointmap、depth、camera encoding、相对旋转、平移方向和实例刚体/
 ### 9.1 无 GT 可部署结果
 
 ```text
-final_instance_ray_pose_v3/<clip>/
+final_instance_ray_pose_v4/<clip>/
   deployable_native/
     full_scene.ply
     instance_<id>.ply
@@ -309,15 +334,21 @@ final_instance_ray_pose_v3/<clip>/
     binary/instance_<id>/
     binary/union/
     mask_summary.csv
+    identity_gate_diagnostics.csv
+  raw_tracking_masks/
+    sequence_overview.png
+    overlays/
+    binary/instance_<id>/
 ```
 
 上述点云和位姿使用同一个 StreamVGGT native gauge。`overlays/` 是 RGB 与彩色实例 mask，
-`binary/` 是方法实际消费的 0/255 tracking/recovery masks。
+`segmentation_masks/binary/` 是严格方法实际消费的 0/255 masks；被几何拒绝但便于诊断的
+SAM3 原始结果保存在 `raw_tracking_masks/`。
 
 ### 9.2 GT / raw / ours 公平比较
 
 ```text
-final_instance_ray_pose_v3/<clip>/comparison_gt_world/
+final_instance_ray_pose_v4/<clip>/comparison_gt_world/
   full_scene/{ground_truth,streamvggt_raw,ours,overlay}.ply
   instance_<id>/
   pointcloud_metrics.csv
@@ -332,10 +363,10 @@ final_instance_ray_pose_v3/<clip>/comparison_gt_world/
 
 ## 10. 运行
 
-复现原序列最终结果：
+重新训练严格几何版，并用固定 checkpoint 测试 `492 512 520 545 561 589`：
 
 ```bash
-zsh streaming_couping/commands_final_joint_pointcloud_pose.txt
+zsh streaming_couping/commands_strict_geometry_train_then_test_492_589.txt
 ```
 
 使用固定 checkpoint 测试另一输入顺序：
@@ -357,6 +388,6 @@ PYTHONPATH=src:. python -m streaming_couping.scripts.run_instance_token_pose \
 - 当前是单场景 proof-of-concept，不是跨场景泛化结论；
 - 它是学习残差前端加解析几何后端，不是迭代 bundle adjustment；
 - refined pose 不会反向再次更新 pointmap；
-- pointmap adapter 在新视角上的可靠性尚未解决；
+- V4 通过空间隔离和原始输出回退限制 pointmap 负迁移，但实际效果仍由新实验决定；
 - reference mask 来自数据集实例标注，不是全自动实例发现；
 - 关闭 adapter 时严格恢复原始 StreamVGGT；ray fit 失败时回退 learned center。

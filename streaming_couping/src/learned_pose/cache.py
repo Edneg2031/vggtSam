@@ -51,7 +51,12 @@ def build_feature_caches(config: LearnedPoseConfig) -> list[Path]:
     pending = [
         (clip, path)
         for clip, path in zip(config.clips, paths)
-        if config.features.rebuild or not _cache_complete(path, clip=clip)
+        if config.features.rebuild
+        or not _cache_complete(
+            path,
+            clip=clip,
+            require_identity=config.fusion.strict_identity_gate,
+        )
     ]
     if not pending:
         print("learned-pose feature caches are complete")
@@ -249,7 +254,45 @@ def _build_geometry_cache(
         & (observations["quality"][..., 1] >= config.fusion.min_geometry_confidence)
         & (observations["quality"][..., 2] >= config.fusion.min_static_score)
     )
+    if config.fusion.strict_identity_gate:
+        trusted_for_rigid = (
+            trusted_for_rigid & observations["identity_valid"].bool()
+        )
     rigid_weight = rigid_weight * trusted_for_rigid.float()
+    trusted_instance_valid = (
+        observations["observed"].bool()
+        & observations["identity_valid"].bool()
+        & (
+            observations["quality"][..., 0]
+            >= config.fusion.min_track_confidence
+        )
+    )
+    trusted_masks_output = (
+        tracking_masks_output
+        & trusted_instance_valid[..., None, None]
+    )
+    trusted_masks_stream = (
+        grid_masks
+        & trusted_instance_valid[..., None, None]
+    )
+    identity_diagnostics = []
+    instance_slot = {
+        int(instance_id): slot
+        for slot, instance_id in enumerate(clip.instance_ids)
+    }
+    for row in observations["identity_diagnostics"]:
+        current = dict(row)
+        slot = instance_slot[int(current["instance_id"])]
+        frame = int(current["sequence_index"])
+        current["trusted_instance"] = int(
+            trusted_instance_valid[frame, slot]
+        )
+        current["used_by_strict_method"] = int(
+            trusted_instance_valid[frame, slot]
+            if config.fusion.strict_identity_gate
+            else observations["observed"][frame, slot]
+        )
+        identity_diagnostics.append(current)
     ground_truth = _load_ground_truth_sequence(
         config.manifest,
         scene_id=clip.scene_id,
@@ -294,19 +337,26 @@ def _build_geometry_cache(
         "frame_indices": list(clip.frame_indices),
         "instance_ids": list(clip.instance_ids),
         "reference_sequence_index": clip.reference_sequence_index,
+        "strict_identity_gate": bool(config.fusion.strict_identity_gate),
         "image_paths": [str(path) for path in shared.image_paths],
         "image_size": list(geometry_sequence.processed_size),
         "patch_start_idx": int(output.geometry.aux["patch_start_idx"]),
+        "patch_shape": list(output.geometry.aux["patch_shape"]),
         # Keep the frozen-head inputs in fp32.  The module-off control is
         # required to reproduce the actual StreamVGGT outputs, not an fp16
         # cache approximation of them.
         "camera_hidden": camera_hidden.float(),
         "baseline_pose_encoding": output.geometry.camera_tokens.detach().float().cpu()[0],
         "baseline_depth": depth.float(),
+        "baseline_depth_confidence": depth_confidence.float(),
         "baseline_world_points": geometry_sequence.world_points.float(),
+        "baseline_world_confidence": geometry_sequence.confidence.float(),
         "geometry": observations["geometry"].float(),
         "quality": observations["quality"].float(),
         "observed": observations["observed"].bool(),
+        "identity_valid": observations["identity_valid"].bool(),
+        "trusted_instance_valid": trusted_instance_valid.bool(),
+        "identity_diagnostics": identity_diagnostics,
         "geometry_feature_names": observations["geometry_feature_names"],
         "quality_names": observations["quality_names"],
         "geometry_dim": int(observations["geometry"].shape[-1]),
@@ -314,6 +364,8 @@ def _build_geometry_cache(
         "scene_scale": float(observations["scene_scale"]),
         "tracking_masks_output": tracking_masks_output.bool(),
         "tracking_masks_stream": grid_masks.bool(),
+        "trusted_tracking_masks_output": trusted_masks_output.bool(),
+        "trusted_tracking_masks_stream": trusted_masks_stream.bool(),
         "tracking_scores": scores.float(),
         "instance_uvd": instance_uvd.float(),
         "instance_uvd_valid": uvd_valid.bool(),
@@ -458,7 +510,12 @@ def _target_depth(
     return torch.where(torch.isfinite(world_points).all(dim=-1, keepdim=True), depth, torch.nan)
 
 
-def _cache_complete(path: Path, *, clip: ClipConfig | None = None) -> bool:
+def _cache_complete(
+    path: Path,
+    *,
+    clip: ClipConfig | None = None,
+    require_identity: bool = False,
+) -> bool:
     if not path.exists():
         return False
     try:
@@ -466,6 +523,20 @@ def _cache_complete(path: Path, *, clip: ClipConfig | None = None) -> bool:
     except (OSError, RuntimeError, TypeError, ValueError):
         return False
     if not bool(payload.get("complete", False)):
+        return False
+    if require_identity and any(
+        name not in payload
+        for name in (
+            "identity_valid",
+            "trusted_instance_valid",
+            "trusted_tracking_masks_output",
+            "trusted_tracking_masks_stream",
+            "identity_diagnostics",
+            "patch_shape",
+            "baseline_depth_confidence",
+            "baseline_world_confidence",
+        )
+    ):
         return False
     if clip is None:
         return True
