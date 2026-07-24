@@ -1,3 +1,4 @@
+import csv
 from pathlib import Path
 
 import torch
@@ -7,6 +8,7 @@ from streaming_couping.scripts.run_joint_pointmap_ba import (
     CONTROL_RAW,
     SUMMARY_FIELDS,
     _compact_summary,
+    _write_csv,
 )
 from streaming_couping.src.learned_pose.joint_ba import (
     JOINT_BA_VARIANTS,
@@ -213,6 +215,37 @@ def test_compact_summary_has_five_ordered_rows_and_raw_deltas() -> None:
     assert rows[-1]["ate_delta_from_raw"] == "-0.04"
     assert rows[-1]["pointmap_delta_from_raw"] == "-0.04"
     assert rows[-1]["reference_anchor_exact"] == 1
+
+
+def test_csv_writer_unions_control_and_ba_diagnostic_fields(tmp_path) -> None:
+    path = tmp_path / "diagnostics.csv"
+
+    _write_csv(
+        path,
+        [
+            {"clip": "clip", "variant": CONTROL_RAW, "status": "control"},
+            {
+                "clip": "clip",
+                "variant": JOINT_BA_VARIANTS[0].name,
+                "status": "accepted_joint_ba",
+                "matches": 32,
+                "final_ray_rmse": 0.05,
+            },
+        ],
+    )
+
+    with path.open(newline="", encoding="utf8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert list(rows[0]) == [
+        "clip",
+        "variant",
+        "status",
+        "matches",
+        "final_ray_rmse",
+    ]
+    assert rows[0]["matches"] == ""
+    assert rows[1]["matches"] == "32"
+    assert rows[1]["final_ray_rmse"] == "0.05"
 
 
 def _synthetic_inputs() -> dict[str, object]:

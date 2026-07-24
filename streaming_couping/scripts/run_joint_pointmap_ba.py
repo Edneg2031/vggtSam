@@ -564,7 +564,19 @@ def _write_csv(
     fieldnames: tuple[str, ...] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    names = list(fieldnames or (rows[0].keys() if rows else ()))
+    if fieldnames is not None:
+        names = list(fieldnames)
+    else:
+        # Control rows intentionally contain fewer diagnostics than optimized
+        # BA rows.  Build a stable union instead of assuming the first row
+        # defines the complete schema.
+        names = list(
+            dict.fromkeys(
+                key
+                for row in rows
+                for key in row
+            )
+        )
     with path.open("w", newline="", encoding="utf8") as handle:
         if not names:
             return
