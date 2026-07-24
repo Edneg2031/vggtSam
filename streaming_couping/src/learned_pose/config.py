@@ -50,6 +50,16 @@ class FusionConfig:
     # Geometry memory writes are intentionally stricter than one-frame use.
     # The existing geometry/static thresholds above control those writes.
     patch_mask_dilation: int = 0
+    # A failed positive registration is only a hard identity mismatch when
+    # abundant 3D evidence has essentially zero support.  Smaller/occluded
+    # observations remain UNKNOWN rather than becoming false negatives.
+    identity_hard_mismatch_min_points: int = 512
+    identity_hard_mismatch_max_fitness: float = 0.02
+    unknown_camera_weight: float = 0.25
+    pose_feature_mode: str = "appearance_only"
+    rotation_update_mode: str = "additive_encoding"
+    max_rotation_update_degrees: float = 5.0
+    spatial_attention_mode: str = "union"
     dpt_layer_indices: tuple[int, ...] = (4, 11, 17, 23)
 
 
@@ -94,6 +104,11 @@ class RayPoseConfig:
     angular_huber_delta: float = 0.02
     angular_min_range: float = 0.05
     preserve_reference: bool = True
+    solver_modes: tuple[str, ...] = ("current_refined",)
+    historical_min_correspondences: int = 128
+    historical_max_points_per_instance: int = 4096
+    historical_min_distance: float = 0.02
+    historical_object_ratio: float = 0.05
     export_confidence_threshold: float = 0.30
     export_max_full_scene_points: int = 1_000_000
     export_max_instance_points: int = 250_000
@@ -130,6 +145,9 @@ FINAL_MODE = "decoupled_dual_branch"
 VALID_PERTURBATIONS = {
     "aligned",
     "module_off",
+    "memory_off",
+    "wrong_id_memory",
+    "spatial_token_shuffle",
 }
 
 
@@ -180,6 +198,27 @@ def load_learned_pose_config(path: str | Path) -> LearnedPoseConfig:
             min_static_score=float(fusion.get("min_static_score", 0.20)),
             strict_identity_gate=bool(fusion.get("strict_identity_gate", False)),
             patch_mask_dilation=int(fusion.get("patch_mask_dilation", 0)),
+            identity_hard_mismatch_min_points=int(
+                fusion.get("identity_hard_mismatch_min_points", 512)
+            ),
+            identity_hard_mismatch_max_fitness=float(
+                fusion.get("identity_hard_mismatch_max_fitness", 0.02)
+            ),
+            unknown_camera_weight=float(
+                fusion.get("unknown_camera_weight", 0.25)
+            ),
+            pose_feature_mode=str(
+                fusion.get("pose_feature_mode", "appearance_only")
+            ),
+            rotation_update_mode=str(
+                fusion.get("rotation_update_mode", "additive_encoding")
+            ),
+            max_rotation_update_degrees=float(
+                fusion.get("max_rotation_update_degrees", 5.0)
+            ),
+            spatial_attention_mode=str(
+                fusion.get("spatial_attention_mode", "union")
+            ),
             dpt_layer_indices=tuple(int(v) for v in fusion.get("dpt_layer_indices", [4, 11, 17, 23])),
         ),
         loss=LossConfig(
@@ -238,6 +277,31 @@ def load_learned_pose_config(path: str | Path) -> LearnedPoseConfig:
                 ),
                 preserve_reference=bool(
                     ray_pose.get("preserve_reference", True)
+                ),
+                solver_modes=tuple(
+                    str(value)
+                    for value in ray_pose.get(
+                        "solver_modes",
+                        ["current_refined"],
+                    )
+                ),
+                historical_min_correspondences=int(
+                    ray_pose.get(
+                        "historical_min_correspondences",
+                        128,
+                    )
+                ),
+                historical_max_points_per_instance=int(
+                    ray_pose.get(
+                        "historical_max_points_per_instance",
+                        4096,
+                    )
+                ),
+                historical_min_distance=float(
+                    ray_pose.get("historical_min_distance", 0.02)
+                ),
+                historical_object_ratio=float(
+                    ray_pose.get("historical_object_ratio", 0.05)
                 ),
                 export_confidence_threshold=float(
                     ray_pose.get("export_confidence_threshold", 0.30)
@@ -305,10 +369,72 @@ def _validate(config: LearnedPoseConfig) -> None:
         raise ValueError("ray_pose.blend must be in [0,1].")
     if ray_pose.angular_huber_delta <= 0.0 or ray_pose.angular_min_range <= 0.0:
         raise ValueError("ray_pose angular robust-fit values must be positive.")
+    if not ray_pose.solver_modes:
+        raise ValueError("ray_pose.solver_modes must not be empty.")
+    unknown_solvers = set(ray_pose.solver_modes) - {
+        "current_raw",
+        "current_refined",
+        "historical_anchor",
+    }
+    if unknown_solvers:
+        raise ValueError(
+            f"Unknown ray_pose solver modes: {sorted(unknown_solvers)}."
+        )
+    if ray_pose.historical_min_correspondences < 3:
+        raise ValueError(
+            "ray_pose.historical_min_correspondences must be at least 3."
+        )
+    if (
+        ray_pose.historical_max_points_per_instance
+        < ray_pose.historical_min_correspondences
+    ):
+        raise ValueError(
+            "ray_pose historical point limit is smaller than its minimum "
+            "correspondence count."
+        )
+    if (
+        ray_pose.historical_min_distance <= 0.0
+        or ray_pose.historical_object_ratio <= 0.0
+    ):
+        raise ValueError(
+            "ray_pose historical correspondence distances must be positive."
+        )
     if config.fusion.attention_dim % config.fusion.num_heads:
         raise ValueError("fusion.attention_dim must be divisible by fusion.num_heads.")
     if config.fusion.patch_mask_dilation < 0:
         raise ValueError("fusion.patch_mask_dilation must be non-negative.")
+    if config.fusion.identity_hard_mismatch_min_points < 1:
+        raise ValueError(
+            "fusion.identity_hard_mismatch_min_points must be positive."
+        )
+    if config.fusion.pose_feature_mode not in {
+        "appearance_only",
+        "residual_only",
+        "appearance_and_residual",
+    }:
+        raise ValueError(
+            "fusion.pose_feature_mode must be appearance_only, residual_only, "
+            "or appearance_and_residual."
+        )
+    if config.fusion.rotation_update_mode not in {
+        "additive_encoding",
+        "bounded_so3",
+    }:
+        raise ValueError(
+            "fusion.rotation_update_mode must be additive_encoding or "
+            "bounded_so3."
+        )
+    if config.fusion.max_rotation_update_degrees <= 0.0:
+        raise ValueError(
+            "fusion.max_rotation_update_degrees must be positive."
+        )
+    if config.fusion.spatial_attention_mode not in {
+        "union",
+        "per_instance",
+    }:
+        raise ValueError(
+            "fusion.spatial_attention_mode must be union or per_instance."
+        )
     if config.fusion.dpt_layer_indices != (4, 11, 17, 23):
         raise ValueError(
             "Current StreamVGGT DPT heads require fusion.dpt_layer_indices "
@@ -320,6 +446,11 @@ def _validate(config: LearnedPoseConfig) -> None:
         ("fusion.min_track_confidence", config.fusion.min_track_confidence),
         ("fusion.min_geometry_confidence", config.fusion.min_geometry_confidence),
         ("fusion.min_static_score", config.fusion.min_static_score),
+        (
+            "fusion.identity_hard_mismatch_max_fitness",
+            config.fusion.identity_hard_mismatch_max_fitness,
+        ),
+        ("fusion.unknown_camera_weight", config.fusion.unknown_camera_weight),
         ("loss.rigid_trim_quantile", config.loss.rigid_trim_quantile),
     ):
         if not 0.0 <= float(value) <= 1.0:

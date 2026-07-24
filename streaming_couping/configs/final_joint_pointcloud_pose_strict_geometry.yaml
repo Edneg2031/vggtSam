@@ -41,6 +41,9 @@ fusion:
   min_static_score: 0.20
   strict_identity_gate: true
   patch_mask_dilation: 1
+  identity_hard_mismatch_min_points: 512
+  identity_hard_mismatch_max_fitness: 0.02
+  unknown_camera_weight: 0.25
   dpt_layer_indices: [4, 11, 17, 23]
 
 loss:

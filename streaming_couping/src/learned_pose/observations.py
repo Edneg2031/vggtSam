@@ -47,6 +47,36 @@ QUALITY_NAMES = (
     "static_score",
 )
 
+POSE_RESIDUAL_FEATURE_NAMES = (
+    "observed_centroid_x",
+    "observed_centroid_y",
+    "projected_centroid_x",
+    "projected_centroid_y",
+    "centroid_residual_x",
+    "centroid_residual_y",
+    "observed_cov_xx",
+    "observed_cov_yy",
+    "observed_cov_xy",
+    "projected_cov_xx",
+    "projected_cov_yy",
+    "projected_cov_xy",
+    "cov_residual_xx",
+    "cov_residual_yy",
+    "cov_residual_xy",
+    "observed_area_fraction",
+    "projected_area_fraction",
+    "projection_coverage",
+    "projection_iou",
+    "mean_ray_x",
+    "mean_ray_y",
+    "mean_ray_z",
+    "ray_variance_x",
+    "ray_variance_y",
+    "ray_variance_z",
+    "normalized_log_map_points",
+    "normalized_object_spread",
+)
+
 
 @torch.no_grad()
 def pool_sam_instance_features(
@@ -107,6 +137,8 @@ def build_geometry_observations(
     confidence_threshold: float,
     refinement: InstanceRefinementConfig,
     sampled_instance_points: int,
+    hard_mismatch_min_points: int = 512,
+    hard_mismatch_max_fitness: float = 0.02,
 ) -> dict[str, object]:
     """Create geometry descriptors and camera-local samples without GT gates.
 
@@ -133,6 +165,8 @@ def build_geometry_observations(
     quality = torch.zeros(sequence, instances, len(QUALITY_NAMES))
     observed = torch.zeros(sequence, instances, dtype=torch.bool)
     identity_valid = torch.zeros(sequence, instances, dtype=torch.bool)
+    identity_unknown = torch.zeros(sequence, instances, dtype=torch.bool)
+    identity_mismatch = torch.zeros(sequence, instances, dtype=torch.bool)
     point_counts = torch.zeros(sequence, instances, dtype=torch.long)
     identity_rows: list[dict[str, object]] = []
 
@@ -223,24 +257,59 @@ def build_geometry_observations(
             consensus_ratio = 2.0
             geometry_confidence = 0.0
             static_score = 0.0
-            if frame == int(reference_index):
+            if not bool(observed[frame, slot]):
+                current_identity_valid = False
+                current_identity_unknown = False
+                current_identity_mismatch = False
+                identity_state = "ABSENT"
+                identity_reason = "absent_tracker_mask"
+            elif frame == int(reference_index):
                 current_identity_valid = int(instance_id) in object_maps
+                current_identity_unknown = not current_identity_valid
+                current_identity_mismatch = False
+                identity_state = (
+                    "MATCH" if current_identity_valid else "UNKNOWN"
+                )
                 identity_reason = (
                     "accepted_reference"
                     if current_identity_valid
-                    else "rejected_reference_insufficient_points"
+                    else "unknown_reference_insufficient_points"
                 )
             elif proposal is None:
                 current_identity_valid = False
-                identity_reason = "rejected_missing_persistent_map"
+                current_identity_unknown = True
+                current_identity_mismatch = False
+                identity_state = "UNKNOWN"
+                identity_reason = "unknown_missing_persistent_map"
             else:
                 current_identity_valid = bool(proposal.accepted)
-                identity_reason = (
-                    "accepted_bounded_3d_registration"
-                    if proposal.accepted
-                    else f"rejected_{proposal.reason.replace('; ', '_').replace(' ', '_')}"
+                current_identity_mismatch = (
+                    not proposal.accepted
+                    and int(proposal.current_points)
+                    >= int(hard_mismatch_min_points)
+                    and int(proposal.correspondences) == 0
+                    and float(proposal.fitness)
+                    <= float(hard_mismatch_max_fitness)
                 )
+                current_identity_unknown = (
+                    not current_identity_valid
+                    and not current_identity_mismatch
+                )
+                reason_suffix = proposal.reason.replace(
+                    "; ", "_"
+                ).replace(" ", "_")
+                if current_identity_valid:
+                    identity_state = "MATCH"
+                    identity_reason = "accepted_bounded_3d_registration"
+                elif current_identity_mismatch:
+                    identity_state = "MISMATCH"
+                    identity_reason = f"mismatch_strong_zero_support_{reason_suffix}"
+                else:
+                    identity_state = "UNKNOWN"
+                    identity_reason = f"unknown_geometry_inconclusive_{reason_suffix}"
             identity_valid[frame, slot] = current_identity_valid
+            identity_unknown[frame, slot] = current_identity_unknown
+            identity_mismatch[frame, slot] = current_identity_mismatch
             if frame == int(reference_index):
                 geometry_confidence = 1.0
                 static_score = 1.0
@@ -323,6 +392,9 @@ def build_geometry_observations(
                     "track_confidence": float(scores[frame, slot]),
                     "point_count": int(point_counts[frame, slot]),
                     "identity_valid": int(current_identity_valid),
+                    "identity_unknown": int(current_identity_unknown),
+                    "identity_mismatch": int(current_identity_mismatch),
+                    "identity_state": identity_state,
                     "identity_reason": identity_reason,
                     "registration_accepted": int(
                         proposal.accepted if proposal is not None else current_identity_valid
@@ -371,6 +443,8 @@ def build_geometry_observations(
         "quality": quality,
         "observed": observed,
         "identity_valid": identity_valid,
+        "identity_unknown": identity_unknown,
+        "identity_mismatch": identity_mismatch,
         "identity_diagnostics": identity_rows,
         "point_counts": point_counts,
         "scene_origin": origin,
@@ -378,6 +452,268 @@ def build_geometry_observations(
         "geometry_feature_names": list(GEOMETRY_FEATURE_NAMES),
         "quality_names": list(QUALITY_NAMES),
     }
+
+
+@torch.no_grad()
+def build_pose_residual_observations(
+    *,
+    world_points: torch.Tensor,
+    confidence: torch.Tensor,
+    masks: torch.Tensor,
+    world_to_camera: torch.Tensor,
+    intrinsics: torch.Tensor,
+    identity_valid: torch.Tensor,
+    quality: torch.Tensor,
+    geometry: torch.Tensor,
+    confidence_threshold: float,
+    min_instance_points: int,
+    max_map_points: int,
+    scene_scale: float,
+    min_geometry_confidence: float,
+    min_static_score: float,
+) -> dict[str, object]:
+    """Build causal mask-versus-history projection residuals for pose fusion."""
+
+    world_points = world_points.detach().float().cpu()
+    confidence = confidence.detach().float().cpu()
+    masks = masks.detach().bool().cpu()
+    world_to_camera = world_to_camera.detach().float().cpu()
+    intrinsics = intrinsics.detach().float().cpu()
+    identity_valid = identity_valid.detach().bool().cpu()
+    quality = quality.detach().float().cpu()
+    geometry = geometry.detach().float().cpu()
+    sequence, instances, height, width = masks.shape
+    expected = (sequence, instances)
+    if identity_valid.shape != expected or quality.shape[:2] != expected:
+        raise ValueError("Pose residual identity/quality tensors disagree with masks.")
+    if world_to_camera.shape != (sequence, 3, 4):
+        raise ValueError("world_to_camera must have shape [S,3,4].")
+    if intrinsics.shape != (sequence, 3, 3):
+        raise ValueError("intrinsics must have shape [S,3,3].")
+
+    features = torch.zeros(
+        sequence,
+        instances,
+        len(POSE_RESIDUAL_FEATURE_NAMES),
+    )
+    valid = torch.zeros(sequence, instances, dtype=torch.bool)
+    object_maps: list[torch.Tensor] = [
+        torch.empty(0, 3) for _ in range(instances)
+    ]
+    scale = max(float(scene_scale), 1e-6)
+    for frame in range(sequence):
+        for slot in range(instances):
+            current_points, _ = _masked_points_and_confidence(
+                world_points[frame],
+                confidence[frame],
+                masks[frame, slot],
+                confidence_threshold=confidence_threshold,
+                max_points=max_map_points,
+            )
+            if frame == 0 and current_points.shape[0] >= min_instance_points:
+                object_maps[slot] = current_points
+
+            observed_xy = _normalized_mask_coordinates(
+                masks[frame, slot],
+                width=width,
+                height=height,
+            )
+            observed_moments = _moments_2d(observed_xy)
+            rays = _mask_rays(
+                masks[frame, slot],
+                intrinsics[frame],
+            )
+            ray_mean, ray_variance = _ray_statistics(rays)
+            historical = object_maps[slot]
+            projected_xy, projected_mask = _project_world_points(
+                historical,
+                world_to_camera[frame],
+                intrinsics[frame],
+                height=height,
+                width=width,
+            )
+            projected_moments = _moments_2d(projected_xy)
+            observed_mask = masks[frame, slot]
+            intersection = int((projected_mask & observed_mask).sum())
+            projected_pixels = int(projected_mask.sum())
+            union = int((projected_mask | observed_mask).sum())
+            coverage = (
+                float(intersection) / projected_pixels
+                if projected_pixels
+                else 0.0
+            )
+            iou = float(intersection) / union if union else 0.0
+            if historical.shape[0] >= 2:
+                spread = float(
+                    torch.sqrt(
+                        torch.linalg.eigvalsh(
+                            torch.cov(historical.T)
+                        ).clamp_min(0).sum()
+                    )
+                ) / scale
+            else:
+                spread = 0.0
+            observed_centroid, observed_cov = observed_moments
+            projected_centroid, projected_cov = projected_moments
+            features[frame, slot] = torch.tensor(
+                [
+                    *observed_centroid.tolist(),
+                    *projected_centroid.tolist(),
+                    *(observed_centroid - projected_centroid).tolist(),
+                    *observed_cov.tolist(),
+                    *projected_cov.tolist(),
+                    *(observed_cov - projected_cov).tolist(),
+                    float(observed_mask.float().mean()),
+                    float(projected_mask.float().mean()),
+                    coverage,
+                    iou,
+                    *ray_mean.tolist(),
+                    *ray_variance.tolist(),
+                    math.log1p(int(historical.shape[0])) / 12.0,
+                    min(spread, 2.0),
+                ]
+            )
+            valid[frame, slot] = (
+                observed_xy.shape[0] >= min_instance_points
+                and historical.shape[0] >= min_instance_points
+            )
+
+            memory_write = (
+                bool(identity_valid[frame, slot])
+                and current_points.shape[0] >= min_instance_points
+                and float(quality[frame, slot, 1])
+                >= float(min_geometry_confidence)
+                and float(quality[frame, slot, 2])
+                >= float(min_static_score)
+            )
+            if memory_write and frame > 0:
+                # The geometry descriptor stores the accepted ICP translation
+                # normalized by scene_scale at indices 9:12.
+                corrected = (
+                    current_points
+                    + geometry[frame, slot, 9:12] * scale
+                )
+                object_maps[slot] = deterministic_limit(
+                    torch.cat([historical, corrected], dim=0),
+                    max_map_points,
+                )
+    return {
+        "pose_geometry": torch.nan_to_num(features),
+        "pose_geometry_valid": valid,
+        "pose_geometry_feature_names": list(
+            POSE_RESIDUAL_FEATURE_NAMES
+        ),
+    }
+
+
+def _normalized_mask_coordinates(
+    mask: torch.Tensor,
+    *,
+    width: int,
+    height: int,
+) -> torch.Tensor:
+    coordinates = torch.nonzero(mask, as_tuple=False).float()
+    if not coordinates.numel():
+        return torch.empty(0, 2)
+    y = 2.0 * coordinates[:, 0] / max(height - 1, 1) - 1.0
+    x = 2.0 * coordinates[:, 1] / max(width - 1, 1) - 1.0
+    return torch.stack([x, y], dim=-1)
+
+
+def _moments_2d(
+    coordinates: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not coordinates.numel():
+        return torch.zeros(2), torch.zeros(3)
+    centroid = coordinates.mean(dim=0)
+    centered = coordinates - centroid
+    covariance = (centered.T @ centered) / max(
+        int(coordinates.shape[0]),
+        1,
+    )
+    packed = torch.stack(
+        [covariance[0, 0], covariance[1, 1], covariance[0, 1]]
+    )
+    return centroid, packed
+
+
+def _mask_rays(
+    mask: torch.Tensor,
+    intrinsics: torch.Tensor,
+) -> torch.Tensor:
+    coordinates = torch.nonzero(mask, as_tuple=False).float()
+    if not coordinates.numel():
+        return torch.empty(0, 3)
+    y, x = coordinates.unbind(dim=-1)
+    fx = intrinsics[0, 0].clamp_min(1e-6)
+    fy = intrinsics[1, 1].clamp_min(1e-6)
+    rays = torch.stack(
+        [
+            (x - intrinsics[0, 2]) / fx,
+            (y - intrinsics[1, 2]) / fy,
+            torch.ones_like(x),
+        ],
+        dim=-1,
+    )
+    return F.normalize(rays, dim=-1)
+
+
+def _ray_statistics(
+    rays: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not rays.numel():
+        return torch.zeros(3), torch.zeros(3)
+    mean = rays.mean(dim=0)
+    variance = (rays - mean).square().mean(dim=0)
+    return mean, variance
+
+
+def _project_world_points(
+    points: torch.Tensor,
+    world_to_camera: torch.Tensor,
+    intrinsics: torch.Tensor,
+    *,
+    height: int,
+    width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    support = torch.zeros(height, width, dtype=torch.bool)
+    if not points.numel():
+        return torch.empty(0, 2), support
+    camera = (
+        points @ world_to_camera[:3, :3].T
+        + world_to_camera[:3, 3]
+    )
+    valid = torch.isfinite(camera).all(dim=-1) & (camera[:, 2] > 1e-6)
+    camera = camera[valid]
+    if not camera.numel():
+        return torch.empty(0, 2), support
+    u = intrinsics[0, 0] * camera[:, 0] / camera[:, 2]
+    u = u + intrinsics[0, 2]
+    v = intrinsics[1, 1] * camera[:, 1] / camera[:, 2]
+    v = v + intrinsics[1, 2]
+    visible = (
+        (u >= 0)
+        & (u <= width - 1)
+        & (v >= 0)
+        & (v <= height - 1)
+    )
+    u = u[visible]
+    v = v[visible]
+    if not u.numel():
+        return torch.empty(0, 2), support
+    x_normalized = 2.0 * u / max(width - 1, 1) - 1.0
+    y_normalized = 2.0 * v / max(height - 1, 1) - 1.0
+    coordinates = torch.stack([x_normalized, y_normalized], dim=-1)
+    pixel_x = u.round().long().clamp(0, width - 1)
+    pixel_y = v.round().long().clamp(0, height - 1)
+    support[pixel_y, pixel_x] = True
+    support = F.max_pool2d(
+        support[None, None].float(),
+        kernel_size=5,
+        stride=1,
+        padding=2,
+    )[0, 0].bool()
+    return coordinates, support
 
 
 @torch.no_grad()

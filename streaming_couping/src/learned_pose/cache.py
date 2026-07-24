@@ -35,12 +35,13 @@ from ..types import TrackingSequence
 from .config import ClipConfig, LearnedPoseConfig
 from .observations import (
     build_geometry_observations,
+    build_pose_residual_observations,
     pool_sam_instance_features,
     sample_instance_uvd,
 )
 
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 
 def build_feature_caches(config: LearnedPoseConfig) -> list[Path]:
@@ -239,9 +240,37 @@ def _build_geometry_cache(
         confidence_threshold=config.features.point_confidence_threshold,
         refinement=refinement,
         sampled_instance_points=config.features.sampled_instance_points,
+        hard_mismatch_min_points=(
+            config.fusion.identity_hard_mismatch_min_points
+        ),
+        hard_mismatch_max_fitness=(
+            config.fusion.identity_hard_mismatch_max_fitness
+        ),
     )
     depth = output.geometry.aux["depth_dense"].detach().float().cpu()
     depth_confidence = output.geometry.aux["depth_confidence_dense"].detach().float().cpu()
+    from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+    baseline_w2c, baseline_intrinsics = pose_encoding_to_extri_intri(
+        output.geometry.camera_tokens.detach().float(),
+        image_size_hw=geometry_sequence.processed_size,
+    )
+    pose_observations = build_pose_residual_observations(
+        world_points=geometry_sequence.world_points,
+        confidence=geometry_sequence.confidence,
+        masks=grid_masks,
+        world_to_camera=baseline_w2c[0],
+        intrinsics=baseline_intrinsics[0],
+        identity_valid=observations["identity_valid"],
+        quality=observations["quality"],
+        geometry=observations["geometry"],
+        confidence_threshold=config.features.point_confidence_threshold,
+        min_instance_points=config.features.min_instance_points,
+        max_map_points=refinement.map_max_points,
+        scene_scale=float(observations["scene_scale"]),
+        min_geometry_confidence=config.fusion.min_geometry_confidence,
+        min_static_score=config.fusion.min_static_score,
+    )
     instance_uvd, uvd_valid, rigid_weight = sample_instance_uvd(
         depth,
         depth_confidence,
@@ -267,6 +296,14 @@ def _build_geometry_cache(
             >= config.fusion.min_track_confidence
         )
     )
+    associated_instance_valid = (
+        observations["observed"].bool()
+        & ~observations["identity_mismatch"].bool()
+        & (
+            observations["quality"][..., 0]
+            >= config.fusion.min_track_confidence
+        )
+    )
     trusted_masks_output = (
         tracking_masks_output
         & trusted_instance_valid[..., None, None]
@@ -274,6 +311,14 @@ def _build_geometry_cache(
     trusted_masks_stream = (
         grid_masks
         & trusted_instance_valid[..., None, None]
+    )
+    associated_masks_output = (
+        tracking_masks_output
+        & associated_instance_valid[..., None, None]
+    )
+    associated_masks_stream = (
+        grid_masks
+        & associated_instance_valid[..., None, None]
     )
     identity_diagnostics = []
     instance_slot = {
@@ -287,8 +332,11 @@ def _build_geometry_cache(
         current["trusted_instance"] = int(
             trusted_instance_valid[frame, slot]
         )
+        current["associated_instance"] = int(
+            associated_instance_valid[frame, slot]
+        )
         current["used_by_strict_method"] = int(
-            trusted_instance_valid[frame, slot]
+            associated_instance_valid[frame, slot]
             if config.fusion.strict_identity_gate
             else observations["observed"][frame, slot]
         )
@@ -352,20 +400,35 @@ def _build_geometry_cache(
         "baseline_world_points": geometry_sequence.world_points.float(),
         "baseline_world_confidence": geometry_sequence.confidence.float(),
         "geometry": observations["geometry"].float(),
+        "pose_geometry": pose_observations["pose_geometry"].float(),
+        "pose_geometry_valid": pose_observations[
+            "pose_geometry_valid"
+        ].bool(),
+        "pose_geometry_feature_names": pose_observations[
+            "pose_geometry_feature_names"
+        ],
         "quality": observations["quality"].float(),
         "observed": observations["observed"].bool(),
         "identity_valid": observations["identity_valid"].bool(),
+        "identity_unknown": observations["identity_unknown"].bool(),
+        "identity_mismatch": observations["identity_mismatch"].bool(),
         "trusted_instance_valid": trusted_instance_valid.bool(),
+        "associated_instance_valid": associated_instance_valid.bool(),
         "identity_diagnostics": identity_diagnostics,
         "geometry_feature_names": observations["geometry_feature_names"],
         "quality_names": observations["quality_names"],
         "geometry_dim": int(observations["geometry"].shape[-1]),
+        "pose_geometry_dim": int(
+            pose_observations["pose_geometry"].shape[-1]
+        ),
         "scene_origin": observations["scene_origin"].float(),
         "scene_scale": float(observations["scene_scale"]),
         "tracking_masks_output": tracking_masks_output.bool(),
         "tracking_masks_stream": grid_masks.bool(),
         "trusted_tracking_masks_output": trusted_masks_output.bool(),
         "trusted_tracking_masks_stream": trusted_masks_stream.bool(),
+        "associated_tracking_masks_output": associated_masks_output.bool(),
+        "associated_tracking_masks_stream": associated_masks_stream.bool(),
         "tracking_scores": scores.float(),
         "instance_uvd": instance_uvd.float(),
         "instance_uvd_valid": uvd_valid.bool(),
@@ -528,11 +591,18 @@ def _cache_complete(
         name not in payload
         for name in (
             "identity_valid",
+            "identity_unknown",
+            "identity_mismatch",
             "trusted_instance_valid",
+            "associated_instance_valid",
             "trusted_tracking_masks_output",
             "trusted_tracking_masks_stream",
+            "associated_tracking_masks_output",
+            "associated_tracking_masks_stream",
             "identity_diagnostics",
             "patch_shape",
+            "pose_geometry",
+            "pose_geometry_dim",
             "baseline_depth_confidence",
             "baseline_world_confidence",
         )

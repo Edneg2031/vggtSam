@@ -2,7 +2,9 @@ import torch
 
 from streaming_couping.src.learned_pose.config import RayPoseConfig
 from streaming_couping.src.learned_pose.ray_pose import (
+    _accept_center_fit,
     _fit_angular_huber_center,
+    _historical_correspondences,
 )
 
 
@@ -56,3 +58,46 @@ def test_angular_huber_ray_center_falls_back_with_too_few_points() -> None:
     assert not fit["solver_accepted"]
     assert torch.equal(fit["center"], center)
     assert fit["status"].startswith("fallback_insufficient_points")
+
+
+def test_historical_correspondences_reject_unrelated_geometry() -> None:
+    current = torch.randn(256, 3, dtype=torch.float64)
+    historical = current + torch.tensor(
+        [5.0, 0.0, 0.0],
+        dtype=torch.float64,
+    )
+    pixels = torch.randn(256, 2, dtype=torch.float64)
+    weights = torch.ones(256, dtype=torch.float64)
+
+    matched, matched_pixels, matched_weights = _historical_correspondences(
+        current,
+        pixels,
+        weights,
+        historical,
+        config=RayPoseConfig(
+            historical_min_correspondences=32,
+            historical_max_points_per_instance=512,
+            max_center_shift=0.75,
+            historical_min_distance=0.01,
+            historical_object_ratio=0.01,
+        ),
+    )
+
+    assert matched.shape == (0, 3)
+    assert matched_pixels.shape == (0, 2)
+    assert matched_weights.shape == (0,)
+
+
+def test_center_fit_policy_rejects_excessive_shift() -> None:
+    fit = {
+        "solver_accepted": True,
+        "status": "accepted_angular_huber",
+        "point_residual_rmse": 0.01,
+    }
+    accepted, reasons = _accept_center_fit(
+        fit,
+        proposed_shift=1.0,
+        config=RayPoseConfig(max_center_shift=0.2),
+    )
+    assert not accepted
+    assert reasons == ["center_shift_above_limit"]

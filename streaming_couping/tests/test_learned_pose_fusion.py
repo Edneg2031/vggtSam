@@ -1,7 +1,17 @@
+from pathlib import Path
+
 import torch
 
 from streaming_couping.src.learned_pose.config import FusionConfig
-from streaming_couping.src.learned_pose.model import InstancePoseAdapter
+from streaming_couping.src.learned_pose.model import (
+    InstancePoseAdapter,
+    ZeroInitializedCrossAttention,
+)
+from streaming_couping.src.learned_pose.pipeline import (
+    _compose_camera_update,
+    _so3_exp,
+)
+from vggtsam.utils.imports import maybe_add_repo_to_path
 
 
 def _inputs():
@@ -36,7 +46,7 @@ def test_camera_zero_initialization_is_exact_and_projection_gets_gradient():
     refined, logs = adapter.forward_camera(
         values["camera"],
         appearance=values["appearance"],
-        geometry=values["geometry"],
+        pose_geometry=values["geometry"],
         quality=values["quality"],
         observed=values["observed"],
     )
@@ -59,7 +69,7 @@ def test_module_off_is_exact_after_parameters_change():
     refined, _ = adapter.forward_camera(
         values["camera"],
         appearance=values["appearance"],
-        geometry=values["geometry"],
+        pose_geometry=values["geometry"],
         quality=values["quality"],
         observed=values["observed"],
         module_off=True,
@@ -86,7 +96,7 @@ def test_no_valid_instance_is_exact_after_parameters_change():
     refined, logs = adapter.forward_camera(
         values["camera"],
         appearance=values["appearance"],
-        geometry=values["geometry"],
+        pose_geometry=values["geometry"],
         quality=torch.zeros_like(values["quality"]),
         observed=values["observed"],
     )
@@ -222,3 +232,285 @@ def test_strict_patch_fusion_writes_only_inside_validated_spatial_mask():
     for layer in levels:
         assert torch.equal(updated[layer][:, :, :4], levels[layer][:, :, :4])
         assert not torch.equal(updated[layer][:, 1:, 4:], levels[layer][:, 1:, 4:])
+
+
+def test_unknown_identity_is_camera_only_and_does_not_update_memory():
+    values = _inputs()
+    config = FusionConfig(
+        instance_dim=8,
+        attention_dim=8,
+        num_heads=2,
+        strict_identity_gate=True,
+        unknown_camera_weight=0.25,
+        dpt_layer_indices=(4, 11, 17, 23),
+    )
+    adapter = InstancePoseAdapter(
+        appearance_dim=4,
+        geometry_dim=5,
+        token_dim=16,
+        config=config,
+    )
+    matches = torch.ones_like(values["observed"])
+    unknown = torch.zeros_like(values["observed"])
+    matches[:, 1] = False
+    unknown[:, 1] = True
+
+    _, pose_valid, pose_logs = adapter.tokenizer(
+        values["appearance"],
+        values["geometry"],
+        values["quality"],
+        values["observed"],
+        matches,
+        unknown,
+        branch="pose",
+    )
+    _, geometry_valid, geometry_logs = adapter.geometry_tokenizer(
+        values["appearance"],
+        values["geometry"],
+        values["quality"],
+        values["observed"],
+        matches,
+        unknown,
+        branch="geometry",
+    )
+
+    assert bool(pose_valid[:, 1].all())
+    assert not bool(geometry_valid[:, 1].any())
+    assert torch.all(
+        pose_logs["_instance_reliability"][:, 1] == 0.25
+    )
+    assert float(pose_logs["memory_updates"][:, 1].sum()) == 0.0
+    assert float(geometry_logs["memory_updates"][:, 1].sum()) == 0.0
+
+
+def test_mismatch_identity_is_fully_isolated():
+    values = _inputs()
+    config = FusionConfig(
+        instance_dim=8,
+        attention_dim=8,
+        num_heads=2,
+        strict_identity_gate=True,
+        dpt_layer_indices=(4, 11, 17, 23),
+    )
+    adapter = InstancePoseAdapter(
+        appearance_dim=4,
+        geometry_dim=5,
+        token_dim=16,
+        config=config,
+    )
+    matches = torch.ones_like(values["observed"])
+    matches[:, 1] = False
+    unknown = torch.zeros_like(values["observed"])
+
+    _, valid, logs = adapter.tokenizer(
+        values["appearance"],
+        values["geometry"],
+        values["quality"],
+        values["observed"],
+        matches,
+        unknown,
+        branch="pose",
+    )
+
+    assert not bool(valid[:, 1].any())
+    assert float(logs["memory_updates"][:, 1].sum()) == 0.0
+    assert float(logs["_instance_reliability"][:, 1].sum()) == 0.0
+
+
+def test_unknown_reliability_scales_single_instance_residual():
+    config = FusionConfig(
+        instance_dim=8,
+        attention_dim=8,
+        num_heads=2,
+    )
+    fusion = ZeroInitializedCrossAttention(8, 8, config)
+    with torch.no_grad():
+        fusion.zero_proj.weight.copy_(torch.eye(8))
+    queries = torch.randn(1, 1, 1, 8)
+    tokens = torch.randn(1, 1, 1, 8)
+    valid = torch.ones(1, 1, 1, dtype=torch.bool)
+    full, _ = fusion(
+        queries,
+        tokens,
+        valid,
+        instance_reliability=torch.ones(1, 1, 1),
+    )
+    weak, _ = fusion(
+        queries,
+        tokens,
+        valid,
+        instance_reliability=torch.full((1, 1, 1), 0.25),
+    )
+
+    assert torch.allclose(
+        weak - queries,
+        0.25 * (full - queries),
+        atol=1e-6,
+        rtol=1e-5,
+    )
+
+
+def test_per_instance_spatial_attention_preserves_token_mask_binding():
+    values = _inputs()
+    config = FusionConfig(
+        instance_dim=8,
+        attention_dim=8,
+        num_heads=2,
+        strict_identity_gate=True,
+        spatial_attention_mode="per_instance",
+        patch_mask_dilation=0,
+        dpt_layer_indices=(4, 11, 17, 23),
+    )
+    adapter = InstancePoseAdapter(
+        appearance_dim=4,
+        geometry_dim=5,
+        token_dim=16,
+        config=config,
+    )
+    with torch.no_grad():
+        for fusion in adapter.patch_token_fusions.values():
+            fusion.zero_proj.weight.normal_()
+    levels = {
+        layer: torch.randn(1, 4, 6, 16)
+        for layer in (4, 11, 17, 23)
+    }
+    masks = torch.zeros(1, 4, 3, 1, 4, dtype=torch.bool)
+    masks[:, :, 0, :, :2] = True
+    masks[:, :, 1, :, 2:3] = True
+    masks[:, :, 2, :, 3:] = True
+    common = dict(
+        patch_start_idx=2,
+        appearance=values["appearance"],
+        geometry=values["geometry"],
+        quality=values["quality"],
+        observed=values["observed"],
+        identity_valid=torch.ones_like(values["observed"]),
+        spatial_mask=masks,
+        patch_shape=(1, 4),
+    )
+    aligned, _ = adapter.forward_patch_tokens(
+        levels,
+        shuffle_instance_tokens=False,
+        **common,
+    )
+    shuffled, _ = adapter.forward_patch_tokens(
+        levels,
+        shuffle_instance_tokens=True,
+        **common,
+    )
+
+    assert any(
+        not torch.equal(aligned[layer][:, 1:], shuffled[layer][:, 1:])
+        for layer in levels
+    )
+
+
+def test_so3_exponential_is_valid_and_has_gradient_at_zero():
+    omega = torch.zeros(2, 3, requires_grad=True)
+    rotation = _so3_exp(omega)
+    identity = torch.eye(3).expand_as(rotation)
+    assert torch.allclose(rotation, identity, atol=1e-7)
+    assert torch.allclose(
+        rotation.transpose(-1, -2) @ rotation,
+        identity,
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        torch.linalg.det(rotation),
+        torch.ones(2),
+        atol=1e-6,
+    )
+    rotation[..., 2, 1].sum().backward()
+    assert omega.grad is not None
+    assert float(omega.grad.abs().sum()) > 0.0
+
+
+def test_bounded_so3_camera_update_is_exact_trainable_and_bounded():
+    maybe_add_repo_to_path(
+        Path(__file__).resolve().parents[2] / "externals/streamvggt"
+    )
+
+    class CameraHead:
+        trunk_depth = 1
+
+        def __call__(
+            self,
+            token_levels,
+            *,
+            past_key_values_camera,
+            use_cache,
+        ):
+            del use_cache
+            hidden = token_levels[-1][:, :, 0]
+            quaternion_x = 0.1 * hidden[..., 0]
+            zero = torch.zeros_like(quaternion_x)
+            pose = torch.stack(
+                [
+                    zero,
+                    zero,
+                    zero,
+                    quaternion_x,
+                    zero,
+                    zero,
+                    torch.ones_like(quaternion_x),
+                    torch.ones_like(quaternion_x),
+                    torch.ones_like(quaternion_x),
+                ],
+                dim=-1,
+            )
+            return [pose], past_key_values_camera
+
+    raw = torch.zeros(1, 2, 4)
+    perturbation = torch.zeros_like(raw, requires_grad=True)
+    refined = raw + perturbation
+    baseline = torch.zeros(1, 2, 9)
+    baseline[..., 6] = 1.0
+    baseline[..., 7:] = 1.0
+    exact, correction = _compose_camera_update(
+        CameraHead(),
+        raw,
+        refined,
+        baseline,
+        image_size=(32, 48),
+        update_mode="bounded_so3",
+        max_rotation_update_degrees=5.0,
+    )
+
+    assert torch.equal(exact, baseline)
+    assert torch.equal(correction, torch.zeros_like(correction))
+    exact[..., 3].sum().backward()
+    assert perturbation.grad is not None
+    assert float(perturbation.grad.abs().sum()) > 0.0
+
+    large = raw.clone()
+    large[..., 0] = 100.0
+    bounded, correction = _compose_camera_update(
+        CameraHead(),
+        raw,
+        large,
+        baseline,
+        image_size=(32, 48),
+        update_mode="bounded_so3",
+        max_rotation_update_degrees=5.0,
+    )
+    from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+    extrinsics, _ = pose_encoding_to_extri_intri(
+        bounded,
+        image_size_hw=(32, 48),
+    )
+    rotation = extrinsics[..., :3, :3]
+    identity = torch.eye(3).expand_as(rotation)
+    assert float(correction.max()) <= 5.001
+    assert torch.allclose(
+        rotation.transpose(-1, -2) @ rotation,
+        identity,
+        atol=1e-5,
+    )
+    assert torch.allclose(
+        torch.linalg.det(rotation),
+        torch.ones_like(torch.linalg.det(rotation)),
+        atol=1e-5,
+    )
+    assert torch.equal(bounded[..., :3], baseline[..., :3])
+    assert torch.equal(bounded[..., 7:], baseline[..., 7:])

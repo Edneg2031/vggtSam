@@ -9,6 +9,7 @@ are frame-local except for the deployable reference-intrinsics stabilization.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import replace
 import math
 
 import torch
@@ -60,6 +61,10 @@ _LEGACY_SPEC = _VariantSpec(
     "angular_huber",
     "deployable_v3_selected",
 )
+HISTORICAL_ANCHOR_POSE_NAME = (
+    "ray_historical_anchor_refined_rotation"
+)
+CURRENT_RAW_POSE_NAME = "ray_current_raw_pointmap_refined_rotation"
 
 
 @torch.no_grad()
@@ -70,6 +75,43 @@ def recover_final_ray_pose(
     refined_outputs: dict,
     config: RayPoseConfig,
 ) -> list[RayPoseResult]:
+    """Evaluate configured analytic translation sources on fixed upstream outputs."""
+
+    results: list[RayPoseResult] = []
+    for solver_mode in config.solver_modes:
+        if solver_mode == "historical_anchor":
+            results.append(
+                _recover_historical_anchor_pose(
+                    batch=batch,
+                    baseline_outputs=baseline_outputs,
+                    refined_outputs=refined_outputs,
+                    config=config,
+                )
+            )
+        elif solver_mode in {"current_raw", "current_refined"}:
+            results.append(
+                _recover_current_pointmap_pose(
+                    batch=batch,
+                    baseline_outputs=baseline_outputs,
+                    refined_outputs=refined_outputs,
+                    config=config,
+                    point_source=solver_mode,
+                )
+            )
+        else:
+            raise ValueError(f"Unknown ray-pose solver mode: {solver_mode!r}.")
+    return results
+
+
+@torch.no_grad()
+def _recover_current_pointmap_pose(
+    *,
+    batch: dict,
+    baseline_outputs: dict,
+    refined_outputs: dict,
+    config: RayPoseConfig,
+    point_source: str,
+) -> RayPoseResult:
     """Recover final camera translation from refined instance-region rays."""
 
     if int(baseline_outputs["pose_encoding"].shape[0]) != 1:
@@ -100,12 +142,22 @@ def recover_final_ray_pose(
     )
 
     baseline_points = _normalize_points(batch["baseline_world_points"])
-    refined_points = _normalize_points(refined_outputs["world_points"])
-    refined_confidence = _normalize_confidence(
-        refined_outputs["world_confidence"],
-        refined_points,
-        name="refined_world_confidence",
-    )
+    if point_source == "current_refined":
+        fitted_points = _normalize_points(refined_outputs["world_points"])
+        fitted_confidence = _normalize_confidence(
+            refined_outputs["world_confidence"],
+            fitted_points,
+            name="refined_world_confidence",
+        )
+    elif point_source == "current_raw":
+        fitted_points = baseline_points
+        fitted_confidence = _normalize_confidence(
+            batch["baseline_world_confidence"],
+            fitted_points,
+            name="baseline_world_confidence",
+        )
+    else:
+        raise ValueError(f"Unknown current point source: {point_source!r}.")
     # Preserve the selected experiment's exact common-finite support: the
     # instance mask is intersected with the frozen baseline pointmap validity,
     # while the fitted coordinates come from the refined pointmap.
@@ -121,12 +173,25 @@ def recover_final_ray_pose(
         .clone()
     )
 
-    name = FINAL_RAY_POSE_NAME
+    name = (
+        FINAL_RAY_POSE_NAME
+        if point_source == "current_refined"
+        else CURRENT_RAW_POSE_NAME
+    )
     spec = (
         _FINAL_SPEC
         if bool(batch.get("strict_identity_gate", False))
         else _LEGACY_SPEC
     )
+    if point_source == "current_raw":
+        spec = _VariantSpec(
+            "baseline",
+            "refined",
+            "baseline_reference",
+            "tracked_instances",
+            "angular_huber",
+            "solver_source_ablation",
+        )
     centers = []
     diagnostic_rows = []
     for sequence_index, frame_index in enumerate(frame_indices):
@@ -148,11 +213,11 @@ def recover_final_ray_pose(
 
         current_confidence = torch.where(
             instance_mask[sequence_index],
-            refined_confidence[sequence_index],
-            torch.full_like(refined_confidence[sequence_index], float("-inf")),
+            fitted_confidence[sequence_index],
+            torch.full_like(fitted_confidence[sequence_index], float("-inf")),
         )
         sampled_points, directions, weights, candidate_points = _prepare_ray_inputs(
-            refined_points[sequence_index],
+            fitted_points[sequence_index],
             current_confidence,
             intrinsics[sequence_index],
             rotation,
@@ -177,19 +242,11 @@ def recover_final_ray_pose(
         proposed_shift = float(
             torch.linalg.vector_norm(fit["center"] - fallback_center)
         )
-        accepted = bool(fit["solver_accepted"])
-        rejection_reasons = []
-        if not accepted:
-            rejection_reasons.append(str(fit["status"]))
-        if not math.isfinite(float(fit["point_residual_rmse"])):
-            accepted = False
-            rejection_reasons.append("non_finite_residual")
-        elif float(fit["point_residual_rmse"]) > float(config.max_residual_rmse):
-            accepted = False
-            rejection_reasons.append("ray_residual_above_limit")
-        if proposed_shift > float(config.max_center_shift):
-            accepted = False
-            rejection_reasons.append("center_shift_above_limit")
+        accepted, rejection_reasons = _accept_center_fit(
+            fit,
+            proposed_shift=proposed_shift,
+            config=config,
+        )
         if accepted:
             applied_center = fallback_center + float(config.blend) * (
                 fit["center"] - fallback_center
@@ -276,14 +333,485 @@ def recover_final_ray_pose(
         encoded_intrinsics,
         image_size_hw=image_size,
     )
-    return [
-        RayPoseResult(
-            name=name,
-            role=spec.role,
-            pose_encoding=pose_encoding,
-            diagnostics=tuple(diagnostic_rows),
+    return RayPoseResult(
+        name=name,
+        role=spec.role,
+        pose_encoding=pose_encoding,
+        diagnostics=tuple(diagnostic_rows),
+    )
+
+
+@torch.no_grad()
+def _recover_historical_anchor_pose(
+    *,
+    batch: dict,
+    baseline_outputs: dict,
+    refined_outputs: dict,
+    config: RayPoseConfig,
+) -> RayPoseResult:
+    """Solve centers from prior-frame instance anchors and current pixels."""
+
+    from streamvggt.utils.pose_enc import (
+        extri_intri_to_pose_encoding,
+        pose_encoding_to_extri_intri,
+    )
+
+    image_size = tuple(int(value) for value in batch["image_size"])
+    frame_indices = [int(value) for value in batch["frame_indices"]]
+    reference_index = int(batch["reference_sequence_index"])
+    baseline_w2c, baseline_intrinsics = pose_encoding_to_extri_intri(
+        baseline_outputs["pose_encoding"].float(),
+        image_size_hw=image_size,
+    )
+    refined_w2c, _ = pose_encoding_to_extri_intri(
+        refined_outputs["pose_encoding"].float(),
+        image_size_hw=image_size,
+    )
+    refined_sequence = _prepare_pose_sequence(
+        refined_w2c[0].detach().double().cpu(),
+        frame_indices=frame_indices,
+        source="historical_anchor_refined_rotation",
+    )
+    baseline_w2c = baseline_w2c[0].detach().double().cpu()
+    baseline_points = _normalize_points(batch["baseline_world_points"])
+    baseline_confidence = _normalize_confidence(
+        batch["baseline_world_confidence"],
+        baseline_points,
+        name="baseline_world_confidence",
+    )
+    masks = batch["trusted_tracking_masks_stream"].detach().bool().cpu()[0]
+    trusted = _trusted_instance_valid(batch)
+    instance_ids = tuple(int(value) for value in batch.get("instance_ids", ()))
+    intrinsics = (
+        baseline_intrinsics[0, reference_index]
+        .detach()
+        .double()
+        .cpu()[None]
+        .expand(len(frame_indices), -1, -1)
+        .clone()
+    )
+    instance_count = masks.shape[1]
+    object_maps = [torch.empty(0, 3, dtype=torch.float64) for _ in range(instance_count)]
+    anchor_frames: list[list[int]] = [[] for _ in range(instance_count)]
+    centers = []
+    diagnostic_rows = []
+    fit_config = replace(
+        config,
+        min_points=int(config.historical_min_correspondences),
+    )
+
+    for sequence_index, frame_index in enumerate(frame_indices):
+        fallback_center = refined_sequence.camera_centers[sequence_index]
+        rotation = refined_sequence.camera_to_world_rotation[sequence_index]
+        matched_points = []
+        matched_pixels = []
+        matched_weights = []
+        per_instance_counts = []
+        source_frames: set[int] = set()
+        current_samples: list[
+            tuple[int, torch.Tensor, torch.Tensor]
+        ] = []
+        for slot in range(instance_count):
+            current_points, pixels, weights = _sample_masked_world_pixels(
+                baseline_points[sequence_index],
+                baseline_confidence[sequence_index],
+                masks[sequence_index, slot],
+                confidence_threshold=float(config.confidence_threshold),
+                max_points=int(
+                    config.historical_max_points_per_instance
+                ),
+            )
+            current_samples.append((slot, current_points, pixels))
+            if (
+                sequence_index == reference_index
+                or not bool(trusted[sequence_index, slot])
+                or object_maps[slot].shape[0]
+                < int(config.historical_min_correspondences)
+                or current_points.shape[0]
+                < int(config.historical_min_correspondences)
+            ):
+                per_instance_counts.append(0)
+                continue
+            historical, current_pixel, current_weight = (
+                _historical_correspondences(
+                    current_points,
+                    pixels,
+                    weights,
+                    object_maps[slot],
+                    config=config,
+                )
+            )
+            per_instance_counts.append(int(historical.shape[0]))
+            if historical.numel():
+                matched_points.append(historical)
+                matched_pixels.append(current_pixel)
+                matched_weights.append(current_weight)
+                source_frames.update(anchor_frames[slot])
+
+        if sequence_index == reference_index:
+            applied_center = fallback_center
+            fit = _angular_fallback(
+                torch.empty(0, 3, dtype=torch.float64),
+                torch.empty(0, 3, dtype=torch.float64),
+                fallback_center,
+                status="reference_initializes_historical_anchors",
+            )
+            accepted = False
+            proposed_shift = 0.0
+            policy_status = "reference_anchor_initialization"
+            initial_point_stats = _distance_statistics(
+                torch.empty(0, dtype=torch.float64)
+            )
+            initial_angular_stats = initial_point_stats
+            sampled_points = torch.empty(0, 3, dtype=torch.float64)
+            candidate_points = 0
+        else:
+            if matched_points:
+                sampled_points = torch.cat(matched_points, dim=0)
+                sampled_pixels = torch.cat(matched_pixels, dim=0)
+                weights = torch.cat(matched_weights, dim=0)
+            else:
+                sampled_points = torch.empty(0, 3, dtype=torch.float64)
+                sampled_pixels = torch.empty(0, 2, dtype=torch.float64)
+                weights = torch.empty(0, dtype=torch.float64)
+            candidate_points = int(sampled_points.shape[0])
+            directions = _pixel_world_directions(
+                sampled_pixels,
+                intrinsics[sequence_index],
+                rotation,
+            )
+            initial_point_stats = _distance_statistics(
+                _ray_residuals(
+                    sampled_points,
+                    directions,
+                    fallback_center,
+                )
+            )
+            initial_angular_stats = _distance_statistics(
+                _angular_residuals(
+                    sampled_points,
+                    directions,
+                    fallback_center,
+                )
+            )
+            fit = _fit_angular_huber_center(
+                sampled_points,
+                directions,
+                weights,
+                candidate_points=candidate_points,
+                fallback_center=fallback_center,
+                config=fit_config,
+            )
+            proposed_shift = float(
+                torch.linalg.vector_norm(
+                    fit["center"] - fallback_center
+                )
+            )
+            accepted, rejection_reasons = _accept_center_fit(
+                fit,
+                proposed_shift=proposed_shift,
+                config=config,
+            )
+            if accepted:
+                applied_center = fallback_center + float(config.blend) * (
+                    fit["center"] - fallback_center
+                )
+                policy_status = "accepted"
+            else:
+                applied_center = fallback_center
+                policy_status = ";".join(
+                    dict.fromkeys(rejection_reasons)
+                )
+        centers.append(applied_center)
+
+        # Add only geometrically trusted observations. Non-reference frames
+        # enter long-term anchors only after a successful historical fit.
+        if sequence_index == reference_index or accepted:
+            for slot, current_points, _ in current_samples:
+                if (
+                    not bool(trusted[sequence_index, slot])
+                    or current_points.shape[0]
+                    < int(config.historical_min_correspondences)
+                ):
+                    continue
+                if sequence_index == reference_index:
+                    reposed = current_points
+                else:
+                    camera_local = (
+                        current_points @ baseline_w2c[
+                            sequence_index, :3, :3
+                        ].T
+                        + baseline_w2c[sequence_index, :3, 3]
+                    )
+                    reposed = (
+                        camera_local @ rotation.T + applied_center
+                    )
+                object_maps[slot] = _limit_points(
+                    torch.cat([object_maps[slot], reposed], dim=0),
+                    int(config.historical_max_points_per_instance),
+                )
+                if frame_index not in anchor_frames[slot]:
+                    anchor_frames[slot].append(frame_index)
+
+        diagnostic_rows.append(
+            {
+                "variant": HISTORICAL_ANCHOR_POSE_NAME,
+                "variant_role": "historical_anchor_ablation",
+                "pointmap_source": "historical_raw_instance_anchors",
+                "pose_source": "refined",
+                "intrinsics_source": "baseline_reference",
+                "spatial_scope": "tracked_instances",
+                "fit_method": "historical_anchor_angular_huber",
+                "correspondence_source": (
+                    "raw_pointmap_icp_to_prior_instance_map"
+                ),
+                "sequence_index": sequence_index,
+                "frame_index": frame_index,
+                "is_reference": int(
+                    sequence_index == reference_index
+                ),
+                "solver_accepted": int(
+                    bool(fit["solver_accepted"])
+                ),
+                "fit_accepted": int(accepted),
+                "fit_status": policy_status,
+                "solver_status": fit["status"],
+                "candidate_points": candidate_points,
+                "sampled_points": int(sampled_points.shape[0]),
+                "retained_points": int(fit["retained_points"]),
+                "solve_iterations": int(fit["solve_iterations"]),
+                "condition_number": float(fit["condition_number"]),
+                "initial_point_ray_rmse_native": initial_point_stats[
+                    "rmse"
+                ],
+                "fitted_point_ray_rmse_native": float(
+                    fit["point_residual_rmse"]
+                ),
+                "initial_angular_rmse": initial_angular_stats["rmse"],
+                "fitted_angular_rmse": float(
+                    fit["angular_residual_rmse"]
+                ),
+                "proposed_center_shift_native": proposed_shift,
+                "applied_center_shift_native": float(
+                    torch.linalg.vector_norm(
+                        applied_center - fallback_center
+                    )
+                ),
+                "blend": float(config.blend),
+                "trusted_instance_ids": _instance_id_text(
+                    instance_ids,
+                    trusted[sequence_index],
+                    selected=True,
+                ),
+                "rejected_instance_ids": _instance_id_text(
+                    instance_ids,
+                    trusted[sequence_index],
+                    selected=False,
+                ),
+                "trusted_instance_count": int(
+                    trusted[sequence_index].sum()
+                ),
+                "per_instance_correspondences": " ".join(
+                    str(value) for value in per_instance_counts
+                ),
+                "anchor_source_frame_ids": " ".join(
+                    str(value) for value in sorted(source_frames)
+                ),
+                "fx": float(intrinsics[sequence_index, 0, 0]),
+                "fy": float(intrinsics[sequence_index, 1, 1]),
+                "cx": float(intrinsics[sequence_index, 0, 2]),
+                "cy": float(intrinsics[sequence_index, 1, 2]),
+                **_vector_fields(
+                    "input_center_native",
+                    fallback_center,
+                ),
+                **_vector_fields(
+                    "fitted_center_native",
+                    fit["center"],
+                ),
+                **_vector_fields(
+                    "applied_center_native",
+                    applied_center,
+                ),
+            }
         )
-    ]
+
+    centers_tensor = torch.stack(centers)
+    c2w_rotation = refined_sequence.camera_to_world_rotation
+    w2c_rotation = c2w_rotation.transpose(-1, -2)
+    w2c_translation = -torch.einsum(
+        "sij,sj->si",
+        w2c_rotation,
+        centers_tensor,
+    )
+    extrinsics = torch.cat(
+        [w2c_rotation, w2c_translation[..., None]],
+        dim=-1,
+    )[None].to(
+        device=refined_outputs["pose_encoding"].device,
+        dtype=torch.float32,
+    )
+    pose_encoding = extri_intri_to_pose_encoding(
+        extrinsics,
+        intrinsics[None].to(
+            device=extrinsics.device,
+            dtype=torch.float32,
+        ),
+        image_size_hw=image_size,
+    )
+    return RayPoseResult(
+        name=HISTORICAL_ANCHOR_POSE_NAME,
+        role="historical_anchor_ablation",
+        pose_encoding=pose_encoding,
+        diagnostics=tuple(diagnostic_rows),
+    )
+
+
+def _sample_masked_world_pixels(
+    points: torch.Tensor,
+    confidence: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    confidence_threshold: float,
+    max_points: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    valid = (
+        mask.bool()
+        & torch.isfinite(points).all(dim=-1)
+        & torch.isfinite(confidence)
+        & (confidence >= float(confidence_threshold))
+    )
+    pixels_yx = torch.nonzero(valid, as_tuple=False)
+    if not pixels_yx.numel():
+        return (
+            torch.empty(0, 3, dtype=torch.float64),
+            torch.empty(0, 2, dtype=torch.float64),
+            torch.empty(0, dtype=torch.float64),
+        )
+    if pixels_yx.shape[0] > int(max_points):
+        keep = torch.linspace(
+            0,
+            pixels_yx.shape[0] - 1,
+            steps=int(max_points),
+        ).round().long()
+        pixels_yx = pixels_yx.index_select(0, keep)
+    selected_points = points[
+        pixels_yx[:, 0],
+        pixels_yx[:, 1],
+    ].double()
+    selected_weights = confidence[
+        pixels_yx[:, 0],
+        pixels_yx[:, 1],
+    ].double().clamp_min(1e-6)
+    pixels_uv = pixels_yx[:, [1, 0]].double()
+    return selected_points, pixels_uv, selected_weights
+
+
+def _historical_correspondences(
+    current_points: torch.Tensor,
+    current_pixels: torch.Tensor,
+    current_weights: torch.Tensor,
+    historical_points: torch.Tensor,
+    *,
+    config: RayPoseConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    initialization = (
+        torch.quantile(historical_points, 0.5, dim=0)
+        - torch.quantile(current_points, 0.5, dim=0)
+    )
+    if float(torch.linalg.vector_norm(initialization)) > float(
+        config.max_center_shift
+    ):
+        initialization = torch.zeros_like(initialization)
+    shifted = current_points + initialization
+    low = torch.quantile(historical_points, 0.05, dim=0)
+    high = torch.quantile(historical_points, 0.95, dim=0)
+    object_scale = float(torch.linalg.vector_norm(high - low))
+    maximum_distance = max(
+        float(config.historical_min_distance),
+        float(config.historical_object_ratio) * object_scale,
+    )
+    # Avoid materializing a 4096 x 4096 double matrix for every instance.
+    nearest_distance_rows = []
+    nearest_index_rows = []
+    chunk_size = 512
+    for start in range(0, shifted.shape[0], chunk_size):
+        distances = torch.cdist(
+            shifted[start : start + chunk_size],
+            historical_points,
+        )
+        distance, index = distances.min(dim=1)
+        nearest_distance_rows.append(distance)
+        nearest_index_rows.append(index)
+    nearest_distance = torch.cat(nearest_distance_rows)
+    nearest_index = torch.cat(nearest_index_rows)
+    keep = nearest_distance <= maximum_distance
+    if int(keep.sum()) < int(config.historical_min_correspondences):
+        return (
+            torch.empty(0, 3, dtype=torch.float64),
+            torch.empty(0, 2, dtype=torch.float64),
+            torch.empty(0, dtype=torch.float64),
+        )
+    return (
+        historical_points.index_select(0, nearest_index[keep]),
+        current_pixels[keep],
+        current_weights[keep],
+    )
+
+
+def _pixel_world_directions(
+    pixels_uv: torch.Tensor,
+    intrinsics: torch.Tensor,
+    camera_to_world_rotation: torch.Tensor,
+) -> torch.Tensor:
+    if not pixels_uv.numel():
+        return torch.empty(0, 3, dtype=torch.float64)
+    u, v = pixels_uv.unbind(dim=-1)
+    camera = torch.stack(
+        [
+            (u - intrinsics[0, 2]) / intrinsics[0, 0],
+            (v - intrinsics[1, 2]) / intrinsics[1, 1],
+            torch.ones_like(u),
+        ],
+        dim=-1,
+    )
+    camera = torch.nn.functional.normalize(camera, dim=-1)
+    world = camera @ camera_to_world_rotation.T
+    return torch.nn.functional.normalize(world, dim=-1)
+
+
+def _accept_center_fit(
+    fit: dict,
+    *,
+    proposed_shift: float,
+    config: RayPoseConfig,
+) -> tuple[bool, list[str]]:
+    accepted = bool(fit["solver_accepted"])
+    reasons = []
+    if not accepted:
+        reasons.append(str(fit["status"]))
+    residual = float(fit["point_residual_rmse"])
+    if not math.isfinite(residual):
+        accepted = False
+        reasons.append("non_finite_residual")
+    elif residual > float(config.max_residual_rmse):
+        accepted = False
+        reasons.append("ray_residual_above_limit")
+    if proposed_shift > float(config.max_center_shift):
+        accepted = False
+        reasons.append("center_shift_above_limit")
+    return accepted, reasons
+
+
+def _limit_points(points: torch.Tensor, maximum: int) -> torch.Tensor:
+    if points.shape[0] <= int(maximum):
+        return points
+    keep = torch.linspace(
+        0,
+        points.shape[0] - 1,
+        steps=int(maximum),
+    ).round().long()
+    return points.index_select(0, keep)
 
 
 def _normalize_points(value: torch.Tensor) -> torch.Tensor:

@@ -1,10 +1,23 @@
-# Frozen V4 checkpoint test on the non-overlapping 492--589 views.
+# V5 single-command ablation suite.
+#
+# The adapter is supervised only on 90/105/119/130/140. Frames 210/240 are a
+# causal suffix holdout, while 492--589 is a completely held-out view sequence.
+# All structural variants receive independent training from zero initialization.
 recovery_config: streaming_couping/configs/recovery_050_025.yaml
-output_dir: outputs/streaming_couping_final_test_00a231a370_492_589_v4_strict_geometry
+output_dir: outputs/streaming_couping_v5_ablation
 
 dataset:
   manifest: data/processed/scannetpp_pinhole_2d/manifest.json
   clips:
+    - name: 00a231a370_90_240_37_68_54
+      scene_id: 00a231a370
+      frame_indices: [90, 105, 119, 130, 140, 210, 240]
+      training_frame_indices: [90, 105, 119, 130, 140]
+      evaluation_frame_indices: [210, 240]
+      instance_ids: [37, 68, 54]
+      reference_sequence_index: 0
+      split: train
+      tracking_cache: outputs/streaming_couping_instance_pose_37_68_54/tracking_cache.npz
     - name: 00a231a370_492_589_37_68_54
       scene_id: 00a231a370
       frame_indices: [492, 512, 520, 545, 561, 589]
@@ -17,7 +30,7 @@ runtime:
   geometry_device: cuda:1
 
 features:
-  cache_dir: outputs/streaming_couping_final_test_00a231a370_492_589_v4_strict_geometry/cache
+  cache_dir: outputs/streaming_couping_v5_ablation/cache
   rebuild: false
   sam_source: detector_fpn2
   sam_resolution: 1008
@@ -26,6 +39,7 @@ features:
   min_instance_points: 128
   sampled_instance_points: 128
 
+# The suite runner replaces the four structural fields below for each variant.
 fusion:
   instance_dim: 512
   attention_dim: 512
@@ -40,6 +54,10 @@ fusion:
   identity_hard_mismatch_min_points: 512
   identity_hard_mismatch_max_fitness: 0.02
   unknown_camera_weight: 0.25
+  pose_feature_mode: appearance_and_residual
+  rotation_update_mode: bounded_so3
+  max_rotation_update_degrees: 5.0
+  spatial_attention_mode: per_instance
   dpt_layer_indices: [4, 11, 17, 23]
 
 loss:
@@ -54,7 +72,6 @@ loss:
   pointmap: 5.0
   rigid_trim_quantile: 0.70
 
-# Used only to construct the frozen adapter; this config never trains.
 training:
   epochs: 30
   repeats_per_epoch: 4
@@ -66,6 +83,8 @@ training:
   amp: false
 
 evaluation:
+  # Structural variants always run aligned + exact module-off. The suite adds
+  # memory/ID/spatial negative controls only to the designated final candidate.
   perturbations: [aligned, module_off]
   strict_equivalence: true
   ray_pose:
@@ -79,7 +98,12 @@ evaluation:
     blend: 1.0
     angular_huber_delta: 0.02
     angular_min_range: 0.05
+    preserve_reference: false
+    solver_modes: [current_raw, current_refined, historical_anchor]
+    historical_min_correspondences: 128
+    historical_max_points_per_instance: 4096
+    historical_min_distance: 0.02
+    historical_object_ratio: 0.05
     export_confidence_threshold: 0.30
     export_max_full_scene_points: 1000000
     export_max_instance_points: 250000
-    preserve_reference: false

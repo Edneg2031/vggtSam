@@ -199,7 +199,7 @@ def export_final_ray_pose_outputs(
 
         clip_root = root / clip.name
         exported_masks = (
-            payload["trusted_tracking_masks_output"]
+            payload["associated_tracking_masks_output"]
             if config.fusion.strict_identity_gate
             else payload["tracking_masks_output"]
         )
@@ -210,10 +210,30 @@ def export_final_ray_pose_outputs(
             image_paths=payload["image_paths"],
             masks=exported_masks,
             scores=payload.get("tracking_scores"),
-            identity_valid=payload.get("trusted_instance_valid"),
+            identity_valid=payload.get("identity_valid"),
+            identity_unknown=payload.get("identity_unknown"),
+            identity_mismatch=payload.get("identity_mismatch"),
             reference_sequence_index=clip.reference_sequence_index,
+            mask_role=(
+                "associated"
+                if config.fusion.strict_identity_gate
+                else "consumed"
+            ),
         )
         if config.fusion.strict_identity_gate:
+            _export_tracking_mask_visualizations(
+                clip_root / "geometry_trusted_masks",
+                frame_indices=clip.frame_indices,
+                instance_ids=clip.instance_ids,
+                image_paths=payload["image_paths"],
+                masks=payload["trusted_tracking_masks_output"],
+                scores=payload.get("tracking_scores"),
+                identity_valid=payload.get("identity_valid"),
+                identity_unknown=payload.get("identity_unknown"),
+                identity_mismatch=payload.get("identity_mismatch"),
+                reference_sequence_index=clip.reference_sequence_index,
+                mask_role="geometry_trusted",
+            )
             _export_tracking_mask_visualizations(
                 clip_root / "raw_tracking_masks",
                 frame_indices=clip.frame_indices,
@@ -221,7 +241,9 @@ def export_final_ray_pose_outputs(
                 image_paths=payload["image_paths"],
                 masks=payload["tracking_masks_output"],
                 scores=payload.get("tracking_scores"),
-                identity_valid=payload.get("trusted_instance_valid"),
+                identity_valid=payload.get("identity_valid"),
+                identity_unknown=payload.get("identity_unknown"),
+                identity_mismatch=payload.get("identity_mismatch"),
                 reference_sequence_index=clip.reference_sequence_index,
                 mask_role="raw_diagnostic",
             )
@@ -1035,6 +1057,8 @@ def _export_tracking_mask_visualizations(
     scores: torch.Tensor | None,
     reference_sequence_index: int,
     identity_valid: torch.Tensor | None = None,
+    identity_unknown: torch.Tensor | None = None,
+    identity_mismatch: torch.Tensor | None = None,
     mask_role: str = "consumed",
 ) -> None:
     """Export the exact persistent-instance masks consumed by the method."""
@@ -1074,6 +1098,24 @@ def _export_tracking_mask_visualizations(
                 "Identity validity must have shape "
                 f"{expected_prefix}, got {tuple(identity_tensor.shape)}."
             )
+    unknown_tensor = _optional_identity_tensor(
+        identity_unknown,
+        expected_prefix=expected_prefix,
+        name="Identity unknown",
+    )
+    mismatch_tensor = _optional_identity_tensor(
+        identity_mismatch,
+        expected_prefix=expected_prefix,
+        name="Identity mismatch",
+    )
+    if bool(
+        (
+            identity_tensor.int()
+            + unknown_tensor.int()
+            + mismatch_tensor.int()
+        ).gt(1).any()
+    ):
+        raise ValueError("MATCH/UNKNOWN/MISMATCH identity states overlap.")
 
     overlay_root = root / "overlays"
     binary_root = root / "binary"
@@ -1127,6 +1169,12 @@ def _export_tracking_mask_visualizations(
                     "geometry_identity_valid": int(
                         identity_tensor[sequence_index, instance_index]
                     ),
+                    "identity_state": _identity_state(
+                        identity_tensor[sequence_index, instance_index],
+                        unknown_tensor[sequence_index, instance_index],
+                        mismatch_tensor[sequence_index, instance_index],
+                        present=bool(source_mask.any()),
+                    ),
                     "source_mask_pixels": int(source_mask.sum()),
                     "source_mask_fraction": float(source_mask.mean()),
                     "visualization_mask_pixels": int(resized.sum()),
@@ -1147,6 +1195,8 @@ def _export_tracking_mask_visualizations(
             instance_ids=instance_ids,
             scores=score_tensor[sequence_index],
             identity_valid=identity_tensor[sequence_index],
+            identity_unknown=unknown_tensor[sequence_index],
+            identity_mismatch=mismatch_tensor[sequence_index],
             present=tuple(bool(value.any()) for value in resized_masks),
             is_reference=sequence_index == int(reference_sequence_index),
         )
@@ -1168,14 +1218,23 @@ def _export_tracking_mask_visualizations(
         ],
     )
     _save_mask_overview(overview_panels, root / "sequence_overview.png")
-    role_text = (
-        "These are raw SAM3 masks for diagnosis only; GEO-REJECT masks are "
-        "not consumed by the strict adapter or ray solver."
-        if mask_role == "raw_diagnostic"
-        else
-        "These are the geometry-validated masks consumed by the strict "
-        "adapter and ray solver."
-    )
+    role_text = {
+        "raw_diagnostic": (
+            "These are raw SAM3 tracking masks for diagnosis. MISMATCH masks "
+            "are visible here but are isolated from every learned and analytic "
+            "branch."
+        ),
+        "associated": (
+            "These are associated MATCH+UNKNOWN masks. MATCH has full camera "
+            "weight; UNKNOWN has reduced camera-only weight and never enters "
+            "geometry, ray solving, or persistent-memory writes."
+        ),
+        "geometry_trusted": (
+            "These are MATCH-only geometry masks consumed by patch-token "
+            "fusion and analytic ray solvers."
+        ),
+        "consumed": "These are the masks consumed by the configured method.",
+    }.get(mask_role, f"Mask role: {mask_role}.")
     (root / "README.txt").write_text(
         "Persistent-instance segmentation masks\n"
         "======================================\n\n"
@@ -1185,7 +1244,7 @@ def _export_tracking_mask_visualizations(
         "sampling. binary/union/ is the union shown in this directory. "
         "sequence_overview.png shows the "
         "configured input order. mask_summary.csv records tracking score, "
-        "geometry identity validity, visibility, and mask area.\n\n"
+        "MATCH/UNKNOWN/MISMATCH identity state, visibility, and mask area.\n\n"
         "The reference-frame mask is the initialization/prompt mask. "
         f"{role_text}\n",
         encoding="utf8",
@@ -1220,6 +1279,8 @@ def _annotate_mask_overlay(
     instance_ids: tuple[int, ...],
     scores: torch.Tensor,
     identity_valid: torch.Tensor,
+    identity_unknown: torch.Tensor,
+    identity_mismatch: torch.Tensor,
     present: tuple[bool, ...],
     is_reference: bool,
 ) -> Image.Image:
@@ -1244,13 +1305,50 @@ def _annotate_mask_overlay(
         score = float(scores[index])
         score_text = f"{score:.3f}" if np.isfinite(score) else "nan"
         label = f"id={instance_id} s={score_text}"
-        if not bool(identity_valid[index]):
-            label += " GEO-REJECT"
+        label += " " + _identity_state(
+            identity_valid[index],
+            identity_unknown[index],
+            identity_mismatch[index],
+            present=visible,
+        )
         if not visible:
             label += " absent"
         draw.text((x + 15, 24), label, fill=(235, 235, 235))
         x += 125
     return output
+
+
+def _optional_identity_tensor(
+    value: torch.Tensor | None,
+    *,
+    expected_prefix: tuple[int, int],
+    name: str,
+) -> torch.Tensor:
+    if value is None:
+        return torch.zeros(expected_prefix, dtype=torch.bool)
+    tensor = torch.as_tensor(value).detach().bool().cpu()
+    if tuple(tensor.shape) != expected_prefix:
+        raise ValueError(
+            f"{name} must have shape {expected_prefix}, got "
+            f"{tuple(tensor.shape)}."
+        )
+    return tensor
+
+
+def _identity_state(
+    matched: torch.Tensor | bool,
+    unknown: torch.Tensor | bool,
+    mismatch: torch.Tensor | bool,
+    *,
+    present: bool,
+) -> str:
+    if bool(matched):
+        return "MATCH"
+    if bool(unknown):
+        return "UNKNOWN"
+    if bool(mismatch):
+        return "MISMATCH"
+    return "ABSENT" if not present else "UNCLASSIFIED"
 
 
 def _save_mask_overview(panels: list[Image.Image], path: Path) -> None:

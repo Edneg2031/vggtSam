@@ -1,0 +1,16 @@
+set -euo pipefail
+
+CONFIG=streaming_couping/configs/v5_ablation_suite.yaml
+OUTPUT=outputs/streaming_couping_v5_ablation
+
+mkdir -p "$OUTPUT"
+
+PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_v5_ablation_suite \
+  --config "$CONFIG" \
+  --sam3-device cuda:3 \
+  --geometry-device cuda:1 \
+  --training-device cuda:1 \
+  --resume \
+  2>&1 | tee "$OUTPUT/v5_suite.log"
+
+sed -n '1,20p' "$OUTPUT/v5_upload_summary.csv"

@@ -99,6 +99,9 @@ def test_tracking_masks_are_exported_as_binary_and_overlay_images(tmp_path) -> N
     masks[0, 1, 1, 2] = True
     masks[1, 0, :, 1] = True
     scores = torch.tensor([[1.0, 0.9], [0.8, 0.0]])
+    matched = torch.tensor([[True, True], [False, False]])
+    unknown = torch.tensor([[False, False], [True, False]])
+    mismatch = torch.tensor([[False, False], [False, True]])
     root = tmp_path / "segmentation_masks"
 
     _export_tracking_mask_visualizations(
@@ -108,6 +111,9 @@ def test_tracking_masks_are_exported_as_binary_and_overlay_images(tmp_path) -> N
         image_paths=image_paths,
         masks=masks,
         scores=scores,
+        identity_valid=matched,
+        identity_unknown=unknown,
+        identity_mismatch=mismatch,
         reference_sequence_index=0,
     )
 
@@ -126,3 +132,9 @@ def test_tracking_masks_are_exported_as_binary_and_overlay_images(tmp_path) -> N
     assert len(rows) == 4
     assert rows[0]["frame_index"] == "105"
     assert rows[0]["instance_id"] == "37"
+    assert [row["identity_state"] for row in rows] == [
+        "MATCH",
+        "MATCH",
+        "UNKNOWN",
+        "MISMATCH",
+    ]

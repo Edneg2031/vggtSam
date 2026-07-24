@@ -429,6 +429,25 @@ def evaluate_final_method(
                             }
                             for row in result.diagnostics
                         )
+                        # Fair pose-only pointcloud control: keep the frozen
+                        # StreamVGGT camera-local geometry and place it back
+                        # into the world with each analytic solver pose.
+                        append_geometry_metrics(
+                            pointmap_frame_rows,
+                            depth_frame_rows,
+                            batch=batch,
+                            outputs={
+                                "pose_encoding": result.pose_encoding,
+                                "world_points": batch[
+                                    "baseline_world_points"
+                                ],
+                                "depth": batch["baseline_depth"],
+                            },
+                            mode="ray_pose_raw_geometry",
+                            perturbation=result.name,
+                            sequence_indices=evaluation_indices,
+                            evaluation_metadata=result_metadata,
+                        )
                     ray_pose_predictions[clip.name] = {
                         "scene_id": clip.scene_id,
                         "frame_indices": list(clip.frame_indices),
@@ -622,16 +641,18 @@ def evaluate_final_method(
         "strict_geometry_v4": {
             "enabled": bool(config.fusion.strict_identity_gate),
             "identity_gate": (
-                "Each current mask point cloud must pass bounded 3D registration "
-                "against its causal same-ID object map before token/ray use."
+                "MATCH passes bounded same-ID 3D registration; UNKNOWN has "
+                "inconclusive geometry and may enter only the camera branch "
+                "with reduced reliability; MISMATCH is fully isolated."
             ),
             "memory_gate": (
-                "Long-term token memory additionally requires configured "
-                "geometry-confidence and static-score thresholds."
+                "Only MATCH may enter geometry/ray branches. Long-term memory "
+                "writes additionally require configured geometry-confidence "
+                "and static-score thresholds."
             ),
             "spatial_fallback": (
                 "Learned DPT residuals are mask-local; decoded geometry outside "
-                "validated masks is copied exactly from frozen StreamVGGT."
+                "MATCH masks is copied exactly from frozen StreamVGGT."
             ),
         },
         (
@@ -685,9 +706,15 @@ def _load_frozen_streamvggt(config: LearnedPoseConfig, *, device: str):
 
 
 def _new_adapter(payload: dict, config: LearnedPoseConfig) -> InstancePoseAdapter:
+    pose_geometry_dim = (
+        int(payload["geometry_dim"])
+        if config.fusion.pose_feature_mode == "appearance_only"
+        else int(payload["pose_geometry_dim"])
+    )
     return InstancePoseAdapter(
         appearance_dim=int(payload["appearance_dim"]),
         geometry_dim=int(payload["geometry_dim"]),
+        pose_geometry_dim=pose_geometry_dim,
         token_dim=int(payload["camera_hidden"].shape[-1]),
         config=config.fusion,
     )
@@ -730,26 +757,47 @@ def _forward_mode(
 ) -> dict[str, torch.Tensor | dict]:
     if mode != FINAL_MODE:
         raise ValueError(f"Only the final decoupled method is supported, got {mode!r}.")
-    if perturbation not in {"aligned", "module_off"}:
+    if perturbation not in {
+        "aligned",
+        "module_off",
+        "memory_off",
+        "wrong_id_memory",
+        "spatial_token_shuffle",
+    }:
         raise ValueError(
             f"Only aligned/module_off execution is supported, got {perturbation!r}."
         )
     module_off = perturbation == "module_off"
+    memory_ablation = {
+        "memory_off": "off",
+        "wrong_id_memory": "wrong_id",
+    }.get(perturbation, "normal")
     camera_hidden, pose_diagnostics = adapter.forward_camera(
         batch["camera_hidden"],
         appearance=batch["appearance"],
-        geometry=batch["geometry"],
+        pose_geometry=(
+            batch["geometry"]
+            if adapter.config.pose_feature_mode == "appearance_only"
+            else batch["pose_geometry"]
+        ),
         quality=batch["quality"],
         observed=batch["observed"],
         identity_valid=batch.get("identity_valid"),
+        identity_unknown=batch.get("identity_unknown"),
+        memory_ablation=memory_ablation,
         module_off=module_off,
     )
-    pose_delta = _decode_streaming_camera_delta(
+    pose_encoding, rotation_update_degrees = _compose_camera_update(
         frozen.camera_head,
         batch["camera_hidden"],
         camera_hidden,
+        batch["baseline_pose_encoding"],
+        image_size=tuple(int(value) for value in batch["image_size"]),
+        update_mode=adapter.config.rotation_update_mode,
+        max_rotation_update_degrees=(
+            adapter.config.max_rotation_update_degrees
+        ),
     )
-    pose_encoding = batch["baseline_pose_encoding"] + pose_delta
     updated, geometry_diagnostics = adapter.forward_patch_tokens(
         _token_level_mapping(batch),
         patch_start_idx=int(batch["patch_start_idx"]),
@@ -758,8 +806,13 @@ def _forward_mode(
         quality=batch["quality"],
         observed=batch["observed"],
         identity_valid=batch.get("identity_valid"),
+        identity_unknown=batch.get("identity_unknown"),
+        memory_ablation=memory_ablation,
+        shuffle_instance_tokens=(
+            perturbation == "spatial_token_shuffle"
+        ),
         spatial_mask=(
-            batch["trusted_tracking_masks_stream"].any(dim=2)
+            batch["trusted_tracking_masks_stream"]
             if adapter.config.strict_identity_gate
             else None
         ),
@@ -771,6 +824,7 @@ def _forward_mode(
         module_off=module_off,
     )
     diagnostics = {
+        "rotation_update_degrees": rotation_update_degrees,
         **{f"pose_{key}": value for key, value in pose_diagnostics.items()},
         **{
             f"geometry_{key}": value
@@ -918,6 +972,179 @@ def _decode_streaming_camera_delta(
         # Jacobian needed to train the initially-zero projection.
         return delta - delta.detach()
     return delta
+
+
+def _compose_camera_update(
+    camera_head,
+    raw_camera_hidden: torch.Tensor,
+    refined_camera_hidden: torch.Tensor,
+    baseline_pose_encoding: torch.Tensor,
+    *,
+    image_size: tuple[int, int],
+    update_mode: str,
+    max_rotation_update_degrees: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if update_mode == "additive_encoding":
+        delta = _decode_streaming_camera_delta(
+            camera_head,
+            raw_camera_hidden,
+            refined_camera_hidden,
+        )
+        pose = baseline_pose_encoding + delta
+        return pose, _rotation_update_degrees(
+            baseline_pose_encoding,
+            pose,
+            image_size=image_size,
+        )
+    if update_mode != "bounded_so3":
+        raise ValueError(f"Unknown camera update mode: {update_mode!r}.")
+
+    from streamvggt.utils.pose_enc import (
+        extri_intri_to_pose_encoding,
+        pose_encoding_to_extri_intri,
+    )
+
+    batch = raw_camera_hidden.shape[0]
+    decoded = _decode_streaming_camera_head(
+        camera_head,
+        torch.cat(
+            [raw_camera_hidden.detach(), refined_camera_hidden],
+            dim=0,
+        ),
+    )
+    raw_decoded = decoded[:batch]
+    refined_decoded = decoded[batch:]
+    raw_w2c, _ = pose_encoding_to_extri_intri(
+        raw_decoded,
+        image_size_hw=image_size,
+    )
+    refined_w2c, _ = pose_encoding_to_extri_intri(
+        refined_decoded,
+        image_size_hw=image_size,
+    )
+    baseline_w2c, baseline_intrinsics = pose_encoding_to_extri_intri(
+        baseline_pose_encoding,
+        image_size_hw=image_size,
+    )
+    delta_rotation = (
+        refined_w2c[..., :3, :3]
+        @ raw_w2c[..., :3, :3].transpose(-1, -2)
+    )
+    omega = _so3_log(delta_rotation)
+    angle = torch.linalg.vector_norm(omega, dim=-1, keepdim=True)
+    maximum = torch.deg2rad(
+        omega.new_tensor(float(max_rotation_update_degrees))
+    )
+    omega = omega * torch.clamp(
+        maximum / angle.clamp_min(1e-8),
+        max=1.0,
+    )
+    bounded_delta = _so3_exp(omega)
+    final_w2c = baseline_w2c.clone()
+    final_w2c[..., :3, :3] = (
+        bounded_delta @ baseline_w2c[..., :3, :3]
+    )
+    composed = extri_intri_to_pose_encoding(
+        final_w2c,
+        baseline_intrinsics,
+        image_size_hw=image_size,
+    )
+    if torch.equal(raw_camera_hidden, refined_camera_hidden):
+        # Exact cached baseline value with the bounded-SO(3) Jacobian intact.
+        composed = baseline_pose_encoding + (
+            composed - composed.detach()
+        )
+    return composed, torch.rad2deg(
+        torch.linalg.vector_norm(omega, dim=-1)
+    )
+
+
+def _rotation_update_degrees(
+    baseline_pose_encoding: torch.Tensor,
+    refined_pose_encoding: torch.Tensor,
+    *,
+    image_size: tuple[int, int],
+) -> torch.Tensor:
+    from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+    baseline, _ = pose_encoding_to_extri_intri(
+        baseline_pose_encoding,
+        image_size_hw=image_size,
+    )
+    refined, _ = pose_encoding_to_extri_intri(
+        refined_pose_encoding,
+        image_size_hw=image_size,
+    )
+    delta = (
+        refined[..., :3, :3]
+        @ baseline[..., :3, :3].transpose(-1, -2)
+    )
+    return torch.rad2deg(
+        torch.linalg.vector_norm(_so3_log(delta), dim=-1)
+    )
+
+
+def _so3_log(rotation: torch.Tensor) -> torch.Tensor:
+    trace = torch.diagonal(
+        rotation,
+        dim1=-2,
+        dim2=-1,
+    ).sum(dim=-1)
+    cosine = ((trace - 1.0) * 0.5).clamp(
+        -1.0 + 1e-6,
+        1.0 - 1e-6,
+    )
+    angle = torch.acos(cosine)
+    vee = torch.stack(
+        [
+            rotation[..., 2, 1] - rotation[..., 1, 2],
+            rotation[..., 0, 2] - rotation[..., 2, 0],
+            rotation[..., 1, 0] - rotation[..., 0, 1],
+        ],
+        dim=-1,
+    )
+    scale = angle / (2.0 * torch.sin(angle).clamp_min(1e-7))
+    scale = torch.where(
+        angle < 1e-4,
+        torch.full_like(scale, 0.5),
+        scale,
+    )
+    return scale[..., None] * vee
+
+
+def _so3_exp(omega: torch.Tensor) -> torch.Tensor:
+    angle = torch.linalg.vector_norm(omega, dim=-1, keepdim=True)
+    x, y, z = omega.unbind(dim=-1)
+    zero = torch.zeros_like(x)
+    skew = torch.stack(
+        [
+            zero, -z, y,
+            z, zero, -x,
+            -y, x, zero,
+        ],
+        dim=-1,
+    ).reshape(omega.shape[:-1] + (3, 3))
+    identity = torch.eye(
+        3,
+        dtype=omega.dtype,
+        device=omega.device,
+    ).expand(omega.shape[:-1] + (3, 3))
+    angle_squared = angle.square()
+    # Rodrigues coefficients written directly in terms of omega retain the
+    # first-order gradient at the exact zero initialization.  The former
+    # normalized-axis branch returned a constant identity near zero, which
+    # made the bounded-SO(3) ablation numerically correct but untrainable.
+    coefficient_a = torch.sinc(angle / torch.pi)
+    coefficient_b = torch.where(
+        angle < 1e-4,
+        0.5 - angle_squared / 24.0 + angle_squared.square() / 720.0,
+        (1.0 - torch.cos(angle)) / angle_squared.clamp_min(1e-12),
+    )
+    return (
+        identity
+        + coefficient_a[..., None] * skew
+        + coefficient_b[..., None] * (skew @ skew)
+    )
 
 
 def _decode_streaming_camera_head(
@@ -1199,10 +1426,15 @@ def _slice_training_payload(payload: dict, clip: ClipConfig) -> dict:
         "camera_hidden",
         "appearance",
         "geometry",
+        "pose_geometry",
+        "pose_geometry_valid",
         "quality",
         "observed",
         "identity_valid",
+        "identity_unknown",
+        "identity_mismatch",
         "trusted_instance_valid",
+        "associated_instance_valid",
         "target_pose_encoding",
         "target_world_to_camera",
         "instance_uvd",
@@ -1220,6 +1452,8 @@ def _slice_training_payload(payload: dict, clip: ClipConfig) -> dict:
         "tracking_masks_stream",
         "trusted_tracking_masks_output",
         "trusted_tracking_masks_stream",
+        "associated_tracking_masks_output",
+        "associated_tracking_masks_stream",
         "tracking_scores",
     }
     index = torch.tensor(indices, dtype=torch.long)
@@ -1339,10 +1573,15 @@ def _batch_to_device(payload: dict, device: str) -> dict:
         "camera_hidden",
         "appearance",
         "geometry",
+        "pose_geometry",
+        "pose_geometry_valid",
         "quality",
         "observed",
         "identity_valid",
+        "identity_unknown",
+        "identity_mismatch",
         "trusted_instance_valid",
+        "associated_instance_valid",
         "target_pose_encoding",
         "instance_uvd",
         "instance_uvd_valid",
@@ -1358,6 +1597,8 @@ def _batch_to_device(payload: dict, device: str) -> dict:
         "tracking_masks_stream",
         "trusted_tracking_masks_output",
         "trusted_tracking_masks_stream",
+        "associated_tracking_masks_output",
+        "associated_tracking_masks_stream",
         "tracking_scores",
     }
     output = dict(payload)
