@@ -105,6 +105,10 @@ class RayPoseConfig:
     angular_min_range: float = 0.05
     preserve_reference: bool = True
     solver_modes: tuple[str, ...] = ("current_refined",)
+    # Optional no-training sweep. Each value evaluates current-refined points
+    # with the reference camera fixed and only the accepted center correction
+    # blended by the requested fraction.
+    reference_blend_values: tuple[float, ...] = ()
     historical_min_correspondences: int = 128
     historical_max_points_per_instance: int = 4096
     historical_min_distance: float = 0.02
@@ -285,6 +289,13 @@ def load_learned_pose_config(path: str | Path) -> LearnedPoseConfig:
                         ["current_refined"],
                     )
                 ),
+                reference_blend_values=tuple(
+                    float(value)
+                    for value in ray_pose.get(
+                        "reference_blend_values",
+                        [],
+                    )
+                ),
                 historical_min_correspondences=int(
                     ray_pose.get(
                         "historical_min_correspondences",
@@ -379,6 +390,19 @@ def _validate(config: LearnedPoseConfig) -> None:
     if unknown_solvers:
         raise ValueError(
             f"Unknown ray_pose solver modes: {sorted(unknown_solvers)}."
+        )
+    if len(set(ray_pose.reference_blend_values)) != len(
+        ray_pose.reference_blend_values
+    ):
+        raise ValueError(
+            "ray_pose.reference_blend_values must not contain duplicates."
+        )
+    if any(
+        not 0.0 < float(value) <= 1.0
+        for value in ray_pose.reference_blend_values
+    ):
+        raise ValueError(
+            "ray_pose.reference_blend_values must be in (0,1]."
         )
     if ray_pose.historical_min_correspondences < 3:
         raise ValueError(

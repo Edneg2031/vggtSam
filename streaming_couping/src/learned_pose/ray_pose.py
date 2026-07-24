@@ -65,6 +65,22 @@ HISTORICAL_ANCHOR_POSE_NAME = (
     "ray_historical_anchor_refined_rotation"
 )
 CURRENT_RAW_POSE_NAME = "ray_current_raw_pointmap_refined_rotation"
+REFERENCE_BLEND_ROLE = "reference_preserving_blend_ablation"
+
+
+def reference_blend_pose_name(blend: float) -> str:
+    """Stable CSV/checkpoint key for a reference-preserving blend policy."""
+
+    percent = int(round(100.0 * float(blend)))
+    if not math.isclose(float(blend), percent / 100.0, abs_tol=1e-8):
+        raise ValueError(
+            "Reference blend names require values representable as an "
+            "integer percentage."
+        )
+    return (
+        "ray_current_refined_preserve_reference_"
+        f"blend_{percent:03d}"
+    )
 
 
 @torch.no_grad()
@@ -100,6 +116,24 @@ def recover_final_ray_pose(
             )
         else:
             raise ValueError(f"Unknown ray-pose solver mode: {solver_mode!r}.")
+    for blend in config.reference_blend_values:
+        sweep_config = replace(
+            config,
+            preserve_reference=True,
+            blend=float(blend),
+            reference_blend_values=(),
+        )
+        results.append(
+            _recover_current_pointmap_pose(
+                batch=batch,
+                baseline_outputs=baseline_outputs,
+                refined_outputs=refined_outputs,
+                config=sweep_config,
+                point_source="current_refined",
+                name_override=reference_blend_pose_name(blend),
+                role_override=REFERENCE_BLEND_ROLE,
+            )
+        )
     return results
 
 
@@ -111,6 +145,8 @@ def _recover_current_pointmap_pose(
     refined_outputs: dict,
     config: RayPoseConfig,
     point_source: str,
+    name_override: str | None = None,
+    role_override: str | None = None,
 ) -> RayPoseResult:
     """Recover final camera translation from refined instance-region rays."""
 
@@ -178,6 +214,8 @@ def _recover_current_pointmap_pose(
         if point_source == "current_refined"
         else CURRENT_RAW_POSE_NAME
     )
+    if name_override is not None:
+        name = str(name_override)
     spec = (
         _FINAL_SPEC
         if bool(batch.get("strict_identity_gate", False))
@@ -192,6 +230,8 @@ def _recover_current_pointmap_pose(
             "angular_huber",
             "solver_source_ablation",
         )
+    if role_override is not None:
+        spec = replace(spec, role=str(role_override))
     centers = []
     diagnostic_rows = []
     for sequence_index, frame_index in enumerate(frame_indices):

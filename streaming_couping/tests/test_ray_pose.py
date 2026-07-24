@@ -1,10 +1,17 @@
+import pytest
 import torch
 
+from streaming_couping.src.learned_pose import ray_pose
 from streaming_couping.src.learned_pose.config import RayPoseConfig
 from streaming_couping.src.learned_pose.ray_pose import (
+    FINAL_RAY_POSE_NAME,
+    REFERENCE_BLEND_ROLE,
+    RayPoseResult,
     _accept_center_fit,
     _fit_angular_huber_center,
     _historical_correspondences,
+    recover_final_ray_pose,
+    reference_blend_pose_name,
 )
 
 
@@ -101,3 +108,60 @@ def test_center_fit_policy_rejects_excessive_shift() -> None:
     )
     assert not accepted
     assert reasons == ["center_shift_above_limit"]
+
+
+@pytest.mark.parametrize(
+    ("blend", "expected"),
+    [
+        (0.25, "ray_current_refined_preserve_reference_blend_025"),
+        (0.50, "ray_current_refined_preserve_reference_blend_050"),
+        (0.75, "ray_current_refined_preserve_reference_blend_075"),
+        (1.00, "ray_current_refined_preserve_reference_blend_100"),
+    ],
+)
+def test_reference_blend_pose_name_is_stable(
+    blend: float,
+    expected: str,
+) -> None:
+    assert reference_blend_pose_name(blend) == expected
+
+
+def test_reference_blend_sweep_has_distinct_anchored_results(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def fake_recover(**kwargs):
+        calls.append(kwargs)
+        return RayPoseResult(
+            name=kwargs.get("name_override") or FINAL_RAY_POSE_NAME,
+            role=kwargs.get("role_override") or "deployable",
+            pose_encoding=torch.zeros(1),
+            diagnostics=(),
+        )
+
+    monkeypatch.setattr(ray_pose, "_recover_current_pointmap_pose", fake_recover)
+    results = recover_final_ray_pose(
+        batch={},
+        baseline_outputs={},
+        refined_outputs={},
+        config=RayPoseConfig(
+            preserve_reference=False,
+            blend=1.0,
+            solver_modes=("current_refined",),
+            reference_blend_values=(0.25, 0.5, 0.75, 1.0),
+        ),
+    )
+
+    assert [result.name for result in results] == [
+        FINAL_RAY_POSE_NAME,
+        reference_blend_pose_name(0.25),
+        reference_blend_pose_name(0.50),
+        reference_blend_pose_name(0.75),
+        reference_blend_pose_name(1.00),
+    ]
+    assert calls[0]["config"].preserve_reference is False
+    assert all(call["config"].preserve_reference for call in calls[1:])
+    assert all(
+        result.role == REFERENCE_BLEND_ROLE for result in results[1:]
+    )

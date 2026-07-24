@@ -50,3 +50,36 @@ def test_temporal_holdout_uses_configured_order_not_frame_number() -> None:
     )
 
     _validate(replace(config, clips=(clip,)))
+
+
+def test_ray_pose_reference_blends_reject_duplicates() -> None:
+    config = load_learned_pose_config(CONFIG)
+    ray_pose = replace(
+        config.evaluation.ray_pose,
+        reference_blend_values=(0.5, 0.5),
+    )
+
+    with pytest.raises(ValueError, match="must not contain duplicates"):
+        _validate(
+            replace(
+                config,
+                evaluation=replace(config.evaluation, ray_pose=ray_pose),
+            )
+        )
+
+
+@pytest.mark.parametrize("blend", [0.0, -0.25, 1.25])
+def test_ray_pose_reference_blends_must_be_bounded(blend: float) -> None:
+    config = load_learned_pose_config(CONFIG)
+    ray_pose = replace(
+        config.evaluation.ray_pose,
+        reference_blend_values=(blend,),
+    )
+
+    with pytest.raises(ValueError, match=r"must be in \(0,1\]"):
+        _validate(
+            replace(
+                config,
+                evaluation=replace(config.evaluation, ray_pose=ray_pose),
+            )
+        )
