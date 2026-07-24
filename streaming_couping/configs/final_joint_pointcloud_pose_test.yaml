@@ -1,6 +1,6 @@
 # Cross-sequence test of the frozen final checkpoint.
 # No training frames are declared: every selected frame is evaluated.
-# frame_indices is the input/view order and may intentionally be non-monotonic.
+# frame_indices ssis the input/view order and may intentionally be non-monotonic.
 recovery_config: streaming_couping/configs/recovery_050_025.yaml
 output_dir: outputs/streaming_couping_final_test_00a231a370_100_500
 
