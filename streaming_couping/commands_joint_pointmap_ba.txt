@@ -1,0 +1,23 @@
+set -euo pipefail
+
+CONFIG=streaming_couping/configs/v5_ablation_suite.yaml
+OUTPUT=outputs/streaming_couping_v5_ablation
+PREDICTIONS="$OUTPUT/joint_solver_sweep/evaluation/ray_pose_predictions.pt"
+
+mkdir -p "$OUTPUT"
+
+if [[ ! -f "$PREDICTIONS" ]]; then
+  echo "reference-blend predictions missing; generating them from the frozen V5 checkpoint"
+  PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_v5_joint_solver_sweep \
+    --config "$CONFIG" \
+    --training-device cuda:1 \
+    2>&1 | tee "$OUTPUT/joint_solver_sweep.log"
+fi
+
+PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_joint_pointmap_ba \
+  --config "$CONFIG" \
+  --device cuda:1 \
+  --predictions "$PREDICTIONS" \
+  2>&1 | tee "$OUTPUT/joint_pointmap_ba.log"
+
+sed -n '1,12p' "$OUTPUT/joint_ba_upload_summary.csv"

@@ -1,5 +1,55 @@
 # 实例引导的点云与相机位姿优化
 
+## 0. 当前收束版：gauge-fixed joint pointmap BA
+
+下面第 1–8 节描述的是生成候选结果的冻结 StreamVGGT、SAM3 tracking 和 V5
+trainable adapter。它们原先分别输出 learned pose、learned pointmap，再用独立 ray solver
+修改相机中心；这三者可能处于不一致的几何规范中。当前最终实验在它们之后增加一个
+**无需训练、推理时联合优化**：
+
+```text
+raw StreamVGGT pose / pointmap（固定参考坐标系）
+             +
+V5 learned pose / pointmap（只作为候选）
+             +
+最后一层 StreamVGGT patch feature + 可信 SAM3 instance masks
+             ↓
+同背景或同一可信实例内建立跨帧局部匹配
+             ↓
+固定 raw reference camera，联合优化非参考帧 SE(3) 残差
+和 raw/learned camera-ray depth 混合系数
+             ↓
+final pointmap = final pose × final camera-ray depth
+```
+
+因此最终位姿和最终点云不再由两个独立后处理产生。参考相机的 pose encoding 被逐元素恢复为
+raw StreamVGGT，reference pointmap 也使用 raw depth，所以已有 fixed-reference Sim(3)
+评估坐标系保持不变。优化不读取 GT；GT 只在优化结束后计算 ATE、rotation 和 pointmap error。
+
+实例匹配采用 DCS 风格的边级可靠性：同一实例跨帧深度不一致越大，权重越低。错误 mask
+不会作为背景使用；匹配不足时，pose 和 pointmap 都严格回退 raw StreamVGGT。当前一次运行
+比较五行：
+
+```text
+raw_control                 原始 StreamVGGT
+fixed_ref_050_control       之前最好但 pose/pointmap 未真正耦合的对照
+gauge_ba_pose_only          只优化 pose，depth 固定 raw
+gauge_ba_global_beta        pose + 每帧全局深度混合
+gauge_ba_instance_switch    pose + 实例区域深度混合 + 异常实例边抑制
+```
+
+运行：
+
+```bash
+zsh streaming_couping/commands_joint_pointmap_ba.txt
+```
+
+精简结果：
+
+```text
+outputs/streaming_couping_v5_ablation/joint_ba_upload_summary.csv
+```
+
 ## 1. 方法概览
 
 目标是从一段 RGB 视角序列同时得到：
