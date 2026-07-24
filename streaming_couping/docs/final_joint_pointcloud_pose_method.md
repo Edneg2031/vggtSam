@@ -1,469 +1,362 @@
-# 实例引导的点云与相机位姿联合优化：当前最终方法
+# 实例引导的点云与相机位姿优化
 
-## 先用直白的话说明方法
+## 1. 方法概览
 
-### 系统到底输出什么
+目标是从一段 RGB 视角序列同时得到：
 
-对一组按指定顺序输入的 RGB 图像，系统输出三类结果：
+- 跨帧一致的实例分割 mask；
+- 修正后的 StreamVGGT world pointmap；
+- 修正后的相机旋转和平移。
 
-1. 每帧、每个 persistent instance 的 SAM3 分割/追踪 mask；
-2. 原始 StreamVGGT 点云和修正后的点云；
-3. 原始 StreamVGGT 相机位姿和修正后的相机位姿。
-
-最终推理可以概括成：
+完整数据流为：
 
 ```text
-RGB 序列
-  ├─ SAM3：从参考帧 mask 出发，追踪同一个物体
-  └─ StreamVGGT：预测初始点云、相机旋转和平移
-             ↓
-固定的 learned adapter
-  ├─ 根据跨帧实例信息，小幅修正 pointmap token → 新点云
-  └─ 根据跨帧实例信息，小幅修正 camera token → 新旋转
-             ↓
-无需训练的几何求解器
-  └─ 用“mask 内世界点必须落在对应相机射线上”重新求相机平移
-             ↓
-mask + refined pointmap + refined camera pose
+RGB 序列 + 参考帧实例 mask
+  │
+  ├─ StreamVGGT → 初始 pointmap、camera pose、aggregator tokens
+  │
+  └─ SAM3 tracking
+       └─ 几何不一致时，用历史实例点云筛选 recovery mask 并写回 memory
+                  ↓
+          persistent instance observations
+                  ↓
+       ┌──────────┴──────────┐
+       │                     │
+四层 patch-token 融合   camera-token 融合
+       │                     │
+frozen DPT point head   frozen CameraHead
+       │                     │
+refined pointmap        refined rotation
+       └──────────┬──────────┘
+                  │
+      实例区域 angular-Huber point-to-ray
+                  │
+          refined camera translation
 ```
 
-### 为什么方法里需要训练
-
-“训练”和“每个新序列上的优化”是两件不同的事。
-
-需要训练的是一个很小的残差 adapter。输入实例外观、mask、跨帧 ID 和三维统计量后，究竟
-应该怎样改 StreamVGGT 的 patch/camera token，没有一个能够直接写出的闭式公式。因此在
-原训练帧上利用 GT pointmap/pose loss，学习这部分映射：
+最终无 GT 输出是同一 StreamVGGT native gauge 中的：
 
 ```text
-实例证据 → pointmap token 应改多少
-实例证据 → camera token 应改多少
+persistent instance masks + refined pointmap + refined camera pose
 ```
 
-SAM3 和 StreamVGGT 主干始终冻结，并不是重新训练两个大模型。只训练新加入的 instance
-encoder、cross-attention、gate 和 zero projection。zero projection 保证开始训练前输出与
-原始 StreamVGGT 完全相同，adapter 只能学习残差。
+## 2. SAM3 tracking 与几何恢复
 
-不需要训练的是最后的相机平移求解。给定 pointmap、rotation、内参和实例 mask 后，相机
-中心只有三个未知数，可以通过 point-to-ray 几何约束直接求解。
+参考帧 mask 来自选定的 ScanNet++ instance ID。SAM3 首先以该 mask 初始化 persistent
+object ID，并按配置中的视角顺序追踪。帧号不要求递增，列表顺序就是模型输入顺序。
 
-### 训练一次还是每个序列重新训练
-
-当前协议是训练一次、测试时固定权重：
-
-| 模块 | 原序列训练阶段 | 新序列测试阶段 |
-|---|---|---|
-| SAM3 / StreamVGGT 主干 | 冻结 | 冻结 |
-| learned pointmap/rotation adapter | 训练 | 固定 checkpoint，不训练 |
-| SAM3 tracking/cache | 为训练序列计算 | 为新序列重新计算 |
-| ray translation solver | 按帧求解 | 按帧重新求解，无梯度 |
-| GT | 训练 loss 和评估 | 只做最终评估 |
-
-因此新序列上的位姿提升不是“拿新序列 GT 再训练”得到的。它使用原先固定 checkpoint，
-只针对当前图像重新计算实例追踪和几何平移。
-
-### 当前已知效果边界
-
-原序列 held-out 帧上，learned pointmap 分支和最终位姿都明显提升。新的
-`105 109 113 122 254` 序列使用固定权重后：
-
-- ATE RMSE 从 `0.1414 m` 降到 `0.0771 m`；
-- translation RPE 从 `0.1220 m` 降到 `0.0576 m`；
-- 5/5 ray fits accepted；
-- 全场景点云 mean 只从 `0.0957 m` 降到 `0.0936 m`；
-- bed 点云改善，但 cabinet 和 wardrobe 退化。
-
-所以当前可以得出的结论是：位姿方法已经表现出跨序列价值；learned pointmap 分支只在原
-训练视角上稳定，新视角下需要加入几何可靠性门控或无 GT 自适应，不能声称已经稳定泛化。
-
-## 1. 研究目标
-
-本项目的目标不是只改善 SAM3 跟踪，也不是只修复 StreamVGGT 位姿，而是同时得到：
-
-1. 更准确、跨帧更一致的全场景和实例点云；
-2. 更准确的相机旋转与平移；
-3. 点云和相机位姿位于同一个内部坐标系，可以作为一套完整重建结果使用。
-
-当前系统采用分阶段的因果混合优化，而不是把 SAM3 token 直接写入 StreamVGGT
-所有 token，也不是端到端迭代 bundle adjustment：
+系统同时把可靠 mask 内的 StreamVGGT 三维点累计为该实例的历史 object map。当当前 tracker
+mask 与 object map 的投影明显不一致时：
 
 ```text
-原始 StreamVGGT 几何
-    -> 几何筛选和恢复 SAM3 跟踪
-    -> 稳定 persistent instance IDs / masks
-
-persistent instances
-    -> V2 patch geometry branch
-    -> refined world pointmap
-
-persistent instance appearance
-    -> V2 camera branch
-    -> refined camera rotation
-
-refined pointmap + refined rotation + reference predicted K
-    -> V3 angular-Huber ray-center solve
-    -> refined camera translation
+tracker geometry coverage < 0.50
+  → SAM3 在当前帧重新生成完整候选 masks
+  → 用投影几何 support 排序
+  → selected support coverage ≥ 0.25
+  → 将候选写回同一个 object ID 的 SAM3 memory
+  → 从该位置继续追踪后续输入视角
 ```
 
-最终可部署结果是：
+每段序列最多接受第一个自然恢复事件。没有触发、候选为空或 support 不足时，直接保留原始
+SAM3 tracking。候选选择不使用后续帧 GT。
+
+## 3. Persistent instance token
+
+### 3.1 SAM3 外观特征来自哪里
+
+mask 由 SAM3 video tracker 产生，外观特征则来自冻结的 SAM3 image detector backbone：
 
 ```text
-V2 refined world pointmap + V3 refined camera pose
+source = detector_fpn2
+tensor = backbone_out["backbone_fpn"][-1]
+text conditioning = none
+feature grid = 72 × 72
 ```
 
-二者共同使用 StreamVGGT native gauge。无 GT 时，这就是完整的方法输出。
-
-## 2. Persistent instance 表示
-
-SAM3 和 StreamVGGT 主干保持冻结。每个跨帧实例构建一个因果 persistent token，输入包括：
-
-- SAM3 mask 内冻结外观特征的均值和方差；
-- persistent instance ID 和当前 tracker score；
-- 当前三维中心与历史中心；
-- 点云协方差特征值和三维 extent；
-- 实例 ICP 位移建议、fitness 和 RMSE ratio；
-- point confidence、mask 面积和点数；
-- geometry confidence 和 static score；
-- 当前观测、EMA 历史记忆及二者差值；
-- 记忆年龄和帧间隔。
-
-tokenizer 只因果读取当前帧及历史信息，不读取未来帧。一个实例必须有可信历史记忆，
-当前 token 才会参与 cross-attention。动态、跟踪不可靠或无有效观测的实例不会产生更新。
-
-## 3. 点云优化：V2 geometry branch
-
-### 3.1 最终结构
-
-最终几何分支沿用消融阶段选出的 tracker-gated patch 更新：
+它不是 tracker memory token，也不是最终 mask-decoder token。对每帧每个实例，将 tracking
+mask resize 到该特征层，然后池化：
 
 ```text
-patch_sam_geometry_tracker_gate
+appearance_t = [mask 内 FPN feature mean, mask 内 FPN feature std]
 ```
 
-persistent instance token 作为 key/value，StreamVGGT 多层 DPT patch tokens 作为 query：
+### 3.2 为什么叫 persistent
+
+同一个 object ID 在当前 clip 内维护 appearance 和 geometry 两份因果 EMA memory：
 
 ```text
-patch_token = patch_token
-            + sigmoid(gate) * zero_proj(cross_attention(patch_token, instance_tokens))
+memory_t = 0.9 × memory_(t-1) + 0.1 × current_t
 ```
 
-只更新 `patch_start_idx` 之后的 patch tokens。camera/register 前缀完全保持不变，避免实例
-语义污染相机头。更新后的多层 tokens 送入冻结的 StreamVGGT point/depth heads，得到新的
-world pointmap、point confidence 和 depth。
+当前实例表示包含：
 
-几何分支拥有独立的 instance tokenizer、cross-attention、gate 和 projection，不与位姿分支
-共享学习模块，防止 pointmap loss 与 pose loss 通过同一个瓶颈互相冲突。
+- 当前、历史及二者差值的 SAM3 appearance；
+- 当前、历史及二者差值的三维中心、协方差、extent、ICP 和点云质量；
+- tracker、geometry、static confidence；
+- memory age。
 
-### 3.2 门控设计
-
-早期严格 geometry gate 会错误拒绝已经正确跟踪的 bed 等实例。因此最终模式采用：
-
-- tracker confidence 负责硬门控；
-- geometry confidence 和 static score 仍作为 token 特征；
-- 网络学习如何使用几何质量，而不是在进入网络前将实例全部丢弃。
-
-### 3.3 几何损失
-
-训练使用：
-
-- fixed-reference Sim(3) aligned pointmap loss；
-- scale-invariant depth loss；
-- fixed-reference depth loss；
-- 跨帧静态实例 trimmed Chamfer/刚体一致性；
-- 实例质心一致性；
-- 小权重 residual regularization。
-
-### 3.4 为什么点云能够提升
-
-原始 StreamVGGT 主要依靠整帧视觉上下文。persistent instances 增加了跨帧稳定的对象级锚点：
-
-1. persistent ID 提供跨帧对应关系；
-2. 外观特征区分不同实例，减少错误关联；
-3. 三维中心、协方差和 extent 提供形状与位置先验；
-4. static/geometry confidence 降低遮挡和错误点图的影响；
-5. 只更新 patch token，使几何监督直接作用于 point/depth head；
-6. 独立分支避免相机与点图优化争夺同一表示。
-
-### 3.5 当前点云结果
-
-训练帧为 `90 105 119 130 140`，held-out 帧为 `210 240`：
-
-| 方法 | held-out 全场景 pointmap mean error |
-|---|---:|
-| 原始 StreamVGGT | 0.15258 m |
-| 单独最佳 geometry branch | **0.06053 m** |
-| 最终 decoupled dual branch | **0.06358 m** |
-
-最终双分支方法相对原始 StreamVGGT 降低约 `58.3%`。单独 geometry branch 略好，但不包含
-完整位姿分支；三方最终比较中的 `ours.ply` 使用同时优化点云和位姿的
-`decoupled_dual_branch`。
-
-## 4. 位姿优化第一阶段：V2 learned rotation
-
-### 4.1 Camera-token fusion
-
-最终位姿学习分支沿用消融阶段选出的 SAM-appearance camera 更新：
+这些量经过 MLP 编码成 `512` 维 persistent instance token：
 
 ```text
-camera_sam_only
+instance_token_t =
+    MLP(current_t, memory_(t-1), current_t - memory_(t-1), quality_t, age)
 ```
 
-每帧 camera token 查询 persistent SAM3 appearance tokens，再通过 zero-initialized residual
-写回 camera token。该分支只使用外观、persistent memory 和 tracker confidence，不通过几何
-特征侧信道直接拉动相机。
+因此它不等于一个 mask-pooled SAM3 token，而是“当前实例证据 + 同一实例历史”的对象级表示。
+memory 在每个可靠观测后更新，开始一个新 clip 时重新初始化。
 
-zero projection 保证初始化及 module-off 时严格恢复原始 StreamVGGT 输出。SAM3 和
-StreamVGGT 主干均冻结，只训练 instance encoder、cross-attention、gate 和 projection。
+第一次可靠观测只建立 memory，不修改 StreamVGGT；从下一个可靠观测开始 token 才能参与
+融合。当前 mask 不可靠时，该帧不写 memory，也不修改 StreamVGGT。
 
-### 4.2 位姿学习损失
+点云和相机使用两个独立 tokenizer：
 
-- camera encoding loss；
-- all-pair relative rotation loss；
-- translation-direction loss；
-- 静态实例刚体一致性；
-- 实例质心一致性。
+- geometry tokenizer 使用 appearance、geometry 和质量特征，但只用 tracker confidence
+  做硬门控；
+- pose tokenizer 将 geometry 输入置零，只使用 persistent SAM3 appearance、tracker
+  confidence 和 memory，避免错误点云直接拖动相机。
 
-### 4.3 V2 得到的结论
+## 4. 实例如何修正 pointmap
 
-V2 显著改善旋转和相对平移，但自由回归的绝对相机平移失败：
+### 4.1 使用哪些 StreamVGGT tokens
 
-| 指标 | 原始 StreamVGGT | learned V2 |
-|---|---:|---:|
-| ATE RMSE | 0.36879 m | 0.37535 m |
-| rotation RPE | 3.518° | **1.171°** |
-| translation RPE RMSE | 0.23981 m | **0.17627 m** |
-| pair translation direction | 44.22° | **34.68°** |
-
-因此 V3 保留 V2 的 refined rotation，替换 learned absolute translation。
-
-## 5. 位姿优化第二阶段：V3 analytic translation
-
-### 5.1 Point-to-ray 约束
-
-对像素 `u`，refined pointmap 给出世界点 `X_u`。使用 refined rotation 和参考帧预测内参
-构造世界射线：
+冻结 StreamVGGT aggregator 先完整运行。系统取其 DPT point/depth head 原本使用的四层输出：
 
 ```text
-r_u = normalize(R_c2w K^-1 [u_x, u_y, 1]^T)
+aggregated_tokens_list[4]
+aggregated_tokens_list[11]
+aggregated_tokens_list[17]
+aggregated_tokens_list[23]
 ```
 
-相机中心 `C`、像素射线和对应世界点应共线，其垂直残差为：
+每层包含 camera/register prefix 和 image patch tokens。只更新
+`patch_start_idx` 之后的 patch 部分，prefix 完全保持原值。
+
+### 4.2 四层分别做 cross-attention
+
+四层各有独立的 8-head cross-attention、projection 和 gate。对每一层：
 
 ```text
-e_line(C) = (I - r_u r_u^T)(X_u - C)
+query = 该层 StreamVGGT patch tokens
+key/value = 当前帧有效 persistent instance tokens
+
+update_l = CrossAttention_l(query, key, value)
+patch_l' = patch_l + sigmoid(gate_l) × zero_proj_l(update_l)
 ```
 
-普通加权最小二乘只有三个未知量，闭式正规方程为：
+这一步发生在 frozen aggregator 运行之后、DPT head 融合之前。四层被独立修正，再一起送进
+冻结的 DPT point/depth head，由该 head 完成多层融合并输出 refined world pointmap、depth
+和 confidence。
+
+当前实现不是在 aggregator 的每个 block 内注入：layer 4 的修改不会继续传播到
+layer 5–23。准确说法是：
 
 ```text
-A = sum_u w_u (I - r_u r_u^T)
-b = sum_u w_u (I - r_u r_u^T) X_u
-C = A^-1 b
+post-aggregator multi-level DPT token conditioning
 ```
 
-最终方法使用 angular-Huber IRLS：
+### 4.3 什么是 zero-initialized gated residual
+
+`zero_proj` 权重初始化为零，`gate_l` 是每层一个可学习标量。初始化时：
 
 ```text
-e_angle(C) = ||e_line(C)|| / ||X_u - C||
-L(C) = sum_u w_u Huber(e_angle(C))
+zero_proj(update) = 0
+patch_l' = patch_l
 ```
 
-### 5.2 最终选定配置
+因此未训练模块逐元素等价于原始 StreamVGGT。训练后 projection 和 gate 才学会写入小残差；
+没有有效实例时，由于 projection 没有 bias，输出仍严格不变。
 
-- pointmap：V2 refined world pointmap；
-- rotation：V2 refined rotation；
-- intrinsics：原始 StreamVGGT 参考帧预测 K，在整段序列中固定；
-- spatial scope：三个 persistent instance masks 的并集；
-- solver：angular-Huber IRLS；
-- minimum points：1024；
+## 5. 相机旋转如何修正
+
+相机分支使用 frozen aggregator 最后一层的第一个 token：
+
+```text
+camera_hidden = aggregated_tokens_list[-1][:, :, 0]
+```
+
+每帧只有一个 camera query：
+
+```text
+query = camera hidden token
+key/value = appearance-only persistent instance tokens
+camera_hidden' =
+    camera_hidden + sigmoid(gate) × zero_proj(cross_attention)
+```
+
+修正后的 hidden token 按 StreamVGGT 原始 causal KV-cache 路径送进冻结 CameraHead。系统同时
+解码 raw 和 refined hidden，只把二者的 pose delta 加到精确缓存的 baseline pose encoding，
+从而保证关闭模块时严格恢复原始输出。
+
+CameraHead 实际预测完整的：
+
+```text
+translation + quaternion rotation + FOV/intrinsics
+```
+
+learned 分支并非结构上只输出旋转。但最终方法只保留它改善后的 rotation；learned camera
+center 作为几何求解的初值/失败回退，learned intrinsics 被舍弃。
+
+## 6. 相机平移如何修正
+
+最终内参固定为原始 StreamVGGT 在参考帧预测的 `K`，并在整段序列复用。对每帧、每个实例
+mask 内的高置信 pointmap 像素：
+
+- refined pointmap 给出世界点 `X`；
+- refined rotation 和 reference `K` 给出世界射线方向 `r`；
+- 正确相机中心 `C` 应使 `X-C` 与 `r` 共线。
+
+系统在三个 tracked-instance masks 的并集上最小化：
+
+```text
+e_line(C)  = (I - rrᵀ)(X - C)
+e_angle(C) = ||e_line(C)|| / ||X - C||
+
+min_C Σ w × Huber(e_angle(C))
+```
+
+这是每帧只有三个未知量的 angular-Huber IRLS，不需要训练。当前配置：
+
+- minimum points：`1024`；
+- maximum iterations：`6`；
+- confidence threshold：`0.30`；
 - condition-number gate：`1e8`；
 - point-to-ray RMSE gate：`0.20` native units；
-- center-shift gate：`0.75` native units；
-- 失败时精确回退到 V2/baseline center。
+- center-shift gate：`0.75` native units。
 
-### 5.3 为什么平移能够提升
+通过检查后，用 solved center 与 refined rotation 重新组成最终外参；失败时回退 learned
+camera center。
 
-1. 输入 pointmap 已比原始结果准确约 58%；
-2. 输入 rotation 已显著改善，像素世界射线方向更可靠；
-3. 相机平移由三个未知量和大量像素约束确定，不再自由回归；
-4. persistent instance 区域比背景 pointmap 更稳定；
-5. 多个空间分散实例提供非平行射线，避免单实例质心/ICP 退化；
-6. angular residual 降低深度尺度误差的影响；
-7. Huber IRLS 抑制错误 mask、遮挡和点图离群值；
-8. reference K 抑制逐帧焦距漂移；
-9. 所有失败条件可在无 GT 情况下检测并回退。
+## 7. 哪些部分需要训练
 
-空间消融支持这一判断：
+SAM3 和 StreamVGGT 主干全部冻结。只训练：
 
-| 求解范围 | held-out ATE RMSE |
-|---|---:|
-| 全图 angular-Huber | 0.18165 m |
-| background only | 0.19273 m |
-| persistent instances only | **0.14387 m** |
-| 全图 GT-K oracle | 0.14615 m |
+- pose/geometry 两个 instance tokenizer；
+- 五个 cross-attention：四个 patch 层和一个 camera 分支；
+- 对应的 zero projection 和 scalar gate。
 
-实例区域使用预测 reference K 仍略优于全图 GT-K oracle，说明主要收益来自更干净的实例
-几何约束，而不是读取 GT 内参。
+需要训练是因为“实例证据应怎样修改 patch/camera token”没有闭式公式。训练损失包括
+pointmap、depth、camera encoding、相对旋转、平移方向和实例刚体/质心一致性。
 
-## 6. 最终位姿结果
+训练一次后，新序列使用固定 checkpoint：
 
-held-out 帧 `210 240`：
+| 模块 | 原训练序列 | 新测试序列 |
+|---|---|---|
+| SAM3 / StreamVGGT | 冻结 | 冻结 |
+| learned adapter | 训练 | 固定，不训练 |
+| tracking 与 persistent memory | 重新计算 | 重新计算 |
+| ray translation | 逐帧求解 | 逐帧求解 |
+| GT | loss 与评估 | 仅评估 |
 
-| 指标 | 原始 StreamVGGT | learned V2 | 最终 V3 |
+## 8. 当前结果
+
+### 8.1 原序列 temporal holdout
+
+训练帧为 `90 105 119 130 140`，held-out 为 `210 240`。
+
+| 指标 | Raw StreamVGGT | Learned adapter | Final |
 |---|---:|---:|---:|
+| pointmap mean error | 0.15258 m | 0.06358 m | 0.06358 m |
 | ATE RMSE | 0.36879 m | 0.37535 m | **0.14387 m** |
-| translation error mean | 0.35304 m | 0.37342 m | **0.14371 m** |
-| translation RPE RMSE | 0.23981 m | 0.17627 m | **0.08986 m** |
+| translation RPE | 0.23981 m | 0.17627 m | **0.08986 m** |
 | rotation RPE | 3.518° | **1.171°** | **1.171°** |
-| pair translation-direction error | 44.22° | **34.68°** | 40.94° |
 
-最终 V3：
+这里 learned adapter 明显改善 pointmap 和 rotation，ray solver 显著改善 translation。
 
-- ATE 相对原始 StreamVGGT 降低约 `61.0%`；
-- translation RPE 相对原始降低约 `62.5%`；
-- translation RPE 相对 learned V2 降低约 `49.0%`；
-- 保留 learned V2 的旋转提升；
-- 两个 held-out fit 均 accepted；
-- mean point-to-ray RMSE 从 `0.14058` 降至 `0.02678` native units；
-- maximum condition number 为 `6.69`，远低于退化阈值。
+### 8.2 固定权重的新视角序列
 
-限制是 pair translation-direction error 虽优于 raw，但不如 learned V2。当前不能声称所有位姿
-指标均改善。
+实际输入帧为 `105 109 113 122 254`；`100_500` 只是旧 clip 标签。
 
-## 7. 最终输出与公平三方比较
+| 位姿指标 | Raw | Learned | Final |
+|---|---:|---:|---:|
+| ATE RMSE | 0.14141 m | 0.11942 m | **0.07714 m** |
+| translation mean | 0.10881 m | 0.08778 m | **0.06756 m** |
+| translation RPE | 0.12200 m | 0.11646 m | **0.05758 m** |
+| rotation mean | 0.6258° | **0.5322°** | **0.5322°** |
 
-### 7.1 无 GT 可部署结果
+5/5 ray fits accepted，point-to-ray RMSE 从 `0.04821` 降至 `0.01277` native units。
+
+点云泛化不稳定：
+
+| pointmap mean error | Raw | Ours |
+|---|---:|---:|
+| full scene | 0.09568 m | 0.09364 m |
+| instance 37 / cabinet | **0.05516 m** | 0.08597 m |
+| instance 68 / wardrobe | **0.05278 m** | 0.09898 m |
+| instance 54 / bed | 0.18653 m | **0.14676 m** |
+
+因此当前最可靠的结论是：
+
+- learned rotation 和 analytic translation 已表现出跨视角价值；
+- learned pointmap 在原训练视角有效，但固定权重在新视角上有实例偏置；
+- 下一步应为 pointmap residual 增加无 GT 几何可靠性门控，不可靠时回退 raw pointmap。
+
+该新序列包含原训练帧 `105`，所以不是严格无重叠泛化实验。
+
+## 9. 输出
+
+### 9.1 无 GT 可部署结果
 
 ```text
-final_instance_ray_pose_v3/<clip>/deployable_native/
-  full_scene.ply
-  instance_37.ply
-  instance_68.ply
-  instance_54.ply
-  camera_poses.csv
-  camera_poses.npz
+final_instance_ray_pose_v3/<clip>/
+  deployable_native/
+    full_scene.ply
+    instance_<id>.ply
+    camera_poses.csv
+    camera_poses.npz
+  segmentation_masks/
+    sequence_overview.png
+    overlays/
+    binary/instance_<id>/
+    binary/union/
+    mask_summary.csv
 ```
 
-这里没有 GT。V2 refined pointmap 和 V3 pose 使用同一个 StreamVGGT native gauge。
+上述点云和位姿使用同一个 StreamVGGT native gauge。`overlays/` 是 RGB 与彩色实例 mask，
+`binary/` 是方法实际消费的 0/255 tracking/recovery masks。
 
-分割/追踪 mask 单独导出到：
-
-```text
-final_instance_ray_pose_v3/<clip>/segmentation_masks/
-  sequence_overview.png
-  overlays/
-    seq_000_frame_<frame>.png
-    ...
-  binary/
-    instance_37/
-    instance_68/
-    instance_54/
-    union/
-  mask_summary.csv
-  legend.csv
-```
-
-`overlays/` 是 RGB 与彩色实例 mask 的叠加图；`binary/instance_<id>/` 是每实例 0/255
-二值 PNG；`binary/union/` 是实例几何求解使用的 mask 并集。参考帧是初始化 prompt mask，
-后续帧是方法实际消费的 SAM3 persistent tracking/recovery mask。
-
-### 7.2 GT / raw StreamVGGT / ours 公平比较
+### 9.2 GT / raw / ours 公平比较
 
 ```text
 final_instance_ray_pose_v3/<clip>/comparison_gt_world/
-  full_scene/
-    ground_truth.ply
-    streamvggt_raw.ply
-    ours.ply
-    overlay.ply
-  instance_37/
-  instance_68/
-  instance_54/
+  full_scene/{ground_truth,streamvggt_raw,ours,overlay}.ply
+  instance_<id>/
   pointcloud_metrics.csv
-  camera_poses.csv
   camera_pose_metrics.csv
-  camera_poses.npz
+  camera_poses.csv
   pose_comparison.png
   pose_comparison.pdf
-  pose_comparison.svg  # matplotlib 不可用时的无依赖 fallback
 ```
 
-比较协议：
+只从 raw StreamVGGT 参考帧 pointmap 拟合一次 Sim(3)，同一个变换应用于 raw 和 ours，禁止
+为 ours 单独重新对齐。比较目录属于 evaluation-only；deployable output 不使用 GT 对齐。
 
-- 三者使用相同帧；
-- 三者只使用 GT/raw/ours 公共有限像素；
-- 三者使用相同确定性采样；
-- 只从 raw StreamVGGT 参考帧 pointmap 拟合一次 Sim(3)；
-- 同一个 Sim(3) 原样应用于 raw 和 ours，禁止分别重新拟合；
-- 所有比较 PLY 均位于 ScanNet++ GT-world；
-- overlay 颜色为 GT=绿色、raw StreamVGGT=红色、ours=蓝色。
+## 10. 运行
 
-`pose_comparison.png/.pdf` 包含四个子图：
-
-- GT/raw/ours 三维相机轨迹及相机前向方向；
-- 自动选择变化最大的两个世界坐标轴生成轨迹投影；
-- 每帧相机中心误差；
-- 每帧旋转误差。
-
-帧 `210、240` 使用黑色外圈/竖线标记为 held-out。三条轨迹使用与点云比较完全相同的
-shared GT-world Sim(3)，不会分别拟合对齐。服务器存在 matplotlib 时输出 PNG 和 PDF；
-否则自动输出不依赖 matplotlib 的 SVG，导出命令不会因此失败。
-
-GT PLY 是选定相机视角下由 ScanNet++ mesh rasterize 得到的可见 GT pointmaps，不是完整扫描
-mesh。这保证了逐像素点图比较公平。
-
-运行当前冻结结果：
+复现原序列最终结果：
 
 ```bash
 zsh streaming_couping/commands_final_joint_pointcloud_pose.txt
 ```
 
-## 8. 当前研究结论和边界
+使用固定 checkpoint 测试另一输入顺序：
 
-当前方法已经实现：
-
-```text
-tracking -> 改善 pointmap 和 rotation
-refined pointmap -> 解析改善 translation
+```bash
+zsh streaming_couping/commands_final_joint_pointcloud_pose_test.txt
 ```
 
-它是一个学习前端与解析几何后端结合的因果系统，不是完整的迭代联合 BA。尚未实现：
+已有 cache 和 ray 结果、只补导出：
 
-```text
-refined pose -> 再更新 pointmap -> 再优化 pose
+```bash
+PYTHONPATH=src:. python -m streaming_couping.scripts.run_instance_token_pose \
+  --config streaming_couping/configs/final_joint_pointcloud_pose_test.yaml \
+  --stage export
 ```
 
-此外：
+## 11. 方法边界
 
-- 当前只在 ScanNet++ 场景 `00a231a370` 上验证；
-- 训练只使用帧 `90 105 119 130 140`；
-- 主要 held-out 指标来自帧 `210 240`；
-- 最终 spatial scope 是查看该场景消融后选定的；
-- 因此这是单场景 proof-of-concept，不是无偏跨场景泛化结论；
-- 不主张当前 depth 指标已经同步达到相同幅度的改善。
-
-当前最可靠的结论是：persistent instance guidance 明显改善 pointmap 和相机旋转；在此基础上，
-使用静态实例区域的 robust point-to-ray 几何后端可以显著修复 StreamVGGT 的绝对相机平移。
-
-## 9. 已冻结的消融结论
-
-旧实现代码已删除，以下结果保留作为最终选择依据：
-
-| 被淘汰方向 | 观察结果 | 最终决定 |
-|---|---|---|
-| fused token 写入 SAM3 | 没有形成可靠的同实例恢复，且会耦合两个冻结主干 | SAM3 只提供 mask、ID、score 和 pooled appearance |
-| camera geometry-only / combined fusion | 不如 SAM-appearance camera branch 稳定 | pose branch 只使用 appearance + tracker gate |
-| all-token fusion | pointmap 与 pose 梯度互相干扰 | camera 与 patch 使用独立 tokenizer/attention |
-| geometry strict gate | 会拒绝 bed 等已正确跟踪但几何分数暂低的实例 | geometry/static 作为特征，只有 tracker 做硬门控 |
-| learned absolute translation | held-out ATE `0.37535 m`，没有优于 raw `0.36879 m` | 学习分支只保留 rotation，translation 交给解析 solver |
-| 全图/background ray solve | held-out ATE 分别为 `0.18165/0.19273 m` | 只使用 persistent-instance mask 并集 |
-| 逐帧 K、trimmed LS、GT-K oracle | 不如 reference predicted K + angular-Huber instance solve | 固定最终无 GT solver |
-
-清理后的代码只允许：
-
-```text
-decoupled_dual_branch + aligned/module_off
-ray_refined_pointmap_refined_rotation_reference_k_instances
-```
-
-`module_off` 仅用于严格确认关闭实例模块时逐元素恢复原始 StreamVGGT，不是另一种候选方法。
+- 当前是单场景 proof-of-concept，不是跨场景泛化结论；
+- 它是学习残差前端加解析几何后端，不是迭代 bundle adjustment；
+- refined pose 不会反向再次更新 pointmap；
+- pointmap adapter 在新视角上的可靠性尚未解决；
+- reference mask 来自数据集实例标注，不是全自动实例发现；
+- 关闭 adapter 时严格恢复原始 StreamVGGT；ray fit 失败时回退 learned center。
