@@ -43,3 +43,6 @@ sed -n '1,24p' \
   "$NEW/final_instance_ray_pose_v3/$CLIP/comparison_gt_world/camera_pose_metrics.csv"
 sed -n '1,24p' \
   "$NEW/final_instance_ray_pose_v3/$CLIP/segmentation_masks/mask_summary.csv"
+   
+
+   
