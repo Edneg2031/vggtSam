@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -21,36 +22,30 @@ from streaming_couping.src.learned_pose.pipeline import (
     _evaluation_sequence_indices,
 )
 from streaming_couping.src.learned_pose.ray_pose import (
+    recover_final_ray_pose,
     reference_blend_pose_name,
-)
-from streaming_couping.src.learned_pose.shared_rigid_graph import (
-    SHARED_RIGID_VARIANTS,
-    SharedRigidConfig,
-    run_shared_rigid_graph,
 )
 from vggtsam.utils.imports import maybe_add_repo_to_path
 
 
 CONTROL_RAW = "raw_control"
 CONTROL_FIXED = "fixed_ref_050_control"
+POINT_BLEND_VALUES = (0.0, 0.25, 0.50, 0.75, 1.0)
 SUMMARY_FIELDS = (
     "split",
     "clip",
     "variant",
-    "joint_consistent",
+    "point_blend",
+    "pose_pointmap_coupled",
     "ate",
     "rotation_deg",
     "pointmap_mean",
     "ate_delta_from_raw",
     "pointmap_delta_from_raw",
-    "point_rmse_before",
-    "point_rmse_after",
-    "matches",
-    "accepted_frames",
-    "active_instance_edges",
-    "rejected_instance_edges",
+    "fit_accepted",
     "mean_center_shift",
     "reference_anchor_exact",
+    "a100_pose_matches_fixed",
     "module_off_exact",
     "status",
 )
@@ -71,7 +66,7 @@ def main() -> None:
     evaluation.mkdir(parents=True, exist_ok=True)
     print(f"reusing predictions: {source_path}")
     print(f"reusing cache: {config.features.cache_dir}")
-    print("shared SE3 graph does not run SAM3, StreamVGGT, or training")
+    print("pointmap blend sweep does not run SAM3, StreamVGGT, or training")
 
     pose_summary: list[dict] = []
     pose_frames: list[dict] = []
@@ -103,6 +98,7 @@ def main() -> None:
         payload = load_feature_cache(path)
         predicted = predictions[clip.name]
         raw_pose = _pose_prediction(predicted, "raw_baseline_control")
+        learned_pose = _learned_pose_prediction(predicted)
         fixed_pose = _pose_prediction(
             predicted,
             reference_blend_pose_name(0.50),
@@ -118,6 +114,17 @@ def main() -> None:
         sequence_indices = _evaluation_sequence_indices(clip)
         metadata = _evaluation_metadata(clip)
         geometry_batch = _geometry_batch(payload, args.device)
+        ray_batch = _ray_batch(
+            payload,
+            clip=clip,
+            strict_identity_gate=bool(config.fusion.strict_identity_gate),
+            device=args.device,
+        )
+        ray_config = replace(
+            config.evaluation.ray_pose,
+            solver_modes=(),
+            reference_blend_values=(0.50,),
+        )
         module_off_exact = int(
             torch.equal(
                 _squeeze_saved(raw_pose).cpu(),
@@ -178,32 +185,78 @@ def main() -> None:
                 "depth": depth.detach().cpu(),
             }
 
-        for variant in SHARED_RIGID_VARIANTS:
-            result = run_shared_rigid_graph(
-                raw_pose_encoding=raw_pose.to(args.device),
-                initial_pose_encoding=fixed_pose.to(args.device),
-                raw_world_points=raw_points[None].to(args.device),
-                learned_world_points=refined_points[None].to(args.device),
-                raw_confidence=raw_confidence[None].to(args.device),
-                learned_confidence=refined_confidence[None].to(args.device),
-                token_levels=payload["token_levels"],
-                patch_start_idx=int(payload["patch_start_idx"]),
-                patch_shape=tuple(int(value) for value in payload["patch_shape"]),
-                tracking_masks=payload["tracking_masks_stream"][None].to(
-                    args.device
-                ),
-                trusted_tracking_masks=payload[
-                    "trusted_tracking_masks_stream"
-                ][None].to(args.device),
-                trusted_instance_valid=payload["trusted_instance_valid"][
-                    None
-                ].to(args.device),
-                image_size=tuple(int(value) for value in payload["image_size"]),
+        for point_blend in POINT_BLEND_VALUES:
+            name = point_blend_name(point_blend)
+            points = _blend_pointmap(
+                raw_points,
+                refined_points,
+                blend=point_blend,
                 reference_index=int(payload["reference_sequence_index"]),
-                scene_scale=float(payload["scene_scale"]),
-                variant=variant,
-                config=SharedRigidConfig(),
             )
+            confidence = _blend_confidence(
+                raw_confidence,
+                refined_confidence,
+                blend=point_blend,
+                reference_index=int(payload["reference_sequence_index"]),
+            )
+            ray_results = recover_final_ray_pose(
+                batch=ray_batch,
+                baseline_outputs={
+                    "pose_encoding": raw_pose.to(args.device),
+                },
+                refined_outputs={
+                    "pose_encoding": learned_pose.to(args.device),
+                    "world_points": points[None].to(args.device),
+                    "world_confidence": confidence[None].to(args.device),
+                },
+                config=ray_config,
+            )
+            if len(ray_results) != 1:
+                raise ValueError(
+                    "Pointmap blend sweep expected exactly one ray-pose result."
+                )
+            ray_result = ray_results[0]
+            pose = ray_result.pose_encoding
+            fit_rows = tuple(ray_result.diagnostics)
+            nonreference_rows = [
+                row for row in fit_rows if int(row.get("is_reference", 0)) == 0
+            ]
+            accepted = sum(
+                int(row.get("fit_accepted", 0))
+                for row in nonreference_rows
+            )
+            accepted_shifts = [
+                float(row.get("applied_center_shift_native", 0.0))
+                for row in nonreference_rows
+                if int(row.get("fit_accepted", 0)) == 1
+            ]
+            pose_matches_fixed = (
+                int(torch.equal(pose.cpu(), fixed_pose.cpu()))
+                if point_blend == 1.0
+                else ""
+            )
+            diagnostics = {
+                "status": (
+                    f"ray_fit_accepted_{accepted}_of_{len(nonreference_rows)}"
+                ),
+                "point_blend": point_blend,
+                "pose_pointmap_coupled": 1,
+                "fit_accepted": accepted,
+                "mean_pose_center_shift_native": (
+                    sum(accepted_shifts) / len(accepted_shifts)
+                    if accepted_shifts
+                    else 0.0
+                ),
+                "reference_anchor_exact": int(
+                    torch.equal(
+                        pose[:, int(payload["reference_sequence_index"])].cpu(),
+                        raw_pose[
+                            :, int(payload["reference_sequence_index"])
+                        ].cpu(),
+                    )
+                ),
+                "a100_pose_matches_fixed": pose_matches_fixed,
+            }
             _append_metrics(
                 pose_summary,
                 pose_frames,
@@ -214,29 +267,28 @@ def main() -> None:
                 depth_frames,
                 payload=payload,
                 batch=geometry_batch,
-                pose=result.pose_encoding,
-                points=result.world_points,
-                depth=result.depth,
-                name=result.name,
+                pose=pose,
+                points=points[None].to(args.device),
+                depth=payload["baseline_depth"][None].to(args.device),
+                name=name,
                 sequence_indices=sequence_indices,
                 metadata=metadata,
             )
             diagnostic_rows.append(
                 {
                     "clip": clip.name,
-                    "variant": result.name,
-                    "joint_consistent": 1,
+                    "variant": name,
                     "module_off_exact": module_off_exact,
-                    **result.diagnostics,
+                    **diagnostics,
                 }
             )
-            clip_outputs[result.name] = {
-                "pose_encoding": result.pose_encoding.detach().cpu(),
-                "world_points": result.world_points.detach().cpu(),
-                "depth": result.depth.detach().cpu(),
-                "diagnostics": result.diagnostics,
+            clip_outputs[name] = {
+                "pose_encoding": pose.detach().cpu(),
+                "world_points": points[None].detach().cpu(),
+                "depth": payload["baseline_depth"][None].detach().cpu(),
+                "diagnostics": diagnostics,
             }
-            del result
+            del ray_result
             if str(args.device).startswith("cuda") and torch.cuda.is_available():
                 torch.cuda.empty_cache()
         saved_predictions[clip.name] = {
@@ -311,6 +363,22 @@ def _pose_prediction(prediction: dict, name: str) -> torch.Tensor:
     return value.float()
 
 
+def _learned_pose_prediction(prediction: dict) -> torch.Tensor:
+    poses = prediction.get("pose_encodings")
+    if not isinstance(poses, dict):
+        raise KeyError("Missing pose_encodings.")
+    matches = [
+        value
+        for name, value in poses.items()
+        if "learned_pose_control" in str(name)
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected one learned pose control, found {len(matches)}."
+        )
+    return matches[0].float()
+
+
 def _squeeze_saved(value: torch.Tensor) -> torch.Tensor:
     if not torch.is_tensor(value):
         raise TypeError("Saved prediction value is not a tensor.")
@@ -341,6 +409,85 @@ def _geometry_batch(payload: dict, device: str) -> dict:
     ):
         output[name] = payload[name].to(device)
     return output
+
+
+def _ray_batch(
+    payload: dict,
+    *,
+    clip,
+    strict_identity_gate: bool,
+    device: str,
+) -> dict:
+    return {
+        "image_size": payload["image_size"],
+        "frame_indices": payload["frame_indices"],
+        "reference_sequence_index": payload["reference_sequence_index"],
+        "instance_ids": tuple(int(value) for value in clip.instance_ids),
+        "strict_identity_gate": bool(strict_identity_gate),
+        "baseline_world_points": payload["baseline_world_points"][
+            None
+        ].to(device),
+        "baseline_world_confidence": payload[
+            "baseline_world_confidence"
+        ][None].to(device),
+        "tracking_masks_stream": payload["tracking_masks_stream"][
+            None
+        ].to(device),
+        "trusted_tracking_masks_stream": payload[
+            "trusted_tracking_masks_stream"
+        ][None].to(device),
+        "trusted_instance_valid": payload["trusted_instance_valid"][
+            None
+        ].to(device),
+    }
+
+
+def point_blend_name(blend: float) -> str:
+    percent = int(round(100.0 * float(blend)))
+    if abs(float(blend) - percent / 100.0) > 1e-8:
+        raise ValueError("Pointmap blend must be an integer percentage.")
+    return f"fixed_pose_pointblend_a{percent:03d}"
+
+
+def _blend_pointmap(
+    raw: torch.Tensor,
+    learned: torch.Tensor,
+    *,
+    blend: float,
+    reference_index: int,
+) -> torch.Tensor:
+    if raw.shape != learned.shape:
+        raise ValueError("Raw and learned pointmaps must have equal shape.")
+    valid = (
+        torch.isfinite(raw).all(dim=-1)
+        & torch.isfinite(learned).all(dim=-1)
+    )
+    value = torch.where(
+        valid[..., None],
+        raw + float(blend) * (learned - raw),
+        raw,
+    )
+    value[int(reference_index)] = raw[int(reference_index)]
+    return value
+
+
+def _blend_confidence(
+    raw: torch.Tensor,
+    learned: torch.Tensor,
+    *,
+    blend: float,
+    reference_index: int,
+) -> torch.Tensor:
+    if raw.ndim == 4 and raw.shape[-1] == 1:
+        raw = raw[..., 0]
+    if learned.ndim == 4 and learned.shape[-1] == 1:
+        learned = learned[..., 0]
+    if raw.shape != learned.shape:
+        raise ValueError("Raw and learned confidence maps must have equal shape.")
+    learned = torch.where(torch.isfinite(learned), learned, raw)
+    value = raw + float(blend) * (learned - raw)
+    value[int(reference_index)] = raw[int(reference_index)]
+    return value
 
 
 def _append_metrics(
@@ -400,7 +547,7 @@ def _compact_summary(
     order = (
         CONTROL_RAW,
         CONTROL_FIXED,
-        *(variant.name for variant in SHARED_RIGID_VARIANTS),
+        *(point_blend_name(value) for value in POINT_BLEND_VALUES),
     )
     for clip in clips:
         raw_pose = _one(
@@ -433,8 +580,12 @@ def _compact_summary(
                 "split": pose.get("evaluation_protocol", ""),
                 "clip": clip,
                 "variant": variant,
-                "joint_consistent": diagnostics.get(
-                    "joint_consistent",
+                "point_blend": diagnostics.get(
+                    "point_blend",
+                    "",
+                ),
+                "pose_pointmap_coupled": diagnostics.get(
+                    "pose_pointmap_coupled",
                     "",
                 ),
                 "ate": float(pose["ate_rmse"]),
@@ -447,25 +598,8 @@ def _compact_summary(
                     - float(raw_pose["ate_rmse"])
                 ),
                 "pointmap_delta_from_raw": point - raw_point,
-                "point_rmse_before": diagnostics.get(
-                    "initial_point_rmse",
-                    "",
-                ),
-                "point_rmse_after": diagnostics.get(
-                    "final_point_rmse",
-                    "",
-                ),
-                "matches": diagnostics.get("matches", ""),
-                "accepted_frames": diagnostics.get(
-                    "accepted_frames",
-                    "",
-                ),
-                "active_instance_edges": diagnostics.get(
-                    "active_instance_edges",
-                    "",
-                ),
-                "rejected_instance_edges": diagnostics.get(
-                    "rejected_instance_edges",
+                "fit_accepted": diagnostics.get(
+                    "fit_accepted",
                     "",
                 ),
                 "mean_center_shift": diagnostics.get(
@@ -474,6 +608,10 @@ def _compact_summary(
                 ),
                 "reference_anchor_exact": diagnostics.get(
                     "reference_anchor_exact",
+                    "",
+                ),
+                "a100_pose_matches_fixed": diagnostics.get(
+                    "a100_pose_matches_fixed",
                     "",
                 ),
                 "module_off_exact": diagnostics.get(

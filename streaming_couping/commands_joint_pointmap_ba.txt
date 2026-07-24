@@ -20,4 +20,4 @@ PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_join
   --predictions "$PREDICTIONS" \
   2>&1 | tee "$OUTPUT/joint_pointmap_ba.log"
 
-sed -n '1,12p' "$OUTPUT/joint_ba_upload_summary.csv"
+sed -n '1,16p' "$OUTPUT/joint_ba_upload_summary.csv"

@@ -6,9 +6,13 @@ import torch
 from streaming_couping.scripts.run_joint_pointmap_ba import (
     CONTROL_FIXED,
     CONTROL_RAW,
+    POINT_BLEND_VALUES,
     SUMMARY_FIELDS,
+    _blend_confidence,
+    _blend_pointmap,
     _compact_summary,
     _write_csv,
+    point_blend_name,
 )
 from streaming_couping.src.learned_pose.joint_ba import (
     JOINT_BA_VARIANTS,
@@ -164,11 +168,11 @@ def test_small_joint_ba_case_is_finite_anchored_and_reduces_ray_error() -> None:
     )
 
 
-def test_compact_summary_has_five_ordered_rows_and_raw_deltas() -> None:
+def test_compact_summary_has_ordered_blend_rows_and_raw_deltas() -> None:
     variants = (
         CONTROL_RAW,
         CONTROL_FIXED,
-        *(variant.name for variant in SHARED_RIGID_VARIANTS),
+        *(point_blend_name(value) for value in POINT_BLEND_VALUES),
     )
     pose_rows = []
     pointmap_rows = []
@@ -199,28 +203,31 @@ def test_compact_summary_has_five_ordered_rows_and_raw_deltas() -> None:
                 "variant": variant,
                 "joint_consistent": int(variant != CONTROL_FIXED),
                 "module_off_exact": 1,
-                "status": "control" if index < 2 else "accepted_shared_se3",
-                "initial_point_rmse": 0.1,
-                "final_point_rmse": 0.05,
-                "matches": 32,
-                "accepted_frames": 1,
-                "active_instance_edges": 2,
-                "rejected_instance_edges": 1,
+                "status": "control" if index < 2 else "ray_fit",
+                "point_blend": (
+                    "" if index < 2 else POINT_BLEND_VALUES[index - 2]
+                ),
+                "pose_pointmap_coupled": int(index >= 2),
+                "fit_accepted": 1,
                 "mean_pose_center_shift_native": 0.01,
                 "reference_anchor_exact": 1,
+                "a100_pose_matches_fixed": (
+                    1 if variant == point_blend_name(1.0) else ""
+                ),
             }
         )
 
     rows = _compact_summary(pose_rows, pointmap_rows, diagnostics)
 
-    assert len(rows) == 5
+    assert len(rows) == 7
     assert tuple(rows[0]) == SUMMARY_FIELDS
     assert [row["variant"] for row in rows] == list(variants)
     assert rows[0]["ate_delta_from_raw"] == "0"
     assert rows[0]["pointmap_delta_from_raw"] == "0"
-    assert rows[-1]["ate_delta_from_raw"] == "-0.04"
-    assert rows[-1]["pointmap_delta_from_raw"] == "-0.04"
+    assert rows[-1]["ate_delta_from_raw"] == "-0.06"
+    assert rows[-1]["pointmap_delta_from_raw"] == "-0.06"
     assert rows[-1]["reference_anchor_exact"] == 1
+    assert rows[-1]["a100_pose_matches_fixed"] == 1
 
 
 def test_csv_writer_unions_control_and_ba_diagnostic_fields(tmp_path) -> None:
@@ -232,10 +239,10 @@ def test_csv_writer_unions_control_and_ba_diagnostic_fields(tmp_path) -> None:
             {"clip": "clip", "variant": CONTROL_RAW, "status": "control"},
             {
                 "clip": "clip",
-                "variant": SHARED_RIGID_VARIANTS[0].name,
-                "status": "accepted_shared_se3",
-                "matches": 32,
-                "final_point_rmse": 0.05,
+                "variant": point_blend_name(0.25),
+                "status": "ray_fit",
+                "fit_accepted": 2,
+                "mean_pose_center_shift_native": 0.05,
             },
         ],
     )
@@ -246,12 +253,45 @@ def test_csv_writer_unions_control_and_ba_diagnostic_fields(tmp_path) -> None:
         "clip",
         "variant",
         "status",
-        "matches",
-        "final_point_rmse",
+        "fit_accepted",
+        "mean_pose_center_shift_native",
     ]
-    assert rows[0]["matches"] == ""
-    assert rows[1]["matches"] == "32"
-    assert rows[1]["final_point_rmse"] == "0.05"
+    assert rows[0]["fit_accepted"] == ""
+    assert rows[1]["fit_accepted"] == "2"
+    assert rows[1]["mean_pose_center_shift_native"] == "0.05"
+
+
+def test_pointmap_blend_is_exact_at_endpoints_and_preserves_reference() -> None:
+    raw = torch.zeros(2, 2, 2, 3)
+    learned = torch.full_like(raw, 2.0)
+    learned[1, 0, 0] = torch.nan
+
+    zero = _blend_pointmap(raw, learned, blend=0.0, reference_index=0)
+    half = _blend_pointmap(raw, learned, blend=0.5, reference_index=0)
+    one = _blend_pointmap(raw, learned, blend=1.0, reference_index=0)
+
+    assert torch.equal(zero, raw)
+    assert torch.equal(half[0], raw[0])
+    assert torch.equal(one[0], raw[0])
+    assert torch.equal(half[1, 1, 1], torch.ones(3))
+    assert torch.equal(one[1, 1, 1], learned[1, 1, 1])
+    assert torch.equal(one[1, 0, 0], raw[1, 0, 0])
+
+
+def test_confidence_blend_accepts_singleton_channel() -> None:
+    raw = torch.zeros(2, 2, 2, 1)
+    learned = torch.ones(2, 2, 2)
+
+    value = _blend_confidence(
+        raw,
+        learned,
+        blend=0.25,
+        reference_index=0,
+    )
+
+    assert value.shape == (2, 2, 2)
+    assert torch.equal(value[0], torch.zeros(2, 2))
+    assert torch.equal(value[1], torch.full((2, 2), 0.25))
 
 
 def test_shared_rigid_graph_falls_back_without_matches() -> None:
