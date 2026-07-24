@@ -1,4 +1,4 @@
-"""Run no-training gauge-fixed joint pointmap bundle adjustment."""
+"""Run no-training shared-SE(3) pose and pointmap graph refinement."""
 
 from __future__ import annotations
 
@@ -15,11 +15,6 @@ from streaming_couping.src.learned_pose.geometry_metrics import (
     append_geometry_metrics,
     summarize_pointmap_metrics,
 )
-from streaming_couping.src.learned_pose.joint_ba import (
-    JOINT_BA_VARIANTS,
-    JointBAConfig,
-    run_joint_ba,
-)
 from streaming_couping.src.learned_pose.pipeline import (
     _append_pose_metrics,
     _evaluation_metadata,
@@ -27,6 +22,11 @@ from streaming_couping.src.learned_pose.pipeline import (
 )
 from streaming_couping.src.learned_pose.ray_pose import (
     reference_blend_pose_name,
+)
+from streaming_couping.src.learned_pose.shared_rigid_graph import (
+    SHARED_RIGID_VARIANTS,
+    SharedRigidConfig,
+    run_shared_rigid_graph,
 )
 from vggtsam.utils.imports import maybe_add_repo_to_path
 
@@ -43,12 +43,13 @@ SUMMARY_FIELDS = (
     "pointmap_mean",
     "ate_delta_from_raw",
     "pointmap_delta_from_raw",
-    "ray_rmse_before",
-    "ray_rmse_after",
+    "point_rmse_before",
+    "point_rmse_after",
     "matches",
+    "accepted_frames",
     "active_instance_edges",
     "rejected_instance_edges",
-    "beta_mean",
+    "mean_center_shift",
     "reference_anchor_exact",
     "module_off_exact",
     "status",
@@ -70,7 +71,7 @@ def main() -> None:
     evaluation.mkdir(parents=True, exist_ok=True)
     print(f"reusing predictions: {source_path}")
     print(f"reusing cache: {config.features.cache_dir}")
-    print("joint BA does not run SAM3, StreamVGGT, or training")
+    print("shared SE3 graph does not run SAM3, StreamVGGT, or training")
 
     pose_summary: list[dict] = []
     pose_frames: list[dict] = []
@@ -98,11 +99,10 @@ def main() -> None:
             raise KeyError(
                 f"Prediction file {source_path} has no clip {clip.name!r}."
             )
-        print(f"joint BA clip={clip.name}")
+        print(f"shared SE3 graph clip={clip.name}")
         payload = load_feature_cache(path)
         predicted = predictions[clip.name]
         raw_pose = _pose_prediction(predicted, "raw_baseline_control")
-        learned_pose = _learned_pose_prediction(predicted)
         fixed_pose = _pose_prediction(
             predicted,
             reference_blend_pose_name(0.50),
@@ -178,10 +178,10 @@ def main() -> None:
                 "depth": depth.detach().cpu(),
             }
 
-        for variant in JOINT_BA_VARIANTS:
-            result = run_joint_ba(
+        for variant in SHARED_RIGID_VARIANTS:
+            result = run_shared_rigid_graph(
                 raw_pose_encoding=raw_pose.to(args.device),
-                learned_pose_encoding=learned_pose.to(args.device),
+                initial_pose_encoding=fixed_pose.to(args.device),
                 raw_world_points=raw_points[None].to(args.device),
                 learned_world_points=refined_points[None].to(args.device),
                 raw_confidence=raw_confidence[None].to(args.device),
@@ -202,7 +202,7 @@ def main() -> None:
                 reference_index=int(payload["reference_sequence_index"]),
                 scene_scale=float(payload["scene_scale"]),
                 variant=variant,
-                config=JointBAConfig(),
+                config=SharedRigidConfig(),
             )
             _append_metrics(
                 pose_summary,
@@ -311,22 +311,6 @@ def _pose_prediction(prediction: dict, name: str) -> torch.Tensor:
     return value.float()
 
 
-def _learned_pose_prediction(prediction: dict) -> torch.Tensor:
-    poses = prediction.get("pose_encodings")
-    if not isinstance(poses, dict):
-        raise KeyError("Missing pose_encodings.")
-    matches = [
-        value
-        for name, value in poses.items()
-        if "learned_pose_control" in str(name)
-    ]
-    if len(matches) != 1:
-        raise ValueError(
-            f"Expected one learned pose control, found {len(matches)}."
-        )
-    return matches[0].float()
-
-
 def _squeeze_saved(value: torch.Tensor) -> torch.Tensor:
     if not torch.is_tensor(value):
         raise TypeError("Saved prediction value is not a tensor.")
@@ -416,7 +400,7 @@ def _compact_summary(
     order = (
         CONTROL_RAW,
         CONTROL_FIXED,
-        *(variant.name for variant in JOINT_BA_VARIANTS),
+        *(variant.name for variant in SHARED_RIGID_VARIANTS),
     )
     for clip in clips:
         raw_pose = _one(
@@ -463,15 +447,19 @@ def _compact_summary(
                     - float(raw_pose["ate_rmse"])
                 ),
                 "pointmap_delta_from_raw": point - raw_point,
-                "ray_rmse_before": diagnostics.get(
-                    "initial_ray_rmse",
+                "point_rmse_before": diagnostics.get(
+                    "initial_point_rmse",
                     "",
                 ),
-                "ray_rmse_after": diagnostics.get(
-                    "final_ray_rmse",
+                "point_rmse_after": diagnostics.get(
+                    "final_point_rmse",
                     "",
                 ),
                 "matches": diagnostics.get("matches", ""),
+                "accepted_frames": diagnostics.get(
+                    "accepted_frames",
+                    "",
+                ),
                 "active_instance_edges": diagnostics.get(
                     "active_instance_edges",
                     "",
@@ -480,19 +468,13 @@ def _compact_summary(
                     "rejected_instance_edges",
                     "",
                 ),
-                "beta_mean": diagnostics.get("beta_mean", ""),
-                "reference_anchor_exact": (
-                    int(
-                        float(
-                            diagnostics.get(
-                                "reference_pose_max_abs_diff",
-                                0.0,
-                            )
-                        )
-                        == 0.0
-                    )
-                    if "reference_pose_max_abs_diff" in diagnostics
-                    else ""
+                "mean_center_shift": diagnostics.get(
+                    "mean_pose_center_shift_native",
+                    "",
+                ),
+                "reference_anchor_exact": diagnostics.get(
+                    "reference_anchor_exact",
+                    "",
                 ),
                 "module_off_exact": diagnostics.get(
                     "module_off_exact",

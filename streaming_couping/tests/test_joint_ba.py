@@ -18,6 +18,11 @@ from streaming_couping.src.learned_pose.joint_ba import (
     run_joint_ba,
     world_points_from_depth,
 )
+from streaming_couping.src.learned_pose.shared_rigid_graph import (
+    SHARED_RIGID_VARIANTS,
+    SharedRigidConfig,
+    run_shared_rigid_graph,
+)
 from vggtsam.utils.imports import maybe_add_repo_to_path
 
 
@@ -163,7 +168,7 @@ def test_compact_summary_has_five_ordered_rows_and_raw_deltas() -> None:
     variants = (
         CONTROL_RAW,
         CONTROL_FIXED,
-        *(variant.name for variant in JOINT_BA_VARIANTS),
+        *(variant.name for variant in SHARED_RIGID_VARIANTS),
     )
     pose_rows = []
     pointmap_rows = []
@@ -194,14 +199,15 @@ def test_compact_summary_has_five_ordered_rows_and_raw_deltas() -> None:
                 "variant": variant,
                 "joint_consistent": int(variant != CONTROL_FIXED),
                 "module_off_exact": 1,
-                "status": "control" if index < 2 else "accepted_joint_ba",
-                "initial_ray_rmse": 0.1,
-                "final_ray_rmse": 0.05,
+                "status": "control" if index < 2 else "accepted_shared_se3",
+                "initial_point_rmse": 0.1,
+                "final_point_rmse": 0.05,
                 "matches": 32,
+                "accepted_frames": 1,
                 "active_instance_edges": 2,
                 "rejected_instance_edges": 1,
-                "beta_mean": 0.1,
-                "reference_pose_max_abs_diff": 0.0,
+                "mean_pose_center_shift_native": 0.01,
+                "reference_anchor_exact": 1,
             }
         )
 
@@ -226,10 +232,10 @@ def test_csv_writer_unions_control_and_ba_diagnostic_fields(tmp_path) -> None:
             {"clip": "clip", "variant": CONTROL_RAW, "status": "control"},
             {
                 "clip": "clip",
-                "variant": JOINT_BA_VARIANTS[0].name,
-                "status": "accepted_joint_ba",
+                "variant": SHARED_RIGID_VARIANTS[0].name,
+                "status": "accepted_shared_se3",
                 "matches": 32,
-                "final_ray_rmse": 0.05,
+                "final_point_rmse": 0.05,
             },
         ],
     )
@@ -241,11 +247,95 @@ def test_csv_writer_unions_control_and_ba_diagnostic_fields(tmp_path) -> None:
         "variant",
         "status",
         "matches",
-        "final_ray_rmse",
+        "final_point_rmse",
     ]
     assert rows[0]["matches"] == ""
     assert rows[1]["matches"] == "32"
-    assert rows[1]["final_ray_rmse"] == "0.05"
+    assert rows[1]["final_point_rmse"] == "0.05"
+
+
+def test_shared_rigid_graph_falls_back_without_matches() -> None:
+    inputs = _synthetic_inputs()
+    result = run_shared_rigid_graph(
+        **_shared_inputs(inputs),
+        variant=SHARED_RIGID_VARIANTS[0],
+        config=SharedRigidConfig(
+            inner_steps=1,
+            min_total_matches=10_000,
+        ),
+    )
+
+    assert result.diagnostics["status"] == (
+        "fallback_insufficient_cross_view_matches"
+    )
+    assert torch.equal(
+        result.pose_encoding,
+        inputs["learned_pose_encoding"],
+    )
+    assert torch.equal(
+        result.world_points,
+        inputs["raw_world_points"],
+    )
+    assert result.diagnostics["reference_anchor_exact"] == 1
+
+
+def test_shared_rigid_graph_preserves_camera_local_shape() -> None:
+    inputs = _synthetic_inputs()
+    result = run_shared_rigid_graph(
+        **_shared_inputs(inputs),
+        variant=SHARED_RIGID_VARIANTS[0],
+        config=SharedRigidConfig(
+            inner_steps=60,
+            learning_rate=0.05,
+            match_radius_patches=1,
+            max_matches_per_edge_region=32,
+            min_matches_per_edge_region=2,
+            min_total_matches=4,
+            min_matches_per_frame=4,
+            feature_dim_limit=16,
+            min_feature_cosine=0.5,
+            max_initial_point_distance_ratio=1.0,
+            max_forward_backward_patches=4.0,
+            rotation_prior_weight=0.01,
+            translation_prior_weight=0.01,
+            max_translation_scene_ratio=0.2,
+            min_relative_residual_improvement=0.001,
+        ),
+    )
+
+    assert result.diagnostics["status"] == "accepted_shared_se3"
+    assert result.diagnostics["accepted_frames"] == 1
+    assert (
+        result.diagnostics["final_point_rmse"]
+        < result.diagnostics["initial_point_rmse"]
+    )
+    assert torch.equal(
+        result.pose_encoding[:, 0],
+        inputs["raw_pose_encoding"][:, 0],
+    )
+
+    maybe_add_repo_to_path(
+        Path(__file__).resolve().parents[2] / "externals/streamvggt"
+    )
+    from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+    initial_w2c, _ = pose_encoding_to_extri_intri(
+        inputs["learned_pose_encoding"],
+        image_size_hw=inputs["image_size"],
+    )
+    final_w2c, _ = pose_encoding_to_extri_intri(
+        result.pose_encoding,
+        image_size_hw=inputs["image_size"],
+    )
+    initial_local = _world_to_camera(
+        inputs["raw_world_points"][0],
+        initial_w2c[0],
+    )
+    final_local = _world_to_camera(
+        result.world_points[0],
+        final_w2c[0],
+    )
+    assert torch.allclose(final_local[1], initial_local[1], atol=1e-5)
 
 
 def _synthetic_inputs() -> dict[str, object]:
@@ -318,6 +408,37 @@ def _synthetic_inputs() -> dict[str, object]:
         "reference_index": 0,
         "scene_scale": 1.0,
     }
+
+
+def _shared_inputs(inputs: dict[str, object]) -> dict[str, object]:
+    return {
+        "raw_pose_encoding": inputs["raw_pose_encoding"],
+        "initial_pose_encoding": inputs["learned_pose_encoding"],
+        "raw_world_points": inputs["raw_world_points"],
+        "learned_world_points": inputs["learned_world_points"],
+        "raw_confidence": inputs["raw_confidence"],
+        "learned_confidence": inputs["learned_confidence"],
+        "token_levels": inputs["token_levels"],
+        "patch_start_idx": inputs["patch_start_idx"],
+        "patch_shape": inputs["patch_shape"],
+        "tracking_masks": inputs["tracking_masks"],
+        "trusted_tracking_masks": inputs["trusted_tracking_masks"],
+        "trusted_instance_valid": inputs["trusted_instance_valid"],
+        "image_size": inputs["image_size"],
+        "reference_index": inputs["reference_index"],
+        "scene_scale": inputs["scene_scale"],
+    }
+
+
+def _world_to_camera(
+    points: torch.Tensor,
+    world_to_camera: torch.Tensor,
+) -> torch.Tensor:
+    return torch.einsum(
+        "sij,shwj->shwi",
+        world_to_camera[:, :3, :3],
+        points,
+    ) + world_to_camera[:, None, None, :3, 3]
 
 
 def _c2w_to_w2c(camera_to_world: torch.Tensor) -> torch.Tensor:

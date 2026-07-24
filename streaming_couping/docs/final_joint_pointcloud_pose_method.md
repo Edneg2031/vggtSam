@@ -1,41 +1,45 @@
 # 实例引导的点云与相机位姿优化
 
-## 0. 当前收束版：gauge-fixed joint pointmap BA
+## 0. 当前实验：保守 shared-SE(3) graph
 
 下面第 1–8 节描述的是生成候选结果的冻结 StreamVGGT、SAM3 tracking 和 V5
 trainable adapter。它们原先分别输出 learned pose、learned pointmap，再用独立 ray solver
-修改相机中心；这三者可能处于不一致的几何规范中。当前最终实验在它们之后增加一个
-**无需训练、推理时联合优化**：
+修改相机中心。
+
+第一版 joint BA 曾把 raw/learned pointmap 转成 camera-ray depth，再使用优化后的 pose
+重新生成世界点云。实验否决了这个设计：原序列 pointmap mean 从 `0.1526` 恶化到
+`0.5087`，新序列从 `0.2245` 恶化到 `0.2554`；深度混合系数仅约 `0.016`，说明破坏主要
+来自用不够准确的 pose 强制重新放置整张 raw 几何，而不是 learned depth。
+
+当前版本不再重建点云，而是从已经验证较好的 `fixed_ref_050 pose` 和 direct pointmap
+候选出发，执行**无需训练的共享刚体图优化**：
 
 ```text
-raw StreamVGGT pose / pointmap（固定参考坐标系）
-             +
-V5 learned pose / pointmap（只作为候选）
-             +
-最后一层 StreamVGGT patch feature + 可信 SAM3 instance masks
+fixed_ref_050 pose + raw 或 learned direct pointmap
+                       +
+最后一层 StreamVGGT patch feature + 可信 SAM3 instance mask
              ↓
 同背景或同一可信实例内建立跨帧局部匹配
              ↓
-固定 raw reference camera，联合优化非参考帧 SE(3) 残差
-和 raw/learned camera-ray depth 混合系数
+固定 raw reference，估计每帧有界的小幅 SE(3) 世界变换
              ↓
-final pointmap = final pose × final camera-ray depth
+同一个 SE(3) 同时作用于 camera pose 和该帧完整 pointmap
 ```
 
-因此最终位姿和最终点云不再由两个独立后处理产生。参考相机的 pose encoding 被逐元素恢复为
-raw StreamVGGT，reference pointmap 也使用 raw depth，所以已有 fixed-reference Sim(3)
-评估坐标系保持不变。优化不读取 GT；GT 只在优化结束后计算 ATE、rotation 和 pointmap error。
+共享变换只改变每帧在世界坐标中的放置，不改变相机坐标中的局部点形状。参考 pose 和
+reference pointmap 强制取 raw StreamVGGT，保持已有 fixed-reference Sim(3) 规范。某帧只有
+在跨帧 3D 残差至少下降 `1%`、匹配数足够且校正处于 trust region 内时才接受；否则该帧
+pose 和 pointmap 均保持输入候选。
 
-实例匹配采用 DCS 风格的边级可靠性：同一实例跨帧深度不一致越大，权重越低。错误 mask
-不会作为背景使用；匹配不足时，pose 和 pointmap 都严格回退 raw StreamVGGT。当前一次运行
-比较五行：
+实例边采用 DCS 权重，几何差异大的错误 mask 被降权，且不允许退化为背景匹配。优化不读取
+GT；GT 只在完成后计算指标。一次运行比较：
 
 ```text
 raw_control                 原始 StreamVGGT
-fixed_ref_050_control       之前最好但 pose/pointmap 未真正耦合的对照
-gauge_ba_pose_only          只优化 pose，depth 固定 raw
-gauge_ba_global_beta        pose + 每帧全局深度混合
-gauge_ba_instance_switch    pose + 实例区域深度混合 + 异常实例边抑制
+fixed_ref_050_control       当前最强未共享校正的对照
+shared_se3_raw_dcs          fixed pose + raw pointmap
+shared_se3_learned          fixed pose + learned pointmap，不使用实例 DCS
+shared_se3_learned_dcs      完整候选
 ```
 
 运行：
