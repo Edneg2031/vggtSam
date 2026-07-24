@@ -1,0 +1,45 @@
+set -euo pipefail
+
+CONFIG=streaming_couping/configs/final_joint_pointcloud_pose_test_492_589.yaml
+OLD=outputs/streaming_couping_instance_token_pose_temporal_holdout_v2
+NEW=outputs/streaming_couping_final_test_00a231a370_492_589
+CLIP=00a231a370_492_589_37_68_54
+
+# Reuse only the adapter trained on frames 90/105/119/130/140.
+mkdir -p "$NEW/checkpoints/decoupled_dual_branch"
+cp -a \
+  "$OLD/checkpoints/decoupled_dual_branch/." \
+  "$NEW/checkpoints/decoupled_dual_branch/"
+
+# Build new StreamVGGT geometry, SAM3 tracking/recovery, and instance tokens.
+PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_instance_token_pose \
+  --config "$CONFIG" \
+  --stage cache \
+  --sam3-device cuda:3 \
+  --geometry-device cuda:1 \
+  --training-device cuda:1 \
+  2>&1 | tee "$NEW/cache.log"
+
+# Apply the frozen learned adapter and solve translation without training.
+PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_instance_token_pose \
+  --config "$CONFIG" \
+  --stage ray \
+  --geometry-device cuda:1 \
+  --training-device cuda:1 \
+  2>&1 | tee "$NEW/final_method.log"
+
+# Export native results, masks, and the evaluation-only GT/raw/ours comparison.
+PYTHONPATH=src:. python -m streaming_couping.scripts.run_instance_token_pose \
+  --config "$CONFIG" \
+  --stage export
+
+PYTHONPATH=src:. python -m streaming_couping.scripts.plot_pose_comparison \
+  --comparison-dir "$NEW/final_instance_ray_pose_v3/$CLIP/comparison_gt_world"
+
+sed -n '1,20p' "$NEW/evaluation/ray_pose_compact_summary.csv"
+sed -n '1,20p' \
+  "$NEW/final_instance_ray_pose_v3/$CLIP/comparison_gt_world/pointcloud_metrics.csv"
+sed -n '1,24p' \
+  "$NEW/final_instance_ray_pose_v3/$CLIP/comparison_gt_world/camera_pose_metrics.csv"
+sed -n '1,24p' \
+  "$NEW/final_instance_ray_pose_v3/$CLIP/segmentation_masks/mask_summary.csv"
