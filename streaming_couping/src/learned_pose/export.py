@@ -29,6 +29,7 @@ def export_final_ray_pose_outputs(
     config: LearnedPoseConfig,
     *,
     output_dir: str | Path | None = None,
+    predictions_path: str | Path | None = None,
 ) -> Path:
     """Export native/development-metric poses and colored PLY files.
 
@@ -40,11 +41,17 @@ def export_final_ray_pose_outputs(
 
     ray_config = config.evaluation.ray_pose
     selected = FINAL_RAY_POSE_NAME
-    predictions_path = config.output_dir / "evaluation" / "ray_pose_predictions.pt"
+    predictions_path = (
+        Path(predictions_path)
+        if predictions_path is not None
+        else config.output_dir / "evaluation" / "ray_pose_predictions.pt"
+    )
     artifact = _torch_load(predictions_path)
     predictions = artifact.get("predictions")
     if not isinstance(predictions, dict):
         raise ValueError(f"Missing predictions mapping in {predictions_path}.")
+    selection_policy = artifact.get("selection_policy")
+    is_adaptive_export = isinstance(selection_policy, dict)
 
     root = Path(output_dir) if output_dir is not None else (
         config.output_dir
@@ -539,11 +546,17 @@ def export_final_ray_pose_outputs(
             ),
         )
         (deployable_root / "README.txt").write_text(
-            "Final deployable V3 reconstruction\n"
-            "==================================\n\n"
-            "full_scene.ply and instance_*.ply are the V2 refined world "
-            "pointmaps. camera_poses.csv/.npz contain the selected V3 camera "
-            "poses recovered directly from those same pointmaps. All files "
+            "Final deployable reconstruction\n"
+            "===============================\n\n"
+            "full_scene.ply and instance_*.ply are the selected "
+            + (
+                "adaptive raw/learned pointmap blend. "
+                f"This clip selected alpha={clip_prediction.get('adaptive_selected_blend')}. "
+                if is_adaptive_export
+                else "learned world pointmaps. "
+            )
+            + "camera_poses.csv/.npz contain camera poses recovered directly "
+            "from those same pointmaps. All files "
             "use one internally consistent StreamVGGT native gauge. No GT "
             "alignment or GT value is used in this directory.\n",
             encoding="utf8",
@@ -576,10 +589,18 @@ def export_final_ray_pose_outputs(
     with (root / "metadata.json").open("w", encoding="utf8") as handle:
         json.dump(
             {
-                "method": "instance-ray pose V3",
+                "method": (
+                    str(selection_policy.get("name"))
+                    if is_adaptive_export
+                    else "instance-ray pose V3"
+                ),
                 "selected_variant": selected,
                 "pose_source": "decoupled V2 learned rotation",
-                "geometry_source": "decoupled V2 refined world pointmap",
+                "geometry_source": (
+                    "adaptive raw/learned pointmap residual blend"
+                    if is_adaptive_export
+                    else "decoupled V2 refined world pointmap"
+                ),
                 "translation_solver": (
                     "angular-Huber point-to-ray center fit restricted to "
                     "persistent tracked-instance masks"
@@ -603,6 +624,9 @@ def export_final_ray_pose_outputs(
                 ),
                 "overlay_colors": "prediction=red, ground_truth=cyan",
                 "source_predictions": str(predictions_path),
+                "selection_policy": (
+                    selection_policy if is_adaptive_export else None
+                ),
                 "config": str(config.source_path),
             },
             handle,

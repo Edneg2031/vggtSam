@@ -38,7 +38,56 @@ fixed_pose_pointblend_a025
 fixed_pose_pointblend_a050
 fixed_pose_pointblend_a075
 fixed_pose_pointblend_a100  learned pointmap
+adaptive_support_gate        最终无 GT 选择策略
 ```
+
+### 0.1 最终选择规则
+
+实验结果表明，learned pointmap residual 在原 temporal holdout 有效，但没有泛化到
+492–589。不能用 GT 在部署时选择 alpha，因此最终规则只读取 `alpha=1` ray solver
+本身的接受比例：
+
+```text
+support_ratio = fit_accepted / 非参考帧数量
+
+support_ratio >= 0.75  → alpha = 1
+support_ratio <  0.75  → alpha = 0
+```
+
+现有两段序列的确定性选择和结果为：
+
+| 协议 | clip | support | alpha | ATE raw→final | pointmap raw→final |
+|---|---|---:|---:|---:|---:|
+| causal temporal holdout | 90–240 | 6/6 | 1 | 0.36879 → 0.15932 | 0.15258 → 0.14045 |
+| held-out clip | 492–589 | 2/5 | 0 | 0.36079 → 0.35361 | 0.22446 → 0.22446 |
+
+所以当前可以声称：
+
+- 位姿在两段序列都提升；
+- 可靠序列的 pointmap 提升约 8%；
+- 不可靠序列严格使用 raw pointmap，不产生点云退化；
+- 不能声称 learned pointmap 已经跨序列通用。
+
+`raw_reference_exact=0` 并不表示 solver 没有保持自己的参考帧。这里的 ray solver 保留
+learned reference，而不是 raw reference；正确检查是 `learned_reference_preserved=1`。
+`fixed_pose_pointblend_a100` 还必须满足 `a100_pose_matches_fixed=1`，证明新 sweep 精确复现
+旧 `fixed_ref_050`。
+
+### 0.2 GT 使用边界
+
+最终推理读取：
+
+```text
+冻结的 raw/learned pose 和 pointmap
+SAM3 tracking/identity cache
+ray solver 的 fit accepted 状态
+```
+
+它不读取 GT pose、GT pointmap 或 GT instance mask。GT 仅用于运行结束后的 ATE、
+rotation error、pointmap error，以及生成 `comparison_gt_world` 下的开发期对比文件。
+`deployable_native` 目录不包含 GT 对齐。
+
+### 0.3 完整可复现命令
 
 运行：
 
@@ -46,10 +95,78 @@ fixed_pose_pointblend_a100  learned pointmap
 zsh streaming_couping/commands_joint_pointmap_ba.txt
 ```
 
-精简结果：
+该命令会：
+
+1. 保留冻结 cache 和 `joint_solver_sweep` predictions；
+2. 删除上一次派生的 blend/adaptive export，避免混入旧文件；
+3. 固定 Python/CUDA 确定性环境并重新计算五个 alpha；
+4. 按上述 support gate 生成最终 pose/pointmap；
+5. 调用与旧实验相同的 exporter；
+6. 为两段 clip 生成 pose comparison PNG/PDF；
+7. 写入输入 SHA256 和完整 artifact manifest。
+
+它是“从冻结模型预测与 feature cache 开始”的最终方法复现，不会重新训练，也不会重新运行
+SAM3 或 StreamVGGT。若要验证 SAM3/cache 本身，则需要另行执行 cache rebuild；这属于更昂贵
+的上游复现，不应与当前最终策略的确定性检查混在一起。
+
+精简指标：
 
 ```text
 outputs/streaming_couping_v5_ablation/joint_ba_upload_summary.csv
+```
+
+完整结果根目录：
+
+```text
+outputs/streaming_couping_v5_ablation/final_adaptive_pointmap_pose/
+```
+
+每个 clip 都输出与旧 exporter 相同类别的文件：
+
+```text
+<clip>/
+├── deployable_native/
+│   ├── camera_poses.csv
+│   ├── camera_poses.npz
+│   ├── full_scene.ply
+│   └── instance_*.ply
+├── segmentation_masks/       # 最终消费的 mask、逐帧 overlay、overview、CSV
+├── geometry_trusted_masks/   # 通过几何门控的 mask
+├── raw_tracking_masks/       # SAM3 原始追踪诊断
+├── pointclouds/              # native、GT-world、paired GT、overlay PLY
+├── comparison_gt_world/
+│   ├── full_scene/
+│   │   ├── ground_truth.ply
+│   │   ├── streamvggt_raw.ply
+│   │   ├── ours.ply
+│   │   └── overlay.ply
+│   ├── instance_*/
+│   ├── camera_poses.csv
+│   ├── camera_pose_metrics.csv
+│   ├── pointcloud_metrics.csv
+│   ├── pose_comparison.png
+│   └── pose_comparison.pdf
+└── camera_centers_overlay_metric_gt_world.ply
+```
+
+命令末尾会把“与旧 exporter 一样完整”作为硬性条件检查。三个 mask 目录中的每个目录均应
+包含 `S` 张 RGB overlay、`3S` 张实例二值 mask、`S` 张 union mask 和 1 张
+`sequence_overview.png`，其中 `S` 是该 clip 的帧数。因此：
+
+| clip | 每套 mask PNG | 三套 mask PNG | pose 图 | PLY |
+|---|---:|---:|---:|---:|
+| 90–240（7 帧） | 36 | 108 | 1 PNG + 1 PDF | 45 |
+| 492–589（6 帧） | 31 | 93 | 1 PNG + 1 PDF | 45 |
+
+这里 45 个 PLY 包括 `deployable_native`、完整 `pointclouds`、四个
+`comparison_gt_world` scope 及相机中心 overlay。任一数量不足或 pose 图/pose CSV
+缺失，命令都会报错退出；不会把不完整的运行误认为复现成功。
+
+复现输入哈希和文件清单：
+
+```text
+outputs/streaming_couping_v5_ablation/adaptive_reproduction_inputs.sha256
+outputs/streaming_couping_v5_ablation/adaptive_artifact_manifest.txt
 ```
 
 ## 1. 方法概览

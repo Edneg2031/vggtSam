@@ -1,4 +1,4 @@
-"""Run no-training shared-SE(3) pose and pointmap graph refinement."""
+"""Reproduce the pointmap-blend sweep and export the adaptive final method."""
 
 from __future__ import annotations
 
@@ -16,12 +16,16 @@ from streaming_couping.src.learned_pose.geometry_metrics import (
     append_geometry_metrics,
     summarize_pointmap_metrics,
 )
+from streaming_couping.src.learned_pose.export import (
+    export_final_ray_pose_outputs,
+)
 from streaming_couping.src.learned_pose.pipeline import (
     _append_pose_metrics,
     _evaluation_metadata,
     _evaluation_sequence_indices,
 )
 from streaming_couping.src.learned_pose.ray_pose import (
+    FINAL_RAY_POSE_NAME,
     recover_final_ray_pose,
     reference_blend_pose_name,
 )
@@ -30,6 +34,8 @@ from vggtsam.utils.imports import maybe_add_repo_to_path
 
 CONTROL_RAW = "raw_control"
 CONTROL_FIXED = "fixed_ref_050_control"
+ADAPTIVE_FINAL = "adaptive_support_gate"
+ADAPTIVE_SUPPORT_THRESHOLD = 0.75
 POINT_BLEND_VALUES = (0.0, 0.25, 0.50, 0.75, 1.0)
 SUMMARY_FIELDS = (
     "split",
@@ -43,8 +49,10 @@ SUMMARY_FIELDS = (
     "ate_delta_from_raw",
     "pointmap_delta_from_raw",
     "fit_accepted",
+    "support_ratio",
     "mean_center_shift",
-    "reference_anchor_exact",
+    "raw_reference_exact",
+    "learned_reference_preserved",
     "a100_pose_matches_fixed",
     "module_off_exact",
     "status",
@@ -77,6 +85,7 @@ def main() -> None:
     depth_frames: list[dict] = []
     diagnostic_rows: list[dict] = []
     saved_predictions: dict[str, dict] = {}
+    adaptive_export_predictions: dict[str, dict] = {}
 
     for clip in config.clips:
         if not (
@@ -94,7 +103,7 @@ def main() -> None:
             raise KeyError(
                 f"Prediction file {source_path} has no clip {clip.name!r}."
             )
-        print(f"shared SE3 graph clip={clip.name}")
+        print(f"pointmap blend clip={clip.name}")
         payload = load_feature_cache(path)
         predicted = predictions[clip.name]
         raw_pose = _pose_prediction(predicted, "raw_baseline_control")
@@ -151,6 +160,7 @@ def main() -> None:
             ),
         )
         clip_outputs: dict[str, dict] = {}
+        blend_records: dict[float, dict[str, object]] = {}
         for name, pose, points, depth, consistent, diagnostics in controls:
             pose = pose.to(args.device)
             _append_metrics(
@@ -242,15 +252,29 @@ def main() -> None:
                 "point_blend": point_blend,
                 "pose_pointmap_coupled": 1,
                 "fit_accepted": accepted,
+                "fit_total": len(nonreference_rows),
+                "support_ratio": (
+                    accepted / len(nonreference_rows)
+                    if nonreference_rows
+                    else 0.0
+                ),
                 "mean_pose_center_shift_native": (
                     sum(accepted_shifts) / len(accepted_shifts)
                     if accepted_shifts
                     else 0.0
                 ),
-                "reference_anchor_exact": int(
+                "raw_reference_exact": int(
                     torch.equal(
                         pose[:, int(payload["reference_sequence_index"])].cpu(),
                         raw_pose[
+                            :, int(payload["reference_sequence_index"])
+                        ].cpu(),
+                    )
+                ),
+                "learned_reference_preserved": int(
+                    torch.equal(
+                        pose[:, int(payload["reference_sequence_index"])].cpu(),
+                        learned_pose[
                             :, int(payload["reference_sequence_index"])
                         ].cpu(),
                     )
@@ -286,16 +310,112 @@ def main() -> None:
                 "pose_encoding": pose.detach().cpu(),
                 "world_points": points[None].detach().cpu(),
                 "depth": payload["baseline_depth"][None].detach().cpu(),
+                "world_confidence": confidence[None].detach().cpu(),
+                "diagnostics": diagnostics,
+            }
+            blend_records[point_blend] = {
+                "pose_encoding": pose.detach().cpu(),
+                "world_points": points[None].detach().cpu(),
+                "world_confidence": confidence[None].detach().cpu(),
+                "depth": payload["baseline_depth"][None].detach().cpu(),
                 "diagnostics": diagnostics,
             }
             del ray_result
             if str(args.device).startswith("cuda") and torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+        gate_source = blend_records[1.0]
+        gate_source_diagnostics = gate_source["diagnostics"]
+        if not isinstance(gate_source_diagnostics, dict):
+            raise TypeError("Adaptive gate diagnostics must be a dictionary.")
+        support_ratio = float(
+            gate_source_diagnostics.get("support_ratio", 0.0)
+        )
+        selected_blend = _select_adaptive_blend(
+            support_ratio,
+            threshold=ADAPTIVE_SUPPORT_THRESHOLD,
+        )
+        selected_record = blend_records[selected_blend]
+        selected_diagnostics = selected_record["diagnostics"]
+        if not isinstance(selected_diagnostics, dict):
+            raise TypeError("Selected diagnostics must be a dictionary.")
+        adaptive_diagnostics = {
+            **selected_diagnostics,
+            "status": (
+                f"adaptive_selected_a{int(100 * selected_blend):03d}_"
+                f"from_a100_support_{support_ratio:.6f}"
+            ),
+            "point_blend": selected_blend,
+            "support_ratio": support_ratio,
+            "adaptive_support_threshold": ADAPTIVE_SUPPORT_THRESHOLD,
+            "a100_pose_matches_fixed": "",
+        }
+        adaptive_pose = selected_record["pose_encoding"]
+        adaptive_points = selected_record["world_points"]
+        adaptive_depth = selected_record["depth"]
+        adaptive_confidence = selected_record["world_confidence"]
+        if not all(
+            torch.is_tensor(value)
+            for value in (
+                adaptive_pose,
+                adaptive_points,
+                adaptive_depth,
+                adaptive_confidence,
+            )
+        ):
+            raise TypeError("Adaptive prediction payload contains non-tensors.")
+        _append_metrics(
+            pose_summary,
+            pose_frames,
+            pose_rpe,
+            pose_pairs,
+            pose_pair_summary,
+            pointmap_frames,
+            depth_frames,
+            payload=payload,
+            batch=geometry_batch,
+            pose=adaptive_pose.to(args.device),
+            points=adaptive_points.to(args.device),
+            depth=adaptive_depth.to(args.device),
+            name=ADAPTIVE_FINAL,
+            sequence_indices=sequence_indices,
+            metadata=metadata,
+        )
+        diagnostic_rows.append(
+            {
+                "clip": clip.name,
+                "variant": ADAPTIVE_FINAL,
+                "module_off_exact": module_off_exact,
+                **adaptive_diagnostics,
+            }
+        )
+        clip_outputs[ADAPTIVE_FINAL] = {
+            **selected_record,
+            "diagnostics": adaptive_diagnostics,
+        }
         saved_predictions[clip.name] = {
             "scene_id": clip.scene_id,
             "frame_indices": list(clip.frame_indices),
             "reference_sequence_index": clip.reference_sequence_index,
             "variants": clip_outputs,
+        }
+        adaptive_export_predictions[clip.name] = {
+            "scene_id": clip.scene_id,
+            "frame_indices": list(clip.frame_indices),
+            "instance_ids": list(clip.instance_ids),
+            "image_paths": list(payload["image_paths"]),
+            "pose_encodings": {
+                "raw_baseline_control": raw_pose.detach().cpu(),
+                FINAL_RAY_POSE_NAME: adaptive_pose.detach().cpu(),
+            },
+            "refined_world_points": adaptive_points.detach().cpu(),
+            "refined_world_confidence": adaptive_confidence.detach().cpu(),
+            "tracking_masks_stream": payload[
+                "trusted_tracking_masks_stream"
+            ][None].detach().bool().cpu(),
+            "adaptive_selected_blend": selected_blend,
+            "adaptive_support_ratio": support_ratio,
+            "adaptive_support_threshold": ADAPTIVE_SUPPORT_THRESHOLD,
         }
 
     pointmap_summary = summarize_pointmap_metrics(pointmap_frames)
@@ -314,6 +434,23 @@ def main() -> None:
         },
         evaluation / "joint_ba_predictions.pt",
     )
+    adaptive_predictions_path = (
+        evaluation / "adaptive_ray_pose_predictions.pt"
+    )
+    torch.save(
+        {
+            "source_predictions": str(source_path),
+            "selection_policy": {
+                "name": ADAPTIVE_FINAL,
+                "support_source": point_blend_name(1.0),
+                "support_threshold": ADAPTIVE_SUPPORT_THRESHOLD,
+                "high_support_blend": 1.0,
+                "low_support_blend": 0.0,
+            },
+            "predictions": adaptive_export_predictions,
+        },
+        adaptive_predictions_path,
+    )
     compact = _compact_summary(
         pose_summary,
         pointmap_summary,
@@ -324,6 +461,13 @@ def main() -> None:
     print(f"joint BA upload summary: {summary_path}")
     with summary_path.open("r", encoding="utf8") as handle:
         print(handle.read().rstrip())
+    if args.export:
+        export_root = export_final_ray_pose_outputs(
+            config,
+            output_dir=config.output_dir / "final_adaptive_pointmap_pose",
+            predictions_path=adaptive_predictions_path,
+        )
+        print(f"adaptive full export: {export_root}")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -334,6 +478,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="cuda:1")
     parser.add_argument("--predictions", type=Path)
+    parser.add_argument(
+        "--export",
+        action="store_true",
+        help="Export GT/raw/ours PLY, masks, poses, and comparison tables.",
+    )
     return parser.parse_args()
 
 
@@ -449,6 +598,18 @@ def point_blend_name(blend: float) -> str:
     return f"fixed_pose_pointblend_a{percent:03d}"
 
 
+def _select_adaptive_blend(
+    support_ratio: float,
+    *,
+    threshold: float = ADAPTIVE_SUPPORT_THRESHOLD,
+) -> float:
+    if not 0.0 <= float(support_ratio) <= 1.0:
+        raise ValueError("Adaptive support ratio must be in [0,1].")
+    if not 0.0 <= float(threshold) <= 1.0:
+        raise ValueError("Adaptive support threshold must be in [0,1].")
+    return 1.0 if float(support_ratio) >= float(threshold) else 0.0
+
+
 def _blend_pointmap(
     raw: torch.Tensor,
     learned: torch.Tensor,
@@ -548,6 +709,7 @@ def _compact_summary(
         CONTROL_RAW,
         CONTROL_FIXED,
         *(point_blend_name(value) for value in POINT_BLEND_VALUES),
+        ADAPTIVE_FINAL,
     )
     for clip in clips:
         raw_pose = _one(
@@ -602,12 +764,20 @@ def _compact_summary(
                     "fit_accepted",
                     "",
                 ),
+                "support_ratio": diagnostics.get(
+                    "support_ratio",
+                    "",
+                ),
                 "mean_center_shift": diagnostics.get(
                     "mean_pose_center_shift_native",
                     "",
                 ),
-                "reference_anchor_exact": diagnostics.get(
-                    "reference_anchor_exact",
+                "raw_reference_exact": diagnostics.get(
+                    "raw_reference_exact",
+                    "",
+                ),
+                "learned_reference_preserved": diagnostics.get(
+                    "learned_reference_preserved",
                     "",
                 ),
                 "a100_pose_matches_fixed": diagnostics.get(

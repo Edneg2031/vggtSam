@@ -3,6 +3,7 @@ set -euo pipefail
 CONFIG=streaming_couping/configs/v5_ablation_suite.yaml
 OUTPUT=outputs/streaming_couping_v5_ablation
 PREDICTIONS="$OUTPUT/joint_solver_sweep/evaluation/ray_pose_predictions.pt"
+FINAL_EXPORT="$OUTPUT/final_adaptive_pointmap_pose"
 
 mkdir -p "$OUTPUT"
 
@@ -14,10 +15,87 @@ if [[ ! -f "$PREDICTIONS" ]]; then
     2>&1 | tee "$OUTPUT/joint_solver_sweep.log"
 fi
 
+rm -rf "$OUTPUT/joint_pointmap_ba" "$FINAL_EXPORT"
+rm -f "$OUTPUT/joint_ba_upload_summary.csv"
+
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+
 PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_joint_pointmap_ba \
   --config "$CONFIG" \
   --device cuda:1 \
   --predictions "$PREDICTIONS" \
+  --export \
   2>&1 | tee "$OUTPUT/joint_pointmap_ba.log"
 
-sed -n '1,16p' "$OUTPUT/joint_ba_upload_summary.csv"
+PYTHONPATH=src:. python -m streaming_couping.scripts.plot_pose_comparison \
+  --comparison-dir \
+  "$FINAL_EXPORT/00a231a370_90_240_37_68_54/comparison_gt_world" \
+  --heldout-frame-indices 210 240
+
+PYTHONPATH=src:. python -m streaming_couping.scripts.plot_pose_comparison \
+  --comparison-dir \
+  "$FINAL_EXPORT/00a231a370_492_589_37_68_54/comparison_gt_world"
+
+validate_clip_export() {
+  local clip="$1"
+  local frames="$2"
+  local root="$FINAL_EXPORT/$clip"
+  local expected_mask_png=$((5 * frames + 1))
+  local mask_kind
+  local actual
+
+  for mask_kind in \
+    segmentation_masks \
+    geometry_trusted_masks \
+    raw_tracking_masks
+  do
+    actual=$(
+      find "$root/$mask_kind" -type f -name '*.png' |
+        wc -l |
+        tr -d '[:space:]'
+    )
+    if [[ "$actual" != "$expected_mask_png" ]]; then
+      echo "incomplete $mask_kind for $clip: $actual PNG, expected $expected_mask_png" >&2
+      return 1
+    fi
+  done
+
+  actual=$(
+    find "$root" -type f -name '*.ply' |
+      wc -l |
+      tr -d '[:space:]'
+  )
+  if [[ "$actual" != "45" ]]; then
+    echo "incomplete point-cloud export for $clip: $actual PLY, expected 45" >&2
+    return 1
+  fi
+
+  for required in \
+    "$root/comparison_gt_world/pose_comparison.png" \
+    "$root/comparison_gt_world/pose_comparison.pdf" \
+    "$root/comparison_gt_world/camera_poses.csv" \
+    "$root/deployable_native/camera_poses.csv"
+  do
+    if [[ ! -f "$required" ]]; then
+      echo "missing required export: $required" >&2
+      return 1
+    fi
+  done
+  echo "validated complete export: $clip"
+}
+
+validate_clip_export 00a231a370_90_240_37_68_54 7
+validate_clip_export 00a231a370_492_589_37_68_54 6
+
+find "$FINAL_EXPORT" -type f | sort > "$OUTPUT/adaptive_artifact_manifest.txt"
+sha256sum \
+  "$CONFIG" \
+  "$PREDICTIONS" \
+  streaming_couping/commands_joint_pointmap_ba.txt \
+  streaming_couping/scripts/run_joint_pointmap_ba.py \
+  streaming_couping/src/learned_pose/export.py \
+  streaming_couping/src/learned_pose/ray_pose.py \
+  > "$OUTPUT/adaptive_reproduction_inputs.sha256"
+
+sed -n '1,18p' "$OUTPUT/joint_ba_upload_summary.csv"

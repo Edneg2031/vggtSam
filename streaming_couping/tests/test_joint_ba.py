@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 
 from streaming_couping.scripts.run_joint_pointmap_ba import (
+    ADAPTIVE_FINAL,
     CONTROL_FIXED,
     CONTROL_RAW,
     POINT_BLEND_VALUES,
@@ -11,6 +12,7 @@ from streaming_couping.scripts.run_joint_pointmap_ba import (
     _blend_confidence,
     _blend_pointmap,
     _compact_summary,
+    _select_adaptive_blend,
     _write_csv,
     point_blend_name,
 )
@@ -173,6 +175,7 @@ def test_compact_summary_has_ordered_blend_rows_and_raw_deltas() -> None:
         CONTROL_RAW,
         CONTROL_FIXED,
         *(point_blend_name(value) for value in POINT_BLEND_VALUES),
+        ADAPTIVE_FINAL,
     )
     pose_rows = []
     pointmap_rows = []
@@ -205,12 +208,20 @@ def test_compact_summary_has_ordered_blend_rows_and_raw_deltas() -> None:
                 "module_off_exact": 1,
                 "status": "control" if index < 2 else "ray_fit",
                 "point_blend": (
-                    "" if index < 2 else POINT_BLEND_VALUES[index - 2]
+                    ""
+                    if index < 2
+                    else (
+                        1.0
+                        if variant == ADAPTIVE_FINAL
+                        else POINT_BLEND_VALUES[index - 2]
+                    )
                 ),
                 "pose_pointmap_coupled": int(index >= 2),
                 "fit_accepted": 1,
+                "support_ratio": 1.0,
                 "mean_pose_center_shift_native": 0.01,
-                "reference_anchor_exact": 1,
+                "raw_reference_exact": 0,
+                "learned_reference_preserved": 1,
                 "a100_pose_matches_fixed": (
                     1 if variant == point_blend_name(1.0) else ""
                 ),
@@ -219,15 +230,16 @@ def test_compact_summary_has_ordered_blend_rows_and_raw_deltas() -> None:
 
     rows = _compact_summary(pose_rows, pointmap_rows, diagnostics)
 
-    assert len(rows) == 7
+    assert len(rows) == 8
     assert tuple(rows[0]) == SUMMARY_FIELDS
     assert [row["variant"] for row in rows] == list(variants)
     assert rows[0]["ate_delta_from_raw"] == "0"
     assert rows[0]["pointmap_delta_from_raw"] == "0"
-    assert rows[-1]["ate_delta_from_raw"] == "-0.06"
-    assert rows[-1]["pointmap_delta_from_raw"] == "-0.06"
-    assert rows[-1]["reference_anchor_exact"] == 1
-    assert rows[-1]["a100_pose_matches_fixed"] == 1
+    assert rows[-1]["ate_delta_from_raw"] == "-0.07"
+    assert rows[-1]["pointmap_delta_from_raw"] == "-0.07"
+    assert rows[-1]["raw_reference_exact"] == 0
+    assert rows[-1]["learned_reference_preserved"] == 1
+    assert rows[-2]["a100_pose_matches_fixed"] == 1
 
 
 def test_csv_writer_unions_control_and_ba_diagnostic_fields(tmp_path) -> None:
@@ -292,6 +304,12 @@ def test_confidence_blend_accepts_singleton_channel() -> None:
     assert value.shape == (2, 2, 2)
     assert torch.equal(value[0], torch.zeros(2, 2))
     assert torch.equal(value[1], torch.full((2, 2), 0.25))
+
+
+def test_adaptive_blend_uses_documented_support_threshold() -> None:
+    assert _select_adaptive_blend(0.7499) == 0.0
+    assert _select_adaptive_blend(0.75) == 1.0
+    assert _select_adaptive_blend(1.0) == 1.0
 
 
 def test_shared_rigid_graph_falls_back_without_matches() -> None:
