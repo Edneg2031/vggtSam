@@ -27,6 +27,26 @@ from streaming_couping.src.learned_pose.v6_camera_fusion import (
     perturb_instance_inputs,
 )
 
+V63_COMPONENT_MODELS = (
+    ("camera_rotation", "camera_only", "rotation", "rotation"),
+    ("instance_rotation", "instance_only", "rotation", "rotation"),
+    ("fusion_rotation", "fusion", "rotation", "rotation"),
+    ("instance_center", "instance_only", "center", "center"),
+    ("camera_center_local", "camera_only", "translation", "center"),
+    ("instance_center_local", "instance_only", "translation", "center"),
+    ("fusion_center_local", "fusion", "translation", "center"),
+)
+V63_ROTATION_BRANCHES = {
+    "camera": "camera_rotation",
+    "instance": "instance_rotation",
+    "fusion": "fusion_rotation",
+}
+V63_LOCAL_CENTER_BRANCHES = {
+    "camera": "camera_center_local",
+    "instance": "instance_center_local",
+    "fusion": "fusion_center_local",
+}
+
 
 @dataclass(frozen=True)
 class V6TrainingConfig:
@@ -203,10 +223,7 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         )
 
     specialized = {}
-    for name, mode, head_component in (
-        ("camera_rotation", "camera_only", "rotation"),
-        ("instance_center", "instance_only", "center"),
-    ):
+    for name, mode, head_component, objective in V63_COMPONENT_MODELS:
         _seed_everything(config.training.seed)
         model = _new_model(
             batch,
@@ -216,7 +233,7 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         training_result = _train_model(
             model,
             mode=mode,
-            objective=head_component,
+            objective=objective,
             batch=batch,
             baseline_w2c=baseline_w2c,
             target_w2c=target_w2c,
@@ -226,6 +243,8 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         specialized[name] = {
             "model": model,
             "mode": mode,
+            "head_component": head_component,
+            "objective": objective,
             **training_result,
         }
         _save_checkpoint(
@@ -239,26 +258,20 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
             training_result=training_result,
         )
 
-    specialized_train_output = _compose_decoupled_output(
-        _predict_model(
-            specialized["camera_rotation"]["model"],
-            mode="camera_only",
-            variant="normal",
-            batch=batch,
-            baseline_w2c=baseline_w2c,
-            reference_index=reference_index,
-        ),
-        _predict_model(
-            specialized["instance_center"]["model"],
-            mode="instance_only",
-            variant="normal",
-            batch=batch,
-            baseline_w2c=baseline_w2c,
-            reference_index=reference_index,
-        ),
+    specialized_train_branches = _predict_specialized_branches(
+        specialized,
+        batch=batch,
         baseline_w2c=baseline_w2c,
         reference_index=reference_index,
     )
+    specialized_train_combinations = _compose_v63_combinations(
+        specialized_train_branches,
+        baseline_w2c=baseline_w2c,
+        reference_index=reference_index,
+    )
+    specialized_train_output = specialized_train_combinations[
+        "direct_world_cameraR_instanceC"
+    ]
     specialized_train_metrics = _prediction_metrics(
         specialized_train_output,
         baseline_w2c=baseline_w2c,
@@ -266,6 +279,16 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         reference_index=reference_index,
         translation_weight=config.training.translation_weight,
     )
+    specialized_train_combination_metrics = {
+        name: _prediction_metrics(
+            output,
+            baseline_w2c=baseline_w2c,
+            target_w2c=target_w2c,
+            reference_index=reference_index,
+            translation_weight=config.training.translation_weight,
+        )
+        for name, output in specialized_train_combinations.items()
+    }
 
     fusion_model = trained["fusion"]["model"]
     evaluations = {
@@ -313,26 +336,20 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
             reference_index=int(full_payload["reference_sequence_index"]),
         ),
     }
-    heldout_specialized_output = _compose_decoupled_output(
-        _predict_model(
-            specialized["camera_rotation"]["model"],
-            mode="camera_only",
-            variant="normal",
-            batch=full_batch,
-            baseline_w2c=full_baseline_w2c,
-            reference_index=int(full_payload["reference_sequence_index"]),
-        ),
-        _predict_model(
-            specialized["instance_center"]["model"],
-            mode="instance_only",
-            variant="normal",
-            batch=full_batch,
-            baseline_w2c=full_baseline_w2c,
-            reference_index=int(full_payload["reference_sequence_index"]),
-        ),
+    heldout_specialized_branches = _predict_specialized_branches(
+        specialized,
+        batch=full_batch,
         baseline_w2c=full_baseline_w2c,
         reference_index=int(full_payload["reference_sequence_index"]),
     )
+    heldout_v63_combinations = _compose_v63_combinations(
+        heldout_specialized_branches,
+        baseline_w2c=full_baseline_w2c,
+        reference_index=int(full_payload["reference_sequence_index"]),
+    )
+    heldout_specialized_output = heldout_v63_combinations[
+        "direct_world_cameraR_instanceC"
+    ]
     heldout = {
         mode: _prediction_metrics(
             output,
@@ -363,6 +380,17 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         translation_weight=config.training.translation_weight,
         evaluation_indices=heldout_indices,
     )
+    heldout_v63_metrics = {
+        name: _prediction_metrics(
+            output,
+            baseline_w2c=full_baseline_w2c,
+            target_w2c=full_target_w2c,
+            reference_index=int(full_payload["reference_sequence_index"]),
+            translation_weight=config.training.translation_weight,
+            evaluation_indices=heldout_indices,
+        )
+        for name, output in heldout_v63_combinations.items()
+    }
     heldout_fusion_best = int(
         float(heldout["fusion"]["loss"])
         < min(
@@ -409,26 +437,20 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
             reference_index=test_reference_index,
         ),
     }
-    cross_specialized_output = _compose_decoupled_output(
-        _predict_model(
-            specialized["camera_rotation"]["model"],
-            mode="camera_only",
-            variant="normal",
-            batch=test_batch,
-            baseline_w2c=test_baseline_w2c,
-            reference_index=test_reference_index,
-        ),
-        _predict_model(
-            specialized["instance_center"]["model"],
-            mode="instance_only",
-            variant="normal",
-            batch=test_batch,
-            baseline_w2c=test_baseline_w2c,
-            reference_index=test_reference_index,
-        ),
+    cross_specialized_branches = _predict_specialized_branches(
+        specialized,
+        batch=test_batch,
         baseline_w2c=test_baseline_w2c,
         reference_index=test_reference_index,
     )
+    cross_v63_combinations = _compose_v63_combinations(
+        cross_specialized_branches,
+        baseline_w2c=test_baseline_w2c,
+        reference_index=test_reference_index,
+    )
+    cross_specialized_output = cross_v63_combinations[
+        "direct_world_cameraR_instanceC"
+    ]
     cross_metrics = {
         mode: _prediction_metrics(
             output,
@@ -459,6 +481,17 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         translation_weight=config.training.translation_weight,
         evaluation_indices=test_indices,
     )
+    cross_v63_metrics = {
+        name: _prediction_metrics(
+            output,
+            baseline_w2c=test_baseline_w2c,
+            target_w2c=test_target_w2c,
+            reference_index=test_reference_index,
+            translation_weight=config.training.translation_weight,
+            evaluation_indices=test_indices,
+        )
+        for name, output in cross_v63_combinations.items()
+    }
     cross_clip_decoupled_best = int(
         float(cross_decoupled_metrics["instanceR_cameraC"]["loss"])
         < min(
@@ -487,7 +520,9 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         target_w2c=full_target_w2c,
         camera_output=heldout_outputs["camera_only"],
         instance_output=heldout_outputs["instance_only"],
-        specialized_output=heldout_specialized_output,
+        specialized_output=heldout_v63_combinations[
+            "cameraR_instanceC_local"
+        ],
         instance_model=trained["instance_only"]["model"],
     )
     frame_diagnostic_rows.extend(
@@ -500,8 +535,118 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
             target_w2c=test_target_w2c,
             camera_output=cross_outputs["camera_only"],
             instance_output=cross_outputs["instance_only"],
-            specialized_output=cross_specialized_output,
+            specialized_output=cross_v63_combinations[
+                "cameraR_instanceC_local"
+            ],
             instance_model=trained["instance_only"]["model"],
+        )
+    )
+    component_rows = []
+    parameterization_names = {
+        "rotation": "so3",
+        "center": "direct_world_center",
+        "translation": "camera_frame_translation",
+    }
+    for name, mode, head_component, objective in V63_COMPONENT_MODELS:
+        raw_train_error = _mean_component_error(
+            baseline_w2c,
+            target_w2c,
+            component=objective,
+            reference_index=reference_index,
+        )
+        raw_heldout_error = _mean_component_error(
+            full_baseline_w2c,
+            full_target_w2c,
+            component=objective,
+            reference_index=int(full_payload["reference_sequence_index"]),
+            evaluation_indices=heldout_indices,
+        )
+        raw_cross_error = _mean_component_error(
+            test_baseline_w2c,
+            test_target_w2c,
+            component=objective,
+            reference_index=test_reference_index,
+            evaluation_indices=test_indices,
+        )
+        train_error = _mean_component_error(
+            specialized_train_branches[name]["world_to_camera"],
+            target_w2c,
+            component=objective,
+            reference_index=reference_index,
+        )
+        heldout_error = _mean_component_error(
+            heldout_specialized_branches[name]["world_to_camera"],
+            full_target_w2c,
+            component=objective,
+            reference_index=int(full_payload["reference_sequence_index"]),
+            evaluation_indices=heldout_indices,
+        )
+        cross_error = _mean_component_error(
+            cross_specialized_branches[name]["world_to_camera"],
+            test_target_w2c,
+            component=objective,
+            reference_index=test_reference_index,
+            evaluation_indices=test_indices,
+        )
+        component_rows.append(
+            {
+                "component": objective,
+                "source": mode.removesuffix("_only"),
+                "parameterization": parameterization_names[head_component],
+                "train_error": _short(train_error),
+                "train_drop_percent": _short(
+                    _loss_drop(raw_train_error, train_error)
+                ),
+                "heldout_error": _short(heldout_error),
+                "heldout_delta": _short(heldout_error - raw_heldout_error),
+                "cross_error": _short(cross_error),
+                "cross_delta": _short(cross_error - raw_cross_error),
+            }
+        )
+
+    development_control_losses = [
+        float(cross_raw["loss"]),
+        *(float(metrics["loss"]) for metrics in cross_metrics.values()),
+        *(
+            float(metrics["loss"])
+            for metrics in cross_decoupled_metrics.values()
+        ),
+    ]
+    development_best_loss = min(
+        *development_control_losses,
+        *(float(metrics["loss"]) for metrics in cross_v63_metrics.values()),
+    )
+    v63_combination_rows = []
+    for name, metrics in cross_v63_metrics.items():
+        cross_loss = float(metrics["loss"])
+        v63_combination_rows.append(
+            {
+                "variant": name,
+                "train_loss": _short(
+                    float(specialized_train_combination_metrics[name]["loss"])
+                ),
+                "heldout_loss": _short(
+                    float(heldout_v63_metrics[name]["loss"])
+                ),
+                "cross_rotation_deg": _short(
+                    float(metrics["rotation_degrees"])
+                ),
+                "cross_center": _short(float(metrics["translation_native"])),
+                "cross_loss": _short(cross_loss),
+                "better_than_raw": int(cross_loss < float(cross_raw["loss"])),
+                "development_best": int(
+                    abs(cross_loss - development_best_loss) <= 1e-12
+                ),
+            }
+        )
+    v63_main_name = "cameraR_instanceC_local"
+    cross_clip_v63_main_best = int(
+        bool(
+            next(
+                row["development_best"]
+                for row in v63_combination_rows
+                if row["variant"] == v63_main_name
+            )
         )
     )
     normal = evaluations["normal"]
@@ -768,20 +913,25 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
     )
     frame_summary_path = output_dir / "v6_frame_diagnostics.csv"
     _write_csv(frame_summary_path, frame_diagnostic_rows)
+    component_summary_path = output_dir / "v6_component_sweep.csv"
+    _write_csv(component_summary_path, component_rows)
+    v63_summary_path = output_dir / "v6_v63_sweep.csv"
+    _write_csv(v63_summary_path, v63_combination_rows)
     with (output_dir / "v6_run.json").open("w", encoding="utf8") as handle:
         json.dump(
             {
                 "purpose": (
-                    "three full-SE3 controls, two specialized 3DoF heads, "
-                    "fusion dependency, and fixed-checkpoint development "
-                    "evaluation"
+                    "three full-SE3 controls, seven specialized 3DoF "
+                    "component models, a 3x3 source sweep, and fixed-"
+                    "checkpoint development evaluation"
                 ),
                 "uses_gt_during_training": True,
                 "runs_pointmap_branch": False,
                 "runs_analytic_pose_solver": False,
                 "specialized_components": {
-                    "rotation": "camera_only",
-                    "center": "instance_only",
+                    "rotation_sources": list(V63_ROTATION_BRANCHES),
+                    "local_center_sources": list(V63_LOCAL_CENTER_BRANCHES),
+                    "direct_world_center_source": "instance",
                 },
                 "capacity_pass": {
                     mode: bool(trained[mode]["capacity_pass"])
@@ -797,7 +947,12 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
                 "cross_clip_specialized_best": bool(
                     cross_clip_specialized_best
                 ),
+                "cross_clip_v63_main_best": bool(
+                    cross_clip_v63_main_best
+                ),
                 "frame_diagnostics": str(frame_summary_path),
+                "component_sweep": str(component_summary_path),
+                "v63_sweep": str(v63_summary_path),
                 "config": str(config.source_path),
                 "cache": str(path),
                 "test_cache": str(test_path),
@@ -869,8 +1024,11 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
     )
     print(f"cross_clip_decoupled_best={cross_clip_decoupled_best}")
     print(f"cross_clip_specialized_best={cross_clip_specialized_best}")
+    print(f"cross_clip_v63_main_best={cross_clip_v63_main_best}")
     print(f"cross_summary={cross_summary_path}")
     print(f"frame_diagnostics={frame_summary_path}")
+    print(f"component_sweep={component_summary_path}")
+    print(f"v63_sweep={v63_summary_path}")
     print(f"full_summary={summary_path}")
     return summary_path
 
@@ -1124,6 +1282,57 @@ def _predict_model(
         )
 
 
+def _predict_specialized_branches(
+    specialized: dict[str, dict[str, object]],
+    *,
+    batch: dict[str, torch.Tensor],
+    baseline_w2c: torch.Tensor,
+    reference_index: int,
+) -> dict[str, dict[str, torch.Tensor]]:
+    outputs = {}
+    for name, item in specialized.items():
+        model = item["model"]
+        mode = str(item["mode"])
+        if not isinstance(model, V6CameraFusion):
+            raise TypeError(f"V6 specialized model {name!r} is invalid.")
+        outputs[name] = _predict_model(
+            model,
+            mode=mode,
+            variant="normal",
+            batch=batch,
+            baseline_w2c=baseline_w2c,
+            reference_index=reference_index,
+        )
+    return outputs
+
+
+def _compose_v63_combinations(
+    branches: dict[str, dict[str, torch.Tensor]],
+    *,
+    baseline_w2c: torch.Tensor,
+    reference_index: int,
+) -> dict[str, dict[str, torch.Tensor]]:
+    combinations = {
+        "direct_world_cameraR_instanceC": _compose_decoupled_output(
+            branches["camera_rotation"],
+            branches["instance_center"],
+            baseline_w2c=baseline_w2c,
+            reference_index=reference_index,
+        )
+    }
+    for rotation_name, rotation_key in V63_ROTATION_BRANCHES.items():
+        for center_name, center_key in V63_LOCAL_CENTER_BRANCHES.items():
+            combinations[f"{rotation_name}R_{center_name}C_local"] = (
+                _compose_decoupled_output(
+                    branches[rotation_key],
+                    branches[center_key],
+                    baseline_w2c=baseline_w2c,
+                    reference_index=reference_index,
+                )
+            )
+    return combinations
+
+
 def _prediction_metrics(
     output: dict[str, torch.Tensor],
     *,
@@ -1269,7 +1478,7 @@ def _frame_diagnostic_rows(
                 "instance_center_delta": _short(
                     float((instance_center[0, index] - raw_center[0, index]).cpu())
                 ),
-                "specialized_rotation_delta": _short(
+                "v63_rotation_delta": _short(
                     float(
                         (
                             specialized_rotation[0, index]
@@ -1277,7 +1486,7 @@ def _frame_diagnostic_rows(
                         ).cpu()
                     )
                 ),
-                "specialized_center_delta": _short(
+                "v63_center_delta": _short(
                     float(
                         (
                             specialized_center[0, index]
@@ -1309,6 +1518,27 @@ def _pose_errors_per_frame(
         dim=-1,
     )
     return rotation, center
+
+
+def _mean_component_error(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    component: str,
+    reference_index: int,
+    evaluation_indices: list[int] | None = None,
+) -> float:
+    if component not in ("rotation", "center"):
+        raise ValueError(f"Unknown V6 diagnostic component: {component!r}.")
+    indices = _evaluation_indices(
+        predicted.shape[1],
+        reference_index=reference_index,
+        evaluation_indices=evaluation_indices,
+    )
+    index = torch.tensor(indices, dtype=torch.long, device=predicted.device)
+    rotation, center = _pose_errors_per_frame(predicted, target)
+    values = rotation if component == "rotation" else center
+    return float(values.index_select(1, index).mean().cpu())
 
 
 def _capacity_pass(

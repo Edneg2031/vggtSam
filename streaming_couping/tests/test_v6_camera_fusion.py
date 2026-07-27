@@ -5,6 +5,7 @@ import torch
 from streaming_couping.scripts.run_v6_camera_overfit import (
     _camera_centers,
     _compose_decoupled_output,
+    _compose_v63_combinations,
     _frame_diagnostic_rows,
     _pose_metrics,
     load_v6_config,
@@ -101,6 +102,7 @@ def test_specialized_heads_have_only_their_declared_pose_authority() -> None:
     for component, mode in (
         ("rotation", "camera_only"),
         ("center", "instance_only"),
+        ("translation", "instance_only"),
     ):
         zero_output = _forward(
             _model(head_component=component),
@@ -133,6 +135,27 @@ def test_specialized_heads_have_only_their_declared_pose_authority() -> None:
     assert not torch.allclose(
         _camera_centers(center_output["world_to_camera"][:, 1:]),
         _camera_centers(baseline[:, 1:]),
+    )
+
+    translation_model = _model(head_component="translation")
+    translation_model.se3_head[-1].bias.data[0] = 0.5
+    translation_output = _forward(
+        translation_model,
+        inputs,
+        mode="instance_only",
+    )
+    assert torch.equal(translation_output["world_to_camera"][:, 0], baseline[:, 0])
+    assert torch.equal(
+        translation_output["world_to_camera"][:, 1:, :3, :3],
+        baseline[:, 1:, :3, :3],
+    )
+    expected_center_delta = -(
+        baseline[:, 1:, :3, :3].transpose(-1, -2)
+        @ translation_output["twist"][:, 1:, 3:, None]
+    ).squeeze(-1)
+    assert torch.allclose(
+        translation_output["center_delta"][:, 1:],
+        expected_center_delta,
     )
 
 
@@ -269,6 +292,42 @@ def test_decoupled_pose_uses_requested_rotation_and_camera_center() -> None:
     )
 
 
+def test_v63_sweep_contains_full_rotation_center_grid() -> None:
+    baseline = torch.cat(
+        [
+            torch.eye(3).reshape(1, 1, 3, 3).expand(1, 2, 3, 3),
+            torch.zeros(1, 2, 3, 1),
+        ],
+        dim=-1,
+    ).clone()
+    branch = {
+        "world_to_camera": baseline,
+        "active_frames": torch.tensor([[False, True]]),
+    }
+    branches = {
+        name: branch
+        for name in (
+            "camera_rotation",
+            "instance_rotation",
+            "fusion_rotation",
+            "instance_center",
+            "camera_center_local",
+            "instance_center_local",
+            "fusion_center_local",
+        )
+    }
+    combinations = _compose_v63_combinations(
+        branches,
+        baseline_w2c=baseline,
+        reference_index=0,
+    )
+
+    assert len(combinations) == 10
+    assert "direct_world_cameraR_instanceC" in combinations
+    assert "cameraR_instanceC_local" in combinations
+    assert "fusionR_fusionC_local" in combinations
+
+
 def test_frame_diagnostics_report_support_and_error_deltas() -> None:
     inputs = _inputs()
     baseline = inputs["baseline_world_to_camera"].clone()
@@ -296,7 +355,7 @@ def test_frame_diagnostics_report_support_and_error_deltas() -> None:
     assert [row["geometry_confidence"] for row in rows] == ["1", "1"]
     assert [row["camera_center_delta"] for row in rows] == ["1", "1"]
     assert [row["instance_center_delta"] for row in rows] == ["2", "2"]
-    assert [row["specialized_center_delta"] for row in rows] == ["1", "1"]
+    assert [row["v63_center_delta"] for row in rows] == ["1", "1"]
 
 
 def test_same_checkpoint_ablations_change_only_requested_inputs() -> None:
@@ -329,6 +388,8 @@ def test_v6_command_and_config_are_retained() -> None:
     assert "run_v6_camera_overfit" in command
     assert "v6_cross_clip_summary.csv" in command
     assert "v6_frame_diagnostics.csv" in command
+    assert "v6_component_sweep.csv" in command
+    assert "v6_v63_sweep.csv" in command
     assert "00a231a370_90_240_37_68_54" in config
     assert "steps: 1200" in config
 

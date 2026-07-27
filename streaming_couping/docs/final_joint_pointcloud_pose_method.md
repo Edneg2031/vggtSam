@@ -349,7 +349,7 @@ outputs/streaming_couping_v6_camera_overfit/v6_cross_clip_summary.csv
 split, frame, usable_instances, geometry_confidence,
 camera_rotation_delta, instance_rotation_delta,
 camera_center_delta, instance_center_delta,
-specialized_rotation_delta, specialized_center_delta
+v63_rotation_delta, v63_center_delta
 ```
 
 delta 均为“对应分支误差减 raw 误差”，因此负数表示改善。`usable_instances` 是 persistent
@@ -386,6 +386,42 @@ cross_clip_specialized_cameraR_instanceC
 第二段 `492...589` 的逐帧 GT 已参与形成 V6.2 假设，所以新 specialized 行只能检查实现与
 development-set 行为，不能作为新的 held-out 证明。必须在不再改变结构和超参数的前提下，
 用第三段序列验证后才能判断该共同规律是否成立。
+
+V6.2 实验中 rotation 专门化从 `2.799°` 改善到 `2.199°`，但 direct-world center 从 raw
+`0.14257` 退化到 `0.16801`，使总 loss 退化。因此职责解耦本身没有被整体否定；需要进一步
+区分 center-only 监督失败与世界坐标参数化失败。
+
+### 8.2 V6.3：一次运行完成的参数化与 token-source sweep
+
+V6.3 保留全部既有对照，并在相同 seed、步数和训练帧下训练七个 3DoF component model：
+
+```text
+rotation / SO(3):                camera, instance, fusion
+center / direct world ΔC:        instance
+center / camera-frame Δt:        camera, instance, fusion
+```
+
+camera-frame center 不直接预测世界向量，而是：
+
+```text
+t_center = t_raw + Δt_camera
+C_center = -R_rawᵀ t_center
+```
+
+因此 correction 会随 baseline camera rotation 等变地转换到世界中心。随后将三个 rotation
+source 与三个 local-center source 形成完整 3×3 组合，并额外保留 direct-world
+`cameraR_instanceC`，共十个组合。该 sweep 同时回答：失败来自坐标参数化、token 来源，还是
+center-only 监督；不会根据单帧 mask 或 GT 动态选路。
+
+一次命令新增两张短表：
+
+```text
+v6_component_sweep.csv  # 7 个 component model 的 train/heldout/cross 误差
+v6_v63_sweep.csv        # 10 个合法组合的 train/heldout/cross 指标
+```
+
+`development_best=1` 只标记第二段 development clip 上的最低 loss，不会进入模型决策。结构
+仍需在第三段预先锁定的序列上验证。
 
 `model_overfit_pass=1` 表示对应独立模型的 loss 下降、旋转、平移和参考帧精确性同时达到
 阈值；`fusion_instance_used=1` 与 `fusion_camera_used=1` 分别表示 fusion checkpoint 的输入

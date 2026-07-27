@@ -23,7 +23,7 @@ V6_VARIANTS = (
     "geometry_only",
 )
 V6_TRAINING_MODES = ("camera_only", "instance_only", "fusion")
-V6_HEAD_COMPONENTS = ("se3", "rotation", "center")
+V6_HEAD_COMPONENTS = ("se3", "rotation", "center", "translation")
 
 
 @dataclass(frozen=True)
@@ -353,7 +353,7 @@ class V6CameraFusion(nn.Module):
             ).expand(omega.shape[:-1] + (4, 4)).clone()
             rotation_correction[..., :3, :3] = so3_exp(omega)
             composed = rotation_correction @ baseline_h
-        else:
+        elif self.head_component == "center":
             center_delta = torch.tanh(raw_delta) * float(
                 self.config.max_translation_native
             )
@@ -369,6 +369,29 @@ class V6CameraFusion(nn.Module):
                 baseline_world_to_camera[..., :3, 3:]
                 - rotation @ center_delta[..., None]
             )
+            composed = homogeneous_world_to_camera(
+                torch.cat([rotation, translation], dim=-1)
+            )
+        else:
+            local_translation = torch.tanh(raw_delta) * float(
+                self.config.max_translation_native
+            )
+            local_translation = torch.where(
+                update_mask[..., None],
+                local_translation,
+                torch.zeros_like(local_translation),
+            )
+            omega = torch.zeros_like(local_translation)
+            rho = local_translation
+            rotation = baseline_world_to_camera[..., :3, :3]
+            translation = (
+                baseline_world_to_camera[..., :3, 3:]
+                + local_translation[..., None]
+            )
+            center_delta = -(
+                rotation.transpose(-1, -2)
+                @ local_translation[..., None]
+            ).squeeze(-1)
             composed = homogeneous_world_to_camera(
                 torch.cat([rotation, translation], dim=-1)
             )

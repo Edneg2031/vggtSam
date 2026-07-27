@@ -6,8 +6,8 @@ OUTPUT=outputs/streaming_couping_v6_camera_overfit
 TRAIN_CACHE=outputs/streaming_couping_v5_ablation/cache/00a231a370_90_240_37_68_54.pt
 TEST_CACHE=outputs/streaming_couping_v5_ablation/cache/00a231a370_492_589_37_68_54.pt
 
-# Do not touch SAM3/StreamVGGT when the exact five-frame cache is present.
-# If it is absent, the retained cache builder creates the frozen observations.
+# Do not touch SAM3/StreamVGGT when both frozen clip caches are present.
+# If either is absent, the retained cache builder creates the observations.
 if [[ -f "$TRAIN_CACHE" && -f "$TEST_CACHE" ]]; then
   echo "reusing frozen cache: $TRAIN_CACHE"
   echo "reusing frozen cache: $TEST_CACHE"
@@ -20,7 +20,7 @@ else
     --training-device cuda:1
 fi
 
-# Always retrain three 6DoF controls plus two specialized 3DoF models.
+# Always retrain three 6DoF controls plus seven specialized 3DoF models.
 export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
@@ -30,3 +30,5 @@ PYTHONUNBUFFERED=1 PYTHONPATH=. python -m streaming_couping.scripts.run_v6_camer
 
 sed -n '1,8p' "$OUTPUT/v6_cross_clip_summary.csv"
 sed -n '1,9p' "$OUTPUT/v6_frame_diagnostics.csv"
+sed -n '1,9p' "$OUTPUT/v6_component_sweep.csv"
+sed -n '1,12p' "$OUTPUT/v6_v63_sweep.csv"
