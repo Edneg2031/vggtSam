@@ -1,0 +1,104 @@
+# V6-only cache/evaluation base. V4/V5 remain frozen with identical clips.
+recovery_config: streaming_couping/configs/recovery_050_025.yaml
+output_dir: outputs/streaming_couping_v6_camera_sweep_base
+
+dataset:
+  manifest: data/processed/scannetpp_pinhole_2d/manifest.json
+  clips:
+    - name: 00a231a370_90_240_37_68_54
+      scene_id: 00a231a370
+      frame_indices: [90, 105, 119, 130, 140, 210, 240]
+      training_frame_indices: [90, 105, 119, 130, 140]
+      evaluation_frame_indices: [210, 240]
+      instance_ids: [37, 68, 54]
+      reference_sequence_index: 0
+      split: train
+      tracking_cache: outputs/streaming_couping_instance_pose_37_68_54/tracking_cache.npz
+    - name: 00a231a370_492_589_37_68_54
+      scene_id: 00a231a370
+      frame_indices: [492, 512, 520, 545, 561, 589]
+      instance_ids: [37, 68, 54]
+      reference_sequence_index: 0
+      split: test
+    - name: 00a231a370_50_80_37_68_54
+      scene_id: 00a231a370
+      # Stop before frame 90 to avoid exact and near-neighbor training leakage.
+      frame_indices: [50, 60, 70, 80]
+      instance_ids: [37, 68, 54]
+      reference_sequence_index: 0
+      split: validation
+
+runtime:
+  sam3_device: cuda:3
+  geometry_device: cuda:1
+
+features:
+  cache_dir: outputs/streaming_couping_v5_ablation/cache
+  rebuild: false
+  sam_source: detector_fpn2
+  sam_resolution: 1008
+  sam_grid: [72, 72]
+  point_confidence_threshold: 0.30
+  min_instance_points: 128
+  sampled_instance_points: 128
+
+fusion:
+  instance_dim: 512
+  attention_dim: 512
+  num_heads: 8
+  dropout: 0.0
+  memory_momentum: 0.90
+  min_track_confidence: 0.50
+  min_geometry_confidence: 0.20
+  min_static_score: 0.20
+  strict_identity_gate: true
+  patch_mask_dilation: 1
+  identity_hard_mismatch_min_points: 512
+  identity_hard_mismatch_max_fitness: 0.02
+  unknown_camera_weight: 0.0
+  pose_feature_mode: appearance_only
+  rotation_update_mode: additive_encoding
+  max_rotation_update_degrees: 5.0
+  dpt_layer_indices: [4, 11, 17, 23]
+
+loss:
+  camera: 20.0
+  relative_rotation: 2.0
+  translation_direction: 2.0
+  rigid: 1.0
+  centroid: 0.25
+  residual: 0.0001
+  depth: 5.0
+  depth_fixed: 5.0
+  pointmap: 5.0
+  rigid_trim_quantile: 0.70
+
+training:
+  epochs: 30
+  repeats_per_epoch: 4
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  grad_clip_norm: 1.0
+  seed: 0
+  device: cuda:1
+  amp: false
+
+evaluation:
+  perturbations: [aligned, module_off]
+  strict_equivalence: true
+  ray_pose:
+    confidence_threshold: 0.30
+    min_points: 1024
+    max_points: 65536
+    max_iterations: 6
+    max_condition_number: 100000000.0
+    max_center_shift: 0.75
+    max_residual_rmse: 0.20
+    blend: 1.0
+    angular_huber_delta: 0.02
+    angular_min_range: 0.05
+    preserve_reference: false
+    solver_modes: [current_refined]
+    export_confidence_threshold: 0.30
+    export_max_full_scene_points: 1000000
+    export_max_instance_points: 250000

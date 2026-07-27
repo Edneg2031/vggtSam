@@ -11,6 +11,7 @@ from streaming_couping.scripts.run_v6_camera_overfit import (
     _pose_metrics,
     load_v6_config,
 )
+from streaming_couping.src.learned_pose.config import load_learned_pose_config
 from streaming_couping.src.learned_pose.v6_camera_fusion import (
     V6CameraFusion,
     V6FusionConfig,
@@ -421,6 +422,7 @@ def test_v6_command_and_config_are_retained() -> None:
     assert "v6_component_sweep.csv" in command
     assert "v6_v63_sweep.csv" in command
     assert "v6_v64_aux_sweep.csv" in command
+    assert "v6_validation_summary.csv" in command
     assert "00a231a370_90_240_37_68_54" in config
     assert "steps: 1200" in config
 
@@ -429,6 +431,14 @@ def test_v6_command_and_config_are_retained() -> None:
     )
     assert loaded.clip_name == "00a231a370_90_240_37_68_54"
     assert loaded.test_clip_name == "00a231a370_492_589_37_68_54"
+    assert loaded.validation_clip_name == "00a231a370_50_80_37_68_54"
     assert loaded.fusion.hidden_dim == 256
     assert loaded.training.steps == 1200
     assert loaded.success.camera_loss_ratio == 0.80
+
+    base = load_learned_pose_config(loaded.base_config)
+    validation = next(
+        clip for clip in base.clips if clip.name == loaded.validation_clip_name
+    )
+    assert validation.frame_indices == (50, 60, 70, 80)
+    assert 90 not in validation.frame_indices

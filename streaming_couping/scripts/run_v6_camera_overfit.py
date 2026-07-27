@@ -81,6 +81,7 @@ class V6ExperimentConfig:
     output_dir: Path
     clip_name: str
     test_clip_name: str
+    validation_clip_name: str
     device: str
     fusion: V6FusionConfig
     training: V6TrainingConfig
@@ -114,6 +115,15 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
             f"once in {config.base_config}."
         )
     test_clip = test_clips[0]
+    validation_clips = [
+        item for item in base.clips if item.name == config.validation_clip_name
+    ]
+    if len(validation_clips) != 1:
+        raise ValueError(
+            f"V6 validation clip {config.validation_clip_name!r} was not "
+            f"found exactly once in {config.base_config}."
+        )
+    validation_clip = validation_clips[0]
     path = cache_path(base, clip)
     if not path.is_file():
         raise FileNotFoundError(
@@ -135,6 +145,15 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
     print(f"V6 reusing frozen cross-clip cache: {test_path}")
     test_payload = load_feature_cache(test_path)
     test_batch = _camera_batch(test_payload, device=config.device)
+    validation_path = cache_path(base, validation_clip)
+    if not validation_path.is_file():
+        raise FileNotFoundError(
+            f"Frozen validation cache is missing: {validation_path}. Run the "
+            "V6 command file to build/reuse all three caches."
+        )
+    print(f"V6 reusing frozen validation cache: {validation_path}")
+    validation_payload = load_feature_cache(validation_path)
+    validation_batch = _camera_batch(validation_payload, device=config.device)
 
     recovery = load_config(base.recovery_config)
     maybe_add_repo_to_path(recovery.streamvggt_repo)
@@ -165,6 +184,17 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
     test_target_w2c, _ = pose_encoding_to_extri_intri(
         test_batch["target_pose_encoding"],
         image_size_hw=test_image_size,
+    )
+    validation_image_size = tuple(
+        int(value) for value in validation_payload["image_size"]
+    )
+    validation_baseline_w2c, _ = pose_encoding_to_extri_intri(
+        validation_batch["baseline_pose_encoding"],
+        image_size_hw=validation_image_size,
+    )
+    validation_target_w2c, _ = pose_encoding_to_extri_intri(
+        validation_batch["target_pose_encoding"],
+        image_size_hw=validation_image_size,
     )
     reference_index = int(payload["reference_sequence_index"])
     heldout_frames = tuple(clip.evaluation_frame_indices or ())
@@ -607,6 +637,70 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         )
         for name, output in v64_cross_combinations.items()
     }
+    validation_reference_index = int(
+        validation_payload["reference_sequence_index"]
+    )
+    validation_indices = _evaluation_indices(
+        len(validation_payload["frame_indices"]),
+        reference_index=validation_reference_index,
+        evaluation_indices=None,
+    )
+    validation_raw = _pose_metrics(
+        validation_baseline_w2c,
+        validation_target_w2c,
+        reference_index=validation_reference_index,
+        translation_weight=config.training.translation_weight,
+        evaluation_indices=validation_indices,
+    )
+    validation_camera_rotation = _predict_model(
+        specialized["camera_rotation"]["model"],
+        mode="camera_only",
+        variant="normal",
+        batch=validation_batch,
+        baseline_w2c=validation_baseline_w2c,
+        reference_index=validation_reference_index,
+    )
+    validation_local_center = _predict_model(
+        specialized["instance_center_local"]["model"],
+        mode="instance_only",
+        variant="normal",
+        batch=validation_batch,
+        baseline_w2c=validation_baseline_w2c,
+        reference_index=validation_reference_index,
+    )
+    validation_aux_center = _predict_model(
+        v64_models["instance_se3_aux_0p1"]["model"],
+        mode="instance_only",
+        variant="normal",
+        batch=validation_batch,
+        baseline_w2c=validation_baseline_w2c,
+        reference_index=validation_reference_index,
+    )
+    validation_outputs = {
+        "candidate_A_3dof_local_center": _compose_decoupled_output(
+            validation_camera_rotation,
+            validation_local_center,
+            baseline_w2c=validation_baseline_w2c,
+            reference_index=validation_reference_index,
+        ),
+        "candidate_B_aux_0p1_se3_center": _compose_decoupled_output(
+            validation_camera_rotation,
+            validation_aux_center,
+            baseline_w2c=validation_baseline_w2c,
+            reference_index=validation_reference_index,
+        ),
+    }
+    validation_metrics = {
+        name: _prediction_metrics(
+            output,
+            baseline_w2c=validation_baseline_w2c,
+            target_w2c=validation_target_w2c,
+            reference_index=validation_reference_index,
+            translation_weight=config.training.translation_weight,
+            evaluation_indices=validation_indices,
+        )
+        for name, output in validation_outputs.items()
+    }
     cross_clip_decoupled_best = int(
         float(cross_decoupled_metrics["instanceR_cameraC"]["loss"])
         < min(
@@ -819,6 +913,42 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
                 "development_best": int(
                     abs(cross_loss - development_best_loss) <= 1e-12
                 ),
+            }
+        )
+    validation_frame_text = " ".join(
+        str(value) for value in validation_payload["frame_indices"]
+    )
+    candidate_b_better_a = int(
+        float(
+            validation_metrics["candidate_B_aux_0p1_se3_center"]["loss"]
+        )
+        < float(validation_metrics["candidate_A_3dof_local_center"]["loss"])
+    )
+    validation_rows = [
+        {
+            "variant": "raw",
+            "frames": validation_frame_text,
+            "rotation_deg": _short(float(validation_raw["rotation_degrees"])),
+            "center_error": _short(float(validation_raw["translation_native"])),
+            "loss": _short(float(validation_raw["loss"])),
+            "better_than_raw": 0,
+            "candidate_b_better_a": candidate_b_better_a,
+            "prelocked": 1,
+        }
+    ]
+    for name, metrics in validation_metrics.items():
+        validation_rows.append(
+            {
+                "variant": name,
+                "frames": validation_frame_text,
+                "rotation_deg": _short(float(metrics["rotation_degrees"])),
+                "center_error": _short(float(metrics["translation_native"])),
+                "loss": _short(float(metrics["loss"])),
+                "better_than_raw": int(
+                    float(metrics["loss"]) < float(validation_raw["loss"])
+                ),
+                "candidate_b_better_a": candidate_b_better_a,
+                "prelocked": 1,
             }
         )
     v63_main_name = "cameraR_instanceC_local"
@@ -1101,6 +1231,8 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
     _write_csv(v63_summary_path, v63_combination_rows)
     v64_summary_path = output_dir / "v6_v64_aux_sweep.csv"
     _write_csv(v64_summary_path, v64_rows)
+    validation_summary_path = output_dir / "v6_validation_summary.csv"
+    _write_csv(validation_summary_path, validation_rows)
     with (output_dir / "v6_run.json").open("w", encoding="utf8") as handle:
         json.dump(
             {
@@ -1129,6 +1261,11 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
                 "heldout_fusion_best": bool(heldout_fusion_best),
                 "cross_clip": test_clip.name,
                 "cross_clip_role": "development_after_component_analysis",
+                "validation_clip": validation_clip.name,
+                "validation_clip_role": "prelocked_final_comparison",
+                "validation_candidate_b_better_a": bool(
+                    candidate_b_better_a
+                ),
                 "cross_clip_decoupled_best": bool(cross_clip_decoupled_best),
                 "cross_clip_specialized_best": bool(
                     cross_clip_specialized_best
@@ -1140,9 +1277,11 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
                 "component_sweep": str(component_summary_path),
                 "v63_sweep": str(v63_summary_path),
                 "v64_aux_sweep": str(v64_summary_path),
+                "validation_summary": str(validation_summary_path),
                 "config": str(config.source_path),
                 "cache": str(path),
                 "test_cache": str(test_path),
+                "validation_cache": str(validation_path),
             },
             handle,
             indent=2,
@@ -1217,6 +1356,7 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
     print(f"component_sweep={component_summary_path}")
     print(f"v63_sweep={v63_summary_path}")
     print(f"v64_aux_sweep={v64_summary_path}")
+    print(f"validation_summary={validation_summary_path}")
     print(f"full_summary={summary_path}")
     return summary_path
 
@@ -1234,6 +1374,7 @@ def load_v6_config(path: str | Path) -> V6ExperimentConfig:
         output_dir=_path(raw.get("output_dir"), source.parent),
         clip_name=str(raw.get("clip_name", "")),
         test_clip_name=str(raw.get("test_clip_name", "")),
+        validation_clip_name=str(raw.get("validation_clip_name", "")),
         device=str(raw.get("device", "cuda:1")),
         fusion=V6FusionConfig(
             hidden_dim=int(model.get("hidden_dim", 256)),
@@ -1999,6 +2140,15 @@ def _validate_config(config: V6ExperimentConfig) -> None:
         raise ValueError("test_clip_name is required.")
     if config.test_clip_name == config.clip_name:
         raise ValueError("test_clip_name must differ from the training clip.")
+    if not config.validation_clip_name:
+        raise ValueError("validation_clip_name is required.")
+    if config.validation_clip_name in (
+        config.clip_name,
+        config.test_clip_name,
+    ):
+        raise ValueError(
+            "validation_clip_name must differ from training and development clips."
+        )
     if config.training.steps < 1 or config.training.log_every < 1:
         raise ValueError("V6 training steps and log_every must be positive.")
     if config.training.learning_rate <= 0.0:

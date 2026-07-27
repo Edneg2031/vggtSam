@@ -49,11 +49,16 @@ appearance_only、geometry_only`。V6.3 另外训练 camera/instance/fusion 三�
 outputs/streaming_couping_v6_camera_overfit/v6_component_sweep.csv
 outputs/streaming_couping_v6_camera_overfit/v6_v63_sweep.csv
 outputs/streaming_couping_v6_camera_overfit/v6_v64_aux_sweep.csv
+outputs/streaming_couping_v6_camera_overfit/v6_validation_summary.csv
 ```
 
 全部训练与依赖消融仍保存在同目录的 `v6_summary.csv`。
 命令还会打印 `v6_frame_diagnostics.csv`：七行 held-out/cross-clip 机制诊断，delta 相对 raw，
 负数表示改善。该表只关联推理时可见的实例支持与事后 GT 误差，不用于逐帧选模型或调阈值。
+
+正式候选比较使用预先锁定的第三段 `50 60 70 80`，并在训练区间从 90 开始前截止，避免
+精确及近邻训练视角泄漏。该段不重新训练，只输出 raw、3DoF local-center 候选 A 和
+`λ_rotation=0.1` 候选 B 三行。
 
 V4/V5 两条命令优先迁移已有 checkpoint；V6 每次从相同 seed 训练十三个模型。它们共用
 冻结 feature cache，但 checkpoint、评估和最终导出目录完全分开。
@@ -64,6 +69,7 @@ V4/V5 两条命令优先迁移已有 checkpoint；V6 每次从相同 seed 训练
 configs/v4_coverage_first.yaml
 configs/v5_adaptive_best.yaml
 configs/v6_camera_overfit.yaml
+configs/v6_camera_sweep_base.yaml
 scripts/run_instance_token_pose.py
 scripts/run_v5_reference_pose.py
 scripts/run_v5_adaptive.py

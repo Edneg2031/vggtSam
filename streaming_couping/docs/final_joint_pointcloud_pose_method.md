@@ -445,6 +445,25 @@ v6_v64_aux_sweep.csv
 若 `λ=0` 的 full-SE(3) center 已优于 3DoF center，收益主要来自参数化；若非零 λ 进一步稳定
 改善，才支持“辅助旋转监督有正则化作用”。所有 `development_best` 仍只用于分析。
 
+### 8.4 预锁定第三段验证
+
+停止使用前两段调结构后，第三段按“从 50 开始、每 10 帧采样”预注册，并在训练区间从 90
+开始前截止，以避免精确训练图像和 100/110/120 等近邻训练视角泄漏：
+
+```text
+50 60 70 80，reference = 50
+```
+
+第三段只比较三个预锁定输出：raw、候选 A（camera SO(3) + instance 3DoF local center）和
+候选 B（相同 camera SO(3) + `λ_rotation=0.1` instance SE(3) center）。两套 checkpoint 都只在
+`90 105 119 130 140` 训练；第三段 GT 只在全部预测完成后计算指标。结果单独写入：
+
+```text
+v6_validation_summary.csv
+```
+
+该表不会根据第三段结果回头选择 blend、阈值、辅助权重或 token source。
+
 `model_overfit_pass=1` 表示对应独立模型的 loss 下降、旋转、平移和参考帧精确性同时达到
 阈值；`fusion_instance_used=1` 与 `fusion_camera_used=1` 分别表示 fusion checkpoint 的输入
 消融支持两种 token 确实参与预测。三套模型都能拟合仍只说明容量；跨 clip 的固定 checkpoint
