@@ -1,0 +1,29 @@
+set -euo pipefail
+
+BASE_CONFIG=streaming_couping/configs/v4_coverage_first.yaml
+V6_CONFIG=streaming_couping/configs/v6_camera_overfit.yaml
+OUTPUT=outputs/streaming_couping_v6_camera_overfit
+CACHE=outputs/streaming_couping_v5_ablation/cache/00a231a370_90_240_37_68_54.pt
+
+# Do not touch SAM3/StreamVGGT when the exact five-frame cache is present.
+# If it is absent, the retained cache builder creates the frozen observations.
+if [[ -f "$CACHE" ]]; then
+  echo "reusing frozen cache: $CACHE"
+else
+  PYTHONUNBUFFERED=1 PYTHONPATH=. python -m streaming_couping.scripts.run_instance_token_pose \
+    --config "$BASE_CONFIG" \
+    --stage cache \
+    --sam3-device cuda:3 \
+    --geometry-device cuda:1 \
+    --training-device cuda:1
+fi
+
+# Always retrain from seed 0 and overwrite the three V6 result files.
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+
+PYTHONUNBUFFERED=1 PYTHONPATH=. python -m streaming_couping.scripts.run_v6_camera_overfit \
+  --config "$V6_CONFIG" \
+  --device cuda:1
+
+sed -n '1,10p' "$OUTPUT/v6_summary.csv"

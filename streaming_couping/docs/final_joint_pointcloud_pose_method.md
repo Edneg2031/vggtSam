@@ -1,11 +1,12 @@
-# StreamVGGT + SAM3：保留的 V4 与 V5
+# StreamVGGT + SAM3：V4、V5 与 V6 camera 消融
 
-当前代码只保留两条可运行方法：
+当前代码保留两条完整方法和一条隔离的 camera-fusion 实验：
 
 | 版本 | 用途 | 核心选择 |
 |---|---|---|
 | V4 coverage-first | 后续解决错检的研究主线 | 保留关联 mask 覆盖率，使用 appearance + additive pose |
 | V5 adaptive-best | 点云安全的最终对照 | residual + bounded SO(3)，按 ray support 选择 raw/learned pointmap |
+| V6 camera overfit | 五帧拟合与 instance-use 检查 | replacement Feature Merger + SE(3) correction head，无点云/solver |
 
 旧结构消融、historical-anchor、current-raw solver、joint BA 和 shared-SE(3) 已从代码删除。
 历史实验结论体现在这里的版本选择中，不再保留不可运行的实验实现。
@@ -43,7 +44,7 @@ StreamVGGT point head 使用 aggregator 的第 `4/11/17/23` 层 patch tokens。�
 实例 cross-attention，再送回冻结 DPT point head。camera branch 只修改 camera token，
 最终由冻结 CameraHead 解码。
 
-所有可学习写入均为门控残差：
+V4/V5 的所有可学习写入均为门控残差：
 
 ```text
 output = frozen_token + sigmoid(gate) * zero_initialized_projection(attention)
@@ -230,3 +231,77 @@ adaptive gate、SAM3 tracking、身份注册和最终 native 输出均不读取�
 - 下一步只研究 V4 的错检拒绝：使用更可靠的多帧空间一致性，在不降低 mask recall 的前提下
   区分外观相似但空间错误的 UNKNOWN；
 - 不再恢复已失败的 joint BA、shared-SE(3) 或额外结构消融。
+
+## 8. V6：camera fusion 拟合能力消融
+
+V6 不替换 V4，也不把 V5 的安全回退包装成新方法。它只回答两个更基础的问题：新的
+camera branch 能否拟合五帧，以及预测是否真的依赖 instance token。
+
+训练序列固定为：
+
+```text
+90 105 119 130 140，reference = 90
+```
+
+数据流为：
+
+```text
+frozen StreamVGGT camera hidden C
+frozen SAM3 mask-pooled appearance A
+pose/reprojection geometry G + identity/quality Q
+                  ↓
+trusted causal persistent-instance memory
+                  ↓
+camera-to-instance cross-attention
+                  ↓
+MLP Feature Merger([C, I, C*I, C-I]) = Z
+                  ↓
+new six-DoF head → Δξ = [ω, ρ]
+                  ↓
+T_v6 = Exp(Δξ) · T_raw
+```
+
+`Z` 是 merger 的新输出，不执行 `C + residual`；但最终相机仍以 SE(3) correction 锚定
+原始 StreamVGGT，最后一层零初始化。参考帧和无可用 persistent instance 的帧强制
+`Δξ=0`，所以零初始化、`instance_off` 和参考帧都能精确回到 raw pose。
+
+persistent memory 只允许几何 `MATCH` 写入。`UNKNOWN` 当前观测可以读取并和可信历史比较，
+但不能更新 memory；临时漏检仍可读取已有 token；显式 `MISMATCH` 不参与融合。这使错检不会
+污染长期 token，同时避免一次漏检令 camera branch 完全失去实例上下文。
+
+训练冻结 SAM3 与 StreamVGGT，只用 cache 中的 camera/instance feature。GT pose 在这里明确
+作为五帧监督目标；pointmap branch、冻结 CameraHead 和解析式 ray solver 全部关闭。因此这个
+实验成功只证明容量、梯度和实现路径正确，不证明 held-out 或跨场景泛化。
+
+同一个训练 checkpoint 评估：
+
+```text
+normal             正常 appearance + geometry
+instance_off       移除所有实例输入，应精确回到 raw
+camera_off         camera hidden 置零，检查 camera token 是否真的参与
+shuffle_time       appearance/geometry 跨时间错配，身份门控与 active 数不变
+wrong_geometry     只把 geometry 跨时间错配
+appearance_only    geometry 置零
+geometry_only      appearance 置零
+```
+
+交换同一帧 instance slot 顺序没有作为消融，因为 cross-attention 对集合排列近似不变。
+`instance_used=1` 要求 normal loss 同时显著低于 `instance_off` 与 `shuffle_time`；
+`camera_used=1` 要求 normal 显著低于 `camera_off`。不能只靠 normal 拟合得好就宣称两个
+来源都参与了融合。
+
+一次运行：
+
+```bash
+zsh streaming_couping/commands_v6_camera_overfit.txt
+```
+
+最终只需看：
+
+```text
+outputs/streaming_couping_v6_camera_overfit/v6_summary.csv
+```
+
+`overfit_pass=1` 表示 loss 下降、旋转、平移和参考帧精确性同时达到配置阈值；
+`instance_used=1` 与 `camera_used=1` 分别表示同一 checkpoint 的输入消融支持 instance token
+和 camera token 确实参与预测。任一为 0 都应如实保留结果，再决定下一轮结构消融。

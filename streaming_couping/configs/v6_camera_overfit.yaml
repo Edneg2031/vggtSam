@@ -1,0 +1,35 @@
+# V6 is a supervised five-frame capacity and instance-use ablation.
+# It intentionally uses GT pose only as a training target. It does not train
+# pointmaps and does not call the analytic ray-pose solver.
+base_config: streaming_couping/configs/v4_coverage_first.yaml
+output_dir: outputs/streaming_couping_v6_camera_overfit
+clip_name: 00a231a370_90_240_37_68_54
+device: cuda:1
+
+model:
+  hidden_dim: 256
+  num_heads: 8
+  dropout: 0.0
+  memory_momentum: 0.90
+  min_track_confidence: 0.25
+  unknown_reliability: 0.50
+  max_rotation_degrees: 15.0
+  max_translation_native: 0.50
+
+training:
+  steps: 1200
+  learning_rate: 0.001
+  weight_decay: 0.0
+  grad_clip_norm: 5.0
+  translation_weight: 10.0
+  seed: 0
+  log_every: 200
+
+# These thresholds label the run; a failed label still writes every result.
+success:
+  minimum_loss_drop_percent: 95.0
+  maximum_rotation_degrees: 0.10
+  maximum_translation_native: 0.005
+  instance_loss_ratio: 0.50
+  shuffle_loss_ratio: 0.80
+  camera_loss_ratio: 0.80

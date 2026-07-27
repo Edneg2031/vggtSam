@@ -1,12 +1,14 @@
 # StreamVGGT + SAM3 instance refinement
 
 This repository contains one project package, `streaming_couping`, with two
-retained methods:
+retained methods and one focused camera-fusion experiment:
 
 - V4 coverage-first: the strongest two-sequence pose result and the main line
   for future false-association work.
 - V5 adaptive-best: the conservative pose/pointmap method that falls back to
   the raw pointmap when geometric ray support is insufficient.
+- V6 camera overfit: a five-frame capacity/instance-use ablation for a true
+  Feature Merger and SE(3) correction head; it is not a deployment result.
 
 Initialize the two upstream model repositories once:
 
@@ -19,6 +21,7 @@ Run either retained method from the repository root:
 ```bash
 zsh streaming_couping/commands_v4_coverage_first.txt
 zsh streaming_couping/commands_v5_adaptive_best.txt
+zsh streaming_couping/commands_v6_camera_overfit.txt
 ```
 
 The commands use `externals/sam3` and `externals/streamvggt`, while datasets,
