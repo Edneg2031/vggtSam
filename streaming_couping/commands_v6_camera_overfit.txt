@@ -18,7 +18,7 @@ else
     --training-device cuda:1
 fi
 
-# Always retrain from seed 0 and overwrite the three V6 result files.
+# Always retrain all three models from seed 0 and overwrite their V6 results.
 export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
@@ -26,4 +26,4 @@ PYTHONUNBUFFERED=1 PYTHONPATH=. python -m streaming_couping.scripts.run_v6_camer
   --config "$V6_CONFIG" \
   --device cuda:1
 
-sed -n '1,10p' "$OUTPUT/v6_summary.csv"
+sed -n '1,12p' "$OUTPUT/v6_summary.csv"

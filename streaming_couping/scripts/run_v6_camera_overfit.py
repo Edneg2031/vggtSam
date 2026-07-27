@@ -20,6 +20,7 @@ from streaming_couping.src.learned_pose.cache import cache_path, load_feature_ca
 from streaming_couping.src.learned_pose.config import load_learned_pose_config
 from streaming_couping.src.learned_pose.pipeline import _slice_training_payload
 from streaming_couping.src.learned_pose.v6_camera_fusion import (
+    V6_TRAINING_MODES,
     V6_VARIANTS,
     V6CameraFusion,
     V6FusionConfig,
@@ -103,142 +104,71 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         image_size_hw=image_size,
     )
     reference_index = int(payload["reference_sequence_index"])
-    model = V6CameraFusion(
-        camera_dim=int(batch["camera_hidden"].shape[-1]),
-        appearance_dim=int(batch["appearance"].shape[-1]),
-        geometry_dim=int(batch["pose_geometry"].shape[-1]),
-        config=config.fusion,
-    ).to(config.device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.training.learning_rate,
-        weight_decay=config.training.weight_decay,
-    )
-
-    model.eval()
-    with torch.no_grad():
-        initial_output = _forward_variant(
-            model,
-            batch,
-            baseline_w2c,
-            reference_index=reference_index,
-            variant="normal",
-        )
-        initial_loss = float(
-            _pose_loss(
-                initial_output["world_to_camera"],
-                target_w2c,
-                reference_index=reference_index,
-                translation_weight=config.training.translation_weight,
-            ).cpu()
-        )
-        if int(initial_output["active_frames"].sum().cpu()) == 0:
-            raise RuntimeError(
-                "V6 found no usable persistent-instance frame. Check that the "
-                "five-frame cache contains an accepted reference observation "
-                "and later MATCH/UNKNOWN observations."
-            )
-
-    best_loss = float("inf")
-    best_step = 0
-    best_state = None
-    model.train()
-    for step in range(1, config.training.steps + 1):
-        optimizer.zero_grad(set_to_none=True)
-        output = _forward_variant(
-            model,
-            batch,
-            baseline_w2c,
-            reference_index=reference_index,
-            variant="normal",
-        )
-        loss = _pose_loss(
-            output["world_to_camera"],
-            target_w2c,
-            reference_index=reference_index,
-            translation_weight=config.training.translation_weight,
-        )
-        if not bool(torch.isfinite(loss)):
-            raise RuntimeError(f"Non-finite V6 loss at step {step}.")
-        loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            config.training.grad_clip_norm,
-        )
-        if not bool(torch.isfinite(grad_norm)):
-            raise RuntimeError(f"Non-finite V6 gradient at step {step}.")
-        optimizer.step()
-        if step % config.training.log_every == 0 or step == config.training.steps:
-            model.eval()
-            with torch.no_grad():
-                checked = _forward_variant(
-                    model,
-                    batch,
-                    baseline_w2c,
-                    reference_index=reference_index,
-                    variant="normal",
-                )
-                current = float(
-                    _pose_loss(
-                        checked["world_to_camera"],
-                        target_w2c,
-                        reference_index=reference_index,
-                        translation_weight=config.training.translation_weight,
-                    ).cpu()
-                )
-            model.train()
-            print(f"V6 train {step:4d}/{config.training.steps}: loss={current:.6g}")
-            if current < best_loss:
-                best_loss = current
-                best_step = step
-                best_state = {
-                    name: value.detach().cpu().clone()
-                    for name, value in model.state_dict().items()
-                }
-
-    if best_state is None:
-        raise RuntimeError("V6 training did not produce a checkpoint.")
-    model.load_state_dict(best_state)
-    model.eval()
+    output_dir = config.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
     raw_metrics = _pose_metrics(
         baseline_w2c,
         target_w2c,
         reference_index=reference_index,
         translation_weight=config.training.translation_weight,
     )
-    evaluations: dict[str, dict[str, float | int]] = {}
-    with torch.no_grad():
-        for variant in V6_VARIANTS:
-            output = _forward_variant(
-                model,
-                batch,
-                baseline_w2c,
-                reference_index=reference_index,
-                variant=variant,
-            )
-            metrics = _pose_metrics(
-                output["world_to_camera"],
-                target_w2c,
-                reference_index=reference_index,
-                translation_weight=config.training.translation_weight,
-            )
-            metrics["reference_exact"] = int(
-                torch.equal(
-                    output["world_to_camera"][:, reference_index].cpu(),
-                    baseline_w2c[:, reference_index].cpu(),
-                )
-            )
-            metrics["active_frames"] = int(output["active_frames"].sum().cpu())
-            evaluations[variant] = metrics
+    initial_loss = float(raw_metrics["loss"])
+    trained = {}
+    for mode in V6_TRAINING_MODES:
+        _seed_everything(config.training.seed)
+        model = _new_model(batch, config)
+        training_result = _train_model(
+            model,
+            mode=mode,
+            batch=batch,
+            baseline_w2c=baseline_w2c,
+            target_w2c=target_w2c,
+            reference_index=reference_index,
+            config=config,
+        )
+        metrics = _evaluate_model(
+            model,
+            mode=mode,
+            variant="normal",
+            batch=batch,
+            baseline_w2c=baseline_w2c,
+            target_w2c=target_w2c,
+            reference_index=reference_index,
+            config=config,
+        )
+        capacity_pass = _capacity_pass(metrics, initial_loss, config)
+        trained[mode] = {
+            "model": model,
+            "metrics": metrics,
+            "capacity_pass": capacity_pass,
+            **training_result,
+        }
+        _save_checkpoint(
+            output_dir / f"v6_checkpoint_{mode}.pt",
+            model=model,
+            mode=mode,
+            batch=batch,
+            payload=payload,
+            reference_index=reference_index,
+            config=config,
+            training_result=training_result,
+        )
 
+    fusion_model = trained["fusion"]["model"]
+    evaluations = {
+        variant: _evaluate_model(
+            fusion_model,
+            mode="fusion",
+            variant=variant,
+            batch=batch,
+            baseline_w2c=baseline_w2c,
+            target_w2c=target_w2c,
+            reference_index=reference_index,
+            config=config,
+        )
+        for variant in V6_VARIANTS
+    }
     normal = evaluations["normal"]
-    loss_drop = _loss_drop(initial_loss, float(normal["loss"]))
-    overfit_pass = int(
-        loss_drop >= config.success.minimum_loss_drop_percent
-        and float(normal["rotation_degrees"]) <= config.success.maximum_rotation_degrees
-        and float(normal["translation_native"]) <= config.success.maximum_translation_native
-        and int(normal["reference_exact"]) == 1
-    )
     instance_used = int(
         float(normal["loss"])
         <= config.success.instance_loss_ratio
@@ -252,61 +182,66 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         <= config.success.camera_loss_ratio
         * float(evaluations["camera_off"]["loss"])
     )
-
-    output_dir = config.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = output_dir / "v6_checkpoint_best.pt"
-    torch.save(
-        {
-            "model": {
-                name: value.detach().cpu()
-                for name, value in model.state_dict().items()
-            },
-            "fusion": asdict(config.fusion),
-            "training": asdict(config.training),
-            "camera_dim": int(batch["camera_hidden"].shape[-1]),
-            "appearance_dim": int(batch["appearance"].shape[-1]),
-            "geometry_dim": int(batch["pose_geometry"].shape[-1]),
-            "clip": clip.name,
-            "frame_indices": list(payload["frame_indices"]),
-            "reference_index": reference_index,
-            "best_step": best_step,
-            "initial_loss": initial_loss,
-            "best_logged_loss": best_loss,
-        },
-        checkpoint_path,
-    )
     summary_path = output_dir / "v6_summary.csv"
-    rows = []
-    all_metrics = {"raw": raw_metrics, **evaluations}
     frames = " ".join(str(value) for value in payload["frame_indices"])
-    for variant, metrics in all_metrics.items():
-        row_loss = float(metrics["loss"])
+    rows = [
+        _summary_row(
+            experiment="control",
+            variant="raw",
+            trained_mode="none",
+            test_input="raw",
+            frames=frames,
+            metrics=raw_metrics,
+            initial_loss=initial_loss,
+            capacity_pass=0,
+            instance_used=instance_used,
+            camera_used=camera_used,
+        )
+    ]
+    for mode in V6_TRAINING_MODES:
         rows.append(
-            {
-                "variant": variant,
-                "frames": frames,
-                "rotation_deg": _short(metrics["rotation_degrees"]),
-                "translation_native": _short(metrics["translation_native"]),
-                "loss": _short(row_loss),
-                "loss_drop_percent": _short(_loss_drop(initial_loss, row_loss)),
-                "active_frames": metrics.get("active_frames", 0),
-                "reference_exact": metrics.get("reference_exact", 1),
-                "overfit_pass": overfit_pass,
-                "instance_used": instance_used,
-                "camera_used": camera_used,
-            }
+            _summary_row(
+                experiment="capacity",
+                variant=f"trained_{mode}",
+                trained_mode=mode,
+                test_input="normal",
+                frames=frames,
+                metrics=trained[mode]["metrics"],
+                initial_loss=initial_loss,
+                capacity_pass=trained[mode]["capacity_pass"],
+                instance_used=instance_used,
+                camera_used=camera_used,
+            )
+        )
+    for variant in V6_VARIANTS:
+        if variant == "normal":
+            continue
+        rows.append(
+            _summary_row(
+                experiment="fusion_dependency",
+                variant=f"fusion_{variant}",
+                trained_mode="fusion",
+                test_input=variant,
+                frames=frames,
+                metrics=evaluations[variant],
+                initial_loss=initial_loss,
+                capacity_pass=trained["fusion"]["capacity_pass"],
+                instance_used=instance_used,
+                camera_used=camera_used,
+            )
         )
     _write_csv(summary_path, rows)
     with (output_dir / "v6_run.json").open("w", encoding="utf8") as handle:
         json.dump(
             {
-                "purpose": "five-frame supervised capacity/instance-use ablation",
+                "purpose": "fair three-model capacity and fusion-dependency ablation",
                 "uses_gt_during_training": True,
                 "runs_pointmap_branch": False,
                 "runs_analytic_pose_solver": False,
-                "best_step": best_step,
-                "overfit_pass": bool(overfit_pass),
+                "capacity_pass": {
+                    mode: bool(trained[mode]["capacity_pass"])
+                    for mode in V6_TRAINING_MODES
+                },
                 "instance_used": bool(instance_used),
                 "camera_used": bool(camera_used),
                 "config": str(config.source_path),
@@ -316,21 +251,22 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
             indent=2,
         )
 
-    print("\nV6 CAMERA OVERFIT (GT-supervised capacity check)")
+    print("\nV6 FAIR CAMERA FUSION ABLATION (GT-supervised)")
     print(
         "raw:     "
         f"rot={float(raw_metrics['rotation_degrees']):.4f} deg  "
         f"trans={float(raw_metrics['translation_native']):.6f}"
     )
+    for mode in V6_TRAINING_MODES:
+        metrics = trained[mode]["metrics"]
+        print(
+            f"{mode:13s} "
+            f"rot={float(metrics['rotation_degrees']):.4f} deg  "
+            f"trans={float(metrics['translation_native']):.6f}  "
+            f"pass={int(trained[mode]['capacity_pass'])}"
+        )
     print(
-        "normal:  "
-        f"rot={float(normal['rotation_degrees']):.4f} deg  "
-        f"trans={float(normal['translation_native']):.6f}  "
-        f"loss_drop={loss_drop:.2f}%"
-    )
-    print(
-        f"overfit_pass={overfit_pass}  instance_used={instance_used}  "
-        f"camera_used={camera_used}  "
+        f"fusion_instance_used={instance_used}  camera_used={camera_used}  "
         f"reference_exact={int(normal['reference_exact'])}"
     )
     print(f"summary={summary_path}")
@@ -408,6 +344,231 @@ def _camera_batch(payload: dict, *, device: str) -> dict[str, torch.Tensor]:
     return output
 
 
+def _new_model(
+    batch: dict[str, torch.Tensor],
+    config: V6ExperimentConfig,
+) -> V6CameraFusion:
+    return V6CameraFusion(
+        camera_dim=int(batch["camera_hidden"].shape[-1]),
+        appearance_dim=int(batch["appearance"].shape[-1]),
+        geometry_dim=int(batch["pose_geometry"].shape[-1]),
+        config=config.fusion,
+    ).to(config.device)
+
+
+def _train_model(
+    model: V6CameraFusion,
+    *,
+    mode: str,
+    batch: dict[str, torch.Tensor],
+    baseline_w2c: torch.Tensor,
+    target_w2c: torch.Tensor,
+    reference_index: int,
+    config: V6ExperimentConfig,
+) -> dict[str, float | int]:
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.training.learning_rate,
+        weight_decay=config.training.weight_decay,
+    )
+    initial = _evaluate_model(
+        model,
+        mode=mode,
+        variant="normal",
+        batch=batch,
+        baseline_w2c=baseline_w2c,
+        target_w2c=target_w2c,
+        reference_index=reference_index,
+        config=config,
+    )
+    if int(initial["active_frames"]) == 0:
+        raise RuntimeError(
+            f"V6 {mode} found no usable non-reference frame. Check the "
+            "persistent-instance cache."
+        )
+
+    best_loss = float("inf")
+    best_step = 0
+    best_state = None
+    model.train()
+    for step in range(1, config.training.steps + 1):
+        optimizer.zero_grad(set_to_none=True)
+        output = _forward_variant(
+            model,
+            batch,
+            baseline_w2c,
+            reference_index=reference_index,
+            variant="normal",
+            mode=mode,
+        )
+        loss = _pose_loss(
+            output["world_to_camera"],
+            target_w2c,
+            reference_index=reference_index,
+            translation_weight=config.training.translation_weight,
+        )
+        if not bool(torch.isfinite(loss)):
+            raise RuntimeError(f"Non-finite V6 {mode} loss at step {step}.")
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            config.training.grad_clip_norm,
+        )
+        if not bool(torch.isfinite(grad_norm)):
+            raise RuntimeError(f"Non-finite V6 {mode} gradient at step {step}.")
+        optimizer.step()
+        if step % config.training.log_every == 0 or step == config.training.steps:
+            checked = _evaluate_model(
+                model,
+                mode=mode,
+                variant="normal",
+                batch=batch,
+                baseline_w2c=baseline_w2c,
+                target_w2c=target_w2c,
+                reference_index=reference_index,
+                config=config,
+            )
+            current = float(checked["loss"])
+            model.train()
+            print(
+                f"V6 {mode:13s} {step:4d}/{config.training.steps}: "
+                f"loss={current:.6g}"
+            )
+            if current < best_loss:
+                best_loss = current
+                best_step = step
+                best_state = {
+                    name: value.detach().cpu().clone()
+                    for name, value in model.state_dict().items()
+                }
+    if best_state is None:
+        raise RuntimeError(f"V6 {mode} did not produce a checkpoint.")
+    model.load_state_dict(best_state)
+    model.eval()
+    return {
+        "best_step": best_step,
+        "initial_loss": float(initial["loss"]),
+        "best_logged_loss": best_loss,
+    }
+
+
+def _evaluate_model(
+    model: V6CameraFusion,
+    *,
+    mode: str,
+    variant: str,
+    batch: dict[str, torch.Tensor],
+    baseline_w2c: torch.Tensor,
+    target_w2c: torch.Tensor,
+    reference_index: int,
+    config: V6ExperimentConfig,
+) -> dict[str, float | int]:
+    model.eval()
+    with torch.no_grad():
+        output = _forward_variant(
+            model,
+            batch,
+            baseline_w2c,
+            reference_index=reference_index,
+            variant=variant,
+            mode=mode,
+        )
+        metrics = _pose_metrics(
+            output["world_to_camera"],
+            target_w2c,
+            reference_index=reference_index,
+            translation_weight=config.training.translation_weight,
+        )
+    metrics["reference_exact"] = int(
+        torch.equal(
+            output["world_to_camera"][:, reference_index].cpu(),
+            baseline_w2c[:, reference_index].cpu(),
+        )
+    )
+    metrics["active_frames"] = int(output["active_frames"].sum().cpu())
+    return metrics
+
+
+def _capacity_pass(
+    metrics: dict[str, float | int],
+    initial_loss: float,
+    config: V6ExperimentConfig,
+) -> int:
+    return int(
+        _loss_drop(initial_loss, float(metrics["loss"]))
+        >= config.success.minimum_loss_drop_percent
+        and float(metrics["rotation_degrees"])
+        <= config.success.maximum_rotation_degrees
+        and float(metrics["translation_native"])
+        <= config.success.maximum_translation_native
+        and int(metrics["reference_exact"]) == 1
+    )
+
+
+def _save_checkpoint(
+    path: Path,
+    *,
+    model: V6CameraFusion,
+    mode: str,
+    batch: dict[str, torch.Tensor],
+    payload: dict,
+    reference_index: int,
+    config: V6ExperimentConfig,
+    training_result: dict[str, float | int],
+) -> None:
+    torch.save(
+        {
+            "model": {
+                name: value.detach().cpu()
+                for name, value in model.state_dict().items()
+            },
+            "mode": mode,
+            "fusion": asdict(config.fusion),
+            "training": asdict(config.training),
+            "camera_dim": int(batch["camera_hidden"].shape[-1]),
+            "appearance_dim": int(batch["appearance"].shape[-1]),
+            "geometry_dim": int(batch["pose_geometry"].shape[-1]),
+            "clip": payload["clip_name"],
+            "frame_indices": list(payload["frame_indices"]),
+            "reference_index": reference_index,
+            **training_result,
+        },
+        path,
+    )
+
+
+def _summary_row(
+    *,
+    experiment: str,
+    variant: str,
+    trained_mode: str,
+    test_input: str,
+    frames: str,
+    metrics: dict[str, float | int],
+    initial_loss: float,
+    capacity_pass: int,
+    instance_used: int,
+    camera_used: int,
+) -> dict[str, object]:
+    row_loss = float(metrics["loss"])
+    return {
+        "experiment": experiment,
+        "variant": variant,
+        "trained_mode": trained_mode,
+        "test_input": test_input,
+        "frames": frames,
+        "rotation_deg": _short(float(metrics["rotation_degrees"])),
+        "translation_native": _short(float(metrics["translation_native"])),
+        "loss": _short(row_loss),
+        "loss_drop_percent": _short(_loss_drop(initial_loss, row_loss)),
+        "active_frames": metrics.get("active_frames", 0),
+        "reference_exact": metrics.get("reference_exact", 1),
+        "model_overfit_pass": capacity_pass,
+        "fusion_instance_used": instance_used,
+        "fusion_camera_used": camera_used,
+    }
+
+
 def _forward_variant(
     model: V6CameraFusion,
     batch: dict[str, torch.Tensor],
@@ -415,6 +576,7 @@ def _forward_variant(
     *,
     reference_index: int,
     variant: str,
+    mode: str,
 ) -> dict[str, torch.Tensor]:
     inputs = perturb_instance_inputs(batch, variant)
     return model(
@@ -427,6 +589,7 @@ def _forward_variant(
         identity_valid=inputs["identity_valid"],
         identity_unknown=inputs["identity_unknown"],
         reference_index=reference_index,
+        mode=mode,
     )
 
 

@@ -6,7 +6,7 @@
 |---|---|---|
 | V4 coverage-first | 后续解决错检的研究主线 | 保留关联 mask 覆盖率，使用 appearance + additive pose |
 | V5 adaptive-best | 点云安全的最终对照 | residual + bounded SO(3)，按 ray support 选择 raw/learned pointmap |
-| V6 camera overfit | 五帧拟合与 instance-use 检查 | replacement Feature Merger + SE(3) correction head，无点云/solver |
+| V6 camera overfit | 三种结构的五帧公平拟合实验 | camera-only / instance-only / fusion，无点云/solver |
 
 旧结构消融、historical-anchor、current-raw solver、joint BA 和 shared-SE(3) 已从代码删除。
 历史实验结论体现在这里的版本选择中，不再保留不可运行的实验实现。
@@ -234,8 +234,8 @@ adaptive gate、SAM3 tracking、身份注册和最终 native 输出均不读取�
 
 ## 8. V6：camera fusion 拟合能力消融
 
-V6 不替换 V4，也不把 V5 的安全回退包装成新方法。它只回答两个更基础的问题：新的
-camera branch 能否拟合五帧，以及预测是否真的依赖 instance token。
+V6 不替换 V4，也不把 V5 的安全回退包装成新方法。它只回答三个更基础的问题：camera
+分支、instance 分支和二者融合分别能否拟合五帧，以及 fusion 预测是否真的依赖两种输入。
 
 训练序列固定为：
 
@@ -269,14 +269,22 @@ persistent memory 只允许几何 `MATCH` 写入。`UNKNOWN` 当前观测可以�
 但不能更新 memory；临时漏检仍可读取已有 token；显式 `MISMATCH` 不参与融合。这使错检不会
 污染长期 token，同时避免一次漏检令 camera branch 完全失去实例上下文。
 
-训练冻结 SAM3 与 StreamVGGT，只用 cache 中的 camera/instance feature。GT pose 在这里明确
-作为五帧监督目标；pointmap branch、冻结 CameraHead 和解析式 ray solver 全部关闭。因此这个
-实验成功只证明容量、梯度和实现路径正确，不证明 held-out 或跨场景泛化。
-
-同一个训练 checkpoint 评估：
+训练冻结 SAM3 与 StreamVGGT，只用 cache 中的 camera/instance feature。三种模型使用相同
+merger/head 容量、随机种子、训练步数和位姿监督，区别仅在有效输入：
 
 ```text
-normal             正常 appearance + geometry
+camera_only    camera hidden → merger → SE(3) head；所有非参考帧可更新
+instance_only  learned query → persistent instances → merger → SE(3) head
+fusion         camera query → persistent instances → merger → SE(3) head
+```
+
+GT pose 在这里明确作为五帧监督目标；pointmap branch、冻结 CameraHead 和解析式 ray solver
+全部关闭。因此实验成功只证明容量、梯度和实现路径正确，不证明 held-out 或跨场景泛化。
+
+独立训练结果写为 `trained_camera_only、trained_instance_only、trained_fusion`。随后只对
+fusion checkpoint 做依赖性评估：
+
+```text
 instance_off       移除所有实例输入，应精确回到 raw
 camera_off         camera hidden 置零，检查 camera token 是否真的参与
 shuffle_time       appearance/geometry 跨时间错配，身份门控与 active 数不变
@@ -286,9 +294,9 @@ geometry_only      appearance 置零
 ```
 
 交换同一帧 instance slot 顺序没有作为消融，因为 cross-attention 对集合排列近似不变。
-`instance_used=1` 要求 normal loss 同时显著低于 `instance_off` 与 `shuffle_time`；
-`camera_used=1` 要求 normal 显著低于 `camera_off`。不能只靠 normal 拟合得好就宣称两个
-来源都参与了融合。
+`fusion_instance_used=1` 要求 normal loss 同时显著低于 `instance_off` 与 `shuffle_time`；
+`fusion_camera_used=1` 要求 normal 显著低于 `camera_off`。不能只靠 normal 拟合得好就
+宣称两个来源都参与了融合。
 
 一次运行：
 
@@ -302,6 +310,7 @@ zsh streaming_couping/commands_v6_camera_overfit.txt
 outputs/streaming_couping_v6_camera_overfit/v6_summary.csv
 ```
 
-`overfit_pass=1` 表示 loss 下降、旋转、平移和参考帧精确性同时达到配置阈值；
-`instance_used=1` 与 `camera_used=1` 分别表示同一 checkpoint 的输入消融支持 instance token
-和 camera token 确实参与预测。任一为 0 都应如实保留结果，再决定下一轮结构消融。
+`model_overfit_pass=1` 表示对应独立模型的 loss 下降、旋转、平移和参考帧精确性同时达到
+阈值；`fusion_instance_used=1` 与 `fusion_camera_used=1` 分别表示 fusion checkpoint 的输入
+消融支持两种 token 确实参与预测。三套模型都能拟合仍只说明容量；只有后续 held-out 结果
+才能判断融合是否优于单分支。

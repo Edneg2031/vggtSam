@@ -22,6 +22,7 @@ V6_VARIANTS = (
     "appearance_only",
     "geometry_only",
 )
+V6_TRAINING_MODES = ("camera_only", "instance_only", "fusion")
 
 
 @dataclass(frozen=True)
@@ -220,6 +221,10 @@ class V6CameraFusion(nn.Module):
             dropout=config.dropout,
             batch_first=True,
         )
+        self.instance_query = nn.Parameter(
+            torch.zeros(1, 1, config.hidden_dim)
+        )
+        nn.init.normal_(self.instance_query, std=0.02)
         # This is a feature replacement: the correction head sees only the
         # output of this merger, never ``camera + residual``.
         self.feature_merger = nn.Sequential(
@@ -249,33 +254,57 @@ class V6CameraFusion(nn.Module):
         identity_valid: torch.Tensor,
         identity_unknown: torch.Tensor,
         reference_index: int,
+        mode: str = "fusion",
     ) -> dict[str, torch.Tensor]:
+        if mode not in V6_TRAINING_MODES:
+            raise ValueError(f"Unknown V6 training mode: {mode!r}.")
         if camera_hidden.ndim != 3:
             raise ValueError("camera_hidden must have shape [B,S,D].")
         if baseline_world_to_camera.shape != camera_hidden.shape[:2] + (3, 4):
             raise ValueError("baseline_world_to_camera must have shape [B,S,3,4].")
-        instance, valid, reliability = self.instance_encoder(
-            appearance=appearance,
-            geometry=geometry,
-            quality=quality,
-            observed=observed,
-            identity_valid=identity_valid,
-            identity_unknown=identity_unknown,
-        )
         camera = self.camera_projector(camera_hidden)
-        attended, active = self._cross_attend(
-            camera,
-            instance,
-            valid,
-            reliability,
-        )
+        if mode == "camera_only":
+            attended = torch.zeros_like(camera)
+            active = torch.ones(
+                camera.shape[:2],
+                dtype=torch.bool,
+                device=camera.device,
+            )
+            camera_feature = camera
+        else:
+            instance, valid, reliability = self.instance_encoder(
+                appearance=appearance,
+                geometry=geometry,
+                quality=quality,
+                observed=observed,
+                identity_valid=identity_valid,
+                identity_unknown=identity_unknown,
+            )
+            query = (
+                camera
+                if mode == "fusion"
+                else self.instance_query.expand(
+                    camera.shape[0],
+                    camera.shape[1],
+                    -1,
+                )
+            )
+            attended, active = self._cross_attend(
+                query,
+                instance,
+                valid,
+                reliability,
+            )
+            camera_feature = (
+                camera if mode == "fusion" else torch.zeros_like(camera)
+            )
         merged = self.feature_merger(
             torch.cat(
                 [
-                    camera,
+                    camera_feature,
                     attended,
-                    camera * attended,
-                    camera - attended,
+                    camera_feature * attended,
+                    camera_feature - attended,
                 ],
                 dim=-1,
             )

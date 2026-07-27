@@ -45,7 +45,12 @@ def _model() -> V6CameraFusion:
     )
 
 
-def _forward(model: V6CameraFusion, inputs: dict[str, torch.Tensor]):
+def _forward(
+    model: V6CameraFusion,
+    inputs: dict[str, torch.Tensor],
+    *,
+    mode: str = "fusion",
+):
     return model(
         camera_hidden=inputs["camera_hidden"],
         baseline_world_to_camera=inputs["baseline_world_to_camera"],
@@ -56,6 +61,7 @@ def _forward(model: V6CameraFusion, inputs: dict[str, torch.Tensor]):
         identity_valid=inputs["identity_valid"],
         identity_unknown=inputs["identity_unknown"],
         reference_index=0,
+        mode=mode,
     )
 
 
@@ -98,6 +104,43 @@ def test_v6_gradients_reach_merger_and_instance_encoder() -> None:
     first_instance_linear = model.instance_encoder.encoder[1]
     assert first_instance_linear.weight.grad is not None
     assert float(first_instance_linear.weight.grad.abs().sum()) > 0.0
+
+
+def test_independently_trained_modes_have_fair_active_paths() -> None:
+    inputs = _inputs()
+    missing = {**inputs, "observed": torch.zeros_like(inputs["observed"])}
+
+    camera = _forward(_model(), missing, mode="camera_only")
+    assert bool(camera["active_frames"][:, 1:].all())
+    assert not bool(camera["active_frames"][:, 0].any())
+
+    instance = _forward(_model(), inputs, mode="instance_only")
+    assert bool(instance["active_frames"][:, 1:].all())
+    assert torch.equal(
+        instance["world_to_camera"],
+        inputs["baseline_world_to_camera"],
+    )
+
+    target = torch.full((1, 3, 6), 0.03)
+    target[:, 0] = 0.0
+    for mode in ("camera_only", "instance_only"):
+        model = _model()
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+        for _ in range(2):
+            optimizer.zero_grad(set_to_none=True)
+            output = _forward(model, inputs, mode=mode)
+            (output["twist"] - target).square().mean().backward()
+            optimizer.step()
+        assert float(_forward(model, inputs, mode=mode)["twist"].abs().sum()) > 0
+
+
+def test_unknown_training_mode_is_rejected() -> None:
+    try:
+        _forward(_model(), _inputs(), mode="not_a_mode")
+    except ValueError as error:
+        assert "training mode" in str(error)
+    else:
+        raise AssertionError("Expected an invalid V6 mode to be rejected.")
 
 
 def test_same_checkpoint_ablations_change_only_requested_inputs() -> None:

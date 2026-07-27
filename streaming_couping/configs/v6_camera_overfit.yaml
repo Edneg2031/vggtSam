@@ -1,4 +1,5 @@
-# V6 is a supervised five-frame capacity and instance-use ablation.
+# V6 independently trains camera-only, instance-only and fusion models, then
+# runs same-checkpoint input-dependency ablations on the fusion model.
 # It intentionally uses GT pose only as a training target. It does not train
 # pointmaps and does not call the analytic ray-pose solver.
 base_config: streaming_couping/configs/v4_coverage_first.yaml
@@ -17,6 +18,7 @@ model:
   max_translation_native: 0.50
 
 training:
+  # Applied independently to each of the three models.
   steps: 1200
   learning_rate: 0.001
   weight_decay: 0.0

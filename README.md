@@ -7,8 +7,8 @@ retained methods and one focused camera-fusion experiment:
   for future false-association work.
 - V5 adaptive-best: the conservative pose/pointmap method that falls back to
   the raw pointmap when geometric ray support is insufficient.
-- V6 camera overfit: a five-frame capacity/instance-use ablation for a true
-  Feature Merger and SE(3) correction head; it is not a deployment result.
+- V6 camera overfit: a fair five-frame camera-only / instance-only / fusion
+  capacity ablation; it is not a deployment result.
 
 Initialize the two upstream model repositories once:
 
