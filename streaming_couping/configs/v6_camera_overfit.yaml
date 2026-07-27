@@ -1,10 +1,13 @@
 # V6 independently trains camera-only, instance-only and fusion models, then
-# runs same-checkpoint input-dependency ablations on the fusion model.
+# runs same-checkpoint input-dependency ablations on the fusion model.  The
+# locked rotation/center combinations are then evaluated on test_clip_name
+# without retraining.
 # It intentionally uses GT pose only as a training target. It does not train
 # pointmaps and does not call the analytic ray-pose solver.
 base_config: streaming_couping/configs/v4_coverage_first.yaml
 output_dir: outputs/streaming_couping_v6_camera_overfit
 clip_name: 00a231a370_90_240_37_68_54
+test_clip_name: 00a231a370_492_589_37_68_54
 device: cuda:1
 
 model:

@@ -1,4 +1,4 @@
-"""Train and ablate the V6 camera-only feature merger on five frames."""
+"""Train V6 pose branches and evaluate fixed checkpoints on held-out clips."""
 
 from __future__ import annotations
 
@@ -55,6 +55,7 @@ class V6ExperimentConfig:
     base_config: Path
     output_dir: Path
     clip_name: str
+    test_clip_name: str
     device: str
     fusion: V6FusionConfig
     training: V6TrainingConfig
@@ -79,6 +80,15 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
             f"{config.base_config}."
         )
     clip = clips[0]
+    test_clips = [
+        item for item in base.clips if item.name == config.test_clip_name
+    ]
+    if len(test_clips) != 1:
+        raise ValueError(
+            f"V6 test clip {config.test_clip_name!r} was not found exactly "
+            f"once in {config.base_config}."
+        )
+    test_clip = test_clips[0]
     path = cache_path(base, clip)
     if not path.is_file():
         raise FileNotFoundError(
@@ -91,6 +101,15 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
     payload = _slice_training_payload(full_payload, clip)
     batch = _camera_batch(payload, device=config.device)
     full_batch = _camera_batch(full_payload, device=config.device)
+    test_path = cache_path(base, test_clip)
+    if not test_path.is_file():
+        raise FileNotFoundError(
+            f"Frozen cross-clip cache is missing: {test_path}. Run the V6 "
+            "command file to build/reuse both caches."
+        )
+    print(f"V6 reusing frozen cross-clip cache: {test_path}")
+    test_payload = load_feature_cache(test_path)
+    test_batch = _camera_batch(test_payload, device=config.device)
 
     recovery = load_config(base.recovery_config)
     maybe_add_repo_to_path(recovery.streamvggt_repo)
@@ -112,6 +131,15 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
     full_target_w2c, _ = pose_encoding_to_extri_intri(
         full_batch["target_pose_encoding"],
         image_size_hw=image_size,
+    )
+    test_image_size = tuple(int(value) for value in test_payload["image_size"])
+    test_baseline_w2c, _ = pose_encoding_to_extri_intri(
+        test_batch["baseline_pose_encoding"],
+        image_size_hw=test_image_size,
+    )
+    test_target_w2c, _ = pose_encoding_to_extri_intri(
+        test_batch["target_pose_encoding"],
+        image_size_hw=test_image_size,
     )
     reference_index = int(payload["reference_sequence_index"])
     heldout_frames = tuple(clip.evaluation_frame_indices or ())
@@ -195,19 +223,52 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         translation_weight=config.training.translation_weight,
         evaluation_indices=heldout_indices,
     )
-    heldout = {
-        mode: _evaluate_model(
+    heldout_outputs = {
+        mode: _predict_model(
             trained[mode]["model"],
             mode=mode,
             variant="normal",
             batch=full_batch,
             baseline_w2c=full_baseline_w2c,
-            target_w2c=full_target_w2c,
             reference_index=int(full_payload["reference_sequence_index"]),
-            config=config,
-            evaluation_indices=heldout_indices,
         )
         for mode in V6_TRAINING_MODES
+    }
+    heldout_decoupled = {
+        "instanceR_cameraC": _compose_decoupled_output(
+            heldout_outputs["instance_only"],
+            heldout_outputs["camera_only"],
+            baseline_w2c=full_baseline_w2c,
+            reference_index=int(full_payload["reference_sequence_index"]),
+        ),
+        "cameraR_instanceC": _compose_decoupled_output(
+            heldout_outputs["camera_only"],
+            heldout_outputs["instance_only"],
+            baseline_w2c=full_baseline_w2c,
+            reference_index=int(full_payload["reference_sequence_index"]),
+        ),
+    }
+    heldout = {
+        mode: _prediction_metrics(
+            output,
+            baseline_w2c=full_baseline_w2c,
+            target_w2c=full_target_w2c,
+            reference_index=int(full_payload["reference_sequence_index"]),
+            translation_weight=config.training.translation_weight,
+            evaluation_indices=heldout_indices,
+        )
+        for mode, output in heldout_outputs.items()
+    }
+    heldout_decoupled_metrics = {
+        name: _prediction_metrics(
+            output,
+            baseline_w2c=full_baseline_w2c,
+            target_w2c=full_target_w2c,
+            reference_index=int(full_payload["reference_sequence_index"]),
+            translation_weight=config.training.translation_weight,
+            evaluation_indices=heldout_indices,
+        )
+        for name, output in heldout_decoupled.items()
     }
     heldout_fusion_best = int(
         float(heldout["fusion"]["loss"])
@@ -215,6 +276,74 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
             float(heldout_raw["loss"]),
             float(heldout["camera_only"]["loss"]),
             float(heldout["instance_only"]["loss"]),
+        )
+    )
+    test_reference_index = int(test_payload["reference_sequence_index"])
+    test_indices = _evaluation_indices(
+        len(test_payload["frame_indices"]),
+        reference_index=test_reference_index,
+        evaluation_indices=None,
+    )
+    cross_raw = _pose_metrics(
+        test_baseline_w2c,
+        test_target_w2c,
+        reference_index=test_reference_index,
+        translation_weight=config.training.translation_weight,
+        evaluation_indices=test_indices,
+    )
+    cross_outputs = {
+        mode: _predict_model(
+            trained[mode]["model"],
+            mode=mode,
+            variant="normal",
+            batch=test_batch,
+            baseline_w2c=test_baseline_w2c,
+            reference_index=test_reference_index,
+        )
+        for mode in V6_TRAINING_MODES
+    }
+    cross_decoupled = {
+        "instanceR_cameraC": _compose_decoupled_output(
+            cross_outputs["instance_only"],
+            cross_outputs["camera_only"],
+            baseline_w2c=test_baseline_w2c,
+            reference_index=test_reference_index,
+        ),
+        "cameraR_instanceC": _compose_decoupled_output(
+            cross_outputs["camera_only"],
+            cross_outputs["instance_only"],
+            baseline_w2c=test_baseline_w2c,
+            reference_index=test_reference_index,
+        ),
+    }
+    cross_metrics = {
+        mode: _prediction_metrics(
+            output,
+            baseline_w2c=test_baseline_w2c,
+            target_w2c=test_target_w2c,
+            reference_index=test_reference_index,
+            translation_weight=config.training.translation_weight,
+            evaluation_indices=test_indices,
+        )
+        for mode, output in cross_outputs.items()
+    }
+    cross_decoupled_metrics = {
+        name: _prediction_metrics(
+            output,
+            baseline_w2c=test_baseline_w2c,
+            target_w2c=test_target_w2c,
+            reference_index=test_reference_index,
+            translation_weight=config.training.translation_weight,
+            evaluation_indices=test_indices,
+        )
+        for name, output in cross_decoupled.items()
+    }
+    cross_clip_decoupled_best = int(
+        float(cross_decoupled_metrics["instanceR_cameraC"]["loss"])
+        < min(
+            float(cross_raw["loss"]),
+            *(float(metrics["loss"]) for metrics in cross_metrics.values()),
+            float(cross_decoupled_metrics["cameraR_instanceC"]["loss"]),
         )
     )
     normal = evaluations["normal"]
@@ -234,6 +363,9 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
     summary_path = output_dir / "v6_summary.csv"
     frames = " ".join(str(value) for value in payload["frame_indices"])
     heldout_frame_text = " ".join(str(value) for value in heldout_frames)
+    test_frame_text = " ".join(
+        str(value) for value in test_payload["frame_indices"]
+    )
     rows = [
         _summary_row(
             experiment="control",
@@ -260,6 +392,75 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
                 metrics=trained[mode]["metrics"],
                 initial_loss=initial_loss,
                 capacity_pass=trained[mode]["capacity_pass"],
+                instance_used=instance_used,
+                camera_used=camera_used,
+                heldout_fusion_best=heldout_fusion_best,
+            )
+        )
+    for name, metrics in heldout_decoupled_metrics.items():
+        rows.append(
+            _summary_row(
+                experiment="heldout_decoupled",
+                variant=f"heldout_{name}",
+                trained_mode="camera_only+instance_only",
+                test_input=name,
+                frames=heldout_frame_text,
+                metrics=metrics,
+                initial_loss=float(heldout_raw["loss"]),
+                capacity_pass=int(
+                    trained["camera_only"]["capacity_pass"]
+                    and trained["instance_only"]["capacity_pass"]
+                ),
+                instance_used=instance_used,
+                camera_used=camera_used,
+                heldout_fusion_best=heldout_fusion_best,
+            )
+        )
+    rows.append(
+        _summary_row(
+            experiment="cross_clip",
+            variant="cross_clip_raw",
+            trained_mode="none",
+            test_input="raw",
+            frames=test_frame_text,
+            metrics=cross_raw,
+            initial_loss=float(cross_raw["loss"]),
+            capacity_pass=0,
+            instance_used=instance_used,
+            camera_used=camera_used,
+            heldout_fusion_best=heldout_fusion_best,
+        )
+    )
+    for mode in V6_TRAINING_MODES:
+        rows.append(
+            _summary_row(
+                experiment="cross_clip",
+                variant=f"cross_clip_{mode}",
+                trained_mode=mode,
+                test_input="normal",
+                frames=test_frame_text,
+                metrics=cross_metrics[mode],
+                initial_loss=float(cross_raw["loss"]),
+                capacity_pass=trained[mode]["capacity_pass"],
+                instance_used=instance_used,
+                camera_used=camera_used,
+                heldout_fusion_best=heldout_fusion_best,
+            )
+        )
+    for name, metrics in cross_decoupled_metrics.items():
+        rows.append(
+            _summary_row(
+                experiment="cross_clip_decoupled",
+                variant=f"cross_clip_{name}",
+                trained_mode="camera_only+instance_only",
+                test_input=name,
+                frames=test_frame_text,
+                metrics=metrics,
+                initial_loss=float(cross_raw["loss"]),
+                capacity_pass=int(
+                    trained["camera_only"]["capacity_pass"]
+                    and trained["instance_only"]["capacity_pass"]
+                ),
                 instance_used=instance_used,
                 camera_used=camera_used,
                 heldout_fusion_best=heldout_fusion_best,
@@ -314,13 +515,45 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
                 heldout_fusion_best=heldout_fusion_best,
             )
         )
+    experiment_order = {
+        "control": 0,
+        "capacity": 1,
+        "heldout": 2,
+        "heldout_decoupled": 3,
+        "cross_clip": 4,
+        "cross_clip_decoupled": 5,
+        "fusion_dependency": 6,
+    }
+    rows.sort(key=lambda row: experiment_order[str(row["experiment"])])
+    for row in rows:
+        row["cross_clip_decoupled_best"] = cross_clip_decoupled_best
     _write_csv(summary_path, rows)
+    cross_summary_path = output_dir / "v6_cross_clip_summary.csv"
+    cross_rows = [
+        row for row in rows if str(row["experiment"]).startswith("cross_clip")
+    ]
+    _write_csv(
+        cross_summary_path,
+        [
+            {
+                "variant": row["variant"],
+                "frames": row["frames"],
+                "rotation_deg": row["rotation_deg"],
+                "translation_native": row["translation_native"],
+                "loss": row["loss"],
+                "better_than_raw": row["better_than_split_raw"],
+                "decoupled_best": cross_clip_decoupled_best,
+            }
+            for row in cross_rows
+        ],
+    )
     with (output_dir / "v6_run.json").open("w", encoding="utf8") as handle:
         json.dump(
             {
                 "purpose": (
-                    "fair three-model capacity, fusion dependency, and "
-                    "fixed-checkpoint temporal holdout"
+                    "fair three-model capacity, fusion dependency, "
+                    "fixed-checkpoint temporal holdout, and locked "
+                    "rotation/center cross-clip validation"
                 ),
                 "uses_gt_during_training": True,
                 "runs_pointmap_branch": False,
@@ -333,8 +566,11 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
                 "camera_used": bool(camera_used),
                 "heldout_frames": list(heldout_frames),
                 "heldout_fusion_best": bool(heldout_fusion_best),
+                "cross_clip": test_clip.name,
+                "cross_clip_decoupled_best": bool(cross_clip_decoupled_best),
                 "config": str(config.source_path),
                 "cache": str(path),
+                "test_cache": str(test_path),
             },
             handle,
             indent=2,
@@ -372,7 +608,28 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
             f"trans={float(metrics['translation_native']):.6f}"
         )
     print(f"heldout_fusion_best={heldout_fusion_best}")
-    print(f"summary={summary_path}")
+    print(f"CROSS-CLIP {test_frame_text}")
+    print(
+        "raw:          "
+        f"rot={float(cross_raw['rotation_degrees']):.4f} deg  "
+        f"trans={float(cross_raw['translation_native']):.6f}"
+    )
+    for mode in V6_TRAINING_MODES:
+        metrics = cross_metrics[mode]
+        print(
+            f"{mode:13s} "
+            f"rot={float(metrics['rotation_degrees']):.4f} deg  "
+            f"trans={float(metrics['translation_native']):.6f}"
+        )
+    for name, metrics in cross_decoupled_metrics.items():
+        print(
+            f"{name:18s} "
+            f"rot={float(metrics['rotation_degrees']):.4f} deg  "
+            f"trans={float(metrics['translation_native']):.6f}"
+        )
+    print(f"cross_clip_decoupled_best={cross_clip_decoupled_best}")
+    print(f"cross_summary={cross_summary_path}")
+    print(f"full_summary={summary_path}")
     return summary_path
 
 
@@ -388,6 +645,7 @@ def load_v6_config(path: str | Path) -> V6ExperimentConfig:
         base_config=_path(raw.get("base_config"), source.parent),
         output_dir=_path(raw.get("output_dir"), source.parent),
         clip_name=str(raw.get("clip_name", "")),
+        test_clip_name=str(raw.get("test_clip_name", "")),
         device=str(raw.get("device", "cuda:1")),
         fusion=V6FusionConfig(
             hidden_dim=int(model.get("hidden_dim", 256)),
@@ -567,9 +825,36 @@ def _evaluate_model(
     config: V6ExperimentConfig,
     evaluation_indices: list[int] | None = None,
 ) -> dict[str, float | int]:
+    output = _predict_model(
+        model,
+        mode=mode,
+        variant=variant,
+        batch=batch,
+        baseline_w2c=baseline_w2c,
+        reference_index=reference_index,
+    )
+    return _prediction_metrics(
+        output,
+        baseline_w2c=baseline_w2c,
+        target_w2c=target_w2c,
+        reference_index=reference_index,
+        translation_weight=config.training.translation_weight,
+        evaluation_indices=evaluation_indices,
+    )
+
+
+def _predict_model(
+    model: V6CameraFusion,
+    *,
+    mode: str,
+    variant: str,
+    batch: dict[str, torch.Tensor],
+    baseline_w2c: torch.Tensor,
+    reference_index: int,
+) -> dict[str, torch.Tensor]:
     model.eval()
     with torch.no_grad():
-        output = _forward_variant(
+        return _forward_variant(
             model,
             batch,
             baseline_w2c,
@@ -577,13 +862,24 @@ def _evaluate_model(
             variant=variant,
             mode=mode,
         )
-        metrics = _pose_metrics(
-            output["world_to_camera"],
-            target_w2c,
-            reference_index=reference_index,
-            translation_weight=config.training.translation_weight,
-            evaluation_indices=evaluation_indices,
-        )
+
+
+def _prediction_metrics(
+    output: dict[str, torch.Tensor],
+    *,
+    baseline_w2c: torch.Tensor,
+    target_w2c: torch.Tensor,
+    reference_index: int,
+    translation_weight: float,
+    evaluation_indices: list[int] | None = None,
+) -> dict[str, float | int]:
+    metrics = _pose_metrics(
+        output["world_to_camera"],
+        target_w2c,
+        reference_index=reference_index,
+        translation_weight=translation_weight,
+        evaluation_indices=evaluation_indices,
+    )
     metrics["reference_exact"] = int(
         torch.equal(
             output["world_to_camera"][:, reference_index].cpu(),
@@ -604,6 +900,35 @@ def _evaluate_model(
         output["active_frames"].index_select(1, active_index).sum().cpu()
     )
     return metrics
+
+
+def _compose_decoupled_output(
+    rotation_output: dict[str, torch.Tensor],
+    center_output: dict[str, torch.Tensor],
+    *,
+    baseline_w2c: torch.Tensor,
+    reference_index: int,
+) -> dict[str, torch.Tensor]:
+    rotation_pose = rotation_output["world_to_camera"]
+    center_pose = center_output["world_to_camera"]
+    if (
+        rotation_pose.shape != center_pose.shape
+        or rotation_pose.shape != baseline_w2c.shape
+    ):
+        raise ValueError("Decoupled V6 pose shapes disagree.")
+    rotation = rotation_pose[..., :3, :3]
+    center = _camera_centers(center_pose)
+    translation = -(rotation @ center[..., None])
+    composed = torch.cat([rotation, translation], dim=-1)
+    composed = composed.clone()
+    composed[:, int(reference_index)] = baseline_w2c[:, int(reference_index)]
+    return {
+        "world_to_camera": composed,
+        "active_frames": (
+            rotation_output["active_frames"]
+            & center_output["active_frames"]
+        ),
+    }
 
 
 def _capacity_pass(
@@ -856,6 +1181,10 @@ def _path(value: object, base: Path) -> Path:
 def _validate_config(config: V6ExperimentConfig) -> None:
     if not config.clip_name:
         raise ValueError("clip_name is required.")
+    if not config.test_clip_name:
+        raise ValueError("test_clip_name is required.")
+    if config.test_clip_name == config.clip_name:
+        raise ValueError("test_clip_name must differ from the training clip.")
     if config.training.steps < 1 or config.training.log_every < 1:
         raise ValueError("V6 training steps and log_every must be positive.")
     if config.training.learning_rate <= 0.0:

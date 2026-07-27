@@ -232,7 +232,7 @@ adaptive gate、SAM3 tracking、身份注册和最终 native 输出均不读取�
   区分外观相似但空间错误的 UNKNOWN；
 - 不再恢复已失败的 joint BA、shared-SE(3) 或额外结构消融。
 
-## 8. V6：camera fusion 拟合能力消融
+## 8. V6：camera fusion 拟合能力与解耦位姿消融
 
 V6 不替换 V4，也不把 V5 的安全回退包装成新方法。它只回答三个更基础的问题：camera
 分支、instance 分支和二者融合分别能否拟合五帧，以及 fusion 预测是否真的依赖两种输入。
@@ -292,6 +292,26 @@ held-out RGB、camera/instance feature 会进入模型；对应 GT pose 只在�
 作为模型输入。`heldout_fusion_best=1` 表示 fusion loss 同时低于 raw 和两个独立单分支；它是
 当前场景两帧证据，不代表跨场景通用。
 
+现有 `210 240` 结果显示 instance-only 的旋转误差最低，而 camera-only 的相机中心误差和总
+loss 最低，feature fusion 没有超过二者。因此 V6.1 不再增加一个 learned fusion，而是在结果
+空间锁定下面的可解释组合：
+
+```text
+主方案：R = instance-only rotation，C = camera-only camera center
+反向对照：R = camera-only rotation，C = instance-only camera center
+t = -R @ C，W2C = [R | t]
+```
+
+这里组合的是旋转与相机中心，而不是直接拼接两个 W2C 的 translation column，否则会破坏
+`t=-RC` 的坐标关系。参考帧逐位复制 raw baseline，两分支 checkpoint 均保持固定。由于
+`210 240` 已用于提出该结构，它不能再作为最终证明；锁定结构后只在第二段序列
+`492 512 520 545 561 589` 上做验证，且绝不重新训练。该序列的 561 还包含已知错误 mask，
+因此同时检验实例旋转分支对错检的鲁棒性。
+
+`cross_clip_decoupled_best=1` 的严格含义是主方案总 loss 同时低于 raw、camera-only、
+instance-only、feature fusion 和反向组合。即使为 1，也只说明同一场景的另一 clip 有效；为 0
+则说明两帧观察到的分支专长不稳定，应否定当前解耦假设。
+
 独立训练结果写为 `trained_camera_only、trained_instance_only、trained_fusion`。随后只对
 fusion checkpoint 做依赖性评估：
 
@@ -315,13 +335,15 @@ geometry_only      appearance 置零
 zsh streaming_couping/commands_v6_camera_overfit.txt
 ```
 
-最终只需看：
+最终只需复制六行短表：
 
 ```text
-outputs/streaming_couping_v6_camera_overfit/v6_summary.csv
+outputs/streaming_couping_v6_camera_overfit/v6_cross_clip_summary.csv
 ```
+
+完整训练、held-out 和输入依赖消融保留在同目录的 `v6_summary.csv`。
 
 `model_overfit_pass=1` 表示对应独立模型的 loss 下降、旋转、平移和参考帧精确性同时达到
 阈值；`fusion_instance_used=1` 与 `fusion_camera_used=1` 分别表示 fusion checkpoint 的输入
-消融支持两种 token 确实参与预测。三套模型都能拟合仍只说明容量；只有后续 held-out 结果
-才能判断融合是否优于单分支。
+消融支持两种 token 确实参与预测。三套模型都能拟合仍只说明容量；跨 clip 的固定 checkpoint
+结果才用于判断解耦组合是否稳定，但还不能据此声称跨场景通用。

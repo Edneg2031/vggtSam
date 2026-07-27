@@ -13,7 +13,7 @@ V5 adaptive-best
 
 V6 camera overfit
   Feature Merger + SE(3) correction head
-  分别训练 camera-only / instance-only / fusion，再检查 fusion 输入依赖
+  分别训练 camera-only / instance-only / fusion，再验证解耦 R/C 组合
 ```
 
 ## 运行
@@ -39,12 +39,15 @@ zsh streaming_couping/commands_v6_camera_overfit.txt
 V6 复用冻结 cache，不训练 SAM3/StreamVGGT，不训练 pointmap，也不运行 ray solver。
 一次命令会用相同 seed 和步数分别训练 `camera_only、instance_only、fusion` 三套模型，再用
 fusion checkpoint 评估 `instance_off、camera_off、shuffle_time、wrong_geometry、
-appearance_only、geometry_only`。三个固定 checkpoint 还会直接测试未参与训练的 `210 240`，
-不重新训练、不运行 solver。只需查看或复制：
+appearance_only、geometry_only`。三个固定 checkpoint 先测试未参与训练的 `210 240`；根据这两帧
+锁定“instance-only 提供旋转、camera-only 提供相机中心”，再用同一 checkpoint 测试完全未参与
+设计的 `492 512 520 545 561 589`，不重新训练、不运行 solver。只需复制短表：
 
 ```text
-outputs/streaming_couping_v6_camera_overfit/v6_summary.csv
+outputs/streaming_couping_v6_camera_overfit/v6_cross_clip_summary.csv
 ```
+
+全部训练与依赖消融仍保存在同目录的 `v6_summary.csv`。
 
 V4/V5 两条命令优先迁移已有 checkpoint；V6 每次从相同 seed 重新训练三种结构。它们共用
 冻结 feature cache，但 checkpoint、评估和最终导出目录完全分开。

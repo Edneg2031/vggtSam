@@ -3,6 +3,8 @@ from pathlib import Path
 import torch
 
 from streaming_couping.scripts.run_v6_camera_overfit import (
+    _camera_centers,
+    _compose_decoupled_output,
     _pose_metrics,
     load_v6_config,
 )
@@ -176,6 +178,53 @@ def test_pose_metrics_can_select_only_heldout_frames() -> None:
     assert second["translation_native"] == 2.0
 
 
+def test_decoupled_pose_uses_requested_rotation_and_camera_center() -> None:
+    baseline = torch.cat(
+        [
+            torch.eye(3).reshape(1, 1, 3, 3).expand(1, 3, 3, 3),
+            torch.zeros(1, 3, 3, 1),
+        ],
+        dim=-1,
+    ).clone()
+    rotation_pose = baseline.clone()
+    quarter_turn = torch.tensor(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+    )
+    rotation_pose[:, 1:, :3, :3] = quarter_turn
+
+    center_pose = baseline.clone()
+    requested_centers = torch.tensor(
+        [[[0.0, 0.0, 0.0], [1.0, 2.0, 3.0], [-2.0, 0.5, 4.0]]]
+    )
+    center_pose[..., :3, 3] = -requested_centers
+    output = _compose_decoupled_output(
+        {
+            "world_to_camera": rotation_pose,
+            "active_frames": torch.tensor([[False, True, True]]),
+        },
+        {
+            "world_to_camera": center_pose,
+            "active_frames": torch.tensor([[False, True, False]]),
+        },
+        baseline_w2c=baseline,
+        reference_index=0,
+    )
+
+    assert torch.equal(output["world_to_camera"][:, 0], baseline[:, 0])
+    assert torch.equal(
+        output["world_to_camera"][:, 1:, :3, :3],
+        rotation_pose[:, 1:, :3, :3],
+    )
+    assert torch.allclose(
+        _camera_centers(output["world_to_camera"]),
+        requested_centers,
+    )
+    assert torch.equal(
+        output["active_frames"],
+        torch.tensor([[False, True, False]]),
+    )
+
+
 def test_same_checkpoint_ablations_change_only_requested_inputs() -> None:
     inputs = _inputs()
     off = perturb_instance_inputs(inputs, "instance_off")
@@ -204,7 +253,7 @@ def test_v6_command_and_config_are_retained() -> None:
     command = (root / "streaming_couping/commands_v6_camera_overfit.txt").read_text()
     config = (root / "streaming_couping/configs/v6_camera_overfit.yaml").read_text()
     assert "run_v6_camera_overfit" in command
-    assert "v6_summary.csv" in command
+    assert "v6_cross_clip_summary.csv" in command
     assert "00a231a370_90_240_37_68_54" in config
     assert "steps: 1200" in config
 
@@ -212,6 +261,7 @@ def test_v6_command_and_config_are_retained() -> None:
         root / "streaming_couping/configs/v6_camera_overfit.yaml"
     )
     assert loaded.clip_name == "00a231a370_90_240_37_68_54"
+    assert loaded.test_clip_name == "00a231a370_492_589_37_68_54"
     assert loaded.fusion.hidden_dim == 256
     assert loaded.training.steps == 1200
     assert loaded.success.camera_loss_ratio == 0.80
