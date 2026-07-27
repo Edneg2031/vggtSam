@@ -343,6 +343,19 @@ outputs/streaming_couping_v6_camera_overfit/v6_cross_clip_summary.csv
 
 完整训练、held-out 和输入依赖消融保留在同目录的 `v6_summary.csv`。
 
+同一命令还打印七行 `v6_frame_diagnostics.csv`：
+
+```text
+split, frame, usable_instances, geometry_confidence,
+camera_rotation_delta, instance_rotation_delta,
+camera_center_delta, instance_center_delta
+```
+
+delta 均为“对应分支误差减 raw 误差”，因此负数表示改善。`usable_instances` 是 persistent
+encoder 在该帧实际可读的实例 token 数，`geometry_confidence` 是这些 token 的当前平均几何
+置信度。GT 只用于事后计算四个 delta；它们不会进入模型或门控。该表用于判断退化是否和
+低几何支持共同出现，不用于针对某一帧挑模型、调阈值或改变最终预测。
+
 `model_overfit_pass=1` 表示对应独立模型的 loss 下降、旋转、平移和参考帧精确性同时达到
 阈值；`fusion_instance_used=1` 与 `fusion_camera_used=1` 分别表示 fusion checkpoint 的输入
 消融支持两种 token 确实参与预测。三套模型都能拟合仍只说明容量；跨 clip 的固定 checkpoint

@@ -48,6 +48,8 @@ outputs/streaming_couping_v6_camera_overfit/v6_cross_clip_summary.csv
 ```
 
 全部训练与依赖消融仍保存在同目录的 `v6_summary.csv`。
+命令还会打印 `v6_frame_diagnostics.csv`：七行 held-out/cross-clip 机制诊断，delta 相对 raw，
+负数表示改善。该表只关联推理时可见的实例支持与事后 GT 误差，不用于逐帧选模型或调阈值。
 
 V4/V5 两条命令优先迁移已有 checkpoint；V6 每次从相同 seed 重新训练三种结构。它们共用
 冻结 feature cache，但 checkpoint、评估和最终导出目录完全分开。

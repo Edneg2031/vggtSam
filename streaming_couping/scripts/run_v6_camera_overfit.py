@@ -346,6 +346,30 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
             float(cross_decoupled_metrics["cameraR_instanceC"]["loss"]),
         )
     )
+    frame_diagnostic_rows = _frame_diagnostic_rows(
+        split="temporal_holdout",
+        frame_indices=full_payload["frame_indices"],
+        evaluation_indices=heldout_indices,
+        batch=full_batch,
+        baseline_w2c=full_baseline_w2c,
+        target_w2c=full_target_w2c,
+        camera_output=heldout_outputs["camera_only"],
+        instance_output=heldout_outputs["instance_only"],
+        instance_model=trained["instance_only"]["model"],
+    )
+    frame_diagnostic_rows.extend(
+        _frame_diagnostic_rows(
+            split="cross_clip",
+            frame_indices=test_payload["frame_indices"],
+            evaluation_indices=test_indices,
+            batch=test_batch,
+            baseline_w2c=test_baseline_w2c,
+            target_w2c=test_target_w2c,
+            camera_output=cross_outputs["camera_only"],
+            instance_output=cross_outputs["instance_only"],
+            instance_model=trained["instance_only"]["model"],
+        )
+    )
     normal = evaluations["normal"]
     instance_used = int(
         float(normal["loss"])
@@ -547,6 +571,8 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
             for row in cross_rows
         ],
     )
+    frame_summary_path = output_dir / "v6_frame_diagnostics.csv"
+    _write_csv(frame_summary_path, frame_diagnostic_rows)
     with (output_dir / "v6_run.json").open("w", encoding="utf8") as handle:
         json.dump(
             {
@@ -568,6 +594,7 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
                 "heldout_fusion_best": bool(heldout_fusion_best),
                 "cross_clip": test_clip.name,
                 "cross_clip_decoupled_best": bool(cross_clip_decoupled_best),
+                "frame_diagnostics": str(frame_summary_path),
                 "config": str(config.source_path),
                 "cache": str(path),
                 "test_cache": str(test_path),
@@ -629,6 +656,7 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         )
     print(f"cross_clip_decoupled_best={cross_clip_decoupled_best}")
     print(f"cross_summary={cross_summary_path}")
+    print(f"frame_diagnostics={frame_summary_path}")
     print(f"full_summary={summary_path}")
     return summary_path
 
@@ -929,6 +957,105 @@ def _compose_decoupled_output(
             & center_output["active_frames"]
         ),
     }
+
+
+def _frame_diagnostic_rows(
+    *,
+    split: str,
+    frame_indices: list[int] | tuple[int, ...],
+    evaluation_indices: list[int],
+    batch: dict[str, torch.Tensor],
+    baseline_w2c: torch.Tensor,
+    target_w2c: torch.Tensor,
+    camera_output: dict[str, torch.Tensor],
+    instance_output: dict[str, torch.Tensor],
+    instance_model: V6CameraFusion,
+) -> list[dict[str, object]]:
+    """Relate per-frame error changes to inference-time instance support."""
+
+    if baseline_w2c.shape[0] != 1:
+        raise ValueError("V6 frame diagnostics require a batch size of one.")
+    sequence = baseline_w2c.shape[1]
+    if len(frame_indices) != sequence:
+        raise ValueError("V6 frame diagnostics frame/pose lengths disagree.")
+    with torch.no_grad():
+        _, usable, _ = instance_model.instance_encoder(
+            appearance=batch["appearance"],
+            geometry=batch["pose_geometry"],
+            quality=batch["quality"],
+            observed=batch["observed"],
+            identity_valid=batch["identity_valid"],
+            identity_unknown=batch["identity_unknown"],
+        )
+    raw_rotation, raw_center = _pose_errors_per_frame(
+        baseline_w2c,
+        target_w2c,
+    )
+    camera_rotation, camera_center = _pose_errors_per_frame(
+        camera_output["world_to_camera"],
+        target_w2c,
+    )
+    instance_rotation, instance_center = _pose_errors_per_frame(
+        instance_output["world_to_camera"],
+        target_w2c,
+    )
+    geometry = batch["quality"][..., 1]
+    rows = []
+    for index in evaluation_indices:
+        index = int(index)
+        if index < 0 or index >= sequence:
+            raise ValueError("V6 frame diagnostic index is outside the sequence.")
+        current_usable = usable[0, index]
+        usable_count = int(current_usable.sum().cpu())
+        geometry_confidence = (
+            float(geometry[0, index][current_usable].mean().cpu())
+            if usable_count
+            else 0.0
+        )
+        rows.append(
+            {
+                "split": split,
+                "frame": int(frame_indices[index]),
+                "usable_instances": usable_count,
+                "geometry_confidence": _short(geometry_confidence),
+                "camera_rotation_delta": _short(
+                    float((camera_rotation[0, index] - raw_rotation[0, index]).cpu())
+                ),
+                "instance_rotation_delta": _short(
+                    float(
+                        (instance_rotation[0, index] - raw_rotation[0, index]).cpu()
+                    )
+                ),
+                "camera_center_delta": _short(
+                    float((camera_center[0, index] - raw_center[0, index]).cpu())
+                ),
+                "instance_center_delta": _short(
+                    float((instance_center[0, index] - raw_center[0, index]).cpu())
+                ),
+            }
+        )
+    return rows
+
+
+def _pose_errors_per_frame(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if predicted.shape != target.shape or predicted.shape[-2:] != (3, 4):
+        raise ValueError("V6 per-frame pose tensors must share shape [B,S,3,4].")
+    relative = (
+        predicted[..., :3, :3]
+        @ target[..., :3, :3].transpose(-1, -2)
+    )
+    cosine = (
+        torch.diagonal(relative, dim1=-2, dim2=-1).sum(dim=-1) - 1.0
+    ) * 0.5
+    rotation = torch.rad2deg(torch.acos(cosine.clamp(-1.0, 1.0)))
+    center = torch.linalg.vector_norm(
+        _camera_centers(predicted) - _camera_centers(target),
+        dim=-1,
+    )
+    return rotation, center
 
 
 def _capacity_pass(

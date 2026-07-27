@@ -5,6 +5,7 @@ import torch
 from streaming_couping.scripts.run_v6_camera_overfit import (
     _camera_centers,
     _compose_decoupled_output,
+    _frame_diagnostic_rows,
     _pose_metrics,
     load_v6_config,
 )
@@ -225,6 +226,34 @@ def test_decoupled_pose_uses_requested_rotation_and_camera_center() -> None:
     )
 
 
+def test_frame_diagnostics_report_support_and_error_deltas() -> None:
+    inputs = _inputs()
+    baseline = inputs["baseline_world_to_camera"].clone()
+    baseline[..., :3, 3] = 0.0
+    target = baseline.clone()
+    camera_pose = baseline.clone()
+    instance_pose = baseline.clone()
+    camera_pose[:, 1:, 0, 3] = -1.0
+    instance_pose[:, 1:, 0, 3] = -2.0
+    rows = _frame_diagnostic_rows(
+        split="test",
+        frame_indices=[10, 20, 30],
+        evaluation_indices=[1, 2],
+        batch=inputs,
+        baseline_w2c=baseline,
+        target_w2c=target,
+        camera_output={"world_to_camera": camera_pose},
+        instance_output={"world_to_camera": instance_pose},
+        instance_model=_model(),
+    )
+
+    assert [row["frame"] for row in rows] == [20, 30]
+    assert [row["usable_instances"] for row in rows] == [2, 2]
+    assert [row["geometry_confidence"] for row in rows] == ["1", "1"]
+    assert [row["camera_center_delta"] for row in rows] == ["1", "1"]
+    assert [row["instance_center_delta"] for row in rows] == ["2", "2"]
+
+
 def test_same_checkpoint_ablations_change_only_requested_inputs() -> None:
     inputs = _inputs()
     off = perturb_instance_inputs(inputs, "instance_off")
@@ -254,6 +283,7 @@ def test_v6_command_and_config_are_retained() -> None:
     config = (root / "streaming_couping/configs/v6_camera_overfit.yaml").read_text()
     assert "run_v6_camera_overfit" in command
     assert "v6_cross_clip_summary.csv" in command
+    assert "v6_frame_diagnostics.csv" in command
     assert "00a231a370_90_240_37_68_54" in config
     assert "steps: 1200" in config
 
