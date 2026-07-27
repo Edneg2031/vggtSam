@@ -335,7 +335,7 @@ geometry_only      appearance 置零
 zsh streaming_couping/commands_v6_camera_overfit.txt
 ```
 
-最终只需复制六行短表：
+最终只需复制短表：
 
 ```text
 outputs/streaming_couping_v6_camera_overfit/v6_cross_clip_summary.csv
@@ -348,13 +348,44 @@ outputs/streaming_couping_v6_camera_overfit/v6_cross_clip_summary.csv
 ```text
 split, frame, usable_instances, geometry_confidence,
 camera_rotation_delta, instance_rotation_delta,
-camera_center_delta, instance_center_delta
+camera_center_delta, instance_center_delta,
+specialized_rotation_delta, specialized_center_delta
 ```
 
 delta 均为“对应分支误差减 raw 误差”，因此负数表示改善。`usable_instances` 是 persistent
 encoder 在该帧实际可读的实例 token 数，`geometry_confidence` 是这些 token 的当前平均几何
-置信度。GT 只用于事后计算四个 delta；它们不会进入模型或门控。该表用于判断退化是否和
+置信度。GT 只用于事后计算这些 delta；它们不会进入模型或门控。该表用于判断退化是否和
 低几何支持共同出现，不用于针对某一帧挑模型、调阈值或改变最终预测。
+
+### 8.1 V6.2：专门化 rotation/center head
+
+V6.1 的逐帧诊断给出了跨两段序列更稳定的结构规律：camera rotation 在全部七个评估帧改善，
+instance rotation 只在三帧改善；camera 与 instance center 则都在全部七帧改善，instance
+center 的平均改善更大。退化与当前 geometry confidence 不单调，因此 V6.2 不增加针对某帧的
+geometry threshold，而是限制分支职责：
+
+```text
+frozen camera token → camera-only merger → 3DoF SO(3) head → R
+frozen persistent instance token → instance-only merger → 3DoF center head → C
+t = -R @ C，W2C = [R | t]
+```
+
+rotation head 只优化旋转损失并逐帧保持 baseline camera center；center head 只优化相机中心
+损失并逐帧保持 baseline rotation。最终组合参考帧逐位复制 raw，两条路径都不可能越权修改
+另一分量。这与把两个联合 6DoF checkpoint 事后拼接不同：V6.2 从训练目标、head 输出维度到
+最终重建都执行相同的可辨识性约束。
+
+命令仍保留原来的三个 6DoF 模型和 V6.1 两种拼接作为公平对照，并额外保存：
+
+```text
+v6_checkpoint_specialized_camera_rotation.pt
+v6_checkpoint_specialized_instance_center.pt
+cross_clip_specialized_cameraR_instanceC
+```
+
+第二段 `492...589` 的逐帧 GT 已参与形成 V6.2 假设，所以新 specialized 行只能检查实现与
+development-set 行为，不能作为新的 held-out 证明。必须在不再改变结构和超参数的前提下，
+用第三段序列验证后才能判断该共同规律是否成立。
 
 `model_overfit_pass=1` 表示对应独立模型的 loss 下降、旋转、平移和参考帧精确性同时达到
 阈值；`fusion_instance_used=1` 与 `fusion_camera_used=1` 分别表示 fusion checkpoint 的输入

@@ -1,7 +1,6 @@
-# V6 independently trains camera-only, instance-only and fusion models, then
-# runs same-checkpoint input-dependency ablations on the fusion model.  The
-# locked rotation/center combinations are then evaluated on test_clip_name
-# without retraining.
+# V6 trains three full-SE(3) controls plus dedicated camera-rotation and
+# instance-center models.  All fixed checkpoints are evaluated on
+# test_clip_name without retraining.
 # It intentionally uses GT pose only as a training target. It does not train
 # pointmaps and does not call the analytic ray-pose solver.
 base_config: streaming_couping/configs/v4_coverage_first.yaml

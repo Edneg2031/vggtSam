@@ -12,8 +12,8 @@ V5 adaptive-best
   安全对照：按无 GT ray support 选择 raw/learned pointmap
 
 V6 camera overfit
-  Feature Merger + SE(3) correction head
-  分别训练 camera-only / instance-only / fusion，再验证解耦 R/C 组合
+  三个完整 SE(3) 对照 + 两个专门化 3DoF head
+  camera rotation + persistent-instance camera center
 ```
 
 ## 运行
@@ -37,11 +37,12 @@ zsh streaming_couping/commands_v6_camera_overfit.txt
 ```
 
 V6 复用冻结 cache，不训练 SAM3/StreamVGGT，不训练 pointmap，也不运行 ray solver。
-一次命令会用相同 seed 和步数分别训练 `camera_only、instance_only、fusion` 三套模型，再用
+一次命令会用相同 seed 和步数训练 `camera_only、instance_only、fusion` 三套 6DoF 对照，再用
 fusion checkpoint 评估 `instance_off、camera_off、shuffle_time、wrong_geometry、
-appearance_only、geometry_only`。三个固定 checkpoint 先测试未参与训练的 `210 240`；根据这两帧
-锁定“instance-only 提供旋转、camera-only 提供相机中心”，再用同一 checkpoint 测试完全未参与
-设计的 `492 512 520 545 561 589`，不重新训练、不运行 solver。只需复制短表：
+appearance_only、geometry_only`。V6.2 另外训练 camera-only rotation head 和 instance-only
+camera-center head，二者都只有 3DoF 输出权限，再合法重建 W2C。所有 checkpoint 测试
+`210 240` 和 `492 512 520 545 561 589` 时均不重新训练、不运行 solver。第二段已参与 V6.2
+设计，只能作为 development evidence；最终结论需要第三段预先锁定的序列。只需复制短表：
 
 ```text
 outputs/streaming_couping_v6_camera_overfit/v6_cross_clip_summary.csv
@@ -51,7 +52,7 @@ outputs/streaming_couping_v6_camera_overfit/v6_cross_clip_summary.csv
 命令还会打印 `v6_frame_diagnostics.csv`：七行 held-out/cross-clip 机制诊断，delta 相对 raw，
 负数表示改善。该表只关联推理时可见的实例支持与事后 GT 误差，不用于逐帧选模型或调阈值。
 
-V4/V5 两条命令优先迁移已有 checkpoint；V6 每次从相同 seed 重新训练三种结构。它们共用
+V4/V5 两条命令优先迁移已有 checkpoint；V6 每次从相同 seed 重新训练五个模型。它们共用
 冻结 feature cache，但 checkpoint、评估和最终导出目录完全分开。
 
 ## 保留的入口

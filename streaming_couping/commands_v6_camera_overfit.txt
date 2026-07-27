@@ -20,7 +20,7 @@ else
     --training-device cuda:1
 fi
 
-# Always retrain all three models from seed 0 and overwrite their V6 results.
+# Always retrain three 6DoF controls plus two specialized 3DoF models.
 export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 

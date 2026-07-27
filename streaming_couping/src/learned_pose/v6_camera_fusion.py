@@ -23,6 +23,7 @@ V6_VARIANTS = (
     "geometry_only",
 )
 V6_TRAINING_MODES = ("camera_only", "instance_only", "fusion")
+V6_HEAD_COMPONENTS = ("se3", "rotation", "center")
 
 
 @dataclass(frozen=True)
@@ -189,7 +190,7 @@ class PersistentInstanceEncoder(nn.Module):
 
 
 class V6CameraFusion(nn.Module):
-    """Feature merger followed by a bounded six-DoF correction head."""
+    """Feature merger followed by a bounded pose-component head."""
 
     def __init__(
         self,
@@ -198,11 +199,15 @@ class V6CameraFusion(nn.Module):
         appearance_dim: int,
         geometry_dim: int,
         config: V6FusionConfig,
+        head_component: str = "se3",
     ) -> None:
         super().__init__()
         if config.hidden_dim % config.num_heads:
             raise ValueError("hidden_dim must be divisible by num_heads.")
+        if head_component not in V6_HEAD_COMPONENTS:
+            raise ValueError(f"Unknown V6 head component: {head_component!r}.")
         self.config = config
+        self.head_component = head_component
         self.instance_encoder = PersistentInstanceEncoder(
             appearance_dim=appearance_dim,
             geometry_dim=geometry_dim,
@@ -237,7 +242,10 @@ class V6CameraFusion(nn.Module):
         self.se3_head = nn.Sequential(
             nn.Linear(config.hidden_dim, config.hidden_dim),
             nn.GELU(),
-            nn.Linear(config.hidden_dim, 6),
+            nn.Linear(
+                config.hidden_dim,
+                6 if head_component == "se3" else 3,
+            ),
         )
         nn.init.zeros_(self.se3_head[-1].weight)
         nn.init.zeros_(self.se3_head[-1].bias)
@@ -310,19 +318,60 @@ class V6CameraFusion(nn.Module):
             )
         )
         raw_delta = self.se3_head(merged)
-        omega = torch.tanh(raw_delta[..., :3]) * torch.deg2rad(
-            raw_delta.new_tensor(float(self.config.max_rotation_degrees))
-        )
-        rho = torch.tanh(raw_delta[..., 3:]) * float(
-            self.config.max_translation_native
-        )
         update_mask = active.clone()
         update_mask[:, int(reference_index)] = False
-        omega = torch.where(update_mask[..., None], omega, torch.zeros_like(omega))
-        rho = torch.where(update_mask[..., None], rho, torch.zeros_like(rho))
-        correction = se3_exp(torch.cat([omega, rho], dim=-1))
         baseline_h = homogeneous_world_to_camera(baseline_world_to_camera)
-        composed = correction @ baseline_h
+        if self.head_component == "se3":
+            omega = torch.tanh(raw_delta[..., :3]) * torch.deg2rad(
+                raw_delta.new_tensor(float(self.config.max_rotation_degrees))
+            )
+            rho = torch.tanh(raw_delta[..., 3:]) * float(
+                self.config.max_translation_native
+            )
+            omega = torch.where(
+                update_mask[..., None], omega, torch.zeros_like(omega)
+            )
+            rho = torch.where(
+                update_mask[..., None], rho, torch.zeros_like(rho)
+            )
+            correction = se3_exp(torch.cat([omega, rho], dim=-1))
+            composed = correction @ baseline_h
+            center_delta = torch.zeros_like(rho)
+        elif self.head_component == "rotation":
+            omega = torch.tanh(raw_delta) * torch.deg2rad(
+                raw_delta.new_tensor(float(self.config.max_rotation_degrees))
+            )
+            omega = torch.where(
+                update_mask[..., None], omega, torch.zeros_like(omega)
+            )
+            rho = torch.zeros_like(omega)
+            center_delta = torch.zeros_like(omega)
+            rotation_correction = torch.eye(
+                4,
+                dtype=omega.dtype,
+                device=omega.device,
+            ).expand(omega.shape[:-1] + (4, 4)).clone()
+            rotation_correction[..., :3, :3] = so3_exp(omega)
+            composed = rotation_correction @ baseline_h
+        else:
+            center_delta = torch.tanh(raw_delta) * float(
+                self.config.max_translation_native
+            )
+            center_delta = torch.where(
+                update_mask[..., None],
+                center_delta,
+                torch.zeros_like(center_delta),
+            )
+            omega = torch.zeros_like(center_delta)
+            rho = torch.zeros_like(center_delta)
+            rotation = baseline_world_to_camera[..., :3, :3]
+            translation = (
+                baseline_world_to_camera[..., :3, 3:]
+                - rotation @ center_delta[..., None]
+            )
+            composed = homogeneous_world_to_camera(
+                torch.cat([rotation, translation], dim=-1)
+            )
         # Preserve inactive and reference frames bit-for-bit.
         final_h = torch.where(
             update_mask[..., None, None],
@@ -332,6 +381,7 @@ class V6CameraFusion(nn.Module):
         return {
             "world_to_camera": final_h[..., :3, :4],
             "twist": torch.cat([omega, rho], dim=-1),
+            "center_delta": center_delta,
             "active_frames": update_mask,
             "fused_camera": merged,
         }
@@ -371,8 +421,6 @@ class V6CameraFusion(nn.Module):
             )
             output.index_copy_(0, indices, attended)
         return output.reshape(batch, sequence, hidden), active.reshape(batch, sequence)
-
-
 def perturb_instance_inputs(batch: dict[str, torch.Tensor], variant: str) -> dict[str, torch.Tensor]:
     """Return one deterministic same-checkpoint V6 ablation input."""
 

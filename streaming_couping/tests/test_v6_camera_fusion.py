@@ -37,7 +37,7 @@ def _inputs() -> dict[str, torch.Tensor]:
     }
 
 
-def _model() -> V6CameraFusion:
+def _model(*, head_component: str = "se3") -> V6CameraFusion:
     return V6CameraFusion(
         camera_dim=8,
         appearance_dim=4,
@@ -48,6 +48,7 @@ def _model() -> V6CameraFusion:
             max_rotation_degrees=10.0,
             max_translation_native=0.25,
         ),
+        head_component=head_component,
     )
 
 
@@ -91,6 +92,48 @@ def test_v6_zero_initialization_and_reference_are_exact() -> None:
     assert torch.equal(output["twist"][:, 0], torch.zeros(1, 6))
     assert not bool(output["active_frames"][:, 0].any())
     assert bool(output["active_frames"][:, 1:].all())
+
+
+def test_specialized_heads_have_only_their_declared_pose_authority() -> None:
+    inputs = _inputs()
+    baseline = inputs["baseline_world_to_camera"]
+
+    for component, mode in (
+        ("rotation", "camera_only"),
+        ("center", "instance_only"),
+    ):
+        zero_output = _forward(
+            _model(head_component=component),
+            inputs,
+            mode=mode,
+        )
+        assert torch.equal(zero_output["world_to_camera"], baseline)
+
+    rotation_model = _model(head_component="rotation")
+    rotation_model.se3_head[-1].bias.data[0] = 0.5
+    rotation_output = _forward(rotation_model, inputs, mode="camera_only")
+    assert torch.equal(rotation_output["world_to_camera"][:, 0], baseline[:, 0])
+    assert torch.allclose(
+        _camera_centers(rotation_output["world_to_camera"][:, 1:]),
+        _camera_centers(baseline[:, 1:]),
+    )
+    assert not torch.equal(
+        rotation_output["world_to_camera"][:, 1:, :3, :3],
+        baseline[:, 1:, :3, :3],
+    )
+
+    center_model = _model(head_component="center")
+    center_model.se3_head[-1].bias.data[0] = 0.5
+    center_output = _forward(center_model, inputs, mode="instance_only")
+    assert torch.equal(center_output["world_to_camera"][:, 0], baseline[:, 0])
+    assert torch.equal(
+        center_output["world_to_camera"][:, 1:, :3, :3],
+        baseline[:, 1:, :3, :3],
+    )
+    assert not torch.allclose(
+        _camera_centers(center_output["world_to_camera"][:, 1:]),
+        _camera_centers(baseline[:, 1:]),
+    )
 
 
 def test_v6_gradients_reach_merger_and_instance_encoder() -> None:
@@ -244,6 +287,7 @@ def test_frame_diagnostics_report_support_and_error_deltas() -> None:
         target_w2c=target,
         camera_output={"world_to_camera": camera_pose},
         instance_output={"world_to_camera": instance_pose},
+        specialized_output={"world_to_camera": camera_pose},
         instance_model=_model(),
     )
 
@@ -252,6 +296,7 @@ def test_frame_diagnostics_report_support_and_error_deltas() -> None:
     assert [row["geometry_confidence"] for row in rows] == ["1", "1"]
     assert [row["camera_center_delta"] for row in rows] == ["1", "1"]
     assert [row["instance_center_delta"] for row in rows] == ["2", "2"]
+    assert [row["specialized_center_delta"] for row in rows] == ["1", "1"]
 
 
 def test_same_checkpoint_ablations_change_only_requested_inputs() -> None:

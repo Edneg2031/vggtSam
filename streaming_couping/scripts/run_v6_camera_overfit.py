@@ -202,6 +202,71 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
             training_result=training_result,
         )
 
+    specialized = {}
+    for name, mode, head_component in (
+        ("camera_rotation", "camera_only", "rotation"),
+        ("instance_center", "instance_only", "center"),
+    ):
+        _seed_everything(config.training.seed)
+        model = _new_model(
+            batch,
+            config,
+            head_component=head_component,
+        )
+        training_result = _train_model(
+            model,
+            mode=mode,
+            objective=head_component,
+            batch=batch,
+            baseline_w2c=baseline_w2c,
+            target_w2c=target_w2c,
+            reference_index=reference_index,
+            config=config,
+        )
+        specialized[name] = {
+            "model": model,
+            "mode": mode,
+            **training_result,
+        }
+        _save_checkpoint(
+            output_dir / f"v6_checkpoint_specialized_{name}.pt",
+            model=model,
+            mode=mode,
+            batch=batch,
+            payload=payload,
+            reference_index=reference_index,
+            config=config,
+            training_result=training_result,
+        )
+
+    specialized_train_output = _compose_decoupled_output(
+        _predict_model(
+            specialized["camera_rotation"]["model"],
+            mode="camera_only",
+            variant="normal",
+            batch=batch,
+            baseline_w2c=baseline_w2c,
+            reference_index=reference_index,
+        ),
+        _predict_model(
+            specialized["instance_center"]["model"],
+            mode="instance_only",
+            variant="normal",
+            batch=batch,
+            baseline_w2c=baseline_w2c,
+            reference_index=reference_index,
+        ),
+        baseline_w2c=baseline_w2c,
+        reference_index=reference_index,
+    )
+    specialized_train_metrics = _prediction_metrics(
+        specialized_train_output,
+        baseline_w2c=baseline_w2c,
+        target_w2c=target_w2c,
+        reference_index=reference_index,
+        translation_weight=config.training.translation_weight,
+    )
+
     fusion_model = trained["fusion"]["model"]
     evaluations = {
         variant: _evaluate_model(
@@ -248,6 +313,26 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
             reference_index=int(full_payload["reference_sequence_index"]),
         ),
     }
+    heldout_specialized_output = _compose_decoupled_output(
+        _predict_model(
+            specialized["camera_rotation"]["model"],
+            mode="camera_only",
+            variant="normal",
+            batch=full_batch,
+            baseline_w2c=full_baseline_w2c,
+            reference_index=int(full_payload["reference_sequence_index"]),
+        ),
+        _predict_model(
+            specialized["instance_center"]["model"],
+            mode="instance_only",
+            variant="normal",
+            batch=full_batch,
+            baseline_w2c=full_baseline_w2c,
+            reference_index=int(full_payload["reference_sequence_index"]),
+        ),
+        baseline_w2c=full_baseline_w2c,
+        reference_index=int(full_payload["reference_sequence_index"]),
+    )
     heldout = {
         mode: _prediction_metrics(
             output,
@@ -270,6 +355,14 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         )
         for name, output in heldout_decoupled.items()
     }
+    heldout_specialized_metrics = _prediction_metrics(
+        heldout_specialized_output,
+        baseline_w2c=full_baseline_w2c,
+        target_w2c=full_target_w2c,
+        reference_index=int(full_payload["reference_sequence_index"]),
+        translation_weight=config.training.translation_weight,
+        evaluation_indices=heldout_indices,
+    )
     heldout_fusion_best = int(
         float(heldout["fusion"]["loss"])
         < min(
@@ -316,6 +409,26 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
             reference_index=test_reference_index,
         ),
     }
+    cross_specialized_output = _compose_decoupled_output(
+        _predict_model(
+            specialized["camera_rotation"]["model"],
+            mode="camera_only",
+            variant="normal",
+            batch=test_batch,
+            baseline_w2c=test_baseline_w2c,
+            reference_index=test_reference_index,
+        ),
+        _predict_model(
+            specialized["instance_center"]["model"],
+            mode="instance_only",
+            variant="normal",
+            batch=test_batch,
+            baseline_w2c=test_baseline_w2c,
+            reference_index=test_reference_index,
+        ),
+        baseline_w2c=test_baseline_w2c,
+        reference_index=test_reference_index,
+    )
     cross_metrics = {
         mode: _prediction_metrics(
             output,
@@ -338,12 +451,31 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         )
         for name, output in cross_decoupled.items()
     }
+    cross_specialized_metrics = _prediction_metrics(
+        cross_specialized_output,
+        baseline_w2c=test_baseline_w2c,
+        target_w2c=test_target_w2c,
+        reference_index=test_reference_index,
+        translation_weight=config.training.translation_weight,
+        evaluation_indices=test_indices,
+    )
     cross_clip_decoupled_best = int(
         float(cross_decoupled_metrics["instanceR_cameraC"]["loss"])
         < min(
             float(cross_raw["loss"]),
             *(float(metrics["loss"]) for metrics in cross_metrics.values()),
             float(cross_decoupled_metrics["cameraR_instanceC"]["loss"]),
+        )
+    )
+    cross_clip_specialized_best = int(
+        float(cross_specialized_metrics["loss"])
+        < min(
+            float(cross_raw["loss"]),
+            *(float(metrics["loss"]) for metrics in cross_metrics.values()),
+            *(
+                float(metrics["loss"])
+                for metrics in cross_decoupled_metrics.values()
+            ),
         )
     )
     frame_diagnostic_rows = _frame_diagnostic_rows(
@@ -355,6 +487,7 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         target_w2c=full_target_w2c,
         camera_output=heldout_outputs["camera_only"],
         instance_output=heldout_outputs["instance_only"],
+        specialized_output=heldout_specialized_output,
         instance_model=trained["instance_only"]["model"],
     )
     frame_diagnostic_rows.extend(
@@ -367,6 +500,7 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
             target_w2c=test_target_w2c,
             camera_output=cross_outputs["camera_only"],
             instance_output=cross_outputs["instance_only"],
+            specialized_output=cross_specialized_output,
             instance_model=trained["instance_only"]["model"],
         )
     )
@@ -421,6 +555,32 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
                 heldout_fusion_best=heldout_fusion_best,
             )
         )
+    specialized_capacity_pass = int(
+        all(
+            _loss_drop(
+                float(specialized[name]["initial_loss"]),
+                float(specialized[name]["best_logged_loss"]),
+            )
+            >= config.success.minimum_loss_drop_percent
+            for name in ("camera_rotation", "instance_center")
+        )
+        and int(specialized_train_metrics["reference_exact"]) == 1
+    )
+    rows.append(
+        _summary_row(
+            experiment="specialized_capacity",
+            variant="trained_specialized_cameraR_instanceC",
+            trained_mode="camera_rotation+instance_center",
+            test_input="normal",
+            frames=frames,
+            metrics=specialized_train_metrics,
+            initial_loss=initial_loss,
+            capacity_pass=specialized_capacity_pass,
+            instance_used=instance_used,
+            camera_used=camera_used,
+            heldout_fusion_best=heldout_fusion_best,
+        )
+    )
     for name, metrics in heldout_decoupled_metrics.items():
         rows.append(
             _summary_row(
@@ -440,6 +600,21 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
                 heldout_fusion_best=heldout_fusion_best,
             )
         )
+    rows.append(
+        _summary_row(
+            experiment="heldout_specialized",
+            variant="heldout_specialized_cameraR_instanceC",
+            trained_mode="camera_rotation+instance_center",
+            test_input="normal",
+            frames=heldout_frame_text,
+            metrics=heldout_specialized_metrics,
+            initial_loss=float(heldout_raw["loss"]),
+            capacity_pass=specialized_capacity_pass,
+            instance_used=instance_used,
+            camera_used=camera_used,
+            heldout_fusion_best=heldout_fusion_best,
+        )
+    )
     rows.append(
         _summary_row(
             experiment="cross_clip",
@@ -492,6 +667,21 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         )
     rows.append(
         _summary_row(
+            experiment="cross_clip_specialized",
+            variant="cross_clip_specialized_cameraR_instanceC",
+            trained_mode="camera_rotation+instance_center",
+            test_input="normal",
+            frames=test_frame_text,
+            metrics=cross_specialized_metrics,
+            initial_loss=float(cross_raw["loss"]),
+            capacity_pass=specialized_capacity_pass,
+            instance_used=instance_used,
+            camera_used=camera_used,
+            heldout_fusion_best=heldout_fusion_best,
+        )
+    )
+    rows.append(
+        _summary_row(
             experiment="heldout",
             variant="heldout_raw",
             trained_mode="none",
@@ -542,15 +732,19 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
     experiment_order = {
         "control": 0,
         "capacity": 1,
-        "heldout": 2,
-        "heldout_decoupled": 3,
-        "cross_clip": 4,
-        "cross_clip_decoupled": 5,
-        "fusion_dependency": 6,
+        "specialized_capacity": 2,
+        "heldout": 3,
+        "heldout_decoupled": 4,
+        "heldout_specialized": 5,
+        "cross_clip": 6,
+        "cross_clip_decoupled": 7,
+        "cross_clip_specialized": 8,
+        "fusion_dependency": 9,
     }
     rows.sort(key=lambda row: experiment_order[str(row["experiment"])])
     for row in rows:
         row["cross_clip_decoupled_best"] = cross_clip_decoupled_best
+        row["cross_clip_specialized_best"] = cross_clip_specialized_best
     _write_csv(summary_path, rows)
     cross_summary_path = output_dir / "v6_cross_clip_summary.csv"
     cross_rows = [
@@ -567,6 +761,7 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
                 "loss": row["loss"],
                 "better_than_raw": row["better_than_split_raw"],
                 "decoupled_best": cross_clip_decoupled_best,
+                "specialized_best": cross_clip_specialized_best,
             }
             for row in cross_rows
         ],
@@ -577,13 +772,17 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         json.dump(
             {
                 "purpose": (
-                    "fair three-model capacity, fusion dependency, "
-                    "fixed-checkpoint temporal holdout, and locked "
-                    "rotation/center cross-clip validation"
+                    "three full-SE3 controls, two specialized 3DoF heads, "
+                    "fusion dependency, and fixed-checkpoint development "
+                    "evaluation"
                 ),
                 "uses_gt_during_training": True,
                 "runs_pointmap_branch": False,
                 "runs_analytic_pose_solver": False,
+                "specialized_components": {
+                    "rotation": "camera_only",
+                    "center": "instance_only",
+                },
                 "capacity_pass": {
                     mode: bool(trained[mode]["capacity_pass"])
                     for mode in V6_TRAINING_MODES
@@ -593,7 +792,11 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
                 "heldout_frames": list(heldout_frames),
                 "heldout_fusion_best": bool(heldout_fusion_best),
                 "cross_clip": test_clip.name,
+                "cross_clip_role": "development_after_component_analysis",
                 "cross_clip_decoupled_best": bool(cross_clip_decoupled_best),
+                "cross_clip_specialized_best": bool(
+                    cross_clip_specialized_best
+                ),
                 "frame_diagnostics": str(frame_summary_path),
                 "config": str(config.source_path),
                 "cache": str(path),
@@ -634,6 +837,11 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
             f"rot={float(metrics['rotation_degrees']):.4f} deg  "
             f"trans={float(metrics['translation_native']):.6f}"
         )
+    print(
+        "specialized   "
+        f"rot={float(heldout_specialized_metrics['rotation_degrees']):.4f} deg  "
+        f"trans={float(heldout_specialized_metrics['translation_native']):.6f}"
+    )
     print(f"heldout_fusion_best={heldout_fusion_best}")
     print(f"CROSS-CLIP {test_frame_text}")
     print(
@@ -654,7 +862,13 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
             f"rot={float(metrics['rotation_degrees']):.4f} deg  "
             f"trans={float(metrics['translation_native']):.6f}"
         )
+    print(
+        "specialized       "
+        f"rot={float(cross_specialized_metrics['rotation_degrees']):.4f} deg  "
+        f"trans={float(cross_specialized_metrics['translation_native']):.6f}"
+    )
     print(f"cross_clip_decoupled_best={cross_clip_decoupled_best}")
+    print(f"cross_clip_specialized_best={cross_clip_specialized_best}")
     print(f"cross_summary={cross_summary_path}")
     print(f"frame_diagnostics={frame_summary_path}")
     print(f"full_summary={summary_path}")
@@ -736,12 +950,15 @@ def _camera_batch(payload: dict, *, device: str) -> dict[str, torch.Tensor]:
 def _new_model(
     batch: dict[str, torch.Tensor],
     config: V6ExperimentConfig,
+    *,
+    head_component: str = "se3",
 ) -> V6CameraFusion:
     return V6CameraFusion(
         camera_dim=int(batch["camera_hidden"].shape[-1]),
         appearance_dim=int(batch["appearance"].shape[-1]),
         geometry_dim=int(batch["pose_geometry"].shape[-1]),
         config=config.fusion,
+        head_component=head_component,
     ).to(config.device)
 
 
@@ -754,23 +971,31 @@ def _train_model(
     target_w2c: torch.Tensor,
     reference_index: int,
     config: V6ExperimentConfig,
+    objective: str = "se3",
 ) -> dict[str, float | int]:
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.training.learning_rate,
         weight_decay=config.training.weight_decay,
     )
-    initial = _evaluate_model(
+    initial_output = _predict_model(
         model,
         mode=mode,
         variant="normal",
         batch=batch,
         baseline_w2c=baseline_w2c,
-        target_w2c=target_w2c,
         reference_index=reference_index,
-        config=config,
     )
-    if int(initial["active_frames"]) == 0:
+    initial_loss = float(
+        _pose_loss(
+            initial_output["world_to_camera"],
+            target_w2c,
+            reference_index=reference_index,
+            translation_weight=config.training.translation_weight,
+            component=objective,
+        ).cpu()
+    )
+    if not bool(initial_output["active_frames"].any()):
         raise RuntimeError(
             f"V6 {mode} found no usable non-reference frame. Check the "
             "persistent-instance cache."
@@ -795,6 +1020,7 @@ def _train_model(
             target_w2c,
             reference_index=reference_index,
             translation_weight=config.training.translation_weight,
+            component=objective,
         )
         if not bool(torch.isfinite(loss)):
             raise RuntimeError(f"Non-finite V6 {mode} loss at step {step}.")
@@ -807,21 +1033,27 @@ def _train_model(
             raise RuntimeError(f"Non-finite V6 {mode} gradient at step {step}.")
         optimizer.step()
         if step % config.training.log_every == 0 or step == config.training.steps:
-            checked = _evaluate_model(
+            checked = _predict_model(
                 model,
                 mode=mode,
                 variant="normal",
                 batch=batch,
                 baseline_w2c=baseline_w2c,
-                target_w2c=target_w2c,
                 reference_index=reference_index,
-                config=config,
             )
-            current = float(checked["loss"])
+            current = float(
+                _pose_loss(
+                    checked["world_to_camera"],
+                    target_w2c,
+                    reference_index=reference_index,
+                    translation_weight=config.training.translation_weight,
+                    component=objective,
+                ).cpu()
+            )
             model.train()
             print(
-                f"V6 {mode:13s} {step:4d}/{config.training.steps}: "
-                f"loss={current:.6g}"
+                f"V6 {mode:13s}/{objective:8s} "
+                f"{step:4d}/{config.training.steps}: loss={current:.6g}"
             )
             if current < best_loss:
                 best_loss = current
@@ -836,7 +1068,7 @@ def _train_model(
     model.eval()
     return {
         "best_step": best_step,
-        "initial_loss": float(initial["loss"]),
+        "initial_loss": initial_loss,
         "best_logged_loss": best_loss,
     }
 
@@ -969,6 +1201,7 @@ def _frame_diagnostic_rows(
     target_w2c: torch.Tensor,
     camera_output: dict[str, torch.Tensor],
     instance_output: dict[str, torch.Tensor],
+    specialized_output: dict[str, torch.Tensor],
     instance_model: V6CameraFusion,
 ) -> list[dict[str, object]]:
     """Relate per-frame error changes to inference-time instance support."""
@@ -997,6 +1230,10 @@ def _frame_diagnostic_rows(
     )
     instance_rotation, instance_center = _pose_errors_per_frame(
         instance_output["world_to_camera"],
+        target_w2c,
+    )
+    specialized_rotation, specialized_center = _pose_errors_per_frame(
+        specialized_output["world_to_camera"],
         target_w2c,
     )
     geometry = batch["quality"][..., 1]
@@ -1031,6 +1268,22 @@ def _frame_diagnostic_rows(
                 ),
                 "instance_center_delta": _short(
                     float((instance_center[0, index] - raw_center[0, index]).cpu())
+                ),
+                "specialized_rotation_delta": _short(
+                    float(
+                        (
+                            specialized_rotation[0, index]
+                            - raw_rotation[0, index]
+                        ).cpu()
+                    )
+                ),
+                "specialized_center_delta": _short(
+                    float(
+                        (
+                            specialized_center[0, index]
+                            - raw_center[0, index]
+                        ).cpu()
+                    )
                 ),
             }
         )
@@ -1092,6 +1345,7 @@ def _save_checkpoint(
                 for name, value in model.state_dict().items()
             },
             "mode": mode,
+            "head_component": model.head_component,
             "fusion": asdict(config.fusion),
             "training": asdict(config.training),
             "camera_dim": int(batch["camera_hidden"].shape[-1]),
@@ -1172,7 +1426,10 @@ def _pose_loss(
     reference_index: int,
     translation_weight: float,
     evaluation_indices: list[int] | None = None,
+    component: str = "se3",
 ) -> torch.Tensor:
+    if component not in ("se3", "rotation", "center"):
+        raise ValueError(f"Unknown V6 pose-loss component: {component!r}.")
     indices = _evaluation_indices(
         predicted.shape[1],
         reference_index=reference_index,
@@ -1189,6 +1446,10 @@ def _pose_loss(
         _camera_centers(target),
         beta=0.01,
     )
+    if component == "rotation":
+        return rotation
+    if component == "center":
+        return float(translation_weight) * translation
     return rotation + float(translation_weight) * translation
 
 
