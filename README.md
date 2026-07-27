@@ -1,121 +1,30 @@
-# vggtSam
+# StreamVGGT + SAM3 instance refinement
 
-Geometry-aware open-vocabulary object tracking experiments built around
-ScanNet++, SAM3 intermediate features, and StreamVGGT latent geometry features.
+This repository contains one project package, `streaming_couping`, with two
+retained methods:
 
-The current mainline is the latent fusion implementation described in:
+- V4 coverage-first: the strongest two-sequence pose result and the main line
+  for future false-association work.
+- V5 adaptive-best: the conservative pose/pointmap method that falls back to
+  the raw pointmap when geometric ray support is insufficient.
 
-```text
-docs/latent_fusion_training_flow.md
-```
-
-## ScanNet++ Pinhole 2D Labels
-
-Generate projected semantic and instance masks for the undistorted/pinhole
-ScanNet++ data. RGB images and COLMAP poses come from the pinhole dataset;
-3D semantic/instance annotations come from the original aligned ScanNet++
-`scans/` files configured by `annotation_root`.
+Initialize the two upstream model repositories once:
 
 ```bash
-PYTHONPATH=src python scripts/prepare_scannetpp_2d.py \
-  --config configs/scannetpp_pinhole_2d.yaml \
-  --scene-ids 00a231a370 \
-  --max-frames 5 \
-  --frame-step 1 \
-  --overwrite \
-  --save-visualizations
+git submodule update --init --recursive
 ```
 
-Output structure:
-
-```text
-data/processed/scannetpp_pinhole_2d/
-  manifest.json
-  <scene_id>/
-    scene_manifest.json
-    semantic_masks/
-    instance_masks/
-    pointmaps/
-    raster/
-    visualizations/
-```
-
-`pointmaps/*.npz` stores COLMAP/mesh-rasterized visible world-space XYZ targets.
-Frames are sampled in COLMAP `images.txt` order, then strided by `frame_step`
-and truncated by `max_frames`.
-
-More details:
-
-```text
-docs/scannetpp_preprocessing.md
-```
-
-## Latent Fusion
-
-Current model direction:
-
-```text
-SAM3 detector FPN-2 + pooled text feature
-  -> semantic query tokens
-
-StreamVGGT aggregator patch tokens + camera tokens
-  -> geometry key/value context
-
-cross-attention fusion
-  -> semantic logits
-  -> pointmap prediction
-  -> cross-frame matching embeddings
-  -> object query masks / centroids / association embeddings
-```
-
-Inspect feature shapes first:
+Run either retained method from the repository root:
 
 ```bash
-PYTHONPATH=src python scripts/inspect_latent_fusion_features.py \
-  --config configs/latent_fusion_train.yaml \
-  --device cuda
+zsh streaming_couping/commands_v4_coverage_first.txt
+zsh streaming_couping/commands_v5_adaptive_best.txt
 ```
 
-Run a small training job:
+The commands use `externals/sam3` and `externals/streamvggt`, while datasets,
+checkpoints, caches, and generated evaluations remain local under `data/` and
+`outputs/`.
 
-```bash
-PYTHONPATH=src python scripts/train_latent_fusion.py \
-  --config configs/latent_fusion_train.yaml \
-  --iterations 20 \
-  --device cuda
-```
-
-The default config is a single-GPU dynamic-prompt experiment:
-
-```text
-sam3.prompt_mode: random_instance
-objects.target_object_labels: []
-objects.excluded_object_labels: [wall, floor, ceiling]
-model.mask_grid: [144, 144]
-```
-
-Each training step samples a valid instance in the clip, uses its metadata class
-name as the SAM3 text prompt, and trains masks/centroids/association for visible
-instances of that class. Set `objects.target_object_labels: [chair]` to reproduce
-the chair-only baseline.
-
-Plot training curves:
-
-```bash
-PYTHONPATH=src python scripts/plot_training_curves.py \
-  --metrics outputs/latent_fusion_debug/training_history.csv \
-  --output outputs/latent_fusion_debug/training_curves.png
-```
-
-## Main Files
-
-```text
-configs/latent_fusion_train.yaml
-scripts/train_latent_fusion.py
-scripts/inspect_latent_fusion_features.py
-src/vggtsam/adapters/sam3_intermediate.py
-src/vggtsam/adapters/streamvggt_latent.py
-src/vggtsam/models/latent_fusion.py
-src/vggtsam/models/fusion.py
-src/vggtsam/training/latent_fusion.py
-```
+See [the package README](streaming_couping/readme.md) for the output layout and
+[the method record](streaming_couping/docs/final_joint_pointcloud_pose_method.md)
+for the retained architecture and metrics.

@@ -1,4 +1,4 @@
-"""Minimal ScanNet++ sequence loader for mask-tracking ablations."""
+"""Minimal ScanNet++ manifest, mask, and pointmap readers."""
 
 from __future__ import annotations
 
@@ -10,9 +10,6 @@ from typing import Any, Iterable, Sequence
 
 import numpy as np
 from PIL import Image
-
-from vggtsam.data.scannetpp.object_sequence import extract_object_labels
-
 
 @dataclass(frozen=True)
 class MaskTrackingSequence:
@@ -193,3 +190,66 @@ def resolve_manifest_path(value: str | Path, manifest_path: Path) -> Path:
 def read_mask(path: Path) -> np.ndarray:
     with Image.open(path) as image:
         return np.asarray(image).copy()
+
+
+def read_pointmap(path: str | Path) -> np.ndarray:
+    payload = np.load(path)
+    if isinstance(payload, np.lib.npyio.NpzFile):
+        try:
+            key = "pointmap" if "pointmap" in payload.files else payload.files[0]
+            pointmap = payload[key]
+        finally:
+            payload.close()
+    else:
+        pointmap = payload
+    pointmap = np.asarray(pointmap, dtype=np.float32)
+    if pointmap.ndim != 3 or pointmap.shape[-1] != 3:
+        raise ValueError(
+            f"Pointmap must have shape [H, W, 3], got {pointmap.shape}: {path}"
+        )
+    return pointmap
+
+
+def extract_object_labels(objects: dict[str, Any]) -> dict[int, str]:
+    labels: dict[int, str] = {}
+    for object_id, metadata in objects.items():
+        try:
+            instance_id = int(object_id)
+        except (TypeError, ValueError):
+            continue
+        label = _find_label_string(metadata)
+        if label:
+            labels[instance_id] = label
+    return labels
+
+
+def _find_label_string(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        preferred = (
+            "label",
+            "label_name",
+            "labelName",
+            "class",
+            "class_name",
+            "className",
+            "category",
+            "category_name",
+            "nyuClass",
+            "rawLabel",
+        )
+        for key in preferred:
+            item = value.get(key)
+            if isinstance(item, str) and item:
+                return item
+        for item in value.values():
+            found = _find_label_string(item)
+            if found:
+                return found
+    if isinstance(value, list):
+        for item in value:
+            found = _find_label_string(item)
+            if found:
+                return found
+    return None

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Optional
 
-from vggtsam.utils.imports import maybe_add_repo_to_path
+from ..external_repos import maybe_add_repo_to_path
 
 
 def _require_package_dir(

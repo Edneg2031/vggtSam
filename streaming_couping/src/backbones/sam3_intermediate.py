@@ -16,8 +16,8 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from vggtsam.models.tokens import SemanticTokens
-from vggtsam.utils.imports import maybe_add_repo_to_path
+from ..external_repos import maybe_add_repo_to_path
+from .tokens import SemanticTokens
 
 
 @dataclass

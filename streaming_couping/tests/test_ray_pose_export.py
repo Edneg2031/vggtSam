@@ -11,7 +11,7 @@ from streaming_couping.src.learned_pose.export import (
     _paired_distance_statistics,
     _world_confidence,
 )
-from vggtsam.utils.imports import maybe_add_repo_to_path
+from streaming_couping.src.external_repos import maybe_add_repo_to_path
 
 
 def test_align_camera_pose_matches_pointmap_similarity() -> None:

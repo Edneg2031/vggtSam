@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from test_sam.coordinates import output_mask_transform, streamvggt_image_transform
-
+from ..coordinates import output_mask_transform, streamvggt_image_transform
 from ..types import RevisitCandidate
 
 

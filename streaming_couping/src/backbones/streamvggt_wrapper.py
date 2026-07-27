@@ -8,7 +8,7 @@ from typing import Sequence
 import torch
 from PIL import Image
 
-from vggtsam.adapters.streamvggt_latent import (
+from .streamvggt_latent import (
     StreamVGGTLatentAdapter,
     load_streamvggt_latent_model,
 )

@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from test_sam.coordinates import streamvggt_image_transform
+from .coordinates import streamvggt_image_transform
 
 
 def load_processed_colors(

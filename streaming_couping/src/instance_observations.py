@@ -16,9 +16,8 @@ from typing import Mapping, Sequence
 import numpy as np
 import torch
 
-from test_sam.data import load_mask_tracking_sequence
-
 from .config import ExperimentConfig
+from .data import load_mask_tracking_sequence
 from .recovery import output_mask_to_stream, resize_target_masks
 from .types import GeometrySequence, TrackingSequence
 

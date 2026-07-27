@@ -8,11 +8,11 @@ from typing import Any, Mapping
 
 import torch
 
-from vggtsam.adapters.sam3_intermediate import (
+from ..backbones.sam3_intermediate import (
     SAM3IntermediateAdapter,
     load_sam3_image_model,
 )
-from vggtsam.adapters.streamvggt_latent import (
+from ..backbones.streamvggt_latent import (
     StreamVGGTLatentAdapter,
     load_streamvggt_latent_model,
 )
@@ -519,7 +519,7 @@ def _processed_intrinsics(
     *,
     image_mode: str,
 ) -> torch.Tensor:
-    from test_sam.coordinates import streamvggt_image_transform
+    from ..coordinates import streamvggt_image_transform
 
     output = intrinsics.clone().double()
     for index, source_size in enumerate(source_sizes):

@@ -9,8 +9,8 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 
-from vggtsam.adapters.vggt import load_streamvggt_model
-from vggtsam.models.tokens import GeometryTokens
+from .tokens import GeometryTokens
+from .vggt_loader import load_streamvggt_model
 
 
 @dataclass

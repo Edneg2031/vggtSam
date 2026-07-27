@@ -11,7 +11,7 @@ from typing import Sequence
 import numpy as np
 import torch
 
-from test_sam.data import resolve_manifest_path
+from .data import resolve_manifest_path
 
 
 @dataclass(frozen=True)

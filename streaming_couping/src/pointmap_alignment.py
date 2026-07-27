@@ -10,11 +10,9 @@ from typing import Sequence
 import numpy as np
 import torch
 
-from test_sam.coordinates import streamvggt_image_transform
-from test_sam.data import resolve_manifest_path
-from vggtsam.data.scannetpp.object_sequence import read_pointmap
-
 from .config import ExperimentConfig
+from .coordinates import streamvggt_image_transform
+from .data import read_pointmap, resolve_manifest_path
 from .types import GeometrySequence
 
 

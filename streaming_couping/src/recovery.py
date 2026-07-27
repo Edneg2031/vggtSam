@@ -6,12 +6,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from test_sam.coordinates import streamvggt_label_to_grid
-
 from .aggregation.mine_revisit_segments import mine_revisit_candidate
 from .aggregation.point_map_fusion import ObjectPointMap, sample_masked_observation
 from .bridge.gating import decide_correction
 from .config import ExperimentConfig
+from .coordinates import streamvggt_label_to_grid
 from .types import GeometrySequence, RevisitCandidate
 
 

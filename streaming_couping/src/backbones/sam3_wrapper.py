@@ -8,7 +8,7 @@ from typing import Sequence
 
 import torch
 
-from vggtsam.adapters.sam3_video import (
+from .sam3_video import (
     SAM3VideoTrackerAdapter,
     collect_frame_objects,
     collect_frame_scores,

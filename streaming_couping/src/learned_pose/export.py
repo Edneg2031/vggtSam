@@ -10,9 +10,8 @@ from typing import Iterable
 import numpy as np
 import torch
 from PIL import Image, ImageDraw
-from vggtsam.utils.imports import maybe_add_repo_to_path
-
 from ..config import load_config
+from ..external_repos import maybe_add_repo_to_path
 from ..instance_point_cloud import (
     _limit_points,
     _write_binary_ply,

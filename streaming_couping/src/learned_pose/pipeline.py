@@ -13,8 +13,7 @@ from typing import Iterable, Mapping
 import numpy as np
 import torch
 
-from vggtsam.adapters.streamvggt_latent import load_streamvggt_latent_model
-
+from ..backbones.streamvggt_latent import load_streamvggt_latent_model
 from ..config import load_config
 from ..pose_evaluation import (
     PoseSequence,

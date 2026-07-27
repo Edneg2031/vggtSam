@@ -11,7 +11,7 @@ from streaming_couping.src.learned_pose.pipeline import (
     _compose_camera_update,
     _so3_exp,
 )
-from vggtsam.utils.imports import maybe_add_repo_to_path
+from streaming_couping.src.external_repos import maybe_add_repo_to_path
 
 
 def _inputs():

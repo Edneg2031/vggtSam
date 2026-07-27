@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 
 from streaming_couping.src.config import load_config
+from streaming_couping.src.external_repos import maybe_add_repo_to_path
 from streaming_couping.src.learned_pose.cache import cache_path, load_feature_cache
 from streaming_couping.src.learned_pose.config import load_learned_pose_config
 from streaming_couping.src.learned_pose.geometry_metrics import (
@@ -29,8 +30,6 @@ from streaming_couping.src.learned_pose.ray_pose import (
     recover_final_ray_pose,
     reference_blend_pose_name,
 )
-from vggtsam.utils.imports import maybe_add_repo_to_path
-
 
 CONTROL_RAW = "raw_control"
 CONTROL_FIXED = "fixed_ref_050_control"
