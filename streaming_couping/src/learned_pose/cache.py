@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping
 
 import torch
@@ -20,6 +21,7 @@ from ..backbones.streamvggt_latent import (
 from ..backbones.sam3_wrapper import SAM3Wrapper
 from ..backbones.streamvggt_wrapper import StreamVGGTWrapper
 from ..config import load_config
+from ..data import load_rgb_sequence
 from ..instance_observations import (
     InstanceRefinementConfig,
     load_instance_sequences,
@@ -173,12 +175,21 @@ def _build_geometry_cache(
             "output_dir": config.features.cache_dir / clip.name,
         },
     )
-    sequences, target_masks = load_instance_sequences(
-        recovery,
-        instance_ids=clip.instance_ids,
-        reference_sequence_index=clip.reference_sequence_index,
-    )
-    shared = sequences[int(clip.instance_ids[0])]
+    if clip.instance_source == "sam3_reference":
+        sequences: dict[int, object] = {}
+        target_masks: dict[int, torch.Tensor] = {}
+        shared = load_rgb_sequence(
+            config.manifest,
+            scene_id=clip.scene_id,
+            frame_indices=clip.frame_indices,
+        )
+    else:
+        sequences, target_masks = load_instance_sequences(
+            recovery,
+            instance_ids=clip.instance_ids,
+            reference_sequence_index=clip.reference_sequence_index,
+        )
+        shared = sequences[int(clip.instance_ids[0])]
     output = stream_adapter.extract_from_paths(
         shared.image_paths,
         return_pointmap=True,
@@ -188,14 +199,23 @@ def _build_geometry_cache(
         output,
         shared.image_paths,
     )
-    recovered = _load_or_run_tracking(
-        recovery,
-        clip,
-        sequences=sequences,
-        target_masks=target_masks,
-        geometry=geometry_sequence,
-        sam_video_holder=sam_video_holder,
-    )
+    if clip.instance_source == "sam3_reference":
+        recovered, target_masks = _load_or_run_sam3_reference_tracking(
+            recovery,
+            clip,
+            shared=shared,
+            geometry=geometry_sequence,
+            sam_video_holder=sam_video_holder,
+        )
+    else:
+        recovered = _load_or_run_tracking(
+            recovery,
+            clip,
+            sequences=sequences,
+            target_masks=target_masks,
+            geometry=geometry_sequence,
+            sam_video_holder=sam_video_holder,
+        )
     grid_masks_by_id = tracking_masks_to_geometry_grid(
         recovered,
         geometry=geometry_sequence,
@@ -384,6 +404,7 @@ def _build_geometry_cache(
         "scene_id": clip.scene_id,
         "frame_indices": list(clip.frame_indices),
         "instance_ids": list(clip.instance_ids),
+        "instance_source": clip.instance_source,
         "reference_sequence_index": clip.reference_sequence_index,
         "strict_identity_gate": bool(config.fusion.strict_identity_gate),
         "image_paths": [str(path) for path in shared.image_paths],
@@ -469,14 +490,7 @@ def _load_or_run_tracking(
     if cached is not None:
         print(f"reusing tracking cache: {path}")
         return cached[1]
-    if "model" not in sam_video_holder:
-        sam_video_holder["model"] = SAM3Wrapper(
-            repo_path=recovery.sam3_repo,
-            checkpoint_path=recovery.sam3_checkpoint,
-            device=recovery.sam3_device,
-            output_threshold=recovery.sam3_output_threshold,
-            prompt_with_box=recovery.prompt_with_box,
-        ).load()
+    sam3 = _sam_video_model(recovery, sam_video_holder)
     original: dict[int, TrackingSequence] = {}
     recovered: dict[int, TrackingSequence] = {}
     rows = []
@@ -486,7 +500,7 @@ def _load_or_run_tracking(
             sequence=sequences[int(instance_id)],
             target_masks=target_masks[int(instance_id)],
             geometry=geometry,
-            sam3=sam_video_holder["model"],
+            sam3=sam3,
         )
         original[int(instance_id)] = result["original"]
         recovered[int(instance_id)] = result["recovered"]
@@ -511,6 +525,217 @@ def _load_or_run_tracking(
         tracking_rows=rows,
     )
     return recovered
+
+
+def _load_or_run_sam3_reference_tracking(
+    recovery,
+    clip: ClipConfig,
+    *,
+    shared,
+    geometry,
+    sam_video_holder: dict[str, SAM3Wrapper],
+) -> tuple[dict[int, TrackingSequence], dict[int, torch.Tensor]]:
+    """Fill exchangeable slots from a deployable SAM3 reference-frame query."""
+
+    path = clip.tracking_cache or (
+        recovery.output_dir / "tracking_cache_sam3_reference.npz"
+    )
+    cached = load_tracking_cache(
+        path,
+        config=recovery,
+        instance_ids=clip.instance_ids,
+        frame_indices=clip.frame_indices,
+    )
+    reference = int(clip.reference_sequence_index)
+    if cached is not None:
+        print(f"reusing SAM3 reference tracking cache: {path}")
+        recovered = cached[1]
+        targets = {
+            int(instance_id): _reference_only_masks(
+                recovered[int(instance_id)].masks[reference],
+                sequence=len(clip.frame_indices),
+                reference_index=reference,
+            )
+            for instance_id in clip.instance_ids
+        }
+        return recovered, targets
+
+    sam3 = _sam_video_model(recovery, sam_video_holder)
+    proposals = sam3.propose_text_masks(
+        shared.image_paths[reference],
+        prompt="object",
+        output_size=recovery.output_size,
+    )
+    selected = _select_reference_candidates(
+        proposals,
+        max_instances=len(clip.instance_ids),
+        min_pixels=recovery.min_pixels,
+    )
+    print(
+        "SAM3 reference instances "
+        f"clip={clip.name} detected={len(selected)} slots={len(clip.instance_ids)}"
+    )
+
+    originals: dict[int, TrackingSequence] = {}
+    recovered: dict[int, TrackingSequence] = {}
+    targets: dict[int, torch.Tensor] = {}
+    rows: list[dict[str, object]] = []
+    for slot, instance_id in enumerate(clip.instance_ids):
+        instance_id = int(instance_id)
+        if slot >= len(selected):
+            empty = _empty_tracking(
+                sequence=len(clip.frame_indices),
+                output_size=recovery.output_size,
+            )
+            originals[instance_id] = empty
+            recovered[instance_id] = empty
+            targets[instance_id] = _reference_only_masks(
+                empty.masks[reference],
+                sequence=len(clip.frame_indices),
+                reference_index=reference,
+            )
+            rows.append(
+                {
+                    "instance_id": instance_id,
+                    "instance_source": "sam3_reference_empty_slot",
+                    "reference_detection_score": 0.0,
+                    "reference_pixels": 0,
+                }
+            )
+            continue
+
+        proposal = selected[slot]
+        target = _reference_only_masks(
+            proposal.mask,
+            sequence=len(clip.frame_indices),
+            reference_index=reference,
+        )
+        sequence = SimpleNamespace(
+            scene_id=clip.scene_id,
+            frame_indices=list(clip.frame_indices),
+            image_paths=list(shared.image_paths),
+            instance_id=instance_id,
+            label="object",
+            reference_frame_idx=reference,
+        )
+        result = run_natural_recovery_tracking(
+            recovery,
+            sequence=sequence,
+            target_masks=target,
+            geometry=geometry,
+            sam3=sam3,
+        )
+        originals[instance_id] = result["original"]
+        recovered[instance_id] = result["recovered"]
+        targets[instance_id] = target
+        rows.append(
+            {
+                "instance_id": instance_id,
+                "instance_source": "sam3_reference",
+                "reference_detection_score": float(proposal.score),
+                "reference_pixels": int(proposal.mask.sum()),
+                "recovery_applied": int(result["recovery_applied"]),
+                "recovery_sequence_index": result["recovery_sequence_index"],
+                "recovery_frame_index": result["recovery_frame_index"],
+                "recovery_reason": result["recovery_reason"],
+            }
+        )
+    save_tracking_cache(
+        path,
+        config=recovery,
+        instance_ids=clip.instance_ids,
+        frame_indices=clip.frame_indices,
+        original=originals,
+        recovered=recovered,
+        tracking_rows=rows,
+    )
+    return recovered, targets
+
+
+def _sam_video_model(
+    recovery,
+    holder: dict[str, SAM3Wrapper],
+) -> SAM3Wrapper:
+    if "model" not in holder:
+        holder["model"] = SAM3Wrapper(
+            repo_path=recovery.sam3_repo,
+            checkpoint_path=recovery.sam3_checkpoint,
+            device=recovery.sam3_device,
+            output_threshold=recovery.sam3_output_threshold,
+            prompt_with_box=recovery.prompt_with_box,
+        ).load()
+    return holder["model"]
+
+
+def _select_reference_candidates(
+    candidates,
+    *,
+    max_instances: int,
+    min_pixels: int,
+) -> list:
+    """Select deterministic, non-duplicate SAM3 masks without consulting GT."""
+
+    ranked = sorted(
+        (
+            candidate
+            for candidate in candidates
+            if int(candidate.mask.sum()) >= int(min_pixels)
+            and float(candidate.mask.float().mean()) <= 0.90
+        ),
+        key=lambda candidate: (
+            -float(candidate.score),
+            -int(candidate.mask.sum()),
+            int(candidate.obj_id),
+        ),
+    )
+    selected = []
+    for candidate in ranked:
+        if any(_binary_iou(candidate.mask, item.mask) > 0.85 for item in selected):
+            continue
+        selected.append(candidate)
+        if len(selected) == int(max_instances):
+            break
+    return selected
+
+
+def _binary_iou(first: torch.Tensor, second: torch.Tensor) -> float:
+    first = first.detach().cpu().bool()
+    second = second.detach().cpu().bool()
+    union = int((first | second).sum())
+    return float((first & second).sum()) / union if union else 0.0
+
+
+def _empty_tracking(
+    *,
+    sequence: int,
+    output_size,
+) -> TrackingSequence:
+    return TrackingSequence(
+        masks=torch.zeros(
+            int(sequence),
+            int(output_size[0]),
+            int(output_size[1]),
+            dtype=torch.bool,
+        ),
+        scores=torch.zeros(int(sequence), dtype=torch.float32),
+        selected_obj_id=None,
+    )
+
+
+def _reference_only_masks(
+    mask: torch.Tensor,
+    *,
+    sequence: int,
+    reference_index: int,
+) -> torch.Tensor:
+    output = torch.zeros(
+        int(sequence),
+        int(mask.shape[0]),
+        int(mask.shape[1]),
+        dtype=torch.bool,
+    )
+    output[int(reference_index)] = mask.detach().cpu().bool()
+    return output
 
 
 def _processed_intrinsics(
@@ -617,6 +842,10 @@ def _cache_complete(
         == clip.frame_indices
         and tuple(int(value) for value in payload.get("instance_ids", ()))
         == clip.instance_ids
+        and str(
+            payload.get("instance_source", "configured_gt_reference")
+        )
+        == clip.instance_source
         and int(payload.get("reference_sequence_index", -1))
         == clip.reference_sequence_index
     )

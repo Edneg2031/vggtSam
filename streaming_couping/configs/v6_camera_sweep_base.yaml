@@ -20,11 +20,14 @@ dataset:
       instance_ids: [37, 68, 54]
       reference_sequence_index: 0
       split: test
-    - name: 00a231a370_50_80_37_68_54
+    - name: 00a231a370_50_80_sam3_auto3
       scene_id: 00a231a370
       # Stop before frame 90 to avoid exact and near-neighbor training leakage.
       frame_indices: [50, 60, 70, 80]
-      instance_ids: [37, 68, 54]
+      # These are three exchangeable slot IDs, not ScanNet++ GT instance IDs.
+      # SAM3 fills as many slots as it detects at frame 50; empty slots stay zero.
+      instance_ids: [1, 2, 3]
+      instance_source: sam3_reference
       reference_sequence_index: 0
       split: validation
 

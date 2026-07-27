@@ -924,6 +924,9 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         )
         < float(validation_metrics["candidate_A_3dof_local_center"]["loss"])
     )
+    reference_instances = int(
+        validation_batch["observed"][0, validation_reference_index].sum().cpu()
+    )
     validation_rows = [
         {
             "variant": "raw",
@@ -932,6 +935,8 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
             "center_error": _short(float(validation_raw["translation_native"])),
             "loss": _short(float(validation_raw["loss"])),
             "better_than_raw": 0,
+            "reference_instances": reference_instances,
+            "active_frames": 0,
             "candidate_b_better_a": candidate_b_better_a,
             "prelocked": 1,
         }
@@ -947,6 +952,8 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
                 "better_than_raw": int(
                     float(metrics["loss"]) < float(validation_raw["loss"])
                 ),
+                "reference_instances": reference_instances,
+                "active_frames": int(metrics["active_frames"]),
                 "candidate_b_better_a": candidate_b_better_a,
                 "prelocked": 1,
             }
@@ -1725,14 +1732,22 @@ def _compose_decoupled_output(
     center = _camera_centers(center_pose)
     translation = -(rotation @ center[..., None])
     composed = torch.cat([rotation, translation], dim=-1)
-    composed = composed.clone()
+    active = (
+        rotation_output["active_frames"]
+        & center_output["active_frames"]
+    )
+    # The deployed V6 candidate is instance-guided as a whole.  A camera-only
+    # rotation must not leak through when no persistent instance supports the
+    # center branch for this frame.
+    composed = torch.where(
+        active[..., None, None],
+        composed,
+        baseline_w2c,
+    ).clone()
     composed[:, int(reference_index)] = baseline_w2c[:, int(reference_index)]
     return {
         "world_to_camera": composed,
-        "active_frames": (
-            rotation_output["active_frames"]
-            & center_output["active_frames"]
-        ),
+        "active_frames": active,
     }
 
 

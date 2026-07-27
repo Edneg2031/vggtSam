@@ -20,6 +20,7 @@ class ClipConfig:
     tracking_cache: Path | None = None
     training_frame_indices: tuple[int, ...] | None = None
     evaluation_frame_indices: tuple[int, ...] | None = None
+    instance_source: str = "configured_gt_reference"
 
 
 @dataclass(frozen=True)
@@ -323,6 +324,9 @@ def _parse_clip(value: dict[str, Any], base: Path) -> ClipConfig:
         evaluation_frame_indices=_optional_int_tuple(
             value.get("evaluation_frame_indices")
         ),
+        instance_source=str(
+            value.get("instance_source", "configured_gt_reference")
+        ),
     )
 
 
@@ -425,6 +429,18 @@ def _validate(config: LearnedPoseConfig) -> None:
     if config.training.epochs < 1 or config.training.repeats_per_epoch < 1:
         raise ValueError("training epochs and repeats_per_epoch must be positive.")
     for clip in config.clips:
+        if clip.instance_source not in {
+            "configured_gt_reference",
+            "sam3_reference",
+        }:
+            raise ValueError(
+                f"Clip {clip.name!r} instance_source must be "
+                "configured_gt_reference or sam3_reference."
+            )
+        if clip.instance_source == "sam3_reference" and clip.split.lower() == "train":
+            raise ValueError(
+                f"Training clip {clip.name!r} cannot use sam3_reference slots."
+            )
         if clip.reference_sequence_index != 0:
             raise ValueError("Learned causal pose refinement requires reference_sequence_index=0.")
         # ``frame_indices`` defines the model's observation order.  A

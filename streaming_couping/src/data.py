@@ -11,6 +11,14 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 from PIL import Image
 
+
+@dataclass(frozen=True)
+class RGBSequence:
+    scene_id: str
+    frame_indices: list[int]
+    image_paths: list[Path]
+
+
 @dataclass(frozen=True)
 class MaskTrackingSequence:
     scene_id: str
@@ -24,6 +32,45 @@ class MaskTrackingSequence:
     @property
     def target_masks(self) -> list[np.ndarray]:
         return [mask == self.instance_id for mask in self.instance_masks]
+
+
+def load_rgb_sequence(
+    manifest_path: str | Path,
+    *,
+    scene_id: str,
+    frame_indices: Sequence[int],
+) -> RGBSequence:
+    """Load only RGB paths, without requiring a GT instance to be visible."""
+
+    manifest_path = Path(manifest_path).expanduser().resolve()
+    with manifest_path.open("r", encoding="utf8") as handle:
+        manifest = json.load(handle)
+    scene = next(
+        (item for item in manifest.get("scenes", []) if item.get("scene_id") == scene_id),
+        None,
+    )
+    if scene is None:
+        available = [item.get("scene_id") for item in manifest.get("scenes", [])]
+        raise ValueError(
+            f"Scene {scene_id!r} is not present in {manifest_path}. "
+            f"Available scenes: {available[:20]}"
+        )
+    frames = scene.get("frames", [])
+    selected_indices = resolve_frame_indices(
+        num_frames=len(frames),
+        frame_indices=frame_indices,
+        sequence_length=len(frame_indices),
+        frame_stride=1,
+        window_index=0,
+    )
+    return RGBSequence(
+        scene_id=scene_id,
+        frame_indices=selected_indices,
+        image_paths=[
+            resolve_manifest_path(frames[index]["image_path"], manifest_path)
+            for index in selected_indices
+        ],
+    )
 
 
 def load_mask_tracking_sequence(

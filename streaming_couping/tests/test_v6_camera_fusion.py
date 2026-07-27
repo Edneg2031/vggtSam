@@ -12,12 +12,14 @@ from streaming_couping.scripts.run_v6_camera_overfit import (
     load_v6_config,
 )
 from streaming_couping.src.learned_pose.config import load_learned_pose_config
+from streaming_couping.src.learned_pose.cache import _select_reference_candidates
 from streaming_couping.src.learned_pose.v6_camera_fusion import (
     V6CameraFusion,
     V6FusionConfig,
     perturb_instance_inputs,
     se3_exp,
 )
+from streaming_couping.src.types import SAM3MaskCandidate
 
 
 def _inputs() -> dict[str, torch.Tensor]:
@@ -276,7 +278,7 @@ def test_se3_training_loss_can_disable_auxiliary_rotation() -> None:
     assert with_rotation > 0.0
 
 
-def test_decoupled_pose_uses_requested_rotation_and_camera_center() -> None:
+def test_decoupled_pose_uses_requested_components_only_with_instance_support() -> None:
     baseline = torch.cat(
         [
             torch.eye(3).reshape(1, 1, 3, 3).expand(1, 3, 3, 3),
@@ -310,17 +312,55 @@ def test_decoupled_pose_uses_requested_rotation_and_camera_center() -> None:
 
     assert torch.equal(output["world_to_camera"][:, 0], baseline[:, 0])
     assert torch.equal(
-        output["world_to_camera"][:, 1:, :3, :3],
-        rotation_pose[:, 1:, :3, :3],
+        output["world_to_camera"][:, 1, :3, :3],
+        rotation_pose[:, 1, :3, :3],
     )
+    assert torch.equal(output["world_to_camera"][:, 2], baseline[:, 2])
     assert torch.allclose(
-        _camera_centers(output["world_to_camera"]),
-        requested_centers,
+        _camera_centers(output["world_to_camera"])[:, :2],
+        requested_centers[:, :2],
     )
     assert torch.equal(
         output["active_frames"],
         torch.tensor([[False, True, False]]),
     )
+
+
+def test_decoupled_pose_is_bit_exact_raw_without_any_instance() -> None:
+    baseline = torch.randn(1, 4, 3, 4)
+    changed = baseline + 1.0
+    output = _compose_decoupled_output(
+        {
+            "world_to_camera": changed,
+            "active_frames": torch.tensor([[False, True, True, True]]),
+        },
+        {
+            "world_to_camera": changed,
+            "active_frames": torch.zeros(1, 4, dtype=torch.bool),
+        },
+        baseline_w2c=baseline,
+        reference_index=0,
+    )
+    assert torch.equal(output["world_to_camera"], baseline)
+    assert not bool(output["active_frames"].any())
+
+
+def test_sam3_reference_selection_accepts_one_object_and_pads_later() -> None:
+    small = torch.zeros(20, 20, dtype=torch.bool)
+    small[2:12, 3:13] = True
+    duplicate = small.clone()
+    other = torch.zeros_like(small)
+    other[12:19, 12:19] = True
+    selected = _select_reference_candidates(
+        [
+            SAM3MaskCandidate(obj_id=8, mask=duplicate, score=0.8),
+            SAM3MaskCandidate(obj_id=7, mask=small, score=0.9),
+            SAM3MaskCandidate(obj_id=9, mask=other, score=0.7),
+        ],
+        max_instances=3,
+        min_pixels=64,
+    )
+    assert [item.obj_id for item in selected] == [7]
 
 
 def test_v63_sweep_contains_full_rotation_center_grid() -> None:
@@ -431,7 +471,7 @@ def test_v6_command_and_config_are_retained() -> None:
     )
     assert loaded.clip_name == "00a231a370_90_240_37_68_54"
     assert loaded.test_clip_name == "00a231a370_492_589_37_68_54"
-    assert loaded.validation_clip_name == "00a231a370_50_80_37_68_54"
+    assert loaded.validation_clip_name == "00a231a370_50_80_sam3_auto3"
     assert loaded.fusion.hidden_dim == 256
     assert loaded.training.steps == 1200
     assert loaded.success.camera_loss_ratio == 0.80
@@ -441,4 +481,6 @@ def test_v6_command_and_config_are_retained() -> None:
         clip for clip in base.clips if clip.name == loaded.validation_clip_name
     )
     assert validation.frame_indices == (50, 60, 70, 80)
+    assert validation.instance_source == "sam3_reference"
+    assert validation.instance_ids == (1, 2, 3)
     assert 90 not in validation.frame_indices
