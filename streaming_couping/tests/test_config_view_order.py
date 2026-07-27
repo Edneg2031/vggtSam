@@ -11,7 +11,7 @@ from streaming_couping.src.learned_pose.config import (
 
 
 ROOT = Path(__file__).resolve().parents[2]
-CONFIG = ROOT / "streaming_couping/configs/final_joint_pointcloud_pose_test.yaml"
+CONFIG = ROOT / "streaming_couping/configs/v4_coverage_first.yaml"
 
 
 def test_final_observation_config_keeps_checkpoint_temporal_scale() -> None:
@@ -23,6 +23,9 @@ def test_configured_view_order_may_be_non_monotonic() -> None:
     clip = replace(
         config.clips[0],
         frame_indices=(100, 500, 200, 400, 300),
+        training_frame_indices=None,
+        evaluation_frame_indices=None,
+        split="test",
     )
 
     _validate(replace(config, clips=(clip,)))
@@ -33,6 +36,9 @@ def test_configured_view_order_rejects_duplicate_frames() -> None:
     clip = replace(
         config.clips[0],
         frame_indices=(100, 500, 200, 500, 300),
+        training_frame_indices=None,
+        evaluation_frame_indices=None,
+        split="test",
     )
 
     with pytest.raises(ValueError, match="contains duplicates"):

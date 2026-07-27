@@ -1,10 +1,26 @@
-# Frozen V4 checkpoint test on the non-overlapping 492--589 views.
+# Frozen V4 coverage-first baseline.
+#
+# This is exactly the v4_match_additive_union structure from the V5 ablation:
+# MATCH-only geometry/ray support, associated MATCH+UNKNOWN masks retained for
+# inspection/output, appearance-only camera features, additive pose encoding,
+# and union-local patch attention.  It is kept independently because it gives
+# strong pose results on both configured sequences and avoids aggressively
+# deleting uncertain masks, even though a wrong UNKNOWN association can remain.
 recovery_config: streaming_couping/configs/recovery_050_025.yaml
-output_dir: outputs/streaming_couping_final_test_00a231a370_492_589_v4_strict_geometry
+output_dir: outputs/streaming_couping_v4_coverage_first
 
 dataset:
   manifest: data/processed/scannetpp_pinhole_2d/manifest.json
   clips:
+    - name: 00a231a370_90_240_37_68_54
+      scene_id: 00a231a370
+      frame_indices: [90, 105, 119, 130, 140, 210, 240]
+      training_frame_indices: [90, 105, 119, 130, 140]
+      evaluation_frame_indices: [210, 240]
+      instance_ids: [37, 68, 54]
+      reference_sequence_index: 0
+      split: train
+      tracking_cache: outputs/streaming_couping_instance_pose_37_68_54/tracking_cache.npz
     - name: 00a231a370_492_589_37_68_54
       scene_id: 00a231a370
       frame_indices: [492, 512, 520, 545, 561, 589]
@@ -17,7 +33,9 @@ runtime:
   geometry_device: cuda:1
 
 features:
-  cache_dir: outputs/streaming_couping_final_test_00a231a370_492_589_v4_strict_geometry/cache
+  # The observations are structurally identical to the V5 suite cache.  The
+  # release command builds this cache only when it is absent.
+  cache_dir: outputs/streaming_couping_v5_ablation/cache
   rebuild: false
   sam_source: detector_fpn2
   sam_resolution: 1008
@@ -39,7 +57,10 @@ fusion:
   patch_mask_dilation: 1
   identity_hard_mismatch_min_points: 512
   identity_hard_mismatch_max_fitness: 0.02
-  unknown_camera_weight: 0.25
+  unknown_camera_weight: 0.0
+  pose_feature_mode: appearance_only
+  rotation_update_mode: additive_encoding
+  max_rotation_update_degrees: 5.0
   dpt_layer_indices: [4, 11, 17, 23]
 
 loss:
@@ -54,7 +75,6 @@ loss:
   pointmap: 5.0
   rigid_trim_quantile: 0.70
 
-# Used only to construct the frozen adapter; this config never trains.
 training:
   epochs: 30
   repeats_per_epoch: 4
@@ -79,7 +99,8 @@ evaluation:
     blend: 1.0
     angular_huber_delta: 0.02
     angular_min_range: 0.05
+    preserve_reference: false
+    solver_modes: [current_refined]
     export_confidence_threshold: 0.30
     export_max_full_scene_points: 1000000
     export_max_instance_points: 250000
-    preserve_reference: false

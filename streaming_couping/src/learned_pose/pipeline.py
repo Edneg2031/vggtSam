@@ -757,21 +757,11 @@ def _forward_mode(
 ) -> dict[str, torch.Tensor | dict]:
     if mode != FINAL_MODE:
         raise ValueError(f"Only the final decoupled method is supported, got {mode!r}.")
-    if perturbation not in {
-        "aligned",
-        "module_off",
-        "memory_off",
-        "wrong_id_memory",
-        "spatial_token_shuffle",
-    }:
+    if perturbation not in {"aligned", "module_off"}:
         raise ValueError(
             f"Only aligned/module_off execution is supported, got {perturbation!r}."
         )
     module_off = perturbation == "module_off"
-    memory_ablation = {
-        "memory_off": "off",
-        "wrong_id_memory": "wrong_id",
-    }.get(perturbation, "normal")
     camera_hidden, pose_diagnostics = adapter.forward_camera(
         batch["camera_hidden"],
         appearance=batch["appearance"],
@@ -784,7 +774,6 @@ def _forward_mode(
         observed=batch["observed"],
         identity_valid=batch.get("identity_valid"),
         identity_unknown=batch.get("identity_unknown"),
-        memory_ablation=memory_ablation,
         module_off=module_off,
     )
     pose_encoding, rotation_update_degrees = _compose_camera_update(
@@ -807,10 +796,6 @@ def _forward_mode(
         observed=batch["observed"],
         identity_valid=batch.get("identity_valid"),
         identity_unknown=batch.get("identity_unknown"),
-        memory_ablation=memory_ablation,
-        shuffle_instance_tokens=(
-            perturbation == "spatial_token_shuffle"
-        ),
         spatial_mask=(
             batch["trusted_tracking_masks_stream"]
             if adapter.config.strict_identity_gate

@@ -1,4 +1,4 @@
-"""Reproduce the pointmap-blend sweep and export the adaptive final method."""
+"""Run the retained V5 adaptive raw/learned pointmap policy."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ CONTROL_RAW = "raw_control"
 CONTROL_FIXED = "fixed_ref_050_control"
 ADAPTIVE_FINAL = "adaptive_support_gate"
 ADAPTIVE_SUPPORT_THRESHOLD = 0.75
-POINT_BLEND_VALUES = (0.0, 0.25, 0.50, 0.75, 1.0)
+POINT_BLEND_VALUES = (0.0, 1.0)
 SUMMARY_FIELDS = (
     "split",
     "clip",
@@ -69,12 +69,12 @@ def main() -> None:
     predictions = source.get("predictions")
     if not isinstance(predictions, dict):
         raise ValueError(f"Prediction file has no clip dictionary: {source_path}")
-    output = config.output_dir / "joint_pointmap_ba"
+    output = config.output_dir / "adaptive_evaluation"
     evaluation = output / "evaluation"
     evaluation.mkdir(parents=True, exist_ok=True)
     print(f"reusing predictions: {source_path}")
     print(f"reusing cache: {config.features.cache_dir}")
-    print("pointmap blend sweep does not run SAM3, StreamVGGT, or training")
+    print("adaptive pointmap policy does not run SAM3, StreamVGGT, or training")
 
     pose_summary: list[dict] = []
     pose_frames: list[dict] = []
@@ -96,7 +96,7 @@ def main() -> None:
         path = cache_path(config, clip)
         if not path.is_file():
             raise FileNotFoundError(
-                "Joint BA intentionally does not rebuild caches. "
+                "Adaptive V5 intentionally does not rebuild caches. "
                 f"Missing: {path}"
             )
         if clip.name not in predictions:
@@ -426,13 +426,13 @@ def main() -> None:
     _write_csv(evaluation / "pose_pair_summary.csv", pose_pair_summary)
     _write_csv(evaluation / "pointmap_frame_metrics.csv", pointmap_frames)
     _write_csv(evaluation / "pointmap_summary.csv", pointmap_summary)
-    _write_csv(evaluation / "joint_ba_diagnostics.csv", diagnostic_rows)
+    _write_csv(evaluation / "adaptive_diagnostics.csv", diagnostic_rows)
     torch.save(
         {
             "source_predictions": str(source_path),
             "predictions": saved_predictions,
         },
-        evaluation / "joint_ba_predictions.pt",
+        evaluation / "adaptive_candidates.pt",
     )
     adaptive_predictions_path = (
         evaluation / "adaptive_ray_pose_predictions.pt"
@@ -456,9 +456,9 @@ def main() -> None:
         pointmap_summary,
         diagnostic_rows,
     )
-    summary_path = config.output_dir / "joint_ba_upload_summary.csv"
+    summary_path = config.output_dir / "adaptive_upload_summary.csv"
     _write_csv(summary_path, compact, fieldnames=SUMMARY_FIELDS)
-    print(f"joint BA upload summary: {summary_path}")
+    print(f"adaptive upload summary: {summary_path}")
     with summary_path.open("r", encoding="utf8") as handle:
         print(handle.read().rstrip())
     if args.export:
@@ -474,7 +474,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
-        default="streaming_couping/configs/v5_ablation_suite.yaml",
+        default="streaming_couping/configs/v5_adaptive_best.yaml",
     )
     parser.add_argument("--device", default="cuda:1")
     parser.add_argument("--predictions", type=Path)
@@ -489,7 +489,7 @@ def _parse_args() -> argparse.Namespace:
 def _default_predictions(output_dir: Path) -> Path:
     candidate = (
         output_dir
-        / "joint_solver_sweep"
+        / "reference_pose"
         / "evaluation"
         / "ray_pose_predictions.pt"
     )
@@ -497,7 +497,7 @@ def _default_predictions(output_dir: Path) -> Path:
         return candidate
     raise FileNotFoundError(
         "Missing the reference-blend sweep predictions required by the "
-        "fixed_ref_050 control. Run commands_joint_pointmap_ba.txt, which "
+        "fixed_ref_050 control. Run commands_v5_adaptive_best.txt, which "
         f"creates them automatically when needed. Expected: {candidate}"
     )
 
@@ -677,7 +677,7 @@ def _append_metrics(
         pose_pair_summary,
         payload=payload,
         pose_encoding=pose,
-        mode="joint_pointmap_ba",
+        mode="v5_adaptive",
         perturbation=name,
         sequence_indices=sequence_indices,
         evaluation_metadata=metadata,
@@ -691,7 +691,7 @@ def _append_metrics(
             "world_points": points,
             "depth": depth,
         },
-        mode="joint_pointmap_ba",
+        mode="v5_adaptive",
         perturbation=name,
         sequence_indices=sequence_indices,
         evaluation_metadata=metadata,

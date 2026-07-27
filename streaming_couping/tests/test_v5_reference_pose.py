@@ -1,12 +1,12 @@
 from dataclasses import replace
 
-from streaming_couping.scripts.run_v5_ablation_suite import _write_csv
-from streaming_couping.scripts.run_v5_joint_solver_sweep import (
-    REFERENCE_BLENDS,
+from streaming_couping.scripts.run_v5_reference_pose import (
+    REFERENCE_BLEND,
     SUMMARY_FIELDS,
-    _build_joint_solver_summary,
+    _build_reference_pose_summary,
     _policy_specs,
     _sweep_config,
+    _write_csv as _write_csv_with_fields,
 )
 from streaming_couping.src.learned_pose.config import (
     FINAL_MODE,
@@ -14,9 +14,16 @@ from streaming_couping.src.learned_pose.config import (
 )
 
 
-def test_joint_solver_summary_is_five_policies_per_clip(tmp_path) -> None:
+def _write_csv(path, rows) -> None:
+    fieldnames = tuple(
+        dict.fromkeys(key for row in rows for key in row)
+    )
+    _write_csv_with_fields(path, rows, fieldnames)
+
+
+def test_reference_pose_summary_is_one_policy_per_clip(tmp_path) -> None:
     base = load_learned_pose_config(
-        "streaming_couping/configs/v5_ablation_suite.yaml"
+        "streaming_couping/configs/v5_adaptive_best.yaml"
     )
     clip = base.clips[1]
     config = _sweep_config(
@@ -119,22 +126,21 @@ def test_joint_solver_summary_is_five_policies_per_clip(tmp_path) -> None:
         [{"clip": clip.name, "mode": FINAL_MODE, "strict_equal": 1}],
     )
 
-    rows = _build_joint_solver_summary(config)
+    rows = _build_reference_pose_summary(config)
 
-    assert len(rows) == 5
+    assert len(rows) == 1
     assert tuple(rows[0]) == SUMMARY_FIELDS
-    assert rows[0]["policy"] == "free_ref_100"
+    assert rows[0]["policy"] == "fixed_ref_050"
     assert rows[0]["solver_ate"] == "0.25"
     assert rows[0]["reposed_delta_from_raw"] == "0.04"
-    assert rows[1]["policy"] == "fixed_ref_025"
-    assert rows[1]["fit_accepted"] == 1
-    assert rows[1]["mean_applied_center_shift_native"] == "0.0125"
-    assert rows[-1]["module_off_exact"] == 1
+    assert rows[0]["fit_accepted"] == 1
+    assert rows[0]["mean_applied_center_shift_native"] == "0.025"
+    assert rows[0]["module_off_exact"] == 1
 
 
 def test_sweep_reuses_residual_so3_union_structure() -> None:
     base = load_learned_pose_config(
-        "streaming_couping/configs/v5_ablation_suite.yaml"
+        "streaming_couping/configs/v5_adaptive_best.yaml"
     )
 
     config = _sweep_config(base)
@@ -143,6 +149,8 @@ def test_sweep_reuses_residual_so3_union_structure() -> None:
     assert config.features.rebuild is False
     assert config.fusion.pose_feature_mode == "residual_only"
     assert config.fusion.rotation_update_mode == "bounded_so3"
-    assert config.fusion.spatial_attention_mode == "union"
-    assert config.evaluation.ray_pose.reference_blend_values == REFERENCE_BLENDS
+    assert config.evaluation.ray_pose.reference_blend_values == (
+        REFERENCE_BLEND,
+    )
     assert config.evaluation.ray_pose.preserve_reference is False
+    assert config.evaluation.ray_pose.solver_modes == ()

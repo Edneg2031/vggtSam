@@ -59,7 +59,6 @@ class FusionConfig:
     pose_feature_mode: str = "appearance_only"
     rotation_update_mode: str = "additive_encoding"
     max_rotation_update_degrees: float = 5.0
-    spatial_attention_mode: str = "union"
     dpt_layer_indices: tuple[int, ...] = (4, 11, 17, 23)
 
 
@@ -109,10 +108,6 @@ class RayPoseConfig:
     # with the reference camera fixed and only the accepted center correction
     # blended by the requested fraction.
     reference_blend_values: tuple[float, ...] = ()
-    historical_min_correspondences: int = 128
-    historical_max_points_per_instance: int = 4096
-    historical_min_distance: float = 0.02
-    historical_object_ratio: float = 0.05
     export_confidence_threshold: float = 0.30
     export_max_full_scene_points: int = 1_000_000
     export_max_instance_points: int = 250_000
@@ -149,9 +144,6 @@ FINAL_MODE = "decoupled_dual_branch"
 VALID_PERTURBATIONS = {
     "aligned",
     "module_off",
-    "memory_off",
-    "wrong_id_memory",
-    "spatial_token_shuffle",
 }
 
 
@@ -219,9 +211,6 @@ def load_learned_pose_config(path: str | Path) -> LearnedPoseConfig:
             ),
             max_rotation_update_degrees=float(
                 fusion.get("max_rotation_update_degrees", 5.0)
-            ),
-            spatial_attention_mode=str(
-                fusion.get("spatial_attention_mode", "union")
             ),
             dpt_layer_indices=tuple(int(v) for v in fusion.get("dpt_layer_indices", [4, 11, 17, 23])),
         ),
@@ -296,24 +285,6 @@ def load_learned_pose_config(path: str | Path) -> LearnedPoseConfig:
                         [],
                     )
                 ),
-                historical_min_correspondences=int(
-                    ray_pose.get(
-                        "historical_min_correspondences",
-                        128,
-                    )
-                ),
-                historical_max_points_per_instance=int(
-                    ray_pose.get(
-                        "historical_max_points_per_instance",
-                        4096,
-                    )
-                ),
-                historical_min_distance=float(
-                    ray_pose.get("historical_min_distance", 0.02)
-                ),
-                historical_object_ratio=float(
-                    ray_pose.get("historical_object_ratio", 0.05)
-                ),
                 export_confidence_threshold=float(
                     ray_pose.get("export_confidence_threshold", 0.30)
                 ),
@@ -380,13 +351,11 @@ def _validate(config: LearnedPoseConfig) -> None:
         raise ValueError("ray_pose.blend must be in [0,1].")
     if ray_pose.angular_huber_delta <= 0.0 or ray_pose.angular_min_range <= 0.0:
         raise ValueError("ray_pose angular robust-fit values must be positive.")
-    if not ray_pose.solver_modes:
-        raise ValueError("ray_pose.solver_modes must not be empty.")
-    unknown_solvers = set(ray_pose.solver_modes) - {
-        "current_raw",
-        "current_refined",
-        "historical_anchor",
-    }
+    if not ray_pose.solver_modes and not ray_pose.reference_blend_values:
+        raise ValueError(
+            "ray_pose requires current_refined or a reference blend."
+        )
+    unknown_solvers = set(ray_pose.solver_modes) - {"current_refined"}
     if unknown_solvers:
         raise ValueError(
             f"Unknown ray_pose solver modes: {sorted(unknown_solvers)}."
@@ -404,25 +373,6 @@ def _validate(config: LearnedPoseConfig) -> None:
         raise ValueError(
             "ray_pose.reference_blend_values must be in (0,1]."
         )
-    if ray_pose.historical_min_correspondences < 3:
-        raise ValueError(
-            "ray_pose.historical_min_correspondences must be at least 3."
-        )
-    if (
-        ray_pose.historical_max_points_per_instance
-        < ray_pose.historical_min_correspondences
-    ):
-        raise ValueError(
-            "ray_pose historical point limit is smaller than its minimum "
-            "correspondence count."
-        )
-    if (
-        ray_pose.historical_min_distance <= 0.0
-        or ray_pose.historical_object_ratio <= 0.0
-    ):
-        raise ValueError(
-            "ray_pose historical correspondence distances must be positive."
-        )
     if config.fusion.attention_dim % config.fusion.num_heads:
         raise ValueError("fusion.attention_dim must be divisible by fusion.num_heads.")
     if config.fusion.patch_mask_dilation < 0:
@@ -434,11 +384,9 @@ def _validate(config: LearnedPoseConfig) -> None:
     if config.fusion.pose_feature_mode not in {
         "appearance_only",
         "residual_only",
-        "appearance_and_residual",
     }:
         raise ValueError(
-            "fusion.pose_feature_mode must be appearance_only, residual_only, "
-            "or appearance_and_residual."
+            "fusion.pose_feature_mode must be appearance_only or residual_only."
         )
     if config.fusion.rotation_update_mode not in {
         "additive_encoding",
@@ -451,13 +399,6 @@ def _validate(config: LearnedPoseConfig) -> None:
     if config.fusion.max_rotation_update_degrees <= 0.0:
         raise ValueError(
             "fusion.max_rotation_update_degrees must be positive."
-        )
-    if config.fusion.spatial_attention_mode not in {
-        "union",
-        "per_instance",
-    }:
-        raise ValueError(
-            "fusion.spatial_attention_mode must be union or per_instance."
         )
     if config.fusion.dpt_layer_indices != (4, 11, 17, 23):
         raise ValueError(

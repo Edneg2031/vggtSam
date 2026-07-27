@@ -54,7 +54,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
-        default="streaming_couping/configs/final_joint_pointcloud_pose.yaml",
+        default="streaming_couping/configs/v5_adaptive_best.yaml",
     )
     parser.add_argument(
         "--stage",

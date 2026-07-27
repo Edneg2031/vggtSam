@@ -1,4 +1,4 @@
-"""Evaluate reference-preserving ray-pose policies with one frozen V5 model."""
+"""Evaluate the retained fixed-reference V5 pose with one frozen checkpoint."""
 
 from __future__ import annotations
 
@@ -16,14 +16,10 @@ from streaming_couping.src.learned_pose.config import (
     load_learned_pose_config,
 )
 from streaming_couping.src.learned_pose.pipeline import evaluate_final_method
-from streaming_couping.src.learned_pose.ray_pose import (
-    FINAL_RAY_POSE_NAME,
-    reference_blend_pose_name,
-)
+from streaming_couping.src.learned_pose.ray_pose import reference_blend_pose_name
 
 
-SOURCE_VARIANT = "v5_residual_so3_union"
-REFERENCE_BLENDS = (0.25, 0.50, 0.75, 1.00)
+REFERENCE_BLEND = 0.50
 SUMMARY_FIELDS = (
     "split",
     "clip",
@@ -57,15 +53,15 @@ def main() -> None:
     _prepare_reused_assets(base, config, args.source_checkpoint)
 
     print(
-        "evaluating one frozen checkpoint: "
-        f"{SOURCE_VARIANT}; no cache build or training"
+        "evaluating retained V5 residual-SO(3)-union checkpoint; "
+        "no cache build or training"
     )
     evaluate_final_method(config)
 
-    rows = _build_joint_solver_summary(config)
-    summary_path = base.output_dir / "joint_solver_sweep_summary.csv"
+    rows = _build_reference_pose_summary(config)
+    summary_path = base.output_dir / "reference_pose_summary.csv"
     _write_csv(summary_path, rows, SUMMARY_FIELDS)
-    print(f"joint solver sweep summary: {summary_path}")
+    print(f"reference pose summary: {summary_path}")
     with summary_path.open("r", encoding="utf8") as handle:
         print(handle.read().rstrip())
 
@@ -74,15 +70,15 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
-        default="streaming_couping/configs/v5_ablation_suite.yaml",
+        default="streaming_couping/configs/v5_adaptive_best.yaml",
     )
     parser.add_argument("--training-device")
     parser.add_argument(
         "--source-checkpoint",
         type=Path,
         help=(
-            "Optional trained v5_residual_so3_union checkpoint. By default "
-            "it is read from the V5 suite output directory."
+            "Optional retained V5 checkpoint. By default it is read from the "
+            "standalone V5 output directory."
         ),
     )
     return parser.parse_args()
@@ -93,20 +89,13 @@ def _sweep_config(base: LearnedPoseConfig) -> LearnedPoseConfig:
         base.evaluation.ray_pose,
         preserve_reference=False,
         blend=1.0,
-        solver_modes=("current_refined",),
-        reference_blend_values=REFERENCE_BLENDS,
+        solver_modes=(),
+        reference_blend_values=(REFERENCE_BLEND,),
     )
     return replace(
         base,
-        output_dir=base.output_dir / "joint_solver_sweep",
+        output_dir=base.output_dir / "reference_pose",
         features=replace(base.features, rebuild=False),
-        fusion=replace(
-            base.fusion,
-            unknown_camera_weight=0.25,
-            pose_feature_mode="residual_only",
-            rotation_update_mode="bounded_so3",
-            spatial_attention_mode="union",
-        ),
         evaluation=replace(
             base.evaluation,
             perturbations=("aligned", "module_off"),
@@ -134,15 +123,13 @@ def _prepare_reused_assets(
 
     source = source_checkpoint or (
         base.output_dir
-        / "variants"
-        / SOURCE_VARIANT
         / "checkpoints"
         / FINAL_MODE
         / "checkpoint_best.pt"
     )
     if not source.is_file():
         raise FileNotFoundError(
-            "Missing trained V5 residual checkpoint; run the V5 suite first "
+            "Missing retained V5 checkpoint; run commands_v5_adaptive_best.txt "
             f"or pass --source-checkpoint. Expected: {source}"
         )
     destination = (
@@ -159,22 +146,17 @@ def _prepare_reused_assets(
 
 
 def _policy_specs() -> tuple[tuple[str, str, bool, float], ...]:
-    anchored = tuple(
-        (
-            f"fixed_ref_{int(round(100.0 * blend)):03d}",
-            reference_blend_pose_name(blend),
-            True,
-            blend,
-        )
-        for blend in REFERENCE_BLENDS
-    )
     return (
-        ("free_ref_100", FINAL_RAY_POSE_NAME, False, 1.0),
-        *anchored,
+        (
+            "fixed_ref_050",
+            reference_blend_pose_name(REFERENCE_BLEND),
+            True,
+            REFERENCE_BLEND,
+        ),
     )
 
 
-def _build_joint_solver_summary(
+def _build_reference_pose_summary(
     config: LearnedPoseConfig,
 ) -> list[dict[str, object]]:
     evaluation = config.output_dir / "evaluation"
@@ -339,7 +321,7 @@ def _compact_value(value: object) -> object:
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
     if not path.is_file():
-        raise FileNotFoundError(f"Missing solver sweep CSV: {path}")
+        raise FileNotFoundError(f"Missing reference-pose CSV: {path}")
     with path.open("r", newline="", encoding="utf8") as handle:
         return list(csv.DictReader(handle))
 

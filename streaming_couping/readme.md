@@ -1,81 +1,48 @@
 # streaming_couping
 
-当前仓库只保留最终的实例引导点云与相机位姿方法：
+仓库只保留两个实例引导的 StreamVGGT + SAM3 版本：
 
 ```text
-StreamVGGT geometry
-  -> geometry-aware SAM3 recovery and persistent instance masks
-  -> decoupled learned adapter
-       patch branch  -> refined world pointmap
-       camera branch -> refined camera rotation
-  -> angular-Huber point-to-ray solve on tracked instances
-  -> refined camera translation
+V4 coverage-first
+  appearance-only + additive pose + current-refined ray solver
+  研究主线：优先保持实例 mask 覆盖率，后续解决错检
+
+V5 adaptive-best
+  residual-only + bounded SO(3) + fixed-reference ray solver
+  安全对照：按无 GT ray support 选择 raw/learned pointmap
 ```
 
-最终输出是同一 StreamVGGT native gauge 中的：
+## 运行
 
-```text
-persistent instance masks + refined world pointmap + refined camera pose
-```
-
-## 保留的代码
-
-```text
-configs/final_joint_pointcloud_pose.yaml  最终配置
-scripts/run_instance_token_pose.py        cache/train/eval/ray/export 入口
-scripts/plot_pose_comparison.py           GT/raw/ours 位姿图
-src/learned_pose/                         最终双分支、损失、ray solver 与导出
-src/instance_observations.py              实例 ICP 特征与 tracking cache
-src/tracking_recovery.py                  几何筛选后的 SAM3 recovery
-docs/final_joint_pointcloud_pose_method.md 方法、结果和实验边界
-```
-
-旧的 token-fusion、pose-refinement 和 ray-solver 消融代码已经删除；对应结果保存在最终
-方法文档中。
-
-## 运行当前已训练结果
-
-在仓库根目录运行：
+V4：
 
 ```bash
-zsh streaming_couping/commands_final_joint_pointcloud_pose.txt
+zsh streaming_couping/commands_v4_coverage_first.txt
 ```
 
-它复用已有 feature cache 和最终 checkpoint，依次运行最终 ray translation、三方导出和
-位姿图，不重新训练。
-
-## 从头训练
+V5：
 
 ```bash
-PYTHONUNBUFFERED=1 PYTHONPATH=src:. python -m streaming_couping.scripts.run_instance_token_pose \
-  --config streaming_couping/configs/final_joint_pointcloud_pose.yaml \
-  --stage all \
-  --sam3-device cuda:3 \
-  --geometry-device cuda:1 \
-  --training-device cuda:1
+zsh streaming_couping/commands_v5_adaptive_best.txt
 ```
 
-## 测试另一序列
+两条命令都优先迁移已经训练好的对应 checkpoint；没有 checkpoint 时只训练自己的固定结构。
+它们共用冻结 feature cache，但 checkpoint、评估和最终导出目录完全分开。
 
-复制最终 YAML，替换 clip 的 `scene_id`、按实际输入顺序填写 `frame_indices`、第一帧可见的静态
-`instance_ids`，并设 `split: test`。为保持真正的跨序列测试，不在新序列上训练：
-
-1. 将现有 `checkpoints/decoupled_dual_branch` 复制到新 `output_dir`；
-2. 运行 `--stage cache`；
-3. 运行 `--stage ray`；
-4. 运行 `--stage export`。
-
-主要结果：
+## 保留的入口
 
 ```text
-evaluation/ray_pose_compact_summary.csv
-final_instance_ray_pose_v3/<clip>/comparison_gt_world/pointcloud_metrics.csv
-final_instance_ray_pose_v3/<clip>/comparison_gt_world/camera_pose_metrics.csv
-final_instance_ray_pose_v3/<clip>/segmentation_masks/sequence_overview.png
+configs/v4_coverage_first.yaml
+configs/v5_adaptive_best.yaml
+scripts/run_instance_token_pose.py
+scripts/run_v5_reference_pose.py
+scripts/run_v5_adaptive.py
+scripts/plot_pose_comparison.py
+docs/final_joint_pointcloud_pose_method.md
 ```
 
-场景 `00a231a370` 的五帧示例 `100 200 300 400 500` 已配置好，可直接运行：
+最终输出包括 native pointcloud/pose、GT/raw/ours 对比 PLY、三套 mask、位姿 PNG/PDF、
+指标 CSV、checkpoint 哈希和 artifact manifest。
 
-```bash
-zsh streaming_couping/commands_final_joint_pointcloud_pose_test.txt
-```
+方法、结果和 GT 使用边界见
+`streaming_couping/docs/final_joint_pointcloud_pose_method.md`。

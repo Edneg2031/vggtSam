@@ -44,7 +44,6 @@ class CausalInstanceTokenizer(nn.Module):
         identity_unknown: torch.Tensor | None = None,
         *,
         branch: str,
-        memory_ablation: str = "normal",
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         _validate_observation_shapes(appearance, geometry, quality, observed)
         if identity_valid is None:
@@ -73,7 +72,7 @@ class CausalInstanceTokenizer(nn.Module):
                 )
             elif feature_mode == "residual_only":
                 appearance = torch.zeros_like(appearance)
-            elif feature_mode != "appearance_and_residual":
+            else:
                 raise ValueError(
                     f"Unknown pose feature mode: {feature_mode!r}."
                 )
@@ -93,11 +92,6 @@ class CausalInstanceTokenizer(nn.Module):
             )
         else:
             raise ValueError(f"Unknown final adapter branch: {branch!r}")
-        if memory_ablation not in {"normal", "off", "wrong_id"}:
-            raise ValueError(
-                f"Unknown memory ablation: {memory_ablation!r}."
-            )
-
         batch, sequence, instances = observed.shape
         app_memory = torch.zeros_like(appearance[:, 0])
         geo_memory = torch.zeros_like(geometry[:, 0])
@@ -161,30 +155,14 @@ class CausalInstanceTokenizer(nn.Module):
                 )
                 memory_trusted = trusted
             token_valid = trusted & has_memory
-            feature_app_memory = app_memory
-            feature_geo_memory = geo_memory
-            if memory_ablation == "off":
-                feature_app_memory = torch.zeros_like(app_memory)
-                feature_geo_memory = torch.zeros_like(geo_memory)
-            elif memory_ablation == "wrong_id" and instances > 1:
-                feature_app_memory = torch.roll(
-                    app_memory,
-                    shifts=1,
-                    dims=1,
-                )
-                feature_geo_memory = torch.roll(
-                    geo_memory,
-                    shifts=1,
-                    dims=1,
-                )
             features = torch.cat(
                 [
                     current_app,
-                    feature_app_memory,
-                    current_app - feature_app_memory,
+                    app_memory,
+                    current_app - app_memory,
                     current_geo,
-                    feature_geo_memory,
-                    current_geo - feature_geo_memory,
+                    geo_memory,
+                    current_geo - geo_memory,
                     current_quality,
                     torch.log1p(age)[..., None] / 4.0,
                 ],
@@ -250,7 +228,6 @@ class ZeroInitializedCrossAttention(nn.Module):
         instance_valid: torch.Tensor,
         *,
         instance_reliability: torch.Tensor | None = None,
-        spatial_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Fuse ``[B,S,Q,D]`` queries with ``[B,S,K,Di]`` instances."""
 
@@ -266,16 +243,6 @@ class ZeroInitializedCrossAttention(nn.Module):
         if instance_reliability.shape != instance_valid.shape:
             raise ValueError(
                 "instance_reliability must have shape [B,S,K]."
-            )
-        if spatial_weight is not None and spatial_weight.shape != (
-            batch,
-            sequence,
-            query_count,
-            instance_valid.shape[2],
-        ):
-            raise ValueError(
-                "spatial_weight must have shape [B,S,Q,K], got "
-                f"{tuple(spatial_weight.shape)}."
             )
         flat_queries = queries.reshape(batch * sequence, query_count, query_dim)
         flat_instances = instance_tokens.reshape(
@@ -293,12 +260,6 @@ class ZeroInitializedCrossAttention(nn.Module):
             query_count,
             -1,
         )
-        if spatial_weight is not None:
-            pair_weight = pair_weight * spatial_weight.reshape(
-                batch * sequence,
-                query_count,
-                instance_valid.shape[2],
-            ).to(dtype=queries.dtype)
         pair_weight = torch.where(
             flat_valid[:, None, :],
             pair_weight.clamp(0.0, 1.0),
@@ -470,7 +431,6 @@ class InstancePoseAdapter(nn.Module):
         observed: torch.Tensor,
         identity_valid: torch.Tensor | None = None,
         identity_unknown: torch.Tensor | None = None,
-        memory_ablation: str = "normal",
         module_off: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if module_off:
@@ -492,7 +452,6 @@ class InstancePoseAdapter(nn.Module):
             identity_valid,
             identity_unknown,
             branch="pose",
-            memory_ablation=memory_ablation,
         )
         instance_reliability = memory_log.pop("_instance_reliability")
         refined, log = self.camera_fusion(
@@ -514,8 +473,6 @@ class InstancePoseAdapter(nn.Module):
         observed: torch.Tensor,
         identity_valid: torch.Tensor | None = None,
         identity_unknown: torch.Tensor | None = None,
-        memory_ablation: str = "normal",
-        shuffle_instance_tokens: bool = False,
         spatial_mask: torch.Tensor | None = None,
         patch_shape: tuple[int, int] | None = None,
         module_off: bool = False,
@@ -532,28 +489,18 @@ class InstancePoseAdapter(nn.Module):
             identity_valid,
             identity_unknown,
             branch="geometry",
-            memory_ablation=memory_ablation,
         )
         instance_reliability = memory_log.pop("_instance_reliability")
-        if shuffle_instance_tokens and instance_tokens.shape[2] > 1:
-            instance_tokens = torch.roll(
-                instance_tokens,
-                shifts=1,
-                dims=2,
-            )
         start = int(patch_start_idx)
         output: dict[int, torch.Tensor] = {}
         logs: dict[str, torch.Tensor] = dict(memory_log)
         patch_gate = None
-        pairwise_gate = None
         if self.config.strict_identity_gate:
             if spatial_mask is None or patch_shape is None:
                 raise ValueError(
                     "Strict identity fusion requires a spatial mask and patch_shape."
                 )
-            instance_spatial_mask = None
             if spatial_mask.ndim == 5:
-                instance_spatial_mask = spatial_mask
                 union_spatial_mask = spatial_mask.any(dim=2)
             elif spatial_mask.ndim == 4:
                 union_spatial_mask = spatial_mask
@@ -588,40 +535,6 @@ class InstancePoseAdapter(nn.Module):
                 sequence,
                 patch_h * patch_w,
             ).bool()
-            if self.config.spatial_attention_mode == "per_instance":
-                if instance_spatial_mask is None:
-                    raise ValueError(
-                        "Per-instance spatial attention requires "
-                        "spatial_mask [B,S,K,H,W]."
-                    )
-                instance_count = instance_spatial_mask.shape[2]
-                pairwise = F.interpolate(
-                    instance_spatial_mask.float().reshape(
-                        batch * sequence * instance_count,
-                        1,
-                        height,
-                        width,
-                    ),
-                    size=(patch_h, patch_w),
-                    mode="nearest",
-                )
-                if dilation:
-                    pairwise = F.max_pool2d(
-                        pairwise,
-                        kernel_size=kernel,
-                        stride=1,
-                        padding=dilation,
-                    )
-                pairwise_gate = (
-                    pairwise.reshape(
-                        batch,
-                        sequence,
-                        instance_count,
-                        patch_h * patch_w,
-                    )
-                    .permute(0, 1, 3, 2)
-                    .contiguous()
-                )
         for layer, tokens in token_levels.items():
             key = str(int(layer))
             if start < 0 or start >= tokens.shape[2]:
@@ -638,7 +551,6 @@ class InstancePoseAdapter(nn.Module):
                 instance_tokens,
                 valid,
                 instance_reliability=instance_reliability,
-                spatial_weight=pairwise_gate,
             )
             if patch_gate is not None:
                 if patch_gate.shape != patches.shape[:3]:

@@ -350,61 +350,6 @@ def test_unknown_reliability_scales_single_instance_residual():
     )
 
 
-def test_per_instance_spatial_attention_preserves_token_mask_binding():
-    values = _inputs()
-    config = FusionConfig(
-        instance_dim=8,
-        attention_dim=8,
-        num_heads=2,
-        strict_identity_gate=True,
-        spatial_attention_mode="per_instance",
-        patch_mask_dilation=0,
-        dpt_layer_indices=(4, 11, 17, 23),
-    )
-    adapter = InstancePoseAdapter(
-        appearance_dim=4,
-        geometry_dim=5,
-        token_dim=16,
-        config=config,
-    )
-    with torch.no_grad():
-        for fusion in adapter.patch_token_fusions.values():
-            fusion.zero_proj.weight.normal_()
-    levels = {
-        layer: torch.randn(1, 4, 6, 16)
-        for layer in (4, 11, 17, 23)
-    }
-    masks = torch.zeros(1, 4, 3, 1, 4, dtype=torch.bool)
-    masks[:, :, 0, :, :2] = True
-    masks[:, :, 1, :, 2:3] = True
-    masks[:, :, 2, :, 3:] = True
-    common = dict(
-        patch_start_idx=2,
-        appearance=values["appearance"],
-        geometry=values["geometry"],
-        quality=values["quality"],
-        observed=values["observed"],
-        identity_valid=torch.ones_like(values["observed"]),
-        spatial_mask=masks,
-        patch_shape=(1, 4),
-    )
-    aligned, _ = adapter.forward_patch_tokens(
-        levels,
-        shuffle_instance_tokens=False,
-        **common,
-    )
-    shuffled, _ = adapter.forward_patch_tokens(
-        levels,
-        shuffle_instance_tokens=True,
-        **common,
-    )
-
-    assert any(
-        not torch.equal(aligned[layer][:, 1:], shuffled[layer][:, 1:])
-        for layer in levels
-    )
-
-
 def test_so3_exponential_is_valid_and_has_gradient_at_zero():
     omega = torch.zeros(2, 3, requires_grad=True)
     rotation = _so3_exp(omega)
