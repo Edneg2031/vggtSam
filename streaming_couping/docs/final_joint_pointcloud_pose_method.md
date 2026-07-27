@@ -423,6 +423,28 @@ v6_v63_sweep.csv        # 10 个合法组合的 train/heldout/cross 指标
 `development_best=1` 只标记第二段 development clip 上的最低 loss，不会进入模型决策。结构
 仍需在第三段预先锁定的序列上验证。
 
+### 8.3 V6.4：center 参数化与旋转辅助监督解耦
+
+旧 instance 6DoF checkpoint 的 center 比严格 3DoF local-center 略好，这可能来自两种不同
+因素：SE(3) 参数化的额外自由度，或旋转监督对 instance representation 的正则化。V6.4 因此
+固定 instance-only 输入和 full-SE(3) head，只改变训练损失中的旋转权重：
+
+```text
+L = 10 * L_center + λ_rot * L_rotation
+λ_rot = 0, 0.1, 1, 10
+```
+
+`λ=1` 直接复用原 instance-only control；另外训练三个权重。推理时四个模型都丢弃 instance
+rotation，只抽取 C，并与同一个 specialized camera rotation 合成。严格 3DoF local-center
+作为第五行结构对照。输出为：
+
+```text
+v6_v64_aux_sweep.csv
+```
+
+若 `λ=0` 的 full-SE(3) center 已优于 3DoF center，收益主要来自参数化；若非零 λ 进一步稳定
+改善，才支持“辅助旋转监督有正则化作用”。所有 `development_best` 仍只用于分析。
+
 `model_overfit_pass=1` 表示对应独立模型的 loss 下降、旋转、平移和参考帧精确性同时达到
 阈值；`fusion_instance_used=1` 与 `fusion_camera_used=1` 分别表示 fusion checkpoint 的输入
 消融支持两种 token 确实参与预测。三套模型都能拟合仍只说明容量；跨 clip 的固定 checkpoint

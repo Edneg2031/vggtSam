@@ -20,7 +20,7 @@ else
     --training-device cuda:1
 fi
 
-# Always retrain three 6DoF controls plus seven specialized 3DoF models.
+# Retrain 3 controls, 7 component models and 3 extra auxiliary-loss models.
 export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
@@ -32,3 +32,4 @@ sed -n '1,8p' "$OUTPUT/v6_cross_clip_summary.csv"
 sed -n '1,9p' "$OUTPUT/v6_frame_diagnostics.csv"
 sed -n '1,9p' "$OUTPUT/v6_component_sweep.csv"
 sed -n '1,12p' "$OUTPUT/v6_v63_sweep.csv"
+sed -n '1,7p' "$OUTPUT/v6_v64_aux_sweep.csv"

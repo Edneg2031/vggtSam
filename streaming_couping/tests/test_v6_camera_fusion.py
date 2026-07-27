@@ -7,6 +7,7 @@ from streaming_couping.scripts.run_v6_camera_overfit import (
     _compose_decoupled_output,
     _compose_v63_combinations,
     _frame_diagnostic_rows,
+    _pose_loss,
     _pose_metrics,
     load_v6_config,
 )
@@ -245,6 +246,35 @@ def test_pose_metrics_can_select_only_heldout_frames() -> None:
     assert second["translation_native"] == 2.0
 
 
+def test_se3_training_loss_can_disable_auxiliary_rotation() -> None:
+    target = torch.cat(
+        [torch.eye(3), torch.zeros(3, 1)],
+        dim=-1,
+    ).reshape(1, 1, 3, 4).expand(1, 2, 3, 4).clone()
+    predicted = target.clone()
+    predicted[:, 1, :3, :3] = torch.tensor(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+    )
+    center_only = _pose_loss(
+        predicted,
+        target,
+        reference_index=0,
+        translation_weight=10.0,
+        component="se3",
+        rotation_weight=0.0,
+    )
+    with_rotation = _pose_loss(
+        predicted,
+        target,
+        reference_index=0,
+        translation_weight=10.0,
+        component="se3",
+        rotation_weight=1.0,
+    )
+    assert center_only == 0.0
+    assert with_rotation > 0.0
+
+
 def test_decoupled_pose_uses_requested_rotation_and_camera_center() -> None:
     baseline = torch.cat(
         [
@@ -390,6 +420,7 @@ def test_v6_command_and_config_are_retained() -> None:
     assert "v6_frame_diagnostics.csv" in command
     assert "v6_component_sweep.csv" in command
     assert "v6_v63_sweep.csv" in command
+    assert "v6_v64_aux_sweep.csv" in command
     assert "00a231a370_90_240_37_68_54" in config
     assert "steps: 1200" in config
 

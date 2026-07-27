@@ -1,6 +1,7 @@
 # V6 trains three full-SE(3) controls plus seven specialized rotation/center
-# models spanning token source and coordinate parameterization. All fixed
-# checkpoints are evaluated on test_clip_name without retraining.
+# models spanning token source and coordinate parameterization, plus three
+# instance-SE(3) auxiliary-loss variants. All fixed checkpoints are evaluated
+# on test_clip_name without retraining.
 # It intentionally uses GT pose only as a training target. It does not train
 # pointmaps and does not call the analytic ray-pose solver.
 base_config: streaming_couping/configs/v4_coverage_first.yaml
