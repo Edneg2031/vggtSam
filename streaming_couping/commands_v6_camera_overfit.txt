@@ -26,4 +26,4 @@ PYTHONUNBUFFERED=1 PYTHONPATH=. python -m streaming_couping.scripts.run_v6_camer
   --config "$V6_CONFIG" \
   --device cuda:1
 
-sed -n '1,12p' "$OUTPUT/v6_summary.csv"
+sed -n '1,16p' "$OUTPUT/v6_summary.csv"

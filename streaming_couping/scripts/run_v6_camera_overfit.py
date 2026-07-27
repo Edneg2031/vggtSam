@@ -87,8 +87,10 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         )
     print(f"V6 reusing frozen cache: {path}")
     print("V6 trains Feature Merger + SE(3) head only; pointmap and solver are off")
-    payload = _slice_training_payload(load_feature_cache(path), clip)
+    full_payload = load_feature_cache(path)
+    payload = _slice_training_payload(full_payload, clip)
     batch = _camera_batch(payload, device=config.device)
+    full_batch = _camera_batch(full_payload, device=config.device)
 
     recovery = load_config(base.recovery_config)
     maybe_add_repo_to_path(recovery.streamvggt_repo)
@@ -103,7 +105,25 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         batch["target_pose_encoding"],
         image_size_hw=image_size,
     )
+    full_baseline_w2c, _ = pose_encoding_to_extri_intri(
+        full_batch["baseline_pose_encoding"],
+        image_size_hw=image_size,
+    )
+    full_target_w2c, _ = pose_encoding_to_extri_intri(
+        full_batch["target_pose_encoding"],
+        image_size_hw=image_size,
+    )
     reference_index = int(payload["reference_sequence_index"])
+    heldout_frames = tuple(clip.evaluation_frame_indices or ())
+    if not heldout_frames:
+        raise ValueError(
+            f"V6 clip {clip.name!r} requires evaluation_frame_indices."
+        )
+    frame_position = {
+        int(frame): index
+        for index, frame in enumerate(full_payload["frame_indices"])
+    }
+    heldout_indices = [frame_position[int(frame)] for frame in heldout_frames]
     output_dir = config.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     raw_metrics = _pose_metrics(
@@ -168,6 +188,35 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         )
         for variant in V6_VARIANTS
     }
+    heldout_raw = _pose_metrics(
+        full_baseline_w2c,
+        full_target_w2c,
+        reference_index=int(full_payload["reference_sequence_index"]),
+        translation_weight=config.training.translation_weight,
+        evaluation_indices=heldout_indices,
+    )
+    heldout = {
+        mode: _evaluate_model(
+            trained[mode]["model"],
+            mode=mode,
+            variant="normal",
+            batch=full_batch,
+            baseline_w2c=full_baseline_w2c,
+            target_w2c=full_target_w2c,
+            reference_index=int(full_payload["reference_sequence_index"]),
+            config=config,
+            evaluation_indices=heldout_indices,
+        )
+        for mode in V6_TRAINING_MODES
+    }
+    heldout_fusion_best = int(
+        float(heldout["fusion"]["loss"])
+        < min(
+            float(heldout_raw["loss"]),
+            float(heldout["camera_only"]["loss"]),
+            float(heldout["instance_only"]["loss"]),
+        )
+    )
     normal = evaluations["normal"]
     instance_used = int(
         float(normal["loss"])
@@ -184,6 +233,7 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
     )
     summary_path = output_dir / "v6_summary.csv"
     frames = " ".join(str(value) for value in payload["frame_indices"])
+    heldout_frame_text = " ".join(str(value) for value in heldout_frames)
     rows = [
         _summary_row(
             experiment="control",
@@ -196,6 +246,7 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
             capacity_pass=0,
             instance_used=instance_used,
             camera_used=camera_used,
+            heldout_fusion_best=heldout_fusion_best,
         )
     ]
     for mode in V6_TRAINING_MODES:
@@ -211,6 +262,38 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
                 capacity_pass=trained[mode]["capacity_pass"],
                 instance_used=instance_used,
                 camera_used=camera_used,
+                heldout_fusion_best=heldout_fusion_best,
+            )
+        )
+    rows.append(
+        _summary_row(
+            experiment="heldout",
+            variant="heldout_raw",
+            trained_mode="none",
+            test_input="raw",
+            frames=heldout_frame_text,
+            metrics=heldout_raw,
+            initial_loss=float(heldout_raw["loss"]),
+            capacity_pass=0,
+            instance_used=instance_used,
+            camera_used=camera_used,
+            heldout_fusion_best=heldout_fusion_best,
+        )
+    )
+    for mode in V6_TRAINING_MODES:
+        rows.append(
+            _summary_row(
+                experiment="heldout",
+                variant=f"heldout_{mode}",
+                trained_mode=mode,
+                test_input="normal",
+                frames=heldout_frame_text,
+                metrics=heldout[mode],
+                initial_loss=float(heldout_raw["loss"]),
+                capacity_pass=trained[mode]["capacity_pass"],
+                instance_used=instance_used,
+                camera_used=camera_used,
+                heldout_fusion_best=heldout_fusion_best,
             )
         )
     for variant in V6_VARIANTS:
@@ -228,13 +311,17 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
                 capacity_pass=trained["fusion"]["capacity_pass"],
                 instance_used=instance_used,
                 camera_used=camera_used,
+                heldout_fusion_best=heldout_fusion_best,
             )
         )
     _write_csv(summary_path, rows)
     with (output_dir / "v6_run.json").open("w", encoding="utf8") as handle:
         json.dump(
             {
-                "purpose": "fair three-model capacity and fusion-dependency ablation",
+                "purpose": (
+                    "fair three-model capacity, fusion dependency, and "
+                    "fixed-checkpoint temporal holdout"
+                ),
                 "uses_gt_during_training": True,
                 "runs_pointmap_branch": False,
                 "runs_analytic_pose_solver": False,
@@ -244,6 +331,8 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
                 },
                 "instance_used": bool(instance_used),
                 "camera_used": bool(camera_used),
+                "heldout_frames": list(heldout_frames),
+                "heldout_fusion_best": bool(heldout_fusion_best),
                 "config": str(config.source_path),
                 "cache": str(path),
             },
@@ -269,6 +358,20 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         f"fusion_instance_used={instance_used}  camera_used={camera_used}  "
         f"reference_exact={int(normal['reference_exact'])}"
     )
+    print(f"HELD-OUT {heldout_frame_text}")
+    print(
+        "raw:          "
+        f"rot={float(heldout_raw['rotation_degrees']):.4f} deg  "
+        f"trans={float(heldout_raw['translation_native']):.6f}"
+    )
+    for mode in V6_TRAINING_MODES:
+        metrics = heldout[mode]
+        print(
+            f"{mode:13s} "
+            f"rot={float(metrics['rotation_degrees']):.4f} deg  "
+            f"trans={float(metrics['translation_native']):.6f}"
+        )
+    print(f"heldout_fusion_best={heldout_fusion_best}")
     print(f"summary={summary_path}")
     return summary_path
 
@@ -462,6 +565,7 @@ def _evaluate_model(
     target_w2c: torch.Tensor,
     reference_index: int,
     config: V6ExperimentConfig,
+    evaluation_indices: list[int] | None = None,
 ) -> dict[str, float | int]:
     model.eval()
     with torch.no_grad():
@@ -478,6 +582,7 @@ def _evaluate_model(
             target_w2c,
             reference_index=reference_index,
             translation_weight=config.training.translation_weight,
+            evaluation_indices=evaluation_indices,
         )
     metrics["reference_exact"] = int(
         torch.equal(
@@ -485,7 +590,19 @@ def _evaluate_model(
             baseline_w2c[:, reference_index].cpu(),
         )
     )
-    metrics["active_frames"] = int(output["active_frames"].sum().cpu())
+    active_indices = _evaluation_indices(
+        output["active_frames"].shape[1],
+        reference_index=reference_index,
+        evaluation_indices=evaluation_indices,
+    )
+    active_index = torch.tensor(
+        active_indices,
+        dtype=torch.long,
+        device=output["active_frames"].device,
+    )
+    metrics["active_frames"] = int(
+        output["active_frames"].index_select(1, active_index).sum().cpu()
+    )
     return metrics
 
 
@@ -549,6 +666,7 @@ def _summary_row(
     capacity_pass: int,
     instance_used: int,
     camera_used: int,
+    heldout_fusion_best: int,
 ) -> dict[str, object]:
     row_loss = float(metrics["loss"])
     return {
@@ -564,8 +682,10 @@ def _summary_row(
         "active_frames": metrics.get("active_frames", 0),
         "reference_exact": metrics.get("reference_exact", 1),
         "model_overfit_pass": capacity_pass,
+        "better_than_split_raw": int(row_loss < initial_loss),
         "fusion_instance_used": instance_used,
         "fusion_camera_used": camera_used,
+        "heldout_fusion_best": heldout_fusion_best,
     }
 
 
@@ -599,12 +719,13 @@ def _pose_loss(
     *,
     reference_index: int,
     translation_weight: float,
+    evaluation_indices: list[int] | None = None,
 ) -> torch.Tensor:
-    indices = [
-        index
-        for index in range(predicted.shape[1])
-        if index != int(reference_index)
-    ]
+    indices = _evaluation_indices(
+        predicted.shape[1],
+        reference_index=reference_index,
+        evaluation_indices=evaluation_indices,
+    )
     if not indices:
         raise ValueError("V6 needs at least one non-reference frame.")
     index = torch.tensor(indices, dtype=torch.long, device=predicted.device)
@@ -625,12 +746,13 @@ def _pose_metrics(
     *,
     reference_index: int,
     translation_weight: float,
+    evaluation_indices: list[int] | None = None,
 ) -> dict[str, float]:
-    indices = [
-        index
-        for index in range(predicted.shape[1])
-        if index != int(reference_index)
-    ]
+    indices = _evaluation_indices(
+        predicted.shape[1],
+        reference_index=reference_index,
+        evaluation_indices=evaluation_indices,
+    )
     index = torch.tensor(indices, dtype=torch.long, device=predicted.device)
     predicted_eval = predicted.index_select(1, index)
     target_eval = target.index_select(1, index)
@@ -651,12 +773,39 @@ def _pose_metrics(
         target,
         reference_index=reference_index,
         translation_weight=translation_weight,
+        evaluation_indices=evaluation_indices,
     )
     return {
         "rotation_degrees": float(rotation.cpu()),
         "translation_native": float(translation.cpu()),
         "loss": float(loss.cpu()),
     }
+
+
+def _evaluation_indices(
+    sequence_length: int,
+    *,
+    reference_index: int,
+    evaluation_indices: list[int] | None,
+) -> list[int]:
+    indices = (
+        [
+            index
+            for index in range(sequence_length)
+            if index != int(reference_index)
+        ]
+        if evaluation_indices is None
+        else [int(index) for index in evaluation_indices]
+    )
+    if not indices:
+        raise ValueError("V6 evaluation requires at least one frame.")
+    if len(set(indices)) != len(indices):
+        raise ValueError("V6 evaluation indices contain duplicates.")
+    if any(index < 0 or index >= sequence_length for index in indices):
+        raise ValueError("V6 evaluation index is outside the sequence.")
+    if int(reference_index) in indices:
+        raise ValueError("V6 held-out evaluation must not include the reference.")
+    return indices
 
 
 def _camera_centers(world_to_camera: torch.Tensor) -> torch.Tensor:

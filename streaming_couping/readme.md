@@ -39,7 +39,8 @@ zsh streaming_couping/commands_v6_camera_overfit.txt
 V6 复用冻结 cache，不训练 SAM3/StreamVGGT，不训练 pointmap，也不运行 ray solver。
 一次命令会用相同 seed 和步数分别训练 `camera_only、instance_only、fusion` 三套模型，再用
 fusion checkpoint 评估 `instance_off、camera_off、shuffle_time、wrong_geometry、
-appearance_only、geometry_only`。只需查看或复制：
+appearance_only、geometry_only`。三个固定 checkpoint 还会直接测试未参与训练的 `210 240`，
+不重新训练、不运行 solver。只需查看或复制：
 
 ```text
 outputs/streaming_couping_v6_camera_overfit/v6_summary.csv

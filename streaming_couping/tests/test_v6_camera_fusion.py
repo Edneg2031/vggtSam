@@ -2,7 +2,10 @@ from pathlib import Path
 
 import torch
 
-from streaming_couping.scripts.run_v6_camera_overfit import load_v6_config
+from streaming_couping.scripts.run_v6_camera_overfit import (
+    _pose_metrics,
+    load_v6_config,
+)
 from streaming_couping.src.learned_pose.v6_camera_fusion import (
     V6CameraFusion,
     V6FusionConfig,
@@ -141,6 +144,36 @@ def test_unknown_training_mode_is_rejected() -> None:
         assert "training mode" in str(error)
     else:
         raise AssertionError("Expected an invalid V6 mode to be rejected.")
+
+
+def test_pose_metrics_can_select_only_heldout_frames() -> None:
+    target = torch.cat(
+        [
+            torch.eye(3).reshape(1, 1, 3, 3).expand(1, 3, 3, 3),
+            torch.zeros(1, 3, 3, 1),
+        ],
+        dim=-1,
+    )
+    predicted = target.clone()
+    predicted[:, 1, 0, 3] = 1.0
+    predicted[:, 2, 0, 3] = 2.0
+
+    first = _pose_metrics(
+        predicted,
+        target,
+        reference_index=0,
+        translation_weight=1.0,
+        evaluation_indices=[1],
+    )
+    second = _pose_metrics(
+        predicted,
+        target,
+        reference_index=0,
+        translation_weight=1.0,
+        evaluation_indices=[2],
+    )
+    assert first["translation_native"] == 1.0
+    assert second["translation_native"] == 2.0
 
 
 def test_same_checkpoint_ablations_change_only_requested_inputs() -> None:

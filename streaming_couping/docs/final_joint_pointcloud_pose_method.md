@@ -281,6 +281,17 @@ fusion         camera query → persistent instances → merger → SE(3) head
 GT pose 在这里明确作为五帧监督目标；pointmap branch、冻结 CameraHead 和解析式 ray solver
 全部关闭。因此实验成功只证明容量、梯度和实现路径正确，不证明 held-out 或跨场景泛化。
 
+三个 checkpoint 训练完成后保持固定，继续读取完整因果上下文并只在 `210 240` 计算指标：
+
+```text
+90 105 119 130 140 → train
+210 240             → held-out evaluation
+```
+
+held-out RGB、camera/instance feature 会进入模型；对应 GT pose 只在预测完成后计算误差，不会
+作为模型输入。`heldout_fusion_best=1` 表示 fusion loss 同时低于 raw 和两个独立单分支；它是
+当前场景两帧证据，不代表跨场景通用。
+
 独立训练结果写为 `trained_camera_only、trained_instance_only、trained_fusion`。随后只对
 fusion checkpoint 做依赖性评估：
 
