@@ -87,6 +87,7 @@ def load_mask_tracking_sequence(
     min_visible_frames: int,
     excluded_labels: Iterable[str],
     seed: int,
+    allow_absent: bool = False,
 ) -> MaskTrackingSequence:
     manifest_path = Path(manifest_path).expanduser().resolve()
     with manifest_path.open("r", encoding="utf8") as handle:
@@ -136,10 +137,13 @@ def load_mask_tracking_sequence(
     label = labels.get(instance_id, "object")
     counts = [int((mask == instance_id).sum()) for mask in instance_masks]
     if max(counts, default=0) == 0:
-        raise ValueError(
-            f"Instance {instance_id} is absent from frames {selected_indices}."
-        )
-    reference_frame_idx = int(np.argmax(counts))
+        if not allow_absent:
+            raise ValueError(
+                f"Instance {instance_id} is absent from frames {selected_indices}."
+            )
+        reference_frame_idx = 0
+    else:
+        reference_frame_idx = int(np.argmax(counts))
 
     return MaskTrackingSequence(
         scene_id=scene_id,

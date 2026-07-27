@@ -58,9 +58,10 @@ outputs/streaming_couping_v6_camera_overfit/v6_validation_summary.csv
 
 正式候选比较使用预先锁定的第三段 `50 60 70 80`，并在训练区间从 90 开始前截止，避免
 精确及近邻训练视角泄漏。该段不重新训练，只输出 raw、3DoF local-center 候选 A 和
-`λ_rotation=0.1` 候选 B 三行。第三段不要求 GT instance 37 出现在参考帧：SAM3 在第 50 帧
-用 `object` 查询自动填充最多三个 exchangeable instance slot。检测到一个实例即可运行；不足
-三个的 slot 补零；某帧没有可用 persistent instance 时，两个候选都在该帧严格回退 raw。
+`λ_rotation=0.1` 候选 B 三行。为与训练段保持同一初始化条件，第三段从参考帧 GT instance
+mask 中读取训练使用的 `37/68/54`；哪个在第 50 帧可见就初始化哪个，不要求三者齐全，缺失
+ID 保留为空槽。后续帧只要仍有一个可用 persistent instance 就运行；全部失效时两个候选在
+该帧严格回退 raw。这里使用 GT reference mask，但 GT pose 仍只参与最终指标计算。
 
 V4/V5 两条命令优先迁移已有 checkpoint；V6 每次从相同 seed 训练十三个模型。它们共用
 冻结 feature cache，但 checkpoint、评估和最终导出目录完全分开。

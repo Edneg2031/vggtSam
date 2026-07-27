@@ -188,6 +188,9 @@ def _build_geometry_cache(
             recovery,
             instance_ids=clip.instance_ids,
             reference_sequence_index=clip.reference_sequence_index,
+            allow_missing_reference=(
+                clip.allow_missing_reference_instances
+            ),
         )
         shared = sequences[int(clip.instance_ids[0])]
     output = stream_adapter.extract_from_paths(
@@ -405,6 +408,9 @@ def _build_geometry_cache(
         "frame_indices": list(clip.frame_indices),
         "instance_ids": list(clip.instance_ids),
         "instance_source": clip.instance_source,
+        "allow_missing_reference_instances": bool(
+            clip.allow_missing_reference_instances
+        ),
         "reference_sequence_index": clip.reference_sequence_index,
         "strict_identity_gate": bool(config.fusion.strict_identity_gate),
         "image_paths": [str(path) for path in shared.image_paths],
@@ -490,11 +496,41 @@ def _load_or_run_tracking(
     if cached is not None:
         print(f"reusing tracking cache: {path}")
         return cached[1]
-    sam3 = _sam_video_model(recovery, sam_video_holder)
+    sam3 = None
     original: dict[int, TrackingSequence] = {}
     recovered: dict[int, TrackingSequence] = {}
     rows = []
     for instance_id in clip.instance_ids:
+        reference_mask = target_masks[int(instance_id)][
+            int(clip.reference_sequence_index)
+        ]
+        if not bool(reference_mask.any()):
+            print(
+                "reference instance unavailable; using empty slot "
+                f"clip={clip.name} frame="
+                f"{clip.frame_indices[clip.reference_sequence_index]} "
+                f"instance={int(instance_id)}"
+            )
+            empty = _empty_tracking(
+                sequence=len(clip.frame_indices),
+                output_size=recovery.output_size,
+            )
+            original[int(instance_id)] = empty
+            recovered[int(instance_id)] = empty
+            rows.append(
+                {
+                    "instance_id": int(instance_id),
+                    "recovery_applied": 0,
+                    "recovery_sequence_index": None,
+                    "recovery_frame_index": None,
+                    "recovery_reason": "instance absent at reference frame",
+                    "selected_support_coverage": 0.0,
+                    "selected_candidate_gt_iou": None,
+                }
+            )
+            continue
+        if sam3 is None:
+            sam3 = _sam_video_model(recovery, sam_video_holder)
         result = run_natural_recovery_tracking(
             recovery,
             sequence=sequences[int(instance_id)],
@@ -846,6 +882,8 @@ def _cache_complete(
             payload.get("instance_source", "configured_gt_reference")
         )
         == clip.instance_source
+        and bool(payload.get("allow_missing_reference_instances", False))
+        == bool(clip.allow_missing_reference_instances)
         and int(payload.get("reference_sequence_index", -1))
         == clip.reference_sequence_index
     )

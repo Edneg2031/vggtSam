@@ -462,12 +462,14 @@ v6_v64_aux_sweep.csv
 v6_validation_summary.csv
 ```
 
-第三段的 instance 初始化不再硬编码 ScanNet++ GT ID `37/68/54`。SAM3 只在参考帧 50 上用
-通用 `object` 文本查询，按置信度选择最多三个非重复 mask，并把它们作为 exchangeable slot
-建立 persistent memory。一个 mask 就足够；不足三个时剩余 slot 为全零。若某个后续帧没有
-通过可见性与 identity gate 的实例，camera rotation 也不会单独生效，整个组合位姿逐元素保持
-StreamVGGT raw；因此零实例时两个候选与 raw bit-exact。该选择过程不读取第三段 GT instance
-mask，GT pose 仍只用于最后的误差计算。
+为隔离“位姿融合”与“开放词汇检测”两个变量，第三段和训练段采用相同的参考帧实例初始化：
+只读取 ScanNet++ GT ID `37/68/54` 在参考帧 50 的 mask，哪个可见就用哪个，不要求三者齐全。
+缺失 ID 保留为空槽，不会终止整段；至少一个实例通过后续可见性与 identity gate 时即可建立
+persistent memory。若某帧没有任何可用实例，camera rotation 也不会单独生效，整个组合位姿
+逐元素保持 StreamVGGT raw，因此零实例时两个候选与 raw bit-exact。这里使用 GT reference
+instance mask；后续帧 GT mask 不参与候选选择或位姿修正，仅保留已有的事后诊断 IoU。GT pose
+仍只用于最后的误差计算。开放文本自动发现应作为单独的 deployable 初始化消融，不能与当前
+候选 A/B 的结构比较混在一起。
 
 该表不会根据第三段结果回头选择 blend、阈值、辅助权重或 token source。
 

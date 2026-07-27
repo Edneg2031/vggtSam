@@ -21,6 +21,7 @@ class ClipConfig:
     training_frame_indices: tuple[int, ...] | None = None
     evaluation_frame_indices: tuple[int, ...] | None = None
     instance_source: str = "configured_gt_reference"
+    allow_missing_reference_instances: bool = False
 
 
 @dataclass(frozen=True)
@@ -327,6 +328,9 @@ def _parse_clip(value: dict[str, Any], base: Path) -> ClipConfig:
         instance_source=str(
             value.get("instance_source", "configured_gt_reference")
         ),
+        allow_missing_reference_instances=bool(
+            value.get("allow_missing_reference_instances", False)
+        ),
     )
 
 
@@ -440,6 +444,14 @@ def _validate(config: LearnedPoseConfig) -> None:
         if clip.instance_source == "sam3_reference" and clip.split.lower() == "train":
             raise ValueError(
                 f"Training clip {clip.name!r} cannot use sam3_reference slots."
+            )
+        if (
+            clip.allow_missing_reference_instances
+            and clip.instance_source != "configured_gt_reference"
+        ):
+            raise ValueError(
+                f"Clip {clip.name!r} may allow missing reference instances "
+                "only with configured_gt_reference."
             )
         if clip.reference_sequence_index != 0:
             raise ValueError("Learned causal pose refinement requires reference_sequence_index=0.")

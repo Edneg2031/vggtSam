@@ -5,7 +5,7 @@ V6_CONFIG=streaming_couping/configs/v6_camera_overfit.yaml
 OUTPUT=outputs/streaming_couping_v6_camera_overfit
 TRAIN_CACHE=outputs/streaming_couping_v5_ablation/cache/00a231a370_90_240_37_68_54.pt
 TEST_CACHE=outputs/streaming_couping_v5_ablation/cache/00a231a370_492_589_37_68_54.pt
-VALIDATION_CACHE=outputs/streaming_couping_v5_ablation/cache/00a231a370_50_80_sam3_auto3.pt
+VALIDATION_CACHE=outputs/streaming_couping_v5_ablation/cache/00a231a370_50_80_37_68_54.pt
 
 # Do not touch SAM3/StreamVGGT when all three frozen clip caches are present.
 # If one is absent, the retained cache builder creates only missing observations.

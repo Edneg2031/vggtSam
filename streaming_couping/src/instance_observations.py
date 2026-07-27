@@ -65,8 +65,15 @@ def load_instance_sequences(
     *,
     instance_ids: Sequence[int],
     reference_sequence_index: int,
+    allow_missing_reference: bool = False,
 ) -> tuple[dict[int, object], dict[int, torch.Tensor]]:
-    """Load the common RGB sequence and per-instance reference masks."""
+    """Load the common RGB sequence and per-instance reference masks.
+
+    When ``allow_missing_reference`` is enabled, a configured instance that is
+    absent at the reference frame is retained as an empty slot. This lets a
+    clip use any visible subset of a pre-registered instance set without
+    silently replacing it with a different semantic object.
+    """
 
     sequences = {}
     target_masks = {}
@@ -84,12 +91,16 @@ def load_instance_sequences(
             min_visible_frames=1,
             excluded_labels=config.excluded_labels,
             seed=0,
+            allow_absent=allow_missing_reference,
         )
         resized = resize_target_masks(sequence.target_masks, config.output_size)
         reference_index = int(reference_sequence_index)
         if not 0 <= reference_index < len(sequence.frame_indices):
             raise ValueError("reference_sequence_index is outside the sequence.")
-        if not resized[reference_index].any():
+        if (
+            not resized[reference_index].any()
+            and not allow_missing_reference
+        ):
             raise ValueError(
                 f"Instance {instance_id} is absent at reference frame "
                 f"{sequence.frame_indices[reference_index]}."

@@ -471,7 +471,7 @@ def test_v6_command_and_config_are_retained() -> None:
     )
     assert loaded.clip_name == "00a231a370_90_240_37_68_54"
     assert loaded.test_clip_name == "00a231a370_492_589_37_68_54"
-    assert loaded.validation_clip_name == "00a231a370_50_80_sam3_auto3"
+    assert loaded.validation_clip_name == "00a231a370_50_80_37_68_54"
     assert loaded.fusion.hidden_dim == 256
     assert loaded.training.steps == 1200
     assert loaded.success.camera_loss_ratio == 0.80
@@ -481,6 +481,7 @@ def test_v6_command_and_config_are_retained() -> None:
         clip for clip in base.clips if clip.name == loaded.validation_clip_name
     )
     assert validation.frame_indices == (50, 60, 70, 80)
-    assert validation.instance_source == "sam3_reference"
-    assert validation.instance_ids == (1, 2, 3)
+    assert validation.instance_source == "configured_gt_reference"
+    assert validation.instance_ids == (37, 68, 54)
+    assert validation.allow_missing_reference_instances
     assert 90 not in validation.frame_indices
