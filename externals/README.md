@@ -9,12 +9,14 @@ Suggested server layout:
 git submodule update --init --recursive
 ```
 
-The scripts also accept explicit `--vggt-repo` and `--sam3-repo` paths, so the
-external repos can stay outside this project if that is cleaner on the server.
+SAM3, StreamVGGT, and HorizonStream are pinned as Git submodules. HorizonStream
+must be run in its own Python 3.11 environment; do not install its PyTorch 2.8
+and `flash-linear-attention` requirements into the existing `3am` environment.
 
 Expected checkpoints in the current server setup:
 
 ```text
 SAM3:       /home/bod/86Nas/95_data_bak/FoundationModels/sam3/sam3.pt
 StreamVGGT: /home/bod/86Nas/95_data_bak/FoundationModels/StreamVGGT/checkpoints.pth
+HorizonStream: set `HORIZONSTREAM_CHECKPOINT` to the downloaded HorizonStream.pt
 ```

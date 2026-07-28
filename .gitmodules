@@ -4,3 +4,6 @@
 [submodule "externals/streamvggt"]
 	path = externals/streamvggt
 	url = https://github.com/wzzheng/StreamVGGT.git
+[submodule "externals/horizonstream"]
+	path = externals/horizonstream
+	url = https://github.com/3DAgentWorld/HorizonStream.git
