@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--window-size", type=int, default=10)
-    parser.add_argument("--sliding-size", type=int, default=21)
+    parser.add_argument("--sliding-size", type=int, default=10)
     parser.add_argument("--max-full-pointcloud-points", type=int, default=2_000_000)
     return parser.parse_args()
 

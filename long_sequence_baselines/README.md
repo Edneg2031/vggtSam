@@ -60,8 +60,17 @@ zsh long_sequence_baselines/commands_streamvggt_5gpu_smoke.txt
 zsh long_sequence_baselines/commands_meeting_room_full.txt
 ```
 
-HorizonStream 使用一张卡和官方 `sliding_size=21`；StreamVGGT 随后使用五张卡。二者
-不会同时运行。三卡 smoke 实测推算600帧需要约26–30 GiB/卡；五卡分片后预计降至
+也可以分开运行，便于共享GPU调度或单独重试失败的模型：
+
+```bash
+zsh long_sequence_baselines/commands_horizonstream_24gb_full.txt
+zsh long_sequence_baselines/commands_streamvggt_5gpu_full.txt
+```
+
+HorizonStream 使用一张卡；在当前24GB GPU上，`sliding_size=21` 实测需要超过23.69
+GiB，因此正式命令固定使用 `sliding_size=10`，但仍流式处理全部帧并保留连续状态。
+StreamVGGT 随后使用五张卡，二者不会同时运行。三卡 smoke 实测推算600帧需要约26–30
+GiB/卡；五卡分片后预计降至
 约16–19 GiB/卡，适合当前24GB GPU，但正式运行仍需观察 `runtime_per_frame.csv`，因为
 StreamVGGT KV 显存还会随帧数增长。
 

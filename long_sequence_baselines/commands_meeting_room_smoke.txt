@@ -21,6 +21,7 @@ cd "$ROOT"
 [[ -x "$HORIZON_PYTHON" ]] || { echo "找不到 HorizonStream Python: $HORIZON_PYTHON"; exit 1; }
 [[ -x "$STREAM_PYTHON" ]] || { echo "找不到 3am Python: $STREAM_PYTHON"; exit 1; }
 
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 CUDA_VISIBLE_DEVICES="$GPU0" "$HORIZON_PYTHON" \
   -m long_sequence_baselines.run_horizonstream \
   --image-dir "$IMAGE_DIR" \
