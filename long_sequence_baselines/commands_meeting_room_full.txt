@@ -1,10 +1,12 @@
 #!/usr/bin/env zsh
 set -euo pipefail
 
-# 改成 nvidia-smi 中三张空闲的物理 GPU 编号；两个任务串行，不会同时占卡。
+# 改成 nvidia-smi 中五张空闲的物理 GPU 编号；两个任务串行，不会同时占卡。
 GPU0=0
 GPU1=1
 GPU2=2
+GPU3=3
+GPU4=4
 
 ROOT=/home/wlh50060092/vggtSam
 IMAGE_DIR=/home/bod/182Nas/share/BaZhuaYu/DemoData/xiaoyi/blind_data/meeting_room_a02/frames
@@ -28,8 +30,8 @@ CUDA_VISIBLE_DEVICES="$GPU0" "$HORIZON_PYTHON" \
   --sliding-size 21 \
   --max-frames 0
 
-CUDA_VISIBLE_DEVICES="$GPU0,$GPU1,$GPU2" "$STREAM_PYTHON" \
-  -m long_sequence_baselines.run_streamvggt_3gpu \
+CUDA_VISIBLE_DEVICES="$GPU0,$GPU1,$GPU2,$GPU3,$GPU4" "$STREAM_PYTHON" \
+  -m long_sequence_baselines.run_streamvggt_5gpu \
   --image-dir "$IMAGE_DIR" \
   --checkpoint "$STREAM_CKPT" \
   --output-root "$OUTPUT_ROOT/streamvggt" \

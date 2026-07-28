@@ -1,23 +1,25 @@
 # Long-sequence external baselines
 
 这个目录只负责会议室长序列的 **HorizonStream / StreamVGGT 原始基线**，不依赖
-SAM3，也不修改 `streaming_couping`。两种模型顺序运行，因此最多同时占三张卡。
+SAM3，也不修改 `streaming_couping`。两种模型顺序运行，因此最多同时占五张卡。
 
-## 为什么 StreamVGGT 要三卡
+## 为什么 StreamVGGT 要五卡
 
 StreamVGGT 是逐帧因果推理，但官方实现会保留每一层的全部历史 KV：帧数增加时显存
-线性增长。不能用 DDP 把 600 帧拆给三张卡，因为后面的帧依赖前面的状态。这里采用
-层间模型并行：24 层固定分为 8/8/8，每层 KV 永久留在对应 GPU，分区边界只传当前帧
+线性增长。不能用 DDP 把 600 帧拆给五张卡，因为后面的帧依赖前面的状态。这里采用
+层间模型并行：24 层固定分为 5/5/5/5/4，每层 KV 永久留在对应 GPU，分区边界只传当前帧
 token。历史从不重置，因此保持官方 full-history 语义。
 
 ```text
-logical cuda:0  patch embed + aggregator 0..7  + depth head
-logical cuda:1                aggregator 8..15 + point head
-logical cuda:2                aggregator 16..23 + camera head
+logical cuda:0  patch embed + aggregator 0..4   + depth head
+logical cuda:1                aggregator 5..9   + point head
+logical cuda:2                aggregator 10..14
+logical cuda:3                aggregator 15..19
+logical cuda:4                aggregator 20..23 + camera head
 ```
 
-运行前用 `nvidia-smi` 选择三张空闲物理卡，再编辑命令文件顶部的 `GPU0/GPU1/GPU2`。
-脚本有安全检查：StreamVGGT 必须恰好只看到三张卡，HorizonStream 必须只看到一张卡，
+运行前用 `nvidia-smi` 选择五张空闲物理卡，再编辑命令文件顶部的 `GPU0` 到 `GPU4`。
+脚本有安全检查：StreamVGGT 必须恰好只看到五张卡，HorizonStream 必须只看到一张卡，
 避免误占共享 GPU。
 
 服务器的 Conda 入口会错误地指向 `/root/anaconda3`，因此命令文件不使用 `conda run`
@@ -46,14 +48,21 @@ git submodule update --init --recursive
 zsh long_sequence_baselines/commands_meeting_room_smoke.txt
 ```
 
+如果 HorizonStream smoke 已经成功，只需重新验证五卡 StreamVGGT：
+
+```bash
+zsh long_sequence_baselines/commands_streamvggt_5gpu_smoke.txt
+```
+
 确认两个 runner 都完成、显存仍有余量后，再运行约 600 帧正式版本：
 
 ```bash
 zsh long_sequence_baselines/commands_meeting_room_full.txt
 ```
 
-HorizonStream 使用一张卡和官方 `sliding_size=21`；StreamVGGT 随后使用三张卡。二者
-不会同时运行。若三卡 20 帧 smoke 已经接近显存上限，不要直接跑 600 帧，因为
+HorizonStream 使用一张卡和官方 `sliding_size=21`；StreamVGGT 随后使用五张卡。二者
+不会同时运行。三卡 smoke 实测推算600帧需要约26–30 GiB/卡；五卡分片后预计降至
+约16–19 GiB/卡，适合当前24GB GPU，但正式运行仍需观察 `runtime_per_frame.csv`，因为
 StreamVGGT KV 显存还会随帧数增长。
 
 ## 输出
@@ -78,7 +87,7 @@ outputs/long_sequence_baselines/full/
 
 StreamVGGT 额外保存 `points/full_all.ply`（不按置信度过滤）；`full.ply` 默认保留每帧
 置信度前 50% 的点。这样既能看完全公平的原始输出，也能看官方常用置信度过滤后的
-可视化。它还保存 `runtime_per_frame.csv`，可检查三卡显存是否按预期线性增长。
+可视化。它还保存 `runtime_per_frame.csv`，可检查五卡显存是否按预期线性增长。
 
 ## 如何比较
 

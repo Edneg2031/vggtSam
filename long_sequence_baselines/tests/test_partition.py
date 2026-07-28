@@ -6,6 +6,11 @@ def test_24_layers_are_split_eight_per_gpu() -> None:
     assert assignment == [0] * 8 + [1] * 8 + [2] * 8
 
 
+def test_24_layers_are_balanced_across_five_gpus() -> None:
+    assignment = partition_layers(24, 5)
+    assert assignment == [0] * 5 + [1] * 5 + [2] * 5 + [3] * 5 + [4] * 4
+
+
 def test_uneven_partition_is_contiguous_and_balanced() -> None:
     assignment = partition_layers(10, 3)
     assert assignment == [0] * 4 + [1] * 3 + [2] * 3

@@ -1,4 +1,4 @@
-"""Run exact full-history StreamVGGT with its 24 aggregator layers on three GPUs.
+"""Run exact full-history StreamVGGT with layer-wise multi-GPU sharding.
 
 This is layer-wise model parallelism, not DDP: every frame still observes the
 complete causal history, while each layer's KV cache remains on that layer's GPU.
@@ -47,8 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scene-name", default="meeting_room_a02")
     parser.add_argument(
         "--devices",
-        default="cuda:0,cuda:1,cuda:2",
-        help="Exactly three logical CUDA devices; select physical GPUs with CUDA_VISIBLE_DEVICES.",
+        default="cuda:0,cuda:1,cuda:2,cuda:3,cuda:4",
+        help="Three or more logical CUDA devices; select physical GPUs with CUDA_VISIBLE_DEVICES.",
     )
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--image-mode", choices=("crop", "pad"), default="crop")
@@ -76,21 +76,21 @@ def partition_layers(depth: int, device_count: int = 3) -> list[int]:
     return result
 
 
-def parse_devices(value: str) -> tuple[torch.device, torch.device, torch.device]:
+def parse_devices(value: str) -> tuple[torch.device, ...]:
     devices = tuple(torch.device(item.strip()) for item in value.split(",") if item.strip())
-    if len(devices) != 3 or len(set(devices)) != 3:
-        raise ValueError(f"--devices must contain exactly three distinct devices, got {devices}")
+    if len(devices) < 3 or len(set(devices)) != len(devices):
+        raise ValueError(f"--devices must contain at least three distinct devices, got {devices}")
     if any(device.type != "cuda" for device in devices):
         raise ValueError(f"All model-parallel devices must be CUDA devices, got {devices}")
-    return devices  # type: ignore[return-value]
+    return devices
 
 
-class ThreeGpuStreamVGGT:
+class LayerShardedStreamVGGT:
     """A no-training, exact-causal, layer-sharded execution wrapper."""
 
     def __init__(self, model: Any, devices: Sequence[torch.device]) -> None:
-        if len(devices) != 3:
-            raise ValueError("ThreeGpuStreamVGGT requires exactly three devices")
+        if len(devices) < 3:
+            raise ValueError("LayerShardedStreamVGGT requires at least three devices")
         self.model = model.eval()
         self.devices = tuple(devices)
         self.aggregator = model.aggregator
@@ -115,7 +115,7 @@ class ThreeGpuStreamVGGT:
         self.past_key_values_camera: list[Any] = [None] * model.camera_head.trunk_depth
 
     def _distribute_model(self) -> None:
-        first, middle, last = self.devices
+        first, middle, last = self.devices[0], self.devices[1], self.devices[-1]
         self.aggregator.patch_embed.to(first)
         _move_parameter(self.aggregator.camera_token, first)
         _move_parameter(self.aggregator.register_token, first)
@@ -202,7 +202,7 @@ class ThreeGpuStreamVGGT:
         return selected
 
     def camera(self, selected: dict[int, torch.Tensor]) -> torch.Tensor:
-        device = self.devices[2]
+        device = self.devices[-1]
         token_list: list[Any] = [None] * self.aggregator.depth
         token_list[-1] = selected[self.aggregator.depth - 1].to(device).float()
         pose_list, self.past_key_values_camera = self.model.camera_head(
@@ -294,6 +294,28 @@ def _sync(devices: Sequence[torch.device]) -> None:
         torch.cuda.synchronize(device)
 
 
+def _layout_lines(layer_devices: Sequence[int], device_count: int) -> list[str]:
+    lines = []
+    for device_index in range(device_count):
+        layers = [
+            index
+            for index, assigned_device in enumerate(layer_devices)
+            if assigned_device == device_index
+        ]
+        roles = []
+        if device_index == 0:
+            roles.append("patch/depth")
+        if device_index == 1:
+            roles.append("point")
+        if device_index == device_count - 1:
+            roles.append("camera")
+        role_text = f" + {','.join(roles)}" if roles else ""
+        lines.append(
+            f"GPU{device_index}=layers {layers[0]}-{layers[-1]}{role_text}"
+        )
+    return lines
+
+
 def _git_commit(repo: Path) -> str | None:
     import subprocess
 
@@ -309,12 +331,12 @@ def main() -> None:
     args = parse_args()
     devices = parse_devices(args.devices)
     if not torch.cuda.is_available():
-        raise RuntimeError("StreamVGGT three-GPU runner requires CUDA")
-    if torch.cuda.device_count() != 3:
+        raise RuntimeError("StreamVGGT multi-GPU runner requires CUDA")
+    if torch.cuda.device_count() != len(devices):
         raise RuntimeError(
-            "This safety check expects exactly three visible GPUs, but PyTorch sees "
+            f"This safety check expects exactly {len(devices)} visible GPUs, but PyTorch sees "
             f"{torch.cuda.device_count()}. Start it with "
-            "CUDA_VISIBLE_DEVICES=<free0>,<free1>,<free2>."
+            "CUDA_VISIBLE_DEVICES containing only the selected free GPUs."
         )
     if not 0 <= args.confidence_percentile <= 100:
         raise ValueError("--confidence-percentile must be in [0, 100]")
@@ -333,7 +355,7 @@ def main() -> None:
     write_image_list(scene_dir / "input_images.txt", images)
 
     model = load_model(repo, checkpoint)
-    runner = ThreeGpuStreamVGGT(model, devices)
+    runner = LayerShardedStreamVGGT(model, devices)
     from streamvggt.utils.load_fn import load_and_preprocess_images
     from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
 
@@ -344,12 +366,9 @@ def main() -> None:
         if all(torch.cuda.get_device_capability(device)[0] >= 8 for device in devices)
         else torch.float16
     )
-    print(
-        "StreamVGGT model parallel layout: "
-        "GPU0=layers 0-7 + patch/depth, GPU1=layers 8-15 + point, "
-        "GPU2=layers 16-23 + camera",
-        flush=True,
-    )
+    print("StreamVGGT model parallel layout:", flush=True)
+    for line in _layout_lines(runner.layer_devices, len(devices)):
+        print(f"  {line}", flush=True)
     print(
         f"Frames={len(images)} amp={amp_dtype} full_history=True; no temporal chunk reset",
         flush=True,
@@ -451,7 +470,7 @@ def main() -> None:
             ):
                 memory = ", ".join(
                     f"gpu{i}={row[f'gpu{i}_allocated_gib']:.2f}GiB"
-                    for i in range(3)
+                    for i in range(len(devices))
                 )
                 print(
                     f"[{frame_index + 1}/{len(images)}] {image_path.name} "
@@ -483,7 +502,7 @@ def main() -> None:
     _write_runtime_csv(scene_dir / "runtime_per_frame.csv", runtime_rows)
 
     summary = {
-        "method": "streamvggt_3gpu_full_history",
+        "method": "streamvggt_multigpu_full_history",
         "scene": args.scene_name,
         "frames": len(images),
         "image_dir": str(Path(args.image_dir).expanduser().resolve()),
@@ -491,7 +510,8 @@ def main() -> None:
         "repo_commit": _git_commit(repo),
         "devices": [str(device) for device in devices],
         "layers_per_device": [
-            runner.layer_devices.count(device_index) for device_index in range(3)
+            runner.layer_devices.count(device_index)
+            for device_index in range(len(devices))
         ],
         "full_history": True,
         "temporal_chunks": False,
