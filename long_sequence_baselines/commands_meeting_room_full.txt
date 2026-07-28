@@ -1,0 +1,32 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# 改成 nvidia-smi 中三张空闲的物理 GPU 编号；两个任务串行，不会同时占卡。
+GPU0=0
+GPU1=1
+GPU2=2
+
+ROOT=/home/wlh50060092/vggtSam
+IMAGE_DIR=/home/bod/182Nas/share/BaZhuaYu/DemoData/xiaoyi/blind_data/meeting_room_a02/frames
+HORIZON_CKPT=/home/wlh50060092/vggtSam/models/HorizonStream.pt
+STREAM_CKPT=/home/bod/86Nas/95_data_bak/FoundationModels/StreamVGGT/checkpoints.pth
+OUTPUT_ROOT=/home/wlh50060092/vggtSam/outputs/long_sequence_baselines/full
+
+cd "$ROOT"
+
+CUDA_VISIBLE_DEVICES="$GPU0" conda run --no-capture-output -n horizonstream \
+  python -m long_sequence_baselines.run_horizonstream \
+  --image-dir "$IMAGE_DIR" \
+  --checkpoint "$HORIZON_CKPT" \
+  --output-root "$OUTPUT_ROOT/horizonstream" \
+  --scene-name meeting_room_a02 \
+  --sliding-size 21 \
+  --max-frames 0
+
+CUDA_VISIBLE_DEVICES="$GPU0,$GPU1,$GPU2" conda run --no-capture-output -n 3am \
+  python -m long_sequence_baselines.run_streamvggt_3gpu \
+  --image-dir "$IMAGE_DIR" \
+  --checkpoint "$STREAM_CKPT" \
+  --output-root "$OUTPUT_ROOT/streamvggt" \
+  --scene-name meeting_room_a02 \
+  --max-frames 0
