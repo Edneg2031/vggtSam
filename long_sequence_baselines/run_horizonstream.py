@@ -114,6 +114,7 @@ def main() -> None:
     with (output_root / "resolved_config.yaml").open("w") as handle:
         yaml.safe_dump(config, handle, sort_keys=False)
 
+    _install_matplotlib_compatibility()
     sys.path.insert(0, str(repo))
     import horizonstream.core.infer as horizon_infer
 
@@ -145,6 +146,21 @@ def main() -> None:
     }
     write_json(output_root / args.scene_name / "run_summary.json", summary)
     print(f"HorizonStream complete: {summary}", flush=True)
+
+
+def _install_matplotlib_compatibility() -> None:
+    """Restore the cmap API used by the pinned HorizonStream revision."""
+
+    from matplotlib import cm, colormaps
+
+    if hasattr(cm, "get_cmap"):
+        return
+
+    def get_cmap(name=None, lut=None):
+        color_map = colormaps.get_cmap(name)
+        return color_map.resampled(lut) if lut is not None else color_map
+
+    cm.get_cmap = get_cmap
 
 
 def _git_commit(repo: Path) -> str | None:
