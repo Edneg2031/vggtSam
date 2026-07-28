@@ -31,6 +31,7 @@ CUDA_VISIBLE_DEVICES="$GPU0" "$HORIZON_PYTHON" \
   --sliding-size 1 \
   --max-frames 20
 
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 CUDA_VISIBLE_DEVICES="$GPU0,$GPU1,$GPU2,$GPU3,$GPU4" "$STREAM_PYTHON" \
   -m long_sequence_baselines.run_streamvggt_5gpu \
   --image-dir "$IMAGE_DIR" \

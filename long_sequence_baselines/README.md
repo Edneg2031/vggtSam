@@ -10,6 +10,11 @@ StreamVGGT 是逐帧因果推理，但官方实现会保留每一层的全部历
 层间模型并行：24 层固定分为 5/5/5/5/4，每层 KV 永久留在对应 GPU，分区边界只传当前帧
 token。历史从不重置，因此保持官方 full-history 语义。
 
+官方缓存保存RoPE前的K，因此每个新帧都会对全部历史K重复执行QK LayerNorm与RoPE，
+在280帧时产生约8 GiB显存碎片并OOM。本runner缓存已经完成这两个逐token操作的K；
+由于LayerNorm和空间RoPE都不跨token，这与先拼接再计算在数学上等价，却只需处理当前
+帧的新K。runner启动时会用三帧小型Attention自动比较两种实现，只有数值一致才继续。
+
 ```text
 logical cuda:0  patch embed + aggregator 0..4   + depth head
 logical cuda:1                aggregator 5..9   + point head

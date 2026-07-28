@@ -7,15 +7,18 @@ complete causal history, while each layer's KV cache remains on that layer's GPU
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import gc
 import sys
 import time
 from pathlib import Path
+from types import MethodType
 from typing import Any, Sequence
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from .common import (
     TemporalPointSampler,
@@ -85,6 +88,142 @@ def parse_devices(value: str) -> tuple[torch.device, ...]:
     return devices
 
 
+def _install_processed_key_cache(attention: torch.nn.Module) -> None:
+    """Cache token-wise normalized/RoPE keys instead of recomputing all history."""
+
+    if getattr(attention, "_long_sequence_processed_key_cache", False):
+        return
+    object.__setattr__(attention, "_long_sequence_processed_key_cache", True)
+    object.__setattr__(
+        attention,
+        "forward",
+        MethodType(_processed_key_cache_forward, attention),
+    )
+
+
+def _processed_key_cache_forward(
+    attention,
+    x: torch.Tensor,
+    pos=None,
+    attn_mask=None,
+    past_key_values=None,
+    use_cache=False,
+):
+    """Equivalent cached attention that never reapplies QK norm/RoPE to old keys."""
+
+    if not use_cache:
+        return type(attention).forward(
+            attention,
+            x,
+            pos=pos,
+            attn_mask=attn_mask,
+            past_key_values=past_key_values,
+            use_cache=False,
+        )
+
+    batch, query_tokens, channels = x.shape
+    qkv = (
+        attention.qkv(x)
+        .reshape(
+            batch,
+            query_tokens,
+            3,
+            attention.num_heads,
+            attention.head_dim,
+        )
+        .permute(2, 0, 3, 1, 4)
+    )
+    query, key, value = qkv.unbind(0)
+    query = attention.q_norm(query)
+    key = attention.k_norm(key)
+    if attention.rope is not None:
+        query = attention.rope(query, pos)
+        key = attention.rope(key, pos)
+
+    key = key.unsqueeze(2)
+    value = value.unsqueeze(2)
+    if past_key_values is not None:
+        past_key, past_value = past_key_values
+        key = torch.cat([past_key, key], dim=2)
+        value = torch.cat([past_value, value], dim=2)
+    new_key_values = (key, value)
+
+    key = key.reshape(
+        batch,
+        attention.num_heads,
+        -1,
+        attention.head_dim,
+    )
+    value = value.reshape(
+        batch,
+        attention.num_heads,
+        -1,
+        attention.head_dim,
+    )
+    if attention.fused_attn:
+        output = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=attention.attn_drop.p if attention.training else 0.0,
+        )
+    else:
+        scores = (query * attention.scale) @ key.transpose(-2, -1)
+        if attn_mask is not None:
+            scores = scores + attn_mask
+        weights = attention.attn_drop(scores.softmax(dim=-1))
+        output = weights @ value
+
+    output = output.transpose(1, 2).reshape(batch, query_tokens, channels)
+    output = attention.proj_drop(attention.proj(output))
+    return output, new_key_values
+
+
+def _assert_processed_key_cache_equivalence() -> None:
+    """Numerically verify the optimized cache against upstream on three frames."""
+
+    from streamvggt.layers.attention import Attention
+    from streamvggt.layers.rope import RotaryPositionEmbedding2D
+
+    with torch.random.fork_rng(devices=[]), torch.inference_mode():
+        torch.manual_seed(2026)
+        reference = Attention(
+            dim=32,
+            num_heads=4,
+            qk_norm=True,
+            rope=RotaryPositionEmbedding2D(frequency=100),
+        ).eval()
+        optimized = copy.deepcopy(reference).eval()
+        _install_processed_key_cache(optimized)
+        positions = torch.tensor(
+            [[[0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [1, 2]]],
+            dtype=torch.long,
+        )
+        reference_cache = None
+        optimized_cache = None
+        for _ in range(3):
+            tokens = torch.randn(1, 6, 32)
+            reference_output, reference_cache = reference(
+                tokens,
+                pos=positions,
+                past_key_values=reference_cache,
+                use_cache=True,
+            )
+            optimized_output, optimized_cache = optimized(
+                tokens,
+                pos=positions,
+                past_key_values=optimized_cache,
+                use_cache=True,
+            )
+            torch.testing.assert_close(
+                optimized_output,
+                reference_output,
+                rtol=1e-5,
+                atol=1e-6,
+            )
+
+
 class LayerShardedStreamVGGT:
     """A no-training, exact-causal, layer-sharded execution wrapper."""
 
@@ -127,6 +266,9 @@ class LayerShardedStreamVGGT:
             device = self.devices[device_index]
             self.aggregator.frame_blocks[layer_index].to(device)
             self.aggregator.global_blocks[layer_index].to(device)
+            _install_processed_key_cache(
+                self.aggregator.global_blocks[layer_index].attn
+            )
         self.model.depth_head.to(first)
         self.model.point_head.to(middle)
         self.model.camera_head.to(last)
@@ -355,6 +497,8 @@ def main() -> None:
     write_image_list(scene_dir / "input_images.txt", images)
 
     model = load_model(repo, checkpoint)
+    _assert_processed_key_cache_equivalence()
+    print("processed_key_cache_equivalence=passed", flush=True)
     runner = LayerShardedStreamVGGT(model, devices)
     from streamvggt.utils.load_fn import load_and_preprocess_images
     from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
@@ -371,6 +515,10 @@ def main() -> None:
         print(f"  {line}", flush=True)
     print(
         f"Frames={len(images)} amp={amp_dtype} full_history=True; no temporal chunk reset",
+        flush=True,
+    )
+    print(
+        "processed_key_cache=True; historical QK norm/RoPE is not recomputed",
         flush=True,
     )
 
@@ -515,6 +663,7 @@ def main() -> None:
         ],
         "full_history": True,
         "temporal_chunks": False,
+        "processed_key_cache": True,
         "amp_dtype": str(amp_dtype),
         "processed_height": processed_shape[0],
         "processed_width": processed_shape[1],
