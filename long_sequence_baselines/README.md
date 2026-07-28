@@ -20,6 +20,16 @@ logical cuda:2                aggregator 16..23 + camera head
 脚本有安全检查：StreamVGGT 必须恰好只看到三张卡，HorizonStream 必须只看到一张卡，
 避免误占共享 GPU。
 
+服务器的 Conda 入口会错误地指向 `/root/anaconda3`，因此命令文件不使用 `conda run`
+或 `conda activate`，而是直接调用以下两个真实环境的 Python：
+
+```text
+/home/huawei/miniconda3/envs/horizonstream/bin/python
+/home/huawei/miniconda3/envs/3am/bin/python
+```
+
+这样无论执行脚本前提示符显示 `(horizonstream)` 还是 `(3am)`，两个阶段都会进入正确环境。
+
 ## 推荐运行顺序
 
 先在服务器同步代码并初始化 external：

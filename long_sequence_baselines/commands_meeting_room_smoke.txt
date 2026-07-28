@@ -11,11 +11,16 @@ IMAGE_DIR=/home/bod/182Nas/share/BaZhuaYu/DemoData/xiaoyi/blind_data/meeting_roo
 HORIZON_CKPT=/home/wlh50060092/vggtSam/models/HorizonStream.pt
 STREAM_CKPT=/home/bod/86Nas/95_data_bak/FoundationModels/StreamVGGT/checkpoints.pth
 OUTPUT_ROOT=/home/wlh50060092/vggtSam/outputs/long_sequence_baselines/smoke
+HORIZON_PYTHON=/home/huawei/miniconda3/envs/horizonstream/bin/python
+STREAM_PYTHON=/home/huawei/miniconda3/envs/3am/bin/python
 
 cd "$ROOT"
 
-CUDA_VISIBLE_DEVICES="$GPU0" conda run --no-capture-output -n horizonstream \
-  python -m long_sequence_baselines.run_horizonstream \
+[[ -x "$HORIZON_PYTHON" ]] || { echo "找不到 HorizonStream Python: $HORIZON_PYTHON"; exit 1; }
+[[ -x "$STREAM_PYTHON" ]] || { echo "找不到 3am Python: $STREAM_PYTHON"; exit 1; }
+
+CUDA_VISIBLE_DEVICES="$GPU0" "$HORIZON_PYTHON" \
+  -m long_sequence_baselines.run_horizonstream \
   --image-dir "$IMAGE_DIR" \
   --checkpoint "$HORIZON_CKPT" \
   --output-root "$OUTPUT_ROOT/horizonstream" \
@@ -23,8 +28,8 @@ CUDA_VISIBLE_DEVICES="$GPU0" conda run --no-capture-output -n horizonstream \
   --sliding-size 1 \
   --max-frames 20
 
-CUDA_VISIBLE_DEVICES="$GPU0,$GPU1,$GPU2" conda run --no-capture-output -n 3am \
-  python -m long_sequence_baselines.run_streamvggt_3gpu \
+CUDA_VISIBLE_DEVICES="$GPU0,$GPU1,$GPU2" "$STREAM_PYTHON" \
+  -m long_sequence_baselines.run_streamvggt_3gpu \
   --image-dir "$IMAGE_DIR" \
   --checkpoint "$STREAM_CKPT" \
   --output-root "$OUTPUT_ROOT/streamvggt" \
