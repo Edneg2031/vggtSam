@@ -158,7 +158,7 @@ V5 并非每个单项都胜过 V4：第二段的 V4 ATE `0.33316` 优于 V5 的 
 
 ### 4.6 V6：camera fusion 与职责解耦消融
 
-V6 固定在 `90 105 119 130 140` 训练，只使用冻结 cache 和 GT pose supervision；不训练 pointmap，也不运行 ray solver。V6 的 rotation/center/loss 采用独立 camera 实验协议，不能把数值直接当作 V4/V5 的 ATE。
+V6 固定在 `90 105 119 130 140` 训练，只使用冻结 cache 和 GT pose supervision；不训练 pointmap，也不运行 ray solver。V6 的 rotation/center/loss 采用独立 camera 实验协议，不能把数值直接当作 V4/V5 的 ATE。当前 V6 门控会把“已观测但零几何对应”的缓存 `MISMATCH` 仅在当前帧软化为权重 `0.25` 的 `UNKNOWN`，但仍只允许 `MATCH` 写入 persistent memory；V4/V5 保持不变。
 
 训练集上 camera-only、instance-only、fusion 都接近零误差，只证明三个结构都有足够容量，不能证明实例因果性或泛化。
 

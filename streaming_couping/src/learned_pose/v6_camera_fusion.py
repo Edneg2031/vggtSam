@@ -24,6 +24,7 @@ V6_VARIANTS = (
 )
 V6_TRAINING_MODES = ("camera_only", "instance_only", "fusion")
 V6_HEAD_COMPONENTS = ("se3", "rotation", "center", "translation")
+V6_IDENTITY_GATE_POLICIES = ("strict", "soft_unknown_strict_memory")
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,8 @@ class V6FusionConfig:
     memory_momentum: float = 0.90
     min_track_confidence: float = 0.25
     unknown_reliability: float = 0.50
+    softened_mismatch_reliability: float = 0.25
+    identity_gate_policy: str = "soft_unknown_strict_memory"
     max_rotation_degrees: float = 15.0
     max_translation_native: float = 0.50
 
@@ -49,6 +52,11 @@ class PersistentInstanceEncoder(nn.Module):
         config: V6FusionConfig,
     ) -> None:
         super().__init__()
+        if config.identity_gate_policy not in V6_IDENTITY_GATE_POLICIES:
+            raise ValueError(
+                "Unknown V6 identity gate policy: "
+                f"{config.identity_gate_policy!r}."
+            )
         self.appearance_dim = int(appearance_dim)
         self.geometry_dim = int(geometry_dim)
         self.config = config
@@ -105,8 +113,14 @@ class PersistentInstanceEncoder(nn.Module):
             current_app = appearance[:, frame]
             current_geo = geometry[:, frame]
             current_observed = observed[:, frame].bool()
-            current_match = identity_valid[:, frame].bool()
-            current_unknown = identity_unknown[:, frame].bool()
+            current_match, current_unknown, softened_mismatch = (
+                v6_effective_identity_states(
+                    observed=current_observed,
+                    identity_valid=identity_valid[:, frame],
+                    identity_unknown=identity_unknown[:, frame],
+                    policy=self.config.identity_gate_policy,
+                )
+            )
             track_ok = (
                 quality[:, frame, :, 0]
                 >= float(self.config.min_track_confidence)
@@ -117,7 +131,8 @@ class PersistentInstanceEncoder(nn.Module):
                 & (current_match | current_unknown)
             )
             # The trusted token remains available through a temporary miss.
-            # A hard observed identity mismatch is excluded.
+            # Under the soft V6 policy, cached mismatches are current-frame
+            # UNKNOWN observations; strict mode still excludes them here.
             usable = has_memory & (associated_now | ~current_observed)
             reliability = quality[:, frame, :, 0].clamp(0.0, 1.0)
             reliability = reliability * torch.where(
@@ -127,6 +142,12 @@ class PersistentInstanceEncoder(nn.Module):
                     reliability,
                     float(self.config.unknown_reliability),
                 ),
+            )
+            reliability = torch.where(
+                softened_mismatch,
+                quality[:, frame, :, 0].clamp(0.0, 1.0)
+                * float(self.config.softened_mismatch_reliability),
+                reliability,
             )
             reliability = torch.where(
                 current_observed,
@@ -187,6 +208,39 @@ class PersistentInstanceEncoder(nn.Module):
             torch.stack(valid_rows, dim=1),
             torch.stack(reliability_rows, dim=1),
         )
+
+
+def v6_effective_identity_states(
+    *,
+    observed: torch.Tensor,
+    identity_valid: torch.Tensor,
+    identity_unknown: torch.Tensor,
+    policy: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply the V6 current-use gate without changing strict memory writes.
+
+    The legacy cache marks an observed mask as MISMATCH when translation-only
+    ICP finds zero correspondences. Partial visibility can produce the same
+    outcome for a correct object, so V6 treats that cached state as a
+    low-reliability UNKNOWN. Only cached MATCH observations may update memory.
+    """
+
+    if policy not in V6_IDENTITY_GATE_POLICIES:
+        raise ValueError(f"Unknown V6 identity gate policy: {policy!r}.")
+    observed = observed.bool()
+    current_match = identity_valid.bool() & observed
+    current_unknown = identity_unknown.bool() & observed
+    cached_mismatch = observed & ~current_match & ~current_unknown
+    softened_mismatch = (
+        cached_mismatch
+        if policy == "soft_unknown_strict_memory"
+        else torch.zeros_like(cached_mismatch)
+    )
+    return (
+        current_match,
+        current_unknown | softened_mismatch,
+        softened_mismatch,
+    )
 
 
 class V6CameraFusion(nn.Module):

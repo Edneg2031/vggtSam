@@ -295,9 +295,13 @@ T_v6 = Exp(Δξ) · T_raw
 原始 StreamVGGT，最后一层零初始化。参考帧和无可用 persistent instance 的帧强制
 `Δξ=0`，所以零初始化、`instance_off` 和参考帧都能精确回到 raw pose。
 
-persistent memory 只允许几何 `MATCH` 写入。`UNKNOWN` 当前观测可以读取并和可信历史比较，
-但不能更新 memory；临时漏检仍可读取已有 token；显式 `MISMATCH` 不参与融合。这使错检不会
-污染长期 token，同时避免一次漏检令 camera branch 完全失去实例上下文。
+persistent memory 只允许缓存中的几何 `MATCH` 写入。`UNKNOWN` 当前观测可以读取并和
+可信历史比较，但不能更新 memory；临时漏检仍可读取已有 token。V6 默认使用
+`soft_unknown_strict_memory` 门控：对“mask 已观测，但旧的单帧注册因零对应点而判为
+`MISMATCH`”的情况，仅在当前帧将其软化为低可靠度 `UNKNOWN`（默认权重 `0.25`），
+严禁它写入 memory。这是为了避免 bed 等正确 mask 在视角变化较大时因参考点云稀疏而被
+连续丢弃；该观测可帮助当前 camera 预测，但无法污染长期 token。配置为 `strict` 时可恢复
+旧的硬拒绝门控，用作对照；V4/V5 的原始逻辑没有改动。
 
 训练冻结 SAM3 与 StreamVGGT，只用 cache 中的 camera/instance feature。三种模型使用相同
 merger/head 容量、随机种子、训练步数和位姿监督，区别仅在有效输入：
@@ -372,6 +376,17 @@ outputs/streaming_couping_v6_camera_overfit/v6_cross_clip_summary.csv
 ```
 
 完整训练、held-out 和输入依赖消融保留在同目录的 `v6_summary.csv`。
+
+同一命令还会生成两个精简诊断表：
+
+```text
+v6_gate_summary.csv       # 每段、每实例的 MATCH/UNKNOWN/MISMATCH、软化数和 memory 写入数
+v6_inference_speed.csv    # 三个 V6 候选在缓存特征上的 latency、FPS、参数量和峰值显存
+```
+
+速度表中的 `latency_ms_per_sequence`/`frames_per_second` 只计算 V6 camera 前向与位姿组合，
+不包含 SAM3、StreamVGGT 或 cache 生成。Cache CPU 读取、checkpoint 读取和输入 H2D/位姿解码
+分别记录在启动时间列中，不与纯前向延迟混在一起。
 
 同一命令还打印七行 `v6_frame_diagnostics.csv`：
 

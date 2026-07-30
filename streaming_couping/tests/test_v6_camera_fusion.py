@@ -18,6 +18,7 @@ from streaming_couping.src.learned_pose.v6_camera_fusion import (
     V6FusionConfig,
     perturb_instance_inputs,
     se3_exp,
+    v6_effective_identity_states,
 )
 from streaming_couping.src.types import SAM3MaskCandidate
 
@@ -97,6 +98,41 @@ def test_v6_zero_initialization_and_reference_are_exact() -> None:
     assert torch.equal(output["twist"][:, 0], torch.zeros(1, 6))
     assert not bool(output["active_frames"][:, 0].any())
     assert bool(output["active_frames"][:, 1:].all())
+
+
+def test_v6_soft_gate_uses_cached_mismatch_without_writing_memory() -> None:
+    observed = torch.ones(1, 4, 1, dtype=torch.bool)
+    identity_valid = torch.tensor([[[True], [True], [False], [False]]])
+    identity_unknown = torch.zeros_like(identity_valid)
+
+    match, unknown, softened = v6_effective_identity_states(
+        observed=observed,
+        identity_valid=identity_valid,
+        identity_unknown=identity_unknown,
+        policy="soft_unknown_strict_memory",
+    )
+
+    assert torch.equal(match, identity_valid)
+    assert not bool(unknown[:, :2].any())
+    assert bool(unknown[:, 2:].all())
+    assert bool(softened[:, 2:].all())
+    assert int(match.sum()) == 2
+
+
+def test_v6_strict_gate_keeps_cached_mismatch_rejected() -> None:
+    observed = torch.ones(1, 2, 1, dtype=torch.bool)
+    identity_valid = torch.tensor([[[True], [False]]])
+    identity_unknown = torch.zeros_like(identity_valid)
+
+    _, unknown, softened = v6_effective_identity_states(
+        observed=observed,
+        identity_valid=identity_valid,
+        identity_unknown=identity_unknown,
+        policy="strict",
+    )
+
+    assert not bool(unknown.any())
+    assert not bool(softened.any())
 
 
 def test_cross_attention_casts_autocast_output_to_feature_dtype() -> None:
@@ -484,6 +520,9 @@ def test_v6_command_and_config_are_retained() -> None:
     assert "v6_v63_sweep.csv" in command
     assert "v6_v64_aux_sweep.csv" in command
     assert "v6_validation_summary.csv" in command
+    assert "run_v6_inference_speed" in command
+    assert "v6_gate_summary.csv" in command
+    assert "v6_inference_speed.csv" in command
     assert "00a231a370_90_240_37_68_54" in config
     assert "steps: 1200" in config
 
@@ -494,6 +533,8 @@ def test_v6_command_and_config_are_retained() -> None:
     assert loaded.test_clip_name == "00a231a370_492_589_37_68_54"
     assert loaded.validation_clip_name == "00a231a370_50_80_37_68_54"
     assert loaded.fusion.hidden_dim == 256
+    assert loaded.fusion.identity_gate_policy == "soft_unknown_strict_memory"
+    assert loaded.fusion.softened_mismatch_reliability == 0.25
     assert loaded.training.steps == 1200
     assert loaded.success.camera_loss_ratio == 0.80
 

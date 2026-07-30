@@ -1,5 +1,16 @@
 set -euo pipefail
 
+if [[ -n "${STREAMING_COUPING_PYTHON:-}" ]]; then
+  PYTHON_BIN="$STREAMING_COUPING_PYTHON"
+elif [[ -x /home/huawei/miniconda3/envs/3am/bin/python ]]; then
+  PYTHON_BIN=/home/huawei/miniconda3/envs/3am/bin/python
+else
+  PYTHON_BIN="$(command -v python)"
+fi
+echo "streaming_couping python=$PYTHON_BIN"
+"$PYTHON_BIN" -c \
+  'import sys, torch; print(f"python={sys.executable} torch={torch.__version__}")'
+
 BASE_CONFIG=streaming_couping/configs/v6_camera_sweep_base.yaml
 V6_CONFIG=streaming_couping/configs/v6_camera_overfit.yaml
 OUTPUT=outputs/streaming_couping_v6_camera_overfit
@@ -14,7 +25,7 @@ if [[ -f "$TRAIN_CACHE" && -f "$TEST_CACHE" && -f "$VALIDATION_CACHE" ]]; then
   echo "reusing frozen cache: $TEST_CACHE"
   echo "reusing frozen cache: $VALIDATION_CACHE"
 else
-  PYTHONUNBUFFERED=1 PYTHONPATH=. python -m streaming_couping.scripts.run_instance_token_pose \
+  PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.run_instance_token_pose \
     --config "$BASE_CONFIG" \
     --stage cache \
     --sam3-device cuda:3 \
@@ -26,9 +37,15 @@ fi
 export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
-PYTHONUNBUFFERED=1 PYTHONPATH=. python -m streaming_couping.scripts.run_v6_camera_overfit \
+PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.run_v6_camera_overfit \
   --config "$V6_CONFIG" \
   --device cuda:1
+
+PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.run_v6_inference_speed \
+  --config "$V6_CONFIG" \
+  --device cuda:1 \
+  --warmup 20 \
+  --repeats 200
 
 sed -n '1,8p' "$OUTPUT/v6_cross_clip_summary.csv"
 sed -n '1,9p' "$OUTPUT/v6_frame_diagnostics.csv"
@@ -36,3 +53,5 @@ sed -n '1,9p' "$OUTPUT/v6_component_sweep.csv"
 sed -n '1,12p' "$OUTPUT/v6_v63_sweep.csv"
 sed -n '1,7p' "$OUTPUT/v6_v64_aux_sweep.csv"
 sed -n '1,5p' "$OUTPUT/v6_validation_summary.csv"
+sed -n '1,10p' "$OUTPUT/v6_gate_summary.csv"
+sed -n '1,10p' "$OUTPUT/v6_inference_speed.csv"

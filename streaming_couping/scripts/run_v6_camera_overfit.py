@@ -1252,6 +1252,11 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
                 "uses_gt_during_training": True,
                 "runs_pointmap_branch": False,
                 "runs_analytic_pose_solver": False,
+                "identity_gate_policy": config.fusion.identity_gate_policy,
+                "softened_mismatch_reliability": (
+                    config.fusion.softened_mismatch_reliability
+                ),
+                "memory_write_policy": "cached_match_only",
                 "specialized_components": {
                     "rotation_sources": list(V63_ROTATION_BRANCHES),
                     "local_center_sources": list(V63_LOCAL_CENTER_BRANCHES),
@@ -1390,6 +1395,15 @@ def load_v6_config(path: str | Path) -> V6ExperimentConfig:
             memory_momentum=float(model.get("memory_momentum", 0.90)),
             min_track_confidence=float(model.get("min_track_confidence", 0.25)),
             unknown_reliability=float(model.get("unknown_reliability", 0.50)),
+            softened_mismatch_reliability=float(
+                model.get("softened_mismatch_reliability", 0.25)
+            ),
+            identity_gate_policy=str(
+                model.get(
+                    "identity_gate_policy",
+                    "soft_unknown_strict_memory",
+                )
+            ),
             max_rotation_degrees=float(model.get("max_rotation_degrees", 15.0)),
             max_translation_native=float(model.get("max_translation_native", 0.50)),
         ),
@@ -1433,6 +1447,7 @@ def _camera_batch(payload: dict, *, device: str) -> dict[str, torch.Tensor]:
         "observed",
         "identity_valid",
         "identity_unknown",
+        "identity_mismatch",
     ):
         value = payload.get(field)
         if not torch.is_tensor(value):
@@ -2176,12 +2191,24 @@ def _validate_config(config: V6ExperimentConfig) -> None:
         ("memory_momentum", config.fusion.memory_momentum),
         ("min_track_confidence", config.fusion.min_track_confidence),
         ("unknown_reliability", config.fusion.unknown_reliability),
+        (
+            "softened_mismatch_reliability",
+            config.fusion.softened_mismatch_reliability,
+        ),
         ("instance_loss_ratio", config.success.instance_loss_ratio),
         ("shuffle_loss_ratio", config.success.shuffle_loss_ratio),
         ("camera_loss_ratio", config.success.camera_loss_ratio),
     ):
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"V6 {name} must be in [0,1].")
+    if config.fusion.identity_gate_policy not in {
+        "strict",
+        "soft_unknown_strict_memory",
+    }:
+        raise ValueError(
+            "V6 identity_gate_policy must be strict or "
+            "soft_unknown_strict_memory."
+        )
 
 
 def _parse_args() -> argparse.Namespace:

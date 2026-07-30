@@ -18,6 +18,10 @@ model:
   memory_momentum: 0.90
   min_track_confidence: 0.25
   unknown_reliability: 0.50
+  # Cached zero-correspondence MISMATCH is not reliable under partial views.
+  # Use it at low weight for the current frame, but never write it to memory.
+  identity_gate_policy: soft_unknown_strict_memory
+  softened_mismatch_reliability: 0.25
   max_rotation_degrees: 15.0
   max_translation_native: 0.50
 
