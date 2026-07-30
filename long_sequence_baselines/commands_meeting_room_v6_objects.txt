@@ -1,0 +1,109 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# 先用五卡补齐原版 StreamVGGT 的部署特征，再释放为一张卡顺序运行 SAM3/V6。
+# 修改为当前空闲物理 GPU；不会同时占用五卡和 SAM3 卡。
+GPU0=0
+GPU1=1
+GPU2=2
+GPU3=3
+GPU4=4
+MAX_FRAMES=300
+
+ROOT=/home/wlh50060092/vggtSam
+IMAGE_DIR=/home/bod/182Nas/share/BaZhuaYu/DemoData/xiaoyi/blind_data/meeting_room_a02/frames
+STREAM_CKPT=/home/bod/86Nas/95_data_bak/FoundationModels/StreamVGGT/checkpoints.pth
+SAM3_CKPT=/home/bod/86Nas/95_data_bak/FoundationModels/sam3/sam3.pt
+OUTPUT_ROOT=/home/wlh50060092/vggtSam/outputs/long_sequence_baselines/frames_300
+STREAM_SCENE=$OUTPUT_ROOT/streamvggt/meeting_room_a02
+HORIZON_SCENE=$OUTPUT_ROOT/horizonstream/meeting_room_a02
+V6_OUTPUT=/home/wlh50060092/vggtSam/outputs/streaming_couping_v6_camera_overfit
+PYTHON=/home/huawei/miniconda3/envs/3am/bin/python
+
+cd "$ROOT"
+[[ -x "$PYTHON" ]] || { echo "找不到 3am Python: $PYTHON"; exit 1; }
+[[ -f "$HORIZON_SCENE/poses/abs_pose.txt" ]] || {
+  echo "缺少已完成的 HorizonStream 300帧结果: $HORIZON_SCENE"; exit 1
+}
+for CHECKPOINT in \
+  "$V6_OUTPUT/v6_checkpoint_fusion.pt" \
+  "$V6_OUTPUT/v6_checkpoint_specialized_camera_rotation.pt" \
+  "$V6_OUTPUT/v6_checkpoint_specialized_instance_center_local.pt" \
+  "$V6_OUTPUT/v6_checkpoint_instance_se3_aux_0p1.pt"
+do
+  [[ -f "$CHECKPOINT" ]] || {
+    echo "缺少 V6 checkpoint: $CHECKPOINT"; exit 1
+  }
+done
+
+WORLD_COUNT=0
+CONF_COUNT=0
+if [[ -d "$STREAM_SCENE/features/world_points" ]]; then
+  WORLD_COUNT=$(find "$STREAM_SCENE/features/world_points" -type f -name '*.npy' | wc -l | tr -d '[:space:]')
+fi
+if [[ -d "$STREAM_SCENE/features/world_confidence" ]]; then
+  CONF_COUNT=$(find "$STREAM_SCENE/features/world_confidence" -type f -name '*.npy' | wc -l | tr -d '[:space:]')
+fi
+if [[ ! -f "$STREAM_SCENE/features/camera_hidden.pt" \
+   || "$WORLD_COUNT" != "$MAX_FRAMES" \
+   || "$CONF_COUNT" != "$MAX_FRAMES" ]]; then
+  echo "补齐 StreamVGGT V6 部署特征；这一步会重新运行原版 300 帧推理。"
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  CUDA_VISIBLE_DEVICES="$GPU0,$GPU1,$GPU2,$GPU3,$GPU4" "$PYTHON" \
+    -m long_sequence_baselines.run_streamvggt_5gpu \
+    --image-dir "$IMAGE_DIR" \
+    --checkpoint "$STREAM_CKPT" \
+    --output-root "$OUTPUT_ROOT/streamvggt" \
+    --scene-name meeting_room_a02 \
+    --confidence-percentile 50 \
+    --depth-percentile-low 1 \
+    --depth-percentile-high 99 \
+    --voxel-size-ratio 0.01 \
+    --min-voxel-observations 2 \
+    --save-deployment-features \
+    --max-frames "$MAX_FRAMES"
+else
+  echo "复用完整 StreamVGGT 部署特征: $STREAM_SCENE/features"
+fi
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES="$GPU0" "$PYTHON" \
+  -m long_sequence_baselines.run_v6_instance_pose \
+  --baseline-root "$OUTPUT_ROOT" \
+  --scene-name meeting_room_a02 \
+  --output-root "$OUTPUT_ROOT/v6_instance_pose" \
+  --sam3-checkpoint "$SAM3_CKPT" \
+  --device cuda:0 \
+  --prompts chair monitor \
+  --reference-frame -1 \
+  --reference-search-stride 10 \
+  --sam-batch-size 4 \
+  --v6-fusion-checkpoint "$V6_OUTPUT/v6_checkpoint_fusion.pt" \
+  --v6-rotation-checkpoint "$V6_OUTPUT/v6_checkpoint_specialized_camera_rotation.pt" \
+  --v6-center-checkpoint "$V6_OUTPUT/v6_checkpoint_specialized_instance_center_local.pt" \
+  --v6-aux-center-checkpoint "$V6_OUTPUT/v6_checkpoint_instance_se3_aux_0p1.pt"
+
+RESULT=$OUTPUT_ROOT/v6_instance_pose/meeting_room_a02
+[[ -f "$RESULT/plots/streamvggt_raw_vs_v6.png" ]] || {
+  echo "缺少 V6 位姿对比图"; exit 1
+}
+[[ -f "$RESULT/plots/streamvggt_v6_vs_horizon_shared_sim3.png" ]] || {
+  echo "缺少 Horizon 伪参考位姿对比图"; exit 1
+}
+[[ -f "$RESULT/masks/reference_overlay.png" ]] || {
+  echo "缺少 chair/monitor 参考 mask 检查图"; exit 1
+}
+[[ -f "$RESULT/masks/tracking_overview.png" ]] || {
+  echo "缺少 chair/monitor 长序列 mask 检查图"; exit 1
+}
+for OBJECT in chair monitor; do
+  for METHOD in streamvggt_raw v6_fusion v6_candidate_a v6_candidate_b horizonstream streamvggt_pointhead; do
+    [[ -f "$RESULT/objects/$OBJECT/${METHOD}_conf_voxel.ply" ]] || {
+      echo "缺少物体点云: $OBJECT/$METHOD"; exit 1
+    }
+  done
+done
+
+echo "V6会议室实验完成。请先看 reference_overlay.png 和 tracking_overview.png，再看下面两个短表："
+sed -n '1,6p' "$RESULT/comparison_summary.csv"
+sed -n '1,13p' "$RESULT/object_pointcloud_summary.csv"

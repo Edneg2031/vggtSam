@@ -71,6 +71,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--voxel-size-ratio", type=float, default=0.01)
     parser.add_argument("--min-voxel-observations", type=int, default=2)
     parser.add_argument("--progress-every", type=int, default=10)
+    parser.add_argument(
+        "--save-deployment-features",
+        action="store_true",
+        help=(
+            "Save exact per-frame camera hidden states and dense point-head "
+            "outputs needed by downstream V6 instance-pose evaluation."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -561,6 +569,7 @@ def main() -> None:
     point_protocol.validate()
     pointhead_products: PointCloudProductAccumulator | None = None
     pose_encodings: list[torch.Tensor] = []
+    camera_hidden_rows: list[torch.Tensor] = []
     runtime_rows: list[dict[str, Any]] = []
     processed_shape: tuple[int, int] | None = None
     started = time.perf_counter()
@@ -589,6 +598,13 @@ def main() -> None:
                 points, point_confidence = runner.points(selected, batch_image)
 
             pose_encodings.append(pose_encoding.detach().float().cpu())
+            if args.save_deployment_features:
+                camera_hidden_rows.append(
+                    selected[runner.aggregator.depth - 1][0, 0, 0]
+                    .detach()
+                    .float()
+                    .cpu()
+                )
             depth_np = depth[0, 0, ..., 0].detach().float().cpu().numpy()
             depth_conf_np = depth_confidence[0, 0].detach().float().cpu().numpy()
             points_np = points[0, 0].detach().float().cpu().numpy()
@@ -602,6 +618,23 @@ def main() -> None:
             (depth_dir / "conf").mkdir(parents=True, exist_ok=True)
             np.save(depth_dir / "dpt" / f"frame_{frame_index:06d}.npy", depth_np)
             np.save(depth_dir / "conf" / f"frame_{frame_index:06d}.npy", depth_conf_np)
+            if args.save_deployment_features:
+                feature_dir = scene_dir / "features"
+                (feature_dir / "world_points").mkdir(parents=True, exist_ok=True)
+                (feature_dir / "world_confidence").mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+                np.save(
+                    feature_dir / "world_points" / f"frame_{frame_index:06d}.npy",
+                    points_np,
+                )
+                np.save(
+                    feature_dir
+                    / "world_confidence"
+                    / f"frame_{frame_index:06d}.npy",
+                    point_conf_np,
+                )
             save_depth_visualization(
                 depth_dir / "dpt_plasma" / f"frame_{frame_index:06d}.png",
                 depth_np,
@@ -669,6 +702,32 @@ def main() -> None:
     elapsed = time.perf_counter() - started
     assert processed_shape is not None
     pose_tensor = torch.cat(pose_encodings, dim=1)
+    if args.save_deployment_features:
+        if len(camera_hidden_rows) != len(images):
+            raise RuntimeError("Incomplete StreamVGGT deployment camera features.")
+        feature_dir = scene_dir / "features"
+        feature_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            torch.stack(camera_hidden_rows, dim=0),
+            feature_dir / "camera_hidden.pt",
+        )
+        torch.save(
+            pose_tensor[0].detach().float().cpu(),
+            feature_dir / "baseline_pose_encoding.pt",
+        )
+        write_json(
+            feature_dir / "deployment_features.json",
+            {
+                "frames": len(images),
+                "camera_hidden_shape": [
+                    len(images),
+                    int(camera_hidden_rows[0].numel()),
+                ],
+                "world_points_per_frame": True,
+                "world_confidence_per_frame": True,
+                "source": "official_streamvggt_point_and_camera_heads",
+            },
+        )
     extrinsics, intrinsics = pose_encoding_to_extri_intri(
         pose_tensor,
         image_size_hw=processed_shape,
@@ -728,6 +787,7 @@ def main() -> None:
         "full_history": True,
         "temporal_chunks": False,
         "processed_key_cache": True,
+        "deployment_features_saved": bool(args.save_deployment_features),
         "amp_dtype": str(amp_dtype),
         "processed_height": processed_shape[0],
         "processed_width": processed_shape[1],

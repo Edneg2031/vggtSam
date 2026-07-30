@@ -32,4 +32,5 @@ CUDA_VISIBLE_DEVICES="$GPU0,$GPU1,$GPU2,$GPU3,$GPU4" "$STREAM_PYTHON" \
   --depth-percentile-high 99 \
   --voxel-size-ratio 0.01 \
   --min-voxel-observations 2 \
+  --save-deployment-features \
   --max-frames "$MAX_FRAMES"

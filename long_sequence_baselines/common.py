@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 from PIL import Image
-
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 
@@ -177,7 +177,7 @@ class TemporalPointSampler:
         finite = np.isfinite(points).all(axis=1)
         points = points[finite]
         colors = colors[finite]
-        self.seen_points += int(len(points))
+        self.seen_points += len(points)
         if not len(points):
             return
         count = min(self.per_frame, len(points))
@@ -240,6 +240,70 @@ def camera_centers_from_w2c(extrinsics: np.ndarray) -> np.ndarray:
     rotations = extrinsics[:, :3, :3]
     translations = extrinsics[:, :3, 3]
     return -np.einsum("nij,nj->ni", rotations.transpose(0, 2, 1), translations)
+
+
+def fit_similarity_transform(
+    source_points: np.ndarray,
+    target_points: np.ndarray,
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """Fit ``target = scale * rotation @ source + translation`` by Umeyama."""
+
+    source = np.asarray(source_points, dtype=np.float64)
+    target = np.asarray(target_points, dtype=np.float64)
+    if source.shape != target.shape or source.ndim != 2 or source.shape[1] != 3:
+        raise ValueError(
+            f"Similarity points must share shape [N,3], got {source.shape}/{target.shape}."
+        )
+    if len(source) < 3 or not np.isfinite(source).all() or not np.isfinite(target).all():
+        raise ValueError("Similarity fitting needs at least three finite point pairs.")
+    source_mean = source.mean(axis=0)
+    target_mean = target.mean(axis=0)
+    source_centered = source - source_mean
+    target_centered = target - target_mean
+    source_variance = float(np.square(source_centered).sum() / len(source))
+    if source_variance <= np.finfo(np.float64).eps:
+        raise ValueError("Similarity source points have zero variance.")
+    covariance = target_centered.T @ source_centered / len(source)
+    left, singular_values, right_transpose = np.linalg.svd(covariance)
+    signs = np.ones(3, dtype=np.float64)
+    if np.linalg.det(left @ right_transpose) < 0.0:
+        signs[-1] = -1.0
+    rotation = left @ np.diag(signs) @ right_transpose
+    scale = float(np.dot(singular_values, signs) / source_variance)
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"Similarity fit produced invalid scale {scale}.")
+    translation = target_mean - scale * (rotation @ source_mean)
+    return scale, rotation, translation
+
+
+def transform_w2c_world_similarity(
+    extrinsics: np.ndarray,
+    *,
+    scale: float,
+    rotation: np.ndarray,
+    translation: np.ndarray,
+) -> np.ndarray:
+    """Express W2C poses in a world frame related by a fitted Sim(3)."""
+
+    extrinsics = np.asarray(extrinsics, dtype=np.float64)
+    rotation = np.asarray(rotation, dtype=np.float64)
+    translation = np.asarray(translation, dtype=np.float64)
+    if extrinsics.ndim != 3 or extrinsics.shape[1:] != (3, 4):
+        raise ValueError(f"Expected W2C poses [N,3,4], got {extrinsics.shape}.")
+    if rotation.shape != (3, 3) or translation.shape != (3,):
+        raise ValueError("Similarity rotation/translation must be [3,3]/[3].")
+    centers = camera_centers_from_w2c(extrinsics)
+    transformed_centers = scale * (centers @ rotation.T) + translation
+    transformed_rotations = extrinsics[:, :3, :3] @ rotation.T
+    transformed_translations = -np.einsum(
+        "nij,nj->ni",
+        transformed_rotations,
+        transformed_centers,
+    )
+    return np.concatenate(
+        [transformed_rotations, transformed_translations[..., None]],
+        axis=-1,
+    )
 
 
 def _set_equal_3d_axes(axis: Any, xyz: np.ndarray) -> None:
@@ -320,6 +384,71 @@ def save_trajectory_plot(
     axis_xz.legend(loc="best")
     axis_xz.grid(True, alpha=0.4)
 
+    figure.tight_layout()
+    figure.savefig(path)
+    plt.close(figure)
+
+
+def save_trajectory_overlay_plot(
+    path: str | Path,
+    trajectories: dict[str, np.ndarray],
+    title: str,
+) -> None:
+    """Overlay same-gauge W2C trajectories with the Horizon three-panel layout."""
+
+    if not trajectories:
+        raise ValueError("At least one trajectory is required.")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    centers = {
+        name: camera_centers_from_w2c(extrinsics)
+        for name, extrinsics in trajectories.items()
+    }
+    lengths = {len(value) for value in centers.values()}
+    if len(lengths) != 1 or next(iter(lengths)) < 2:
+        raise ValueError("Overlay trajectories must share at least two frames.")
+    all_centers = np.concatenate(list(centers.values()), axis=0)
+    colors = (
+        "#1f77b4",
+        "#ff7f0e",
+        "#2ca02c",
+        "#9467bd",
+        "#d62728",
+        "#8c564b",
+    )
+    figure = plt.figure(figsize=(16, 5), dpi=140)
+    axis_3d = figure.add_subplot(1, 3, 1, projection="3d")
+    axis_xy = figure.add_subplot(1, 3, 2)
+    axis_xz = figure.add_subplot(1, 3, 3)
+    for index, (name, xyz) in enumerate(centers.items()):
+        color = colors[index % len(colors)]
+        axis_3d.plot(
+            xyz[:, 0], xyz[:, 1], xyz[:, 2], color=color, linewidth=1.8, label=name
+        )
+        axis_xy.plot(xyz[:, 0], xyz[:, 1], color=color, linewidth=1.8, label=name)
+        axis_xz.plot(xyz[:, 0], xyz[:, 2], color=color, linewidth=1.8, label=name)
+    _set_equal_3d_axes(axis_3d, all_centers)
+    axis_3d.set_title(title)
+    axis_3d.set_xlabel("X")
+    axis_3d.set_ylabel("Y")
+    axis_3d.set_zlabel("Z")
+    axis_3d.legend(loc="best")
+    axis_3d.grid(True)
+    for axis, projection_title, x_label, y_label in (
+        (axis_xy, "XY Projection", "X", "Y"),
+        (axis_xz, "XZ Projection", "X", "Z"),
+    ):
+        axis.set_title(projection_title)
+        axis.set_xlabel(x_label)
+        axis.set_ylabel(y_label)
+        axis.set_aspect("equal", adjustable="box")
+        axis.legend(loc="best")
+        axis.grid(True, alpha=0.4)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     figure.tight_layout()
     figure.savefig(path)
     plt.close(figure)

@@ -147,3 +147,48 @@ CloudCompare/MeshLab 应先比较两个 `depthpose_conf_voxel.ply`，重点看�
 注意：统一绘图只消除了可视化实现差异。两种模型的预测仍各自在独立、无 GT 对齐的坐标系
 和尺度中，不能根据两张图的绝对轴值直接判断谁的位姿误差更小；当前可以比较轨迹形状、
 连续性、漂移趋势和回访闭合程度。
+
+## 会议室 V6 + chair/monitor 实验
+
+固定使用已经在旧场景训练好的 V6 checkpoint，在会议室上做真正的跨场景测试：
+
+```bash
+zsh long_sequence_baselines/commands_meeting_room_v6_objects.txt
+```
+
+第一次运行若发现旧的 StreamVGGT 结果没有 `features/camera_hidden.pt` 和逐帧 dense point
+head，会自动以相同的 300 帧、full-history、五卡原版模型补跑一次；已有完整特征时直接复用。
+随后只占一张卡，SAM3 用英文文本 `chair`、`monitor` 自动寻找最早同时可见的参考帧，分别
+跟踪一个实例并提取 frozen FPN appearance。整个会议室阶段不读取 GT pose、GT mask 或
+GT instance ID。
+
+固定输出四条同 gauge 轨迹：`StreamVGGT raw`、`V6 fusion`、预锁定候选 A
+（camera rotation + instance 3DoF local center）和候选 B（同一 rotation + `0.1` 辅助
+旋转监督的 instance SE(3) center）；无有效 persistent instance 的帧回退 raw。
+HorizonStream 使用独立 gauge，只单独画相同样式的图，不直接把原生坐标轴与 StreamVGGT
+比较。关键文件：
+
+```text
+outputs/long_sequence_baselines/frames_300/v6_instance_pose/meeting_room_a02/
+  masks/reference_overlay.png
+  masks/tracking_overview.png
+  plots/streamvggt_raw_vs_v6.png
+  plots/streamvggt_v6_vs_horizon_shared_sim3.png
+  comparison_summary.csv
+  trajectory_stability_proxies.csv
+  trajectory_horizon_proxy.csv
+  identity_diagnostics.csv
+  object_pointcloud_summary.csv
+  objects/chair/*_conf_voxel.ply
+  objects/monitor/*_conf_voxel.ply
+```
+
+每个物体会输出 `streamvggt_raw`、`v6_fusion`、`v6_candidate_a`、`v6_candidate_b`、
+`horizonstream` 的相同 mask depth+pose 点云，以及 pose 无关的 `streamvggt_pointhead`
+点云。会议室没有 GT，所以轨迹
+二阶变化和物体多视图重合只能作为稳定性/一致性代理，不能写成 ATE 或绝对精度。首先检查
+`reference_overlay.png` 是否确实为椅子和显示器（红色为 chair，绿色为 monitor），再用
+`tracking_overview.png` 检查均匀采样的长期跟踪；mask 错误时点云比较没有解释意义。第二张
+轨迹叠加图只用 raw StreamVGGT 的全部相机中心拟合一次到
+HorizonStream 的 Sim(3)，再把同一个变换用于全部 V6 结果；它可用于判断 V6 是否相对 raw
+更接近 Horizon 的轨迹形状，但 HorizonStream 不是 GT，因此仍不能当作位姿准确率。

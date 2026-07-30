@@ -5,9 +5,13 @@ from PIL import Image
 
 from long_sequence_baselines.common import (
     TemporalPointSampler,
+    camera_centers_from_w2c,
     discover_images,
+    fit_similarity_transform,
     natural_sort_key,
+    save_trajectory_overlay_plot,
     save_trajectory_plot,
+    transform_w2c_world_similarity,
     write_binary_ply,
 )
 
@@ -60,3 +64,53 @@ def test_horizon_style_trajectory_plot_is_written(tmp_path: Path) -> None:
     save_trajectory_plot(path, world_to_camera, "test")
     assert path.is_file()
     assert path.stat().st_size > 0
+
+    overlay = tmp_path / "trajectory_overlay.png"
+    save_trajectory_overlay_plot(
+        overlay,
+        {"raw": world_to_camera, "refined": world_to_camera.copy()},
+        "test overlay",
+    )
+    assert overlay.is_file()
+    assert overlay.stat().st_size > 0
+
+
+def test_similarity_fit_and_w2c_transform_share_one_world_gauge() -> None:
+    source_centers = np.asarray(
+        ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 2.0, 0.0), (0.0, 0.0, 3.0))
+    )
+    angle = np.deg2rad(30.0)
+    expected_rotation = np.asarray(
+        (
+            (np.cos(angle), -np.sin(angle), 0.0),
+            (np.sin(angle), np.cos(angle), 0.0),
+            (0.0, 0.0, 1.0),
+        )
+    )
+    expected_scale = 2.5
+    expected_translation = np.asarray((4.0, -2.0, 1.0))
+    target_centers = (
+        expected_scale * (source_centers @ expected_rotation.T)
+        + expected_translation
+    )
+    scale, rotation, translation = fit_similarity_transform(
+        source_centers,
+        target_centers,
+    )
+    np.testing.assert_allclose(scale, expected_scale, atol=1e-10)
+    np.testing.assert_allclose(rotation, expected_rotation, atol=1e-10)
+    np.testing.assert_allclose(translation, expected_translation, atol=1e-10)
+
+    source_w2c = np.repeat(np.eye(4)[None, :3], len(source_centers), axis=0)
+    source_w2c[:, :3, 3] = -source_centers
+    aligned = transform_w2c_world_similarity(
+        source_w2c,
+        scale=scale,
+        rotation=rotation,
+        translation=translation,
+    )
+    np.testing.assert_allclose(
+        camera_centers_from_w2c(aligned),
+        target_centers,
+        atol=1e-10,
+    )
