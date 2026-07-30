@@ -442,7 +442,12 @@ class V6CameraFusion(nn.Module):
                 key_padding_mask=key_padding_mask,
                 need_weights=False,
             )
-            output.index_copy_(0, indices, attended)
+            # SAM3's upstream video predictor keeps a process-wide BF16
+            # autocast context open.  A downstream V6 call can therefore
+            # receive BF16 attention output even though its persistent buffer
+            # and frozen checkpoint inputs are FP32.  Preserve the caller's
+            # feature dtype at this explicit scatter boundary.
+            output.index_copy_(0, indices, attended.to(dtype=output.dtype))
         return output.reshape(batch, sequence, hidden), active.reshape(batch, sequence)
 def perturb_instance_inputs(batch: dict[str, torch.Tensor], variant: str) -> dict[str, torch.Tensor]:
     """Return one deterministic same-checkpoint V6 ablation input."""

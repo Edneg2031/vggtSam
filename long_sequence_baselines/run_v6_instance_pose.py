@@ -290,7 +290,14 @@ def main() -> None:
         batch=batch,
         device=args.device,
     )
-    with torch.inference_mode():
+    # The upstream SAM3 video predictor enters a long-lived BF16 autocast
+    # context during construction.  V6 checkpoints were trained/evaluated in
+    # FP32, so establish an explicit precision boundary for reproducible pose
+    # corrections even on a fresh run that just executed SAM3.
+    with torch.inference_mode(), torch.autocast(
+        device_type=torch.device(args.device).type,
+        enabled=False,
+    ):
         fusion_output = _run_v6(
             fusion_model,
             fusion_mode,

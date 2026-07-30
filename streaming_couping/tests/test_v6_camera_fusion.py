@@ -11,8 +11,8 @@ from streaming_couping.scripts.run_v6_camera_overfit import (
     _pose_metrics,
     load_v6_config,
 )
-from streaming_couping.src.learned_pose.config import load_learned_pose_config
 from streaming_couping.src.learned_pose.cache import _select_reference_candidates
+from streaming_couping.src.learned_pose.config import load_learned_pose_config
 from streaming_couping.src.learned_pose.v6_camera_fusion import (
     V6CameraFusion,
     V6FusionConfig,
@@ -97,6 +97,27 @@ def test_v6_zero_initialization_and_reference_are_exact() -> None:
     assert torch.equal(output["twist"][:, 0], torch.zeros(1, 6))
     assert not bool(output["active_frames"][:, 0].any())
     assert bool(output["active_frames"][:, 1:].all())
+
+
+def test_cross_attention_casts_autocast_output_to_feature_dtype() -> None:
+    class BFloatAttention(torch.nn.Module):
+        def forward(self, query, key, value, **kwargs):
+            return query.to(torch.bfloat16), None
+
+    model = _model()
+    model.cross_attention = BFloatAttention()
+    camera = torch.randn(1, 3, 8, dtype=torch.float32)
+    instance = torch.randn(1, 3, 2, 8, dtype=torch.float32)
+    valid = torch.ones(1, 3, 2, dtype=torch.bool)
+    reliability = torch.ones(1, 3, 2, dtype=torch.float32)
+    attended, active = model._cross_attend(
+        camera,
+        instance,
+        valid,
+        reliability,
+    )
+    assert attended.dtype == camera.dtype
+    assert bool(active.all())
 
 
 def test_specialized_heads_have_only_their_declared_pose_authority() -> None:
