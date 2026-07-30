@@ -21,7 +21,6 @@ import torch
 import torch.nn.functional as F
 
 from .common import (
-    TemporalPointSampler,
     discover_images,
     save_depth_visualization,
     save_rgb,
@@ -31,6 +30,11 @@ from .common import (
     write_intrinsics_txt,
     write_json,
     write_w2c_txt,
+)
+from .pointcloud_products import (
+    PointCloudProductAccumulator,
+    PointCloudProtocol,
+    rebuild_depth_pose_products,
 )
 
 
@@ -62,6 +66,10 @@ def parse_args() -> argparse.Namespace:
         help="Per-frame percentile used by points/full.ply; full_all.ply remains unfiltered.",
     )
     parser.add_argument("--max-full-pointcloud-points", type=int, default=2_000_000)
+    parser.add_argument("--depth-percentile-low", type=float, default=1.0)
+    parser.add_argument("--depth-percentile-high", type=float, default=99.0)
+    parser.add_argument("--voxel-size-ratio", type=float, default=0.01)
+    parser.add_argument("--min-voxel-observations", type=int, default=2)
     parser.add_argument("--progress-every", type=int, default=10)
     return parser.parse_args()
 
@@ -522,8 +530,16 @@ def main() -> None:
         flush=True,
     )
 
-    all_points = TemporalPointSampler(args.max_full_pointcloud_points, len(images))
-    confident_points = TemporalPointSampler(args.max_full_pointcloud_points, len(images))
+    point_protocol = PointCloudProtocol(
+        confidence_percentile=args.confidence_percentile,
+        depth_percentile_low=args.depth_percentile_low,
+        depth_percentile_high=args.depth_percentile_high,
+        voxel_size_ratio=args.voxel_size_ratio,
+        min_voxel_observations=args.min_voxel_observations,
+        max_points=args.max_full_pointcloud_points,
+    )
+    point_protocol.validate()
+    pointhead_products: PointCloudProductAccumulator | None = None
     pose_encodings: list[torch.Tensor] = []
     runtime_rows: list[dict[str, Any]] = []
     processed_shape: tuple[int, int] | None = None
@@ -574,19 +590,23 @@ def main() -> None:
             flat_points = points_np.reshape(-1, 3)
             flat_colors = rgb.reshape(-1, 3)
             flat_confidence = point_conf_np.reshape(-1)
-            finite = np.isfinite(flat_points).all(axis=1) & np.isfinite(flat_confidence)
-            all_points.add(flat_points[finite], flat_colors[finite])
-            if np.any(finite):
-                threshold = float(
-                    np.percentile(
-                        flat_confidence[finite], args.confidence_percentile
-                    )
+            if pointhead_products is None:
+                positive_depth = depth_np[np.isfinite(depth_np) & (depth_np > 0)]
+                if not len(positive_depth):
+                    raise ValueError("First StreamVGGT frame has no positive finite depth.")
+                pointhead_products = PointCloudProductAccumulator(
+                    total_frames=len(images),
+                    protocol=point_protocol,
+                    scale_reference=float(np.median(positive_depth)),
                 )
-                confident = finite & (flat_confidence >= threshold)
-            else:
-                threshold = float("nan")
-                confident = finite
-            confident_points.add(flat_points[confident], flat_colors[confident])
+            point_diagnostics = pointhead_products.add_frame(
+                flat_points,
+                flat_colors,
+                flat_confidence,
+            )
+            finite_count = int(point_diagnostics["raw_points"])
+            confident_count = int(point_diagnostics["filtered_points"])
+            threshold = float(point_diagnostics["confidence_threshold"])
 
             del selected, pose_encoding, depth, depth_confidence, points, point_confidence
             del batch_image
@@ -598,8 +618,8 @@ def main() -> None:
                 "height": current_shape[0],
                 "width": current_shape[1],
                 "confidence_threshold": threshold,
-                "finite_points": int(finite.sum()),
-                "confident_points": int(confident.sum()),
+                "finite_points": finite_count,
+                "confident_points": confident_count,
                 "frame_seconds": frame_seconds,
             }
             for logical_index, device in enumerate(devices):
@@ -643,10 +663,21 @@ def main() -> None:
         extrinsics_np,
         "StreamVGGT prediction (no GT/alignment)",
     )
-    points_all, colors_all = all_points.arrays()
-    points_conf, colors_conf = confident_points.arrays()
+    if pointhead_products is None:
+        raise RuntimeError("StreamVGGT produced no point-head products.")
+    pointcloud_started = time.perf_counter()
+    print("[pointcloud] finalizing StreamVGGT pointhead products", flush=True)
+    pointhead_summary = pointhead_products.write(scene_dir / "points", "pointhead")
+    points_all, colors_all = pointhead_products.raw.arrays()
+    points_conf, colors_conf = pointhead_products.filtered.arrays()
+    # Backward-compatible aliases used by the first long-sequence runs.
     write_binary_ply(scene_dir / "points" / "full_all.ply", points_all, colors_all)
     write_binary_ply(scene_dir / "points" / "full.ply", points_conf, colors_conf)
+    depthpose_summary = rebuild_depth_pose_products(
+        scene_dir,
+        protocol=point_protocol,
+    )
+    pointcloud_seconds = time.perf_counter() - pointcloud_started
     _write_runtime_csv(scene_dir / "runtime_per_frame.csv", runtime_rows)
 
     summary = {
@@ -668,10 +699,13 @@ def main() -> None:
         "processed_height": processed_shape[0],
         "processed_width": processed_shape[1],
         "confidence_percentile": args.confidence_percentile,
-        "raw_points_seen": all_points.seen_points,
-        "confident_points_seen": confident_points.seen_points,
+        "raw_points_seen": pointhead_products.raw.seen_points,
+        "confident_points_seen": pointhead_products.filtered_points_seen,
         "full_all_ply_points": len(points_all),
         "full_ply_points": len(points_conf),
+        "pointcloud_processing_seconds": pointcloud_seconds,
+        "pointhead_products": pointhead_summary,
+        "depthpose_products": depthpose_summary,
         "elapsed_seconds": elapsed,
         "frames_per_second": len(images) / elapsed if elapsed else None,
         "gpus": _gpu_summary(devices),

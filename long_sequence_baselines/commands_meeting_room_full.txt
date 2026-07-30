@@ -31,6 +31,11 @@ CUDA_VISIBLE_DEVICES="$GPU0" "$HORIZON_PYTHON" \
   --output-root "$OUTPUT_ROOT/horizonstream" \
   --scene-name meeting_room_a02 \
   --sliding-size 10 \
+  --confidence-percentile 50 \
+  --depth-percentile-low 1 \
+  --depth-percentile-high 99 \
+  --voxel-size-ratio 0.01 \
+  --min-voxel-observations 2 \
   --max-frames "$MAX_FRAMES"
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -40,6 +45,11 @@ CUDA_VISIBLE_DEVICES="$GPU0,$GPU1,$GPU2,$GPU3,$GPU4" "$STREAM_PYTHON" \
   --checkpoint "$STREAM_CKPT" \
   --output-root "$OUTPUT_ROOT/streamvggt" \
   --scene-name meeting_room_a02 \
+  --confidence-percentile 50 \
+  --depth-percentile-low 1 \
+  --depth-percentile-high 99 \
+  --voxel-size-ratio 0.01 \
+  --min-voxel-observations 2 \
   --max-frames "$MAX_FRAMES"
 
 HORIZON_INPUTS="$OUTPUT_ROOT/horizonstream/input_images.txt"
@@ -48,4 +58,18 @@ cmp "$HORIZON_INPUTS" "$STREAM_INPUTS"
 [[ "$(wc -l < "$HORIZON_INPUTS")" -eq "$MAX_FRAMES" ]] || {
   echo "输入帧数不是 $MAX_FRAMES"; exit 1
 }
+for METHOD_ROOT in \
+  "$OUTPUT_ROOT/horizonstream/meeting_room_a02" \
+  "$OUTPUT_ROOT/streamvggt/meeting_room_a02"; do
+  for PRODUCT in depthpose_raw depthpose_conf depthpose_conf_voxel; do
+    [[ -f "$METHOD_ROOT/points/$PRODUCT.ply" ]] || {
+      echo "缺少点云结果: $METHOD_ROOT/points/$PRODUCT.ply"; exit 1
+    }
+  done
+done
+for PRODUCT in pointhead_raw pointhead_conf pointhead_conf_voxel; do
+  [[ -f "$OUTPUT_ROOT/streamvggt/meeting_room_a02/points/$PRODUCT.ply" ]] || {
+    echo "缺少 StreamVGGT point-head 结果: $PRODUCT.ply"; exit 1
+  }
+done
 echo "300-frame comparison complete; input lists are identical."

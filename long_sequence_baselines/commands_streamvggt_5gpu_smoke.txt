@@ -25,4 +25,9 @@ CUDA_VISIBLE_DEVICES="$GPU0,$GPU1,$GPU2,$GPU3,$GPU4" "$STREAM_PYTHON" \
   --checkpoint "$STREAM_CKPT" \
   --output-root "$OUTPUT_ROOT/streamvggt" \
   --scene-name meeting_room_a02 \
+  --confidence-percentile 50 \
+  --depth-percentile-low 1 \
+  --depth-percentile-high 99 \
+  --voxel-size-ratio 0.01 \
+  --min-voxel-observations 2 \
   --max-frames 20

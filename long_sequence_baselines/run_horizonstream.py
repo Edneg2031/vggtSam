@@ -11,6 +11,7 @@ import torch
 import yaml
 
 from .common import discover_images, write_image_list, write_json
+from .pointcloud_products import PointCloudProtocol, rebuild_depth_pose_products
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +33,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-size", type=int, default=10)
     parser.add_argument("--sliding-size", type=int, default=10)
     parser.add_argument("--max-full-pointcloud-points", type=int, default=2_000_000)
+    parser.add_argument("--confidence-percentile", type=float, default=50.0)
+    parser.add_argument("--depth-percentile-low", type=float, default=1.0)
+    parser.add_argument("--depth-percentile-high", type=float, default=99.0)
+    parser.add_argument("--voxel-size-ratio", type=float, default=0.01)
+    parser.add_argument("--min-voxel-observations", type=int, default=2)
     return parser.parse_args()
 
 
@@ -95,6 +101,15 @@ def build_config(args: argparse.Namespace, images: list[Path]) -> dict:
 
 def main() -> None:
     args = parse_args()
+    pointcloud_protocol = PointCloudProtocol(
+        confidence_percentile=args.confidence_percentile,
+        depth_percentile_low=args.depth_percentile_low,
+        depth_percentile_high=args.depth_percentile_high,
+        voxel_size_ratio=args.voxel_size_ratio,
+        min_voxel_observations=args.min_voxel_observations,
+        max_points=args.max_full_pointcloud_points,
+    )
+    pointcloud_protocol.validate()
     repo = Path(args.repo).expanduser().resolve()
     checkpoint = Path(args.checkpoint).expanduser().resolve()
     if not checkpoint.is_file():
@@ -130,6 +145,13 @@ def main() -> None:
     horizon_infer.run_inference_cfg(config)
     torch.cuda.synchronize(device_index)
     elapsed = time.perf_counter() - started
+    scene_dir = output_root / args.scene_name
+    pointcloud_started = time.perf_counter()
+    pointcloud_products = rebuild_depth_pose_products(
+        scene_dir,
+        protocol=pointcloud_protocol,
+    )
+    pointcloud_seconds = time.perf_counter() - pointcloud_started
     summary = {
         "method": "horizonstream",
         "scene": args.scene_name,
@@ -142,9 +164,11 @@ def main() -> None:
         "elapsed_seconds": elapsed,
         "frames_per_second": len(images) / elapsed if elapsed else None,
         "peak_gpu_memory_gib": torch.cuda.max_memory_allocated(device_index) / 2**30,
-        "output": str(output_root / args.scene_name),
+        "pointcloud_processing_seconds": pointcloud_seconds,
+        "pointcloud_products": pointcloud_products,
+        "output": str(scene_dir),
     }
-    write_json(output_root / args.scene_name / "run_summary.json", summary)
+    write_json(scene_dir / "run_summary.json", summary)
     print(f"HorizonStream complete: {summary}", flush=True)
 
 

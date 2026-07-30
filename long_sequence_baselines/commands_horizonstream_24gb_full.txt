@@ -24,4 +24,9 @@ CUDA_VISIBLE_DEVICES="$GPU0" "$HORIZON_PYTHON" \
   --output-root "$OUTPUT_ROOT/horizonstream" \
   --scene-name meeting_room_a02 \
   --sliding-size 10 \
+  --confidence-percentile 50 \
+  --depth-percentile-low 1 \
+  --depth-percentile-high 99 \
+  --voxel-size-ratio 0.01 \
+  --min-voxel-observations 2 \
   --max-frames "$MAX_FRAMES"
