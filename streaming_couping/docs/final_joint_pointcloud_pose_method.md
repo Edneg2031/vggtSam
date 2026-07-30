@@ -165,6 +165,11 @@ support_ratio <  0.75  → 使用 P(0)
 zsh streaming_couping/commands_v5_adaptive_best.txt
 ```
 
+命令会优先直接使用服务器的
+`/home/huawei/miniconda3/envs/3am/bin/python`，所以即使当前 shell 显示
+`(horizonstream)` 也不会误用 HorizonStream 的 PyTorch。其他机器可通过
+`STREAMING_COUPING_PYTHON=/path/to/python` 显式指定兼容解释器。
+
 第一次运行优先迁移已有 `v5_residual_so3_union` checkpoint；若不存在，只训练这一种结构。
 命令随后重新计算固定 reference pose、adaptive gate、完整导出、位姿图和数量检查。
 

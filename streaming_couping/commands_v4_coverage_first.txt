@@ -1,5 +1,18 @@
 set -euo pipefail
 
+if [[ -n "${STREAMING_COUPING_PYTHON:-}" ]]; then
+  PYTHON_BIN="$STREAMING_COUPING_PYTHON"
+elif [[ -x /home/huawei/miniconda3/envs/3am/bin/python ]]; then
+  PYTHON_BIN=/home/huawei/miniconda3/envs/3am/bin/python
+else
+  PYTHON_BIN="$(command -v python)"
+fi
+echo "streaming_couping python=$PYTHON_BIN"
+"$PYTHON_BIN" -c \
+  'import sys, torch; print(f"python={sys.executable} torch={torch.__version__}")'
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+
 CONFIG=streaming_couping/configs/v4_coverage_first.yaml
 OUTPUT=outputs/streaming_couping_v4_coverage_first
 EXPORT="$OUTPUT/final_v4_coverage_first"
@@ -10,7 +23,7 @@ mkdir -p "$OUTPUT/checkpoints/decoupled_dual_branch"
 
 # Reuse the common frozen observations.  If they are absent, build them once
 # with the V4-compatible identity thresholds.
-PYTHONUNBUFFERED=1 PYTHONPATH=. python -m streaming_couping.scripts.run_instance_token_pose \
+PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.run_instance_token_pose \
   --config "$CONFIG" \
   --stage cache \
   --sam3-device cuda:3 \
@@ -26,7 +39,7 @@ if [[ ! -f "$CHECKPOINT" ]]; then
     echo "preserved existing V4 checkpoint: $SOURCE_CHECKPOINT"
   else
     echo "existing V4 checkpoint not found; training the standalone V4 release"
-    PYTHONUNBUFFERED=1 PYTHONPATH=. python -m streaming_couping.scripts.run_instance_token_pose \
+    PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.run_instance_token_pose \
       --config "$CONFIG" \
       --stage train \
       --training-device cuda:1 \
@@ -36,24 +49,24 @@ fi
 
 rm -rf "$OUTPUT/evaluation" "$EXPORT"
 
-PYTHONUNBUFFERED=1 PYTHONPATH=. python -m streaming_couping.scripts.run_instance_token_pose \
+PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.run_instance_token_pose \
   --config "$CONFIG" \
   --stage eval \
   --geometry-device cuda:1 \
   --training-device cuda:1 \
   2>&1 | tee "$OUTPUT/eval.log"
 
-PYTHONPATH=. python -m streaming_couping.scripts.run_instance_token_pose \
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.run_instance_token_pose \
   --config "$CONFIG" \
   --stage export \
   --export-output-dir "$EXPORT"
 
-PYTHONPATH=. python -m streaming_couping.scripts.plot_pose_comparison \
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.plot_pose_comparison \
   --comparison-dir \
   "$EXPORT/00a231a370_90_240_37_68_54/comparison_gt_world" \
   --heldout-frame-indices 210 240
 
-PYTHONPATH=. python -m streaming_couping.scripts.plot_pose_comparison \
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.plot_pose_comparison \
   --comparison-dir \
   "$EXPORT/00a231a370_492_589_37_68_54/comparison_gt_world"
 

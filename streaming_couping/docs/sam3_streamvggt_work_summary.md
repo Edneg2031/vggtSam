@@ -290,6 +290,9 @@ zsh streaming_couping/commands_v5_adaptive_best.txt
 zsh streaming_couping/commands_v6_camera_overfit.txt
 ```
 
+V4/V5 命令在当前服务器优先调用 `3am/bin/python`，避免从 `(horizonstream)` shell 误用
+不同 PyTorch 版本重放冻结 DPT head。其他机器可设置 `STREAMING_COUPING_PYTHON` 覆盖路径。
+
 V5 的主要结果：
 
 ```text

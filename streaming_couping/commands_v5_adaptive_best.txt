@@ -1,5 +1,21 @@
 set -euo pipefail
 
+# This pipeline and its frozen feature caches were built in the 3am
+# environment. Calling that interpreter directly avoids accidentally replaying
+# the frozen DPT heads with the incompatible HorizonStream PyTorch build.
+if [[ -n "${STREAMING_COUPING_PYTHON:-}" ]]; then
+  PYTHON_BIN="$STREAMING_COUPING_PYTHON"
+elif [[ -x /home/huawei/miniconda3/envs/3am/bin/python ]]; then
+  PYTHON_BIN=/home/huawei/miniconda3/envs/3am/bin/python
+else
+  PYTHON_BIN="$(command -v python)"
+fi
+echo "streaming_couping python=$PYTHON_BIN"
+"$PYTHON_BIN" -c \
+  'import sys, torch; print(f"python={sys.executable} torch={torch.__version__}")'
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+
 CONFIG=streaming_couping/configs/v5_adaptive_best.yaml
 OUTPUT=outputs/streaming_couping_v5_adaptive_best
 LEGACY_CHECKPOINT=outputs/streaming_couping_v5_ablation/variants/v5_residual_so3_union/checkpoints/decoupled_dual_branch/checkpoint_best.pt
@@ -11,7 +27,7 @@ FINAL_EXPORT="$OUTPUT/final_adaptive_pointmap_pose"
 mkdir -p "$OUTPUT/checkpoints/decoupled_dual_branch"
 
 # Reuse/build the two frozen observation caches.
-PYTHONUNBUFFERED=1 PYTHONPATH=. python -m streaming_couping.scripts.run_instance_token_pose \
+PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.run_instance_token_pose \
   --config "$CONFIG" \
   --stage cache \
   --sam3-device cuda:3 \
@@ -26,7 +42,7 @@ if [[ ! -f "$CHECKPOINT" ]]; then
     cp -p "$LEGACY_CHECKPOINT" "$CHECKPOINT"
     echo "preserved existing best V5 checkpoint: $LEGACY_CHECKPOINT"
   else
-    PYTHONUNBUFFERED=1 PYTHONPATH=. python -m streaming_couping.scripts.run_instance_token_pose \
+    PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.run_instance_token_pose \
       --config "$CONFIG" \
       --stage train \
       --training-device cuda:1 \
@@ -37,27 +53,24 @@ fi
 rm -rf "$REFERENCE_OUTPUT" "$OUTPUT/adaptive_evaluation" "$FINAL_EXPORT"
 rm -f "$OUTPUT/adaptive_upload_summary.csv"
 
-export PYTHONHASHSEED=0
-export CUBLAS_WORKSPACE_CONFIG=:4096:8
-
-PYTHONUNBUFFERED=1 PYTHONPATH=. python -m streaming_couping.scripts.run_v5_reference_pose \
+PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.run_v5_reference_pose \
   --config "$CONFIG" \
   --training-device cuda:1 \
   2>&1 | tee "$OUTPUT/reference_pose.log"
 
-PYTHONUNBUFFERED=1 PYTHONPATH=. python -m streaming_couping.scripts.run_v5_adaptive \
+PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.run_v5_adaptive \
   --config "$CONFIG" \
   --device cuda:1 \
   --predictions "$PREDICTIONS" \
   --export \
   2>&1 | tee "$OUTPUT/adaptive.log"
 
-PYTHONPATH=. python -m streaming_couping.scripts.plot_pose_comparison \
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.plot_pose_comparison \
   --comparison-dir \
   "$FINAL_EXPORT/00a231a370_90_240_37_68_54/comparison_gt_world" \
   --heldout-frame-indices 210 240
 
-PYTHONPATH=. python -m streaming_couping.scripts.plot_pose_comparison \
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.plot_pose_comparison \
   --comparison-dir \
   "$FINAL_EXPORT/00a231a370_492_589_37_68_54/comparison_gt_world"
 
