@@ -57,6 +57,30 @@ PYTHONPATH=. python -m streaming_couping.scripts.plot_pose_comparison \
   --comparison-dir \
   "$EXPORT/00a231a370_492_589_37_68_54/comparison_gt_world"
 
+for clip in \
+  00a231a370_90_240_37_68_54 \
+  00a231a370_492_589_37_68_54
+do
+  root="$EXPORT/$clip/comparison_gt_objects"
+  for required in \
+    "$root/object_comparison_metrics.csv" \
+    "$root/object_comparison_short.csv" \
+    "$root/object_artifacts.csv" \
+    "$root/instance_37/gt_object.ply" \
+    "$root/instance_37/ours_predicted_object.ply" \
+    "$root/instance_68/gt_object.ply" \
+    "$root/instance_68/ours_predicted_object.ply" \
+    "$root/instance_54/gt_object.ply" \
+    "$root/instance_54/ours_predicted_object.ply"
+  do
+    if [[ ! -f "$required" ]]; then
+      echo "missing required GT-object export: $required" >&2
+      exit 1
+    fi
+  done
+  echo "validated GT-object comparison: $clip"
+done
+
 find "$EXPORT" -type f | sort > "$OUTPUT/v4_coverage_first_artifact_manifest.txt"
 sha256sum \
   "$CONFIG" \
@@ -68,3 +92,10 @@ sha256sum \
   > "$OUTPUT/v4_coverage_first_reproduction_inputs.sha256"
 
 sed -n '1,12p' "$OUTPUT/evaluation/ray_pose_compact_summary.csv"
+for clip in \
+  00a231a370_90_240_37_68_54 \
+  00a231a370_492_589_37_68_54
+do
+  sed -n '1,4p' \
+    "$EXPORT/$clip/comparison_gt_objects/object_comparison_short.csv"
+done

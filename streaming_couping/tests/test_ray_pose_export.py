@@ -1,17 +1,20 @@
 import csv
+import json
 
 import numpy as np
 import torch
 from PIL import Image
 
+from streaming_couping.src.external_repos import maybe_add_repo_to_path
 from streaming_couping.src.learned_pose.export import (
     _align_camera_pose,
     _camera_matrices_from_world_to_camera,
+    _export_gt_object_comparison,
     _export_tracking_mask_visualizations,
+    _load_gt_instance_masks,
     _paired_distance_statistics,
     _world_confidence,
 )
-from streaming_couping.src.external_repos import maybe_add_repo_to_path
 
 
 def test_align_camera_pose_matches_pointmap_similarity() -> None:
@@ -138,3 +141,102 @@ def test_tracking_masks_are_exported_as_binary_and_overlay_images(tmp_path) -> N
         "UNKNOWN",
         "MISMATCH",
     ]
+
+
+def test_gt_instance_masks_are_loaded_independently_of_tracking(tmp_path) -> None:
+    image_paths = []
+    mask_paths = []
+    for index in range(2):
+        image_path = tmp_path / f"rgb_{index}.png"
+        mask_path = tmp_path / f"mask_{index}.png"
+        Image.new("RGB", (6, 4), color=(20, 30, 40)).save(image_path)
+        labels = np.zeros((4, 6), dtype=np.uint16)
+        labels[:, :3] = 37
+        labels[:, 3:] = 68
+        Image.fromarray(labels).save(mask_path)
+        image_paths.append(image_path)
+        mask_paths.append(mask_path)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "scenes": [
+                    {
+                        "scene_id": "scene",
+                        "objects": {"37": "chair", "68": "wardrobe"},
+                        "frames": [
+                            {
+                                "image_path": str(image_path),
+                                "instance_mask": str(mask_path),
+                            }
+                            for image_path, mask_path in zip(image_paths, mask_paths)
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf8",
+    )
+
+    masks = _load_gt_instance_masks(
+        manifest,
+        scene_id="scene",
+        frame_indices=(0, 1),
+        instance_ids=(37, 68),
+        processed_size=(2, 3),
+        image_mode="crop",
+    )
+
+    assert masks.shape == (2, 2, 2, 3)
+    assert masks[:, 0].any()
+    assert masks[:, 1].any()
+    assert not (masks[:, 0] & masks[:, 1]).any()
+
+
+def test_gt_object_export_separates_gt_and_predicted_masks(tmp_path) -> None:
+    target = torch.zeros(1, 2, 3, 3)
+    target[..., 0] = torch.arange(6).reshape(1, 2, 3)
+    raw = target + torch.tensor([1.0, 0.0, 0.0])
+    ours = target + torch.tensor([0.5, 0.0, 0.0])
+    colors = torch.full((1, 2, 3, 3), 128, dtype=torch.uint8)
+    gt_masks = torch.zeros(1, 1, 2, 3, dtype=torch.bool)
+    gt_masks[0, 0, 0, :2] = True
+    predicted_masks = torch.zeros_like(gt_masks)
+    predicted_masks[0, 0, 0, 1:] = True
+
+    _export_gt_object_comparison(
+        tmp_path,
+        clip_name="clip",
+        scene_id="scene",
+        instance_ids=(37,),
+        reference_sequence_index=0,
+        raw_points=raw,
+        refined_points=ours,
+        target_points=target,
+        predicted_masks=predicted_masks,
+        gt_masks=gt_masks,
+        colors=colors,
+        scale=1.0,
+        rotation=torch.eye(3),
+        translation=torch.zeros(3),
+        max_instance_points=100,
+    )
+
+    with (tmp_path / "object_comparison_metrics.csv").open(
+        newline="", encoding="utf8"
+    ) as handle:
+        row = next(csv.DictReader(handle))
+    assert float(row["mask_iou"]) == 1.0 / 3.0
+    assert float(row["mask_precision"]) == 0.5
+    assert float(row["mask_recall"]) == 0.5
+    assert float(row["raw_gt_mask_rmse"]) == 1.0
+    assert float(row["ours_gt_mask_rmse"]) == 0.5
+    with (tmp_path / "object_comparison_short.csv").open(
+        newline="", encoding="utf8"
+    ) as handle:
+        short_row = next(csv.DictReader(handle))
+    assert float(short_row["ours_minus_raw_gt_mask_rmse"]) == -0.5
+    instance_root = tmp_path / "instance_37"
+    assert (instance_root / "gt_object.ply").is_file()
+    assert (instance_root / "ours_predicted_object.ply").is_file()
+    assert (instance_root / "ours_on_gt_mask.ply").is_file()

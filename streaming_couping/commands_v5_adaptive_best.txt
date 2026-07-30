@@ -66,6 +66,7 @@ validate_clip_export() {
   local frames="$2"
   local root="$FINAL_EXPORT/$clip"
   local expected_mask_png=$((5 * frames + 1))
+  local instance_id
   local mask_kind
   local actual
 
@@ -85,26 +86,34 @@ validate_clip_export() {
     fi
   done
 
-  actual=$(
-    find "$root" -type f -name '*.ply' |
-      wc -l |
-      tr -d '[:space:]'
-  )
-  if [[ "$actual" != "45" ]]; then
-    echo "incomplete point-cloud export for $clip: $actual PLY, expected 45" >&2
-    return 1
-  fi
-
   for required in \
     "$root/comparison_gt_world/pose_comparison.png" \
     "$root/comparison_gt_world/pose_comparison.pdf" \
     "$root/comparison_gt_world/camera_poses.csv" \
-    "$root/deployable_native/camera_poses.csv"
+    "$root/deployable_native/camera_poses.csv" \
+    "$root/comparison_gt_objects/object_comparison_metrics.csv" \
+    "$root/comparison_gt_objects/object_comparison_short.csv" \
+    "$root/comparison_gt_objects/object_artifacts.csv" \
+    "$root/comparison_gt_objects/README.txt"
   do
     if [[ ! -f "$required" ]]; then
       echo "missing required export: $required" >&2
       return 1
     fi
+  done
+  for instance_id in 37 68 54; do
+    for required in \
+      "$root/comparison_gt_objects/instance_$instance_id/gt_object.ply" \
+      "$root/comparison_gt_objects/instance_$instance_id/streamvggt_raw_predicted_object.ply" \
+      "$root/comparison_gt_objects/instance_$instance_id/ours_predicted_object.ply" \
+      "$root/comparison_gt_objects/instance_$instance_id/ours_on_gt_mask.ply" \
+      "$root/comparison_gt_objects/instance_$instance_id/overlay_gt_green_raw_red_ours_blue.ply"
+    do
+      if [[ ! -f "$required" ]]; then
+        echo "missing required GT-object export: $required" >&2
+        return 1
+      fi
+    done
   done
   echo "validated complete export: $clip"
 }
@@ -125,3 +134,10 @@ sha256sum \
   > "$OUTPUT/adaptive_reproduction_inputs.sha256"
 
 sed -n '1,12p' "$OUTPUT/adaptive_upload_summary.csv"
+for clip in \
+  00a231a370_90_240_37_68_54 \
+  00a231a370_492_589_37_68_54
+do
+  sed -n '1,4p' \
+    "$FINAL_EXPORT/$clip/comparison_gt_objects/object_comparison_short.csv"
+done

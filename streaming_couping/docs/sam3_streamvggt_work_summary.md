@@ -304,8 +304,18 @@ outputs/streaming_couping_v5_adaptive_best/
         ├── geometry_trusted_masks/
         ├── raw_tracking_masks/
         ├── pointclouds/
-        └── comparison_gt_world/
+        ├── comparison_gt_world/
+        └── comparison_gt_objects/
 ```
+
+`comparison_gt_objects/instance_*/gt_object.ply` 使用 GT instance mask，是真正的 GT 可见物体
+点云；`ours_predicted_object.ply` 使用方法实际消费的几何 tracking mask（V5 为 strict
+geometry trusted mask），包含分割与几何两类误差；
+`ours_on_gt_mask.ply` 固定 GT mask，只检查几何。`object_comparison_metrics.csv` 用一行汇总
+每个实例的 mask IoU/precision/recall 和 GT-mask 内的 raw/ours 3D 误差。
+命令行打印更短的 `object_comparison_short.csv`，便于直接复制结果。
+参考帧使用 GT mask 初始化，因此分割结果以短表的 `nonref_mask_*` 为准；GT PLY 表示所选
+帧内可见 GT 深度点，不等同于完整场景 mesh。
 
 ## 8. 最终推荐
 

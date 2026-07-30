@@ -202,11 +202,35 @@ outputs/streaming_couping_v5_adaptive_best/
 │   ├── pointcloud_metrics.csv
 │   ├── pose_comparison.png
 │   └── pose_comparison.pdf
+├── comparison_gt_objects/
+│   ├── instance_*/
+│   │   ├── gt_object.ply
+│   │   ├── streamvggt_raw_predicted_object.ply
+│   │   ├── ours_predicted_object.ply
+│   │   ├── ours_on_gt_mask.ply
+│   │   └── overlay_gt_green_raw_red_ours_blue.ply
+│   ├── object_comparison_metrics.csv
+│   ├── object_comparison_short.csv
+│   └── object_artifacts.csv
 └── camera_centers_overlay_metric_gt_world.ply
 ```
 
 `deployable_native` 不读取 GT，使用 StreamVGGT native gauge。`comparison_gt_world` 使用一次
 固定 reference-frame Sim(3)，只用于开发期公平比较；raw 和 ours 使用同一个对齐。
+
+需要比较完整 GT 物体时使用 `comparison_gt_objects`，不要把旧的
+`comparison_gt_world/instance_*/ground_truth.ply` 当成完整 GT 物体：旧文件是在预测 tracking
+mask 内截取 GT pointmap，只适合同像素几何比较。新目录中 `gt_object.ply` 由 ScanNet++ GT
+instance mask 截取，`ours_predicted_object.ply` 由预测文件中方法实际用于几何的 tracking
+mask 截取（V5 为 strict geometry trusted mask），
+因此两者的差别同时包含分割和几何误差；`ours_on_gt_mask.ply` 固定使用 GT mask，只比较
+pointmap 几何。overlay 颜色为 GT 绿、raw 红、ours 蓝。指标表同时给出 mask IoU、precision、
+recall，以及 GT mask 和 GT/预测 mask 交集内的逐像素 3D 距离。
+命令最后只打印 `object_comparison_short.csv`；其中
+`ours_minus_raw_gt_mask_rmse < 0` 表示在相同 GT mask 上，本方法的点云几何优于 raw。
+由于当前 tracking 的参考帧由 GT mask 初始化，分割泛化应报告短表中的 `nonref_mask_*`，
+而不是包含参考帧的整体 `mask_iou`。这里的 GT 点云也是“所选帧可见 GT 深度点”的并集，
+不是完整 ScanNet++ mesh。
 
 ## 6. GT 使用边界
 
@@ -220,7 +244,8 @@ SAM3 tracking 与 identity state
 ray fit accepted 状态
 ```
 
-训练时 GT 用于 pose/depth/pointmap supervision；评估时 GT 用于指标和 GT-world 可视化。
+训练时 GT 用于 pose/depth/pointmap supervision；评估时 GT 用于指标、GT object mask 和
+GT-world 可视化。
 adaptive gate、SAM3 tracking、身份注册和最终 native 输出均不读取测试帧 GT。
 
 ## 7. 当前结论与下一步

@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import csv
 import json
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 import torch
 from PIL import Image, ImageDraw
+
 from ..config import load_config
+from ..data import load_mask_tracking_sequence
 from ..external_repos import maybe_add_repo_to_path
 from ..instance_point_cloud import (
     _limit_points,
@@ -18,6 +20,7 @@ from ..instance_point_cloud import (
     load_processed_colors,
 )
 from ..pose_evaluation import _prepare_pose_sequence
+from ..recovery import output_mask_to_stream
 from .cache import cache_path, load_feature_cache
 from .config import LearnedPoseConfig
 from .ray_pose import FINAL_RAY_POSE_NAME
@@ -48,7 +51,7 @@ def export_final_ray_pose_outputs(
     artifact = _torch_load(predictions_path)
     predictions = artifact.get("predictions")
     if not isinstance(predictions, dict):
-        raise ValueError(f"Missing predictions mapping in {predictions_path}.")
+        raise TypeError(f"Missing predictions mapping in {predictions_path}.")
     selection_policy = artifact.get("selection_policy")
     is_adaptive_export = isinstance(selection_policy, dict)
 
@@ -75,7 +78,7 @@ def export_final_ray_pose_outputs(
     for clip in config.clips:
         clip_prediction = predictions.get(clip.name)
         if not isinstance(clip_prediction, dict):
-            raise ValueError(
+            raise TypeError(
                 f"No saved ray-pose prediction for clip {clip.name!r}."
             )
         pose_encodings = clip_prediction.get("pose_encodings")
@@ -113,6 +116,14 @@ def export_final_ray_pose_outputs(
                 f"RGB/pointmap shape mismatch for {clip.name}: "
                 f"{tuple(colors.shape)} versus {tuple(points.shape)}."
             )
+        gt_instance_masks = _load_gt_instance_masks(
+            config.manifest,
+            scene_id=clip.scene_id,
+            frame_indices=clip.frame_indices,
+            instance_ids=clip.instance_ids,
+            processed_size=processed_size,
+            image_mode=recovery.image_mode,
+        )
 
         native_c2w, native_w2c, intrinsics = _decode_pose(
             pose_encodings[selected],
@@ -123,7 +134,7 @@ def export_final_ray_pose_outputs(
             "raw_baseline_control",
             payload["baseline_pose_encoding"],
         )
-        raw_c2w, raw_w2c, raw_intrinsics = _decode_pose(
+        raw_c2w, _raw_w2c, raw_intrinsics = _decode_pose(
             raw_pose_encoding,
             image_size=processed_size,
             frame_indices=clip.frame_indices,
@@ -316,6 +327,23 @@ def export_final_ray_pose_outputs(
             target_w2c=target_w2c,
             target_intrinsics=target_intrinsics,
             max_full_scene_points=int(ray_config.export_max_full_scene_points),
+            max_instance_points=int(ray_config.export_max_instance_points),
+        )
+        _export_gt_object_comparison(
+            clip_root / "comparison_gt_objects",
+            clip_name=clip.name,
+            scene_id=clip.scene_id,
+            instance_ids=clip.instance_ids,
+            reference_sequence_index=clip.reference_sequence_index,
+            raw_points=_world_points(payload["baseline_world_points"]),
+            refined_points=points,
+            target_points=target_points,
+            predicted_masks=masks,
+            gt_masks=gt_instance_masks,
+            colors=colors,
+            scale=scale,
+            rotation=rotation,
+            translation=translation,
             max_instance_points=int(ray_config.export_max_instance_points),
         )
 
@@ -550,7 +578,8 @@ def export_final_ray_pose_outputs(
             "full_scene.ply and instance_*.ply are the selected "
             + (
                 "adaptive raw/learned pointmap blend. "
-                f"This clip selected alpha={clip_prediction.get('adaptive_selected_blend')}. "
+                "This clip selected alpha="
+                f"{clip_prediction.get('adaptive_selected_blend')}. "
                 if is_adaptive_export
                 else "learned world pointmaps. "
             )
@@ -579,7 +608,14 @@ def export_final_ray_pose_outputs(
         "and the same GT-world coordinate system.\n\n"
         "Use *_predicted_metric_gt_world.ply with "
         "*_gt_visible_all_finite_metric_gt_world.ply to compare the complete "
-        "visible prediction and GT pointmaps.\n\n"
+        "visible prediction and GT pointmaps. These legacy instance files "
+        "still use the predicted tracking mask and are not complete GT "
+        "objects.\n\n"
+        "Use <clip>/comparison_gt_objects/ for the true object comparison. "
+        "There, gt_object.ply uses the ScanNet++ GT instance mask, while "
+        "ours_predicted_object.ply uses the mask consumed by the method. "
+        "ours_on_gt_mask.ply isolates pointmap geometry from segmentation "
+        "errors.\n\n"
         "camera_poses.csv contains native prediction, GT-world prediction, and "
         "raw ScanNet++ GT poses. camera_comparison_pointmap_sim3.csv compares "
         "the latter two in the joint pointmap coordinate system.\n",
@@ -632,6 +668,373 @@ def export_final_ray_pose_outputs(
             indent=2,
         )
     return root
+
+
+def _load_gt_instance_masks(
+    manifest_path: str | Path,
+    *,
+    scene_id: str,
+    frame_indices: Iterable[int],
+    instance_ids: Iterable[int],
+    processed_size: tuple[int, int],
+    image_mode: str,
+) -> torch.Tensor:
+    """Load ScanNet++ instance labels and map them to the point-head grid."""
+
+    frame_indices = tuple(int(value) for value in frame_indices)
+    instance_ids = tuple(int(value) for value in instance_ids)
+    if not instance_ids:
+        raise ValueError("GT object export requires at least one instance ID.")
+    sequence = load_mask_tracking_sequence(
+        manifest_path,
+        scene_id=scene_id,
+        frame_indices=frame_indices,
+        sequence_length=len(frame_indices),
+        frame_stride=1,
+        window_index=0,
+        instance_id=instance_ids[0],
+        min_pixels=1,
+        max_area_ratio=1.0,
+        min_visible_frames=1,
+        excluded_labels=(),
+        seed=0,
+        allow_absent=True,
+    )
+    if tuple(sequence.frame_indices) != frame_indices:
+        raise ValueError(
+            "Manifest returned different frames for GT object export: "
+            f"{tuple(sequence.frame_indices)} versus {frame_indices}."
+        )
+    frames: list[torch.Tensor] = []
+    for labels in sequence.instance_masks:
+        if labels.ndim != 2:
+            raise ValueError(
+                f"Expected a 2D GT instance label map, got {labels.shape}."
+            )
+        source_size = (int(labels.shape[0]), int(labels.shape[1]))
+        frames.append(
+            torch.stack(
+                [
+                    output_mask_to_stream(
+                        torch.from_numpy(labels == instance_id),
+                        source_size=source_size,
+                        processed_size=processed_size,
+                        image_mode=image_mode,
+                    )
+                    for instance_id in instance_ids
+                ],
+                dim=0,
+            )
+        )
+    masks = torch.stack(frames, dim=0).bool().cpu()
+    expected = (len(frame_indices), len(instance_ids), *processed_size)
+    if tuple(masks.shape) != expected:
+        raise ValueError(
+            "GT instance-mask/pointmap mismatch: "
+            f"{tuple(masks.shape)} versus {expected}."
+        )
+    return masks
+
+
+def _export_gt_object_comparison(
+    root: Path,
+    *,
+    clip_name: str,
+    scene_id: str,
+    instance_ids: Iterable[int],
+    reference_sequence_index: int,
+    raw_points: torch.Tensor,
+    refined_points: torch.Tensor,
+    target_points: torch.Tensor,
+    predicted_masks: torch.Tensor,
+    gt_masks: torch.Tensor,
+    colors: torch.Tensor,
+    scale: float,
+    rotation: torch.Tensor,
+    translation: torch.Tensor,
+    max_instance_points: int,
+) -> None:
+    """Export true GT-mask objects and complete predicted-mask objects."""
+
+    instance_ids = tuple(int(value) for value in instance_ids)
+    expected_points = tuple(target_points.shape)
+    reference_sequence_index = int(reference_sequence_index)
+    if not 0 <= reference_sequence_index < expected_points[0]:
+        raise ValueError(
+            "reference_sequence_index is outside the GT object sequence: "
+            f"{reference_sequence_index} versus {expected_points[0]} frames."
+        )
+    if (
+        tuple(raw_points.shape) != expected_points
+        or tuple(refined_points.shape) != expected_points
+    ):
+        raise ValueError("GT/raw/ours object pointmaps must share [S,H,W,3].")
+    expected_masks = (expected_points[0], len(instance_ids), *expected_points[1:3])
+    if tuple(predicted_masks.shape) != expected_masks:
+        raise ValueError(
+            "Predicted object-mask/pointmap mismatch: "
+            f"{tuple(predicted_masks.shape)} versus {expected_masks}."
+        )
+    if tuple(gt_masks.shape) != expected_masks:
+        raise ValueError(
+            f"GT object-mask/pointmap mismatch: {tuple(gt_masks.shape)} "
+            f"versus {expected_masks}."
+        )
+    if tuple(colors.shape[:3]) != expected_points[:3]:
+        raise ValueError("RGB and GT object pointmaps use different grids.")
+
+    root.mkdir(parents=True, exist_ok=True)
+    aligned_raw = float(scale) * (
+        raw_points.float() @ rotation.T.float()
+    ) + translation.float()
+    aligned_ours = float(scale) * (
+        refined_points.float() @ rotation.T.float()
+    ) + translation.float()
+    finite_gt = torch.isfinite(target_points).all(dim=-1)
+    finite_raw = torch.isfinite(aligned_raw).all(dim=-1)
+    finite_ours = torch.isfinite(aligned_ours).all(dim=-1)
+    common_finite = finite_gt & finite_raw & finite_ours
+
+    metric_rows: list[dict] = []
+    artifact_rows: list[dict] = []
+    for instance_index, instance_id in enumerate(instance_ids):
+        gt_mask = gt_masks[:, instance_index].bool()
+        predicted_mask = predicted_masks[:, instance_index].bool()
+        intersection = gt_mask & predicted_mask
+        union = gt_mask | predicted_mask
+        gt_pixels = int(gt_mask.sum())
+        predicted_pixels = int(predicted_mask.sum())
+        intersection_pixels = int(intersection.sum())
+        union_pixels = int(union.sum())
+        non_reference = torch.ones_like(gt_mask)
+        non_reference[reference_sequence_index] = False
+        nonref_gt_pixels = int((gt_mask & non_reference).sum())
+        nonref_predicted_pixels = int((predicted_mask & non_reference).sum())
+        nonref_intersection_pixels = int((intersection & non_reference).sum())
+        nonref_union_pixels = int((union & non_reference).sum())
+
+        gt_selection = gt_mask & finite_gt
+        raw_predicted_selection = predicted_mask & finite_raw
+        ours_predicted_selection = predicted_mask & finite_ours
+        ours_gt_selection = gt_mask & finite_gt & finite_ours
+        gt_paired_selection = gt_mask & common_finite
+        intersection_paired_selection = intersection & common_finite
+
+        gt_object = target_points[gt_selection].detach().float().cpu()
+        gt_rgb = colors[gt_selection].detach().to(torch.uint8).cpu()
+        raw_object = aligned_raw[raw_predicted_selection].detach().float().cpu()
+        raw_rgb = colors[raw_predicted_selection].detach().to(torch.uint8).cpu()
+        ours_object = aligned_ours[ours_predicted_selection].detach().float().cpu()
+        ours_rgb = colors[ours_predicted_selection].detach().to(torch.uint8).cpu()
+        ours_on_gt = aligned_ours[ours_gt_selection].detach().float().cpu()
+        ours_on_gt_rgb = colors[ours_gt_selection].detach().to(torch.uint8).cpu()
+
+        raw_gt_stats = _prefixed_statistics(
+            "raw_gt_mask_",
+            _paired_distance_statistics(
+                aligned_raw[gt_paired_selection],
+                target_points[gt_paired_selection],
+            ),
+        )
+        ours_gt_stats = _prefixed_statistics(
+            "ours_gt_mask_",
+            _paired_distance_statistics(
+                aligned_ours[gt_paired_selection],
+                target_points[gt_paired_selection],
+            ),
+        )
+        raw_intersection_stats = _prefixed_statistics(
+            "raw_intersection_",
+            _paired_distance_statistics(
+                aligned_raw[intersection_paired_selection],
+                target_points[intersection_paired_selection],
+            ),
+        )
+        ours_intersection_stats = _prefixed_statistics(
+            "ours_intersection_",
+            _paired_distance_statistics(
+                aligned_ours[intersection_paired_selection],
+                target_points[intersection_paired_selection],
+            ),
+        )
+        metric_rows.append(
+            {
+                "clip": clip_name,
+                "scene_id": scene_id,
+                "instance_id": instance_id,
+                "coordinate_system": "scannetpp_gt_world",
+                "gt_mask_pixels": gt_pixels,
+                "predicted_mask_pixels": predicted_pixels,
+                "mask_intersection_pixels": intersection_pixels,
+                "mask_union_pixels": union_pixels,
+                "mask_iou": _safe_ratio(intersection_pixels, union_pixels),
+                "mask_precision": _safe_ratio(intersection_pixels, predicted_pixels),
+                "mask_recall": _safe_ratio(intersection_pixels, gt_pixels),
+                "nonref_mask_iou": _safe_ratio(
+                    nonref_intersection_pixels,
+                    nonref_union_pixels,
+                ),
+                "nonref_mask_precision": _safe_ratio(
+                    nonref_intersection_pixels,
+                    nonref_predicted_pixels,
+                ),
+                "nonref_mask_recall": _safe_ratio(
+                    nonref_intersection_pixels,
+                    nonref_gt_pixels,
+                ),
+                "gt_object_finite_points": int(gt_selection.sum()),
+                "raw_predicted_object_finite_points": int(
+                    raw_predicted_selection.sum()
+                ),
+                "ours_predicted_object_finite_points": int(
+                    ours_predicted_selection.sum()
+                ),
+                "gt_mask_paired_points": int(gt_paired_selection.sum()),
+                "intersection_paired_points": int(intersection_paired_selection.sum()),
+                **raw_gt_stats,
+                **ours_gt_stats,
+                **raw_intersection_stats,
+                **ours_intersection_stats,
+            }
+        )
+
+        gt_object, gt_rgb = _limit_points(
+            gt_object,
+            gt_rgb,
+            max_points=int(max_instance_points),
+        )
+        raw_object, raw_rgb = _limit_points(
+            raw_object,
+            raw_rgb,
+            max_points=int(max_instance_points),
+        )
+        ours_object, ours_rgb = _limit_points(
+            ours_object,
+            ours_rgb,
+            max_points=int(max_instance_points),
+        )
+        ours_on_gt, ours_on_gt_rgb = _limit_points(
+            ours_on_gt,
+            ours_on_gt_rgb,
+            max_points=int(max_instance_points),
+        )
+        instance_root = root / f"instance_{instance_id}"
+        instance_root.mkdir(parents=True, exist_ok=True)
+        paths = {
+            "gt_object_gt_mask": instance_root / "gt_object.ply",
+            "streamvggt_raw_predicted_object": (
+                instance_root / "streamvggt_raw_predicted_object.ply"
+            ),
+            "ours_predicted_object": instance_root / "ours_predicted_object.ply",
+            "ours_on_gt_mask": instance_root / "ours_on_gt_mask.ply",
+            "overlay_gt_green_raw_red_ours_blue": (
+                instance_root / "overlay_gt_green_raw_red_ours_blue.ply"
+            ),
+        }
+        _write_binary_ply(paths["gt_object_gt_mask"], gt_object, gt_rgb)
+        _write_binary_ply(
+            paths["streamvggt_raw_predicted_object"],
+            raw_object,
+            raw_rgb,
+        )
+        _write_binary_ply(paths["ours_predicted_object"], ours_object, ours_rgb)
+        _write_binary_ply(paths["ours_on_gt_mask"], ours_on_gt, ours_on_gt_rgb)
+        overlay_points = torch.cat([gt_object, raw_object, ours_object], dim=0)
+        overlay_colors = torch.cat(
+            [
+                _solid_colors(len(gt_object), (64, 255, 64)),
+                _solid_colors(len(raw_object), (255, 64, 64)),
+                _solid_colors(len(ours_object), (64, 128, 255)),
+            ],
+            dim=0,
+        )
+        _write_binary_ply(
+            paths["overlay_gt_green_raw_red_ours_blue"],
+            overlay_points,
+            overlay_colors,
+        )
+        for role, path, count, mask_source in (
+            ("gt_object_gt_mask", paths["gt_object_gt_mask"], len(gt_object), "gt"),
+            (
+                "streamvggt_raw_predicted_object",
+                paths["streamvggt_raw_predicted_object"],
+                len(raw_object),
+                "predicted",
+            ),
+            (
+                "ours_predicted_object",
+                paths["ours_predicted_object"],
+                len(ours_object),
+                "predicted",
+            ),
+            ("ours_on_gt_mask", paths["ours_on_gt_mask"], len(ours_on_gt), "gt"),
+            (
+                "overlay_gt_green_raw_red_ours_blue",
+                paths["overlay_gt_green_raw_red_ours_blue"],
+                len(overlay_points),
+                "mixed",
+            ),
+        ):
+            artifact_rows.append(
+                {
+                    "clip": clip_name,
+                    "scene_id": scene_id,
+                    "instance_id": instance_id,
+                    "artifact_role": role,
+                    "mask_source": mask_source,
+                    "coordinate_system": "scannetpp_gt_world",
+                    "exported_points": int(count),
+                    "ply_path": str(path),
+                }
+            )
+
+    _write_csv(root / "object_comparison_metrics.csv", metric_rows)
+    _write_csv(
+        root / "object_comparison_short.csv",
+        [
+            {
+                "clip": row["clip"],
+                "instance_id": row["instance_id"],
+                "mask_iou": row["mask_iou"],
+                "nonref_mask_iou": row["nonref_mask_iou"],
+                "nonref_mask_precision": row["nonref_mask_precision"],
+                "nonref_mask_recall": row["nonref_mask_recall"],
+                "gt_object_points": row["gt_object_finite_points"],
+                "predicted_object_points": row[
+                    "ours_predicted_object_finite_points"
+                ],
+                "raw_gt_mask_rmse": row["raw_gt_mask_rmse"],
+                "ours_gt_mask_rmse": row["ours_gt_mask_rmse"],
+                "ours_minus_raw_gt_mask_rmse": (
+                    row["ours_gt_mask_rmse"] - row["raw_gt_mask_rmse"]
+                ),
+            }
+            for row in metric_rows
+        ],
+    )
+    _write_csv(root / "object_artifacts.csv", artifact_rows)
+    (root / "README.txt").write_text(
+        "True GT-object comparison\n"
+        "=========================\n\n"
+        "gt_object.ply uses the ScanNet++ GT instance mask and contains the "
+        "visible object points from the selected frames, not a complete mesh. "
+        "streamvggt_raw_predicted_object.ply and "
+        "ours_predicted_object.ply use the geometry tracking mask saved in "
+        "the prediction artifact (the strict trusted mask for V5), so they "
+        "include both segmentation and geometry error. "
+        "ours_on_gt_mask.ply uses the GT mask and isolates pointmap geometry "
+        "error. All files are evaluation-only and use the same fixed "
+        "reference-point Sim(3) in the ScanNet++ GT world.\n\n"
+        "Open overlay_gt_green_raw_red_ours_blue.ply: GT object=green, raw "
+        "StreamVGGT predicted object=red, ours predicted object=blue. "
+        "object_comparison_metrics.csv reports mask IoU/precision/recall and "
+        "paired 3D errors on the GT mask and mask intersection. "
+        "object_comparison_short.csv keeps only the main upload metrics; a "
+        "negative ours_minus_raw_gt_mask_rmse means ours improves geometry. "
+        "Because the reference mask initializes tracking from GT, nonref_* "
+        "columns are the unbiased tracking-mask metrics to report.\n",
+        encoding="utf8",
+    )
 
 
 def _export_three_way_comparison(
@@ -1534,6 +1937,20 @@ def _paired_distance_statistics(
     }
 
 
+def _prefixed_statistics(
+    prefix: str,
+    statistics: dict[str, float],
+) -> dict[str, float]:
+    return {
+        f"{prefix}{name.removeprefix('paired_distance_')}": value
+        for name, value in statistics.items()
+    }
+
+
+def _safe_ratio(numerator: int, denominator: int) -> float:
+    return float(numerator) / float(denominator) if denominator else float("nan")
+
+
 def _rotation_error_degrees(
     predicted: torch.Tensor,
     target: torch.Tensor,
@@ -1573,5 +1990,5 @@ def _torch_load(path: Path) -> dict:
     except TypeError:
         value = torch.load(path, map_location="cpu")
     if not isinstance(value, dict):
-        raise ValueError(f"Unsupported ray-pose prediction artifact: {path}.")
+        raise TypeError(f"Unsupported ray-pose prediction artifact: {path}.")
     return value
