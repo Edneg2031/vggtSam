@@ -417,7 +417,6 @@ def load_model(repo: Path, checkpoint: Path) -> Any:
         state = state["model"]
     model.load_state_dict(state, strict=True)
     del state
-    model.track_head = None
     gc.collect()
     return model.eval()
 
@@ -477,6 +476,18 @@ def _git_commit(repo: Path) -> str | None:
         return None
 
 
+def _git_is_dirty(repo: Path) -> bool | None:
+    import subprocess
+
+    try:
+        output = subprocess.check_output(
+            ["git", "-C", str(repo), "status", "--porcelain"], text=True
+        )
+        return bool(output.strip())
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
 def main() -> None:
     args = parse_args()
     devices = parse_devices(args.devices)
@@ -507,6 +518,15 @@ def main() -> None:
     model = load_model(repo, checkpoint)
     _assert_processed_key_cache_equivalence()
     print("processed_key_cache_equivalence=passed", flush=True)
+    repo_commit = _git_commit(repo)
+    repo_dirty = _git_is_dirty(repo)
+    print(
+        "Baseline provenance: official wzzheng/StreamVGGT model + strict checkpoint; "
+        "no SAM3, adapter, training, or pose refinement. "
+        f"repo_commit={repo_commit}; repo_dirty={repo_dirty}; "
+        "execution=exact five-GPU layer sharding.",
+        flush=True,
+    )
     runner = LayerShardedStreamVGGT(model, devices)
     from streamvggt.utils.load_fn import load_and_preprocess_images
     from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
@@ -659,7 +679,7 @@ def main() -> None:
     write_w2c_txt(scene_dir / "poses" / "abs_pose.txt", extrinsics_np, frame_ids)
     write_intrinsics_txt(scene_dir / "poses" / "intri.txt", intrinsics_np, frame_ids)
     save_trajectory_plot(
-        scene_dir / "plots" / "trajectory.png",
+        scene_dir / "plots" / "trajectory_compare.png",
         extrinsics_np,
         "StreamVGGT prediction (no GT/alignment)",
     )
@@ -686,7 +706,20 @@ def main() -> None:
         "frames": len(images),
         "image_dir": str(Path(args.image_dir).expanduser().resolve()),
         "checkpoint": str(checkpoint),
-        "repo_commit": _git_commit(repo),
+        "repo_commit": repo_commit,
+        "repo_dirty": repo_dirty,
+        "model_provenance": {
+            "repository": "https://github.com/wzzheng/StreamVGGT.git",
+            "model_class": "streamvggt.models.streamvggt.StreamVGGT",
+            "strict_checkpoint_load": True,
+            "official_model_architecture_and_heads_unchanged": True,
+            "sam3_used": False,
+            "learned_adapter_used": False,
+            "pose_refinement_used": False,
+            "official_single_gpu_entrypoint_used": False,
+            "execution_wrapper": "exact_layer_sharded_full_history_kv_cache",
+            "processed_key_cache_equivalence": "passed",
+        },
         "devices": [str(device) for device in devices],
         "layers_per_device": [
             runner.layer_devices.count(device_index)

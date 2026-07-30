@@ -7,6 +7,7 @@ from long_sequence_baselines.common import (
     TemporalPointSampler,
     discover_images,
     natural_sort_key,
+    save_trajectory_plot,
     write_binary_ply,
 )
 
@@ -46,3 +47,16 @@ def test_binary_ply_header_has_expected_vertex_count(tmp_path: Path) -> None:
         np.zeros((3, 3), dtype=np.uint8),
     )
     assert b"element vertex 3\n" in path.read_bytes()[:256]
+
+
+def test_horizon_style_trajectory_plot_is_written(tmp_path: Path) -> None:
+    world_to_camera = np.repeat(
+        np.eye(4, dtype=np.float64)[None, :3, :],
+        2,
+        axis=0,
+    )
+    world_to_camera[1, 0, 3] = -1.0
+    path = tmp_path / "trajectory_compare.png"
+    save_trajectory_plot(path, world_to_camera, "test")
+    assert path.is_file()
+    assert path.stat().st_size > 0

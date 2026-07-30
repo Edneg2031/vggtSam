@@ -61,6 +61,9 @@ cmp "$HORIZON_INPUTS" "$STREAM_INPUTS"
 for METHOD_ROOT in \
   "$OUTPUT_ROOT/horizonstream/meeting_room_a02" \
   "$OUTPUT_ROOT/streamvggt/meeting_room_a02"; do
+  [[ -f "$METHOD_ROOT/plots/trajectory_compare.png" ]] || {
+    echo "缺少统一位姿图: $METHOD_ROOT/plots/trajectory_compare.png"; exit 1
+  }
   for PRODUCT in depthpose_raw depthpose_conf depthpose_conf_voxel; do
     [[ -f "$METHOD_ROOT/points/$PRODUCT.ply" ]] || {
       echo "缺少点云结果: $METHOD_ROOT/points/$PRODUCT.ply"; exit 1

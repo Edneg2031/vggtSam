@@ -242,33 +242,84 @@ def camera_centers_from_w2c(extrinsics: np.ndarray) -> np.ndarray:
     return -np.einsum("nij,nj->ni", rotations.transpose(0, 2, 1), translations)
 
 
-def save_trajectory_plot(path: str | Path, extrinsics: np.ndarray, title: str) -> None:
+def _set_equal_3d_axes(axis: Any, xyz: np.ndarray) -> None:
+    """Use the same cubic 3-D bounds as HorizonStream's trajectory plot."""
+
+    xyz = np.asarray(xyz, dtype=np.float64)
+    mins = xyz.min(axis=0)
+    maxs = xyz.max(axis=0)
+    center = 0.5 * (mins + maxs)
+    radius = 0.5 * np.max(np.maximum(maxs - mins, 1e-6))
+    axis.set_xlim(center[0] - radius, center[0] + radius)
+    axis.set_ylim(center[1] - radius, center[1] + radius)
+    axis.set_zlim(center[2] - radius, center[2] + radius)
+
+
+def save_trajectory_plot(
+    path: str | Path,
+    extrinsics: np.ndarray,
+    title: str,
+    *,
+    label: str = "prediction",
+) -> None:
+    """Draw one W2C trajectory with HorizonStream's prediction-only layout.
+
+    Both long-sequence baselines call this exact function, so camera-center
+    conversion, 3-D bounds, projections, colors, and figure size are identical.
+    """
+
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     centers = camera_centers_from_w2c(extrinsics)
+    if len(centers) < 2:
+        raise ValueError("A trajectory plot requires at least two camera poses.")
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    figure = plt.figure(figsize=(10, 4.5))
-    axis_3d = figure.add_subplot(1, 2, 1, projection="3d")
-    axis_2d = figure.add_subplot(1, 2, 2)
-    color = np.arange(len(centers))
-    axis_3d.plot(centers[:, 0], centers[:, 1], centers[:, 2], linewidth=1)
-    axis_3d.scatter(centers[:, 0], centers[:, 1], centers[:, 2], c=color, s=8)
+    figure = plt.figure(figsize=(16, 5), dpi=140)
+    axis_3d = figure.add_subplot(1, 3, 1, projection="3d")
+    axis_xy = figure.add_subplot(1, 3, 2)
+    axis_xz = figure.add_subplot(1, 3, 3)
+    color = "#1f77b4"
+
+    axis_3d.plot(
+        centers[:, 0],
+        centers[:, 1],
+        centers[:, 2],
+        color=color,
+        linewidth=2.0,
+        label=label,
+    )
+    _set_equal_3d_axes(axis_3d, centers)
     axis_3d.set_xlabel("X")
     axis_3d.set_ylabel("Y")
     axis_3d.set_zlabel("Z")
-    axis_3d.set_title("3D camera centers")
-    axis_2d.plot(centers[:, 0], centers[:, 2], linewidth=1)
-    axis_2d.scatter(centers[:, 0], centers[:, 2], c=color, s=8)
-    axis_2d.set_xlabel("X")
-    axis_2d.set_ylabel("Z")
-    axis_2d.set_aspect("equal", adjustable="datalim")
-    axis_2d.grid(alpha=0.25)
-    axis_2d.set_title("Top view (X-Z)")
-    figure.suptitle(title)
+    axis_3d.set_title(title)
+    axis_3d.legend(loc="best")
+    axis_3d.grid(True)
+
+    axis_xy.plot(
+        centers[:, 0], centers[:, 1], color=color, linewidth=2.0, label=label
+    )
+    axis_xy.set_xlabel("X")
+    axis_xy.set_ylabel("Y")
+    axis_xy.set_aspect("equal", adjustable="box")
+    axis_xy.set_title("XY Projection")
+    axis_xy.legend(loc="best")
+    axis_xy.grid(True, alpha=0.4)
+
+    axis_xz.plot(
+        centers[:, 0], centers[:, 2], color=color, linewidth=2.0, label=label
+    )
+    axis_xz.set_xlabel("X")
+    axis_xz.set_ylabel("Z")
+    axis_xz.set_aspect("equal", adjustable="box")
+    axis_xz.set_title("XZ Projection")
+    axis_xz.legend(loc="best")
+    axis_xz.grid(True, alpha=0.4)
+
     figure.tight_layout()
-    figure.savefig(path, dpi=180)
+    figure.savefig(path)
     plt.close(figure)

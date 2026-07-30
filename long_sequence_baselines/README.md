@@ -72,6 +72,12 @@ zsh long_sequence_baselines/commands_horizonstream_24gb_full.txt
 zsh long_sequence_baselines/commands_streamvggt_5gpu_full.txt
 ```
 
+如果两种方法已经完成推理，只想把已有位姿统一重画，不需要 GPU，也不会重新加载模型：
+
+```bash
+zsh long_sequence_baselines/commands_redraw_trajectory_plots.txt
+```
+
 HorizonStream 使用一张卡；在当前24GB GPU上，`sliding_size=21` 实测需要超过23.69
 GiB，因此正式命令固定使用 `sliding_size=10`。StreamVGGT 随后使用五张卡，二者不会
 同时运行。StreamVGGT 的 full-history KV 和 attention 临时张量仍随帧数增长，544 帧运行在
@@ -93,7 +99,9 @@ outputs/long_sequence_baselines/frames_300/
 
 - `poses/abs_pose.txt`：逐帧 world-to-camera 位姿；
 - `poses/intri.txt`：内参；
-- `plots/trajectory*.png`：无 GT 的预测轨迹图；
+- `plots/trajectory_compare.png`：无 GT 的预测轨迹图。两种方法都由本目录同一函数
+  按 HorizonStream 的 3D + XY + XZ 三联图样式绘制，W2C 到相机中心的转换、颜色、
+  等比例坐标轴和画布尺寸完全相同；
 - `depth/dpt/*.npy`、`depth/dpt_plasma/*.png`、`depth/conf/*.npy`；
 - `images/rgb/*.png`：模型实际看到的预处理图；
 - `points/depthpose_raw.ply`：统一的 depth + online pose 原始累积，最多 200 万点；
@@ -119,6 +127,13 @@ StreamVGGT 额外保存：
 `pointhead_*` 与自身 `depthpose_*`，可以判断收益是否来自 world point head。所有结果仍
 保留 `runtime_per_frame.csv`，可检查五卡显存是否按预期线性增长。
 
+这里的 StreamVGGT 模型类、网络结构和 camera/depth/point/track head 直接来自官方
+`wzzheng/StreamVGGT` 子模块；指定的 checkpoint 以 `strict=True` 加载，没有 SAM3、训练
+adapter 或解析式位姿修正。为了在 24 GiB 卡上保留 300 帧完整历史，执行入口不是官方
+单卡 demo，而是把同一组 aggregator 层分配到五卡，并使用经过启动时数值等价检查的 KV
+cache；这改变设备放置和缓存实现，不改变模型计算图对应的预测含义。上述来源信息也会写入
+StreamVGGT 的 `run_summary.json`，包括代码 commit 和工作区是否有修改。
+
 ## 如何比较
 
 这批数据目前没有 GT，所以不能报告绝对 ATE、深度误差或点云精度。可以在
@@ -128,3 +143,7 @@ CloudCompare/MeshLab 应先比较两个 `depthpose_conf_voxel.ply`，重点看�
 直接拿它和 HorizonStream 的 raw depth 点云归因于位姿优劣。两个模型的输出坐标系和尺度
 各自独立，不能直接把两份 PLY 叠加后把坐标差当成误差。后续有 GT 时再做统一 Sim(3)
 对齐和定量评估。
+
+注意：统一绘图只消除了可视化实现差异。两种模型的预测仍各自在独立、无 GT 对齐的坐标系
+和尺度中，不能根据两张图的绝对轴值直接判断谁的位姿误差更小；当前可以比较轨迹形状、
+连续性、漂移趋势和回访闭合程度。

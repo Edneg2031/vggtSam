@@ -10,8 +10,17 @@ from pathlib import Path
 import torch
 import yaml
 
-from .common import discover_images, write_image_list, write_json
-from .pointcloud_products import PointCloudProtocol, rebuild_depth_pose_products
+from .common import (
+    discover_images,
+    save_trajectory_plot,
+    write_image_list,
+    write_json,
+)
+from .pointcloud_products import (
+    PointCloudProtocol,
+    read_w2c_txt,
+    rebuild_depth_pose_products,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -146,6 +155,12 @@ def main() -> None:
     torch.cuda.synchronize(device_index)
     elapsed = time.perf_counter() - started
     scene_dir = output_root / args.scene_name
+    _, trajectory_w2c = read_w2c_txt(scene_dir / "poses" / "abs_pose.txt")
+    save_trajectory_plot(
+        scene_dir / "plots" / "trajectory_compare.png",
+        trajectory_w2c,
+        "HorizonStream prediction (no GT/alignment)",
+    )
     pointcloud_started = time.perf_counter()
     pointcloud_products = rebuild_depth_pose_products(
         scene_dir,
