@@ -59,7 +59,7 @@ zsh long_sequence_baselines/commands_meeting_room_smoke.txt
 zsh long_sequence_baselines/commands_streamvggt_5gpu_smoke.txt
 ```
 
-确认两个 runner 都完成、显存仍有余量后，再运行约 600 帧正式版本：
+确认两个 runner 都完成后，运行前 300 帧的正式公平对比：
 
 ```bash
 zsh long_sequence_baselines/commands_meeting_room_full.txt
@@ -73,18 +73,18 @@ zsh long_sequence_baselines/commands_streamvggt_5gpu_full.txt
 ```
 
 HorizonStream 使用一张卡；在当前24GB GPU上，`sliding_size=21` 实测需要超过23.69
-GiB，因此正式命令固定使用 `sliding_size=10`，但仍流式处理全部帧并保留连续状态。
-StreamVGGT 随后使用五张卡，二者不会同时运行。三卡 smoke 实测推算600帧需要约26–30
-GiB/卡；五卡分片后预计降至
-约16–19 GiB/卡，适合当前24GB GPU，但正式运行仍需观察 `runtime_per_frame.csv`，因为
-StreamVGGT KV 显存还会随帧数增长。
+GiB，因此正式命令固定使用 `sliding_size=10`。StreamVGGT 随后使用五张卡，二者不会
+同时运行。StreamVGGT 的 full-history KV 和 attention 临时张量仍随帧数增长，544 帧运行在
+约第 410 帧 OOM；因此三个正式命令都固定对自然排序后的同一批前 `300` 张图片推理。
+300 帧实测 GPU0 常驻峰值约 `13.53 GiB`，为 attention 临时分配保留了足够余量。
 
 ## 输出
 
-正式结果位于：
+300 帧正式结果位于新的独立目录，避免和先前 544 帧 HorizonStream 结果或失败的
+StreamVGGT 残留文件混合：
 
 ```text
-outputs/long_sequence_baselines/full/
+outputs/long_sequence_baselines/frames_300/
   horizonstream/meeting_room_a02/
   streamvggt/meeting_room_a02/
 ```

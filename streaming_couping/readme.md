@@ -84,5 +84,8 @@ docs/final_joint_pointcloud_pose_method.md
 V4/V5 最终输出包括 native pointcloud/pose、GT/raw/ours 对比 PLY、三套 mask、位姿 PNG/PDF、
 指标 CSV、checkpoint 哈希和 artifact manifest。
 
-方法、结果和 GT 使用边界见
+版本演进、结果对比和当前最终版本总结见
+`streaming_couping/docs/sam3_streamvggt_work_summary.md`。
+
+V4/V5/V6 的详细实现与实验约束见
 `streaming_couping/docs/final_joint_pointcloud_pose_method.md`。

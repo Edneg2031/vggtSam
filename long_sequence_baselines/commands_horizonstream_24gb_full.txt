@@ -1,13 +1,15 @@
 #!/usr/bin/env zsh
 set -euo pipefail
 
+# 固定比较自然排序后的前 300 张图。
 # 改成 nvidia-smi 中一张空闲的物理 GPU 编号。
 GPU0=0
+MAX_FRAMES=300
 
 ROOT=/home/wlh50060092/vggtSam
 IMAGE_DIR=/home/bod/182Nas/share/BaZhuaYu/DemoData/xiaoyi/blind_data/meeting_room_a02/frames
 HORIZON_CKPT=/home/wlh50060092/vggtSam/models/HorizonStream.pt
-OUTPUT_ROOT=/home/wlh50060092/vggtSam/outputs/long_sequence_baselines/full
+OUTPUT_ROOT=/home/wlh50060092/vggtSam/outputs/long_sequence_baselines/frames_300
 HORIZON_PYTHON=/home/huawei/miniconda3/envs/horizonstream/bin/python
 
 cd "$ROOT"
@@ -22,4 +24,4 @@ CUDA_VISIBLE_DEVICES="$GPU0" "$HORIZON_PYTHON" \
   --output-root "$OUTPUT_ROOT/horizonstream" \
   --scene-name meeting_room_a02 \
   --sliding-size 10 \
-  --max-frames 0
+  --max-frames "$MAX_FRAMES"

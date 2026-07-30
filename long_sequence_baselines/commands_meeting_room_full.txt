@@ -1,18 +1,20 @@
 #!/usr/bin/env zsh
 set -euo pipefail
 
-# 改成 nvidia-smi 中五张空闲的物理 GPU 编号；两个任务串行，不会同时占卡。
+# 固定比较自然排序后的前 300 张图；两个任务串行，不会同时占卡。
+# 改成 nvidia-smi 中五张空闲的物理 GPU 编号。
 GPU0=0
 GPU1=1
 GPU2=2
 GPU3=3
 GPU4=4
+MAX_FRAMES=300
 
 ROOT=/home/wlh50060092/vggtSam
 IMAGE_DIR=/home/bod/182Nas/share/BaZhuaYu/DemoData/xiaoyi/blind_data/meeting_room_a02/frames
 HORIZON_CKPT=/home/wlh50060092/vggtSam/models/HorizonStream.pt
 STREAM_CKPT=/home/bod/86Nas/95_data_bak/FoundationModels/StreamVGGT/checkpoints.pth
-OUTPUT_ROOT=/home/wlh50060092/vggtSam/outputs/long_sequence_baselines/full
+OUTPUT_ROOT=/home/wlh50060092/vggtSam/outputs/long_sequence_baselines/frames_300
 HORIZON_PYTHON=/home/huawei/miniconda3/envs/horizonstream/bin/python
 STREAM_PYTHON=/home/huawei/miniconda3/envs/3am/bin/python
 
@@ -29,7 +31,7 @@ CUDA_VISIBLE_DEVICES="$GPU0" "$HORIZON_PYTHON" \
   --output-root "$OUTPUT_ROOT/horizonstream" \
   --scene-name meeting_room_a02 \
   --sliding-size 10 \
-  --max-frames 0
+  --max-frames "$MAX_FRAMES"
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 CUDA_VISIBLE_DEVICES="$GPU0,$GPU1,$GPU2,$GPU3,$GPU4" "$STREAM_PYTHON" \
@@ -38,4 +40,12 @@ CUDA_VISIBLE_DEVICES="$GPU0,$GPU1,$GPU2,$GPU3,$GPU4" "$STREAM_PYTHON" \
   --checkpoint "$STREAM_CKPT" \
   --output-root "$OUTPUT_ROOT/streamvggt" \
   --scene-name meeting_room_a02 \
-  --max-frames 0
+  --max-frames "$MAX_FRAMES"
+
+HORIZON_INPUTS="$OUTPUT_ROOT/horizonstream/input_images.txt"
+STREAM_INPUTS="$OUTPUT_ROOT/streamvggt/meeting_room_a02/input_images.txt"
+cmp "$HORIZON_INPUTS" "$STREAM_INPUTS"
+[[ "$(wc -l < "$HORIZON_INPUTS")" -eq "$MAX_FRAMES" ]] || {
+  echo "输入帧数不是 $MAX_FRAMES"; exit 1
+}
+echo "300-frame comparison complete; input lists are identical."
