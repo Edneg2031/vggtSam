@@ -1,7 +1,6 @@
-# V7 isolates fusion architecture while reusing frozen SAM3.1/StreamVGGT
-# observations. Cross-clip and long30 are report-only, not model-selection data.
-base_config: streaming_couping/configs/v6_sam31_long30_base.yaml
-external_base_config: streaming_couping/configs/v6_camera_sweep_base.yaml
+# V7 owns its cache and training outputs. It does not read a V6 config or V6
+# output directory. Cross-clip and long30 remain report-only.
+data_config: streaming_couping/configs/v7_fusion_data.yaml
 output_dir: outputs/streaming_couping_v7_fusion_ablation
 
 training_clip_name: 00a231a370_90_240_37_68_54

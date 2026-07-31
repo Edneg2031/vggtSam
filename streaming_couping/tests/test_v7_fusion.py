@@ -1,9 +1,15 @@
+from pathlib import Path
+
 import torch
 
 from streaming_couping.scripts.run_v7_fusion_ablation import (
     _compact_rows,
     _label_rows,
     _local_geometry_features,
+    load_v7_config,
+)
+from streaming_couping.src.learned_pose.config import (
+    load_learned_pose_config,
 )
 from streaming_couping.src.learned_pose.v6_camera_fusion import (
     V6FusionConfig,
@@ -345,3 +351,21 @@ def test_v7_compact_output_has_one_row_per_architecture() -> None:
     assert compact[1]["architecture"] == "l0_camera_only"
     assert compact[0]["reference_exact_all_splits"] == 1
     assert "long30_wrong_geometry_loss" in compact[1]
+
+
+def test_v7_data_stage_has_an_independent_four_clip_cache() -> None:
+    root = Path(__file__).resolve().parents[2]
+    experiment = load_v7_config(
+        root / "streaming_couping/configs/v7_fusion_ablation.yaml"
+    )
+    data = load_learned_pose_config(experiment.data_config)
+
+    assert experiment.data_config.name == "v7_fusion_data.yaml"
+    assert len(data.clips) == 4
+    assert data.recovery_config.name == "recovery_v7_sam31.yaml"
+    assert (
+        data.features.cache_dir
+        == root / "outputs/streaming_couping_v7_fusion_ablation/cache"
+    )
+    assert "streaming_couping_v6" not in str(data.output_dir)
+    assert "streaming_couping_v6" not in str(data.features.cache_dir)

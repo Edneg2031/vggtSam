@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train and compare V7 fusion architectures using frozen V6 caches."""
+"""Train and compare V7 fusion architectures using V7-owned frozen caches."""
 
 from __future__ import annotations
 
@@ -56,8 +56,7 @@ class V7TrainingConfig:
 @dataclass(frozen=True)
 class V7ExperimentConfig:
     source_path: Path
-    base_config: Path
-    external_base_config: Path
+    data_config: Path
     output_dir: Path
     training_clip_name: str
     validation_clip_name: str
@@ -93,17 +92,16 @@ def main() -> None:
 
 def run_v7_ablation(config: V7ExperimentConfig) -> Path:
     _seed_everything(config.training.seed)
-    primary = load_learned_pose_config(config.base_config)
-    external = load_learned_pose_config(config.external_base_config)
-    train_clip = _find_clip(primary, config.training_clip_name)
-    validation_clip = _find_clip(primary, config.validation_clip_name)
-    long_clip = _find_clip(primary, config.long_clip_name)
-    external_clip = _find_clip(external, config.external_clip_name)
+    data = load_learned_pose_config(config.data_config)
+    train_clip = _find_clip(data, config.training_clip_name)
+    validation_clip = _find_clip(data, config.validation_clip_name)
+    long_clip = _find_clip(data, config.long_clip_name)
+    external_clip = _find_clip(data, config.external_clip_name)
 
-    train_full_payload = _load_cache(primary, train_clip)
-    validation_payload = _load_cache(primary, validation_clip)
-    long_payload = _load_cache(primary, long_clip)
-    external_payload = _load_cache(external, external_clip)
+    train_full_payload = _load_cache(data, train_clip)
+    validation_payload = _load_cache(data, validation_clip)
+    long_payload = _load_cache(data, long_clip)
+    external_payload = _load_cache(data, external_clip)
     for name, payload in (
         ("training", train_full_payload),
         ("validation", validation_payload),
@@ -116,7 +114,7 @@ def run_v7_ablation(config: V7ExperimentConfig) -> Path:
                 f"{payload.get('sam_version')!r}."
             )
 
-    recovery = load_config(primary.recovery_config)
+    recovery = load_config(data.recovery_config)
     maybe_add_repo_to_path(recovery.streamvggt_repo)
     from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
 
@@ -1052,11 +1050,7 @@ def load_v7_config(path: str | Path) -> V7ExperimentConfig:
     training = raw.get("training", {})
     config = V7ExperimentConfig(
         source_path=source,
-        base_config=_path(raw.get("base_config"), source.parent),
-        external_base_config=_path(
-            raw.get("external_base_config"),
-            source.parent,
-        ),
+        data_config=_path(raw.get("data_config"), source.parent),
         output_dir=_path(raw.get("output_dir"), source.parent),
         training_clip_name=str(raw.get("training_clip_name", "")),
         validation_clip_name=str(raw.get("validation_clip_name", "")),
@@ -1151,8 +1145,9 @@ def _load_cache(config: LearnedPoseConfig, clip: ClipConfig) -> dict:
     path = cache_path(config, clip)
     if not path.is_file():
         raise FileNotFoundError(
-            f"V7 requires frozen cache {path}. Build the retained V6 caches "
-            "before running V7; V7 itself never runs a backbone."
+            f"V7 requires its frozen cache {path}. Run "
+            "streaming_couping/commands_v7_fusion_ablation.txt so the V7 "
+            "data stage builds any missing SAM3.1/StreamVGGT observations."
         )
     print(f"V7 reusing cache: {path}")
     return load_feature_cache(path)

@@ -54,11 +54,17 @@ zsh streaming_couping/commands_v6_sam31_long30_tracking_visualization_once.txt
 将非参考、GT 可见且 mask IoU ≥ 0.5 定义为追踪成功；GT 缺席帧的误检单独统计，
 不会抬高成功率。重复运行发现 `COMPLETE` 标记时直接复用，不重复渲染。
 
-V7 从轻到重的 fusion 消融复用上述 SAM3.1/StreamVGGT cache，不重新运行 backbone：
+V7 从轻到重的 fusion 消融拥有独立的 SAM3.1/StreamVGGT cache 和训练输出，不读取
+任何 V6 配置或输出目录：
 
 ```bash
 zsh streaming_couping/commands_v7_fusion_ablation.txt
 ```
+
+首次运行会用两张卡执行完整历史 StreamVGGT、第三张卡执行 SAM3.1，并构建 train、
+temporal holdout、validation、cross-clip 和 long30 所需的四段 cache；之后重复运行会
+自动复用。可用 `V7_STREAM_GPU0`、`V7_STREAM_GPU1`、`V7_SAM_GPU` 选择三张物理卡，
+或设置 `V7_REBUILD_CACHE=1` 强制从 backbone 重新生成全部 V7 cache。
 
 它依次比较 camera-only、monolithic weighted pooling、当前式 monolithic
 cross-attention、identity-Key/geometry-Value 解耦 attention，以及 32 个局部世界几何
