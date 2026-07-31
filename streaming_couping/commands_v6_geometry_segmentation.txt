@@ -14,6 +14,11 @@ OUTPUT=outputs/streaming_couping_v6_geometry_segmentation
 SAM31_CHECKPOINT=/home/bod/86Nas/95_data_bak/FoundationModels/sam3.1/sam3.1_multiplex.pt
 
 echo "streaming_couping python=$PYTHON_BIN"
+"$PYTHON_BIN" -c \
+  'import sys, torch; print(f"python={sys.executable} torch={torch.__version__}")'
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+
 if [[ ! -f "$SAM31_CHECKPOINT" ]]; then
   echo "missing SAM3.1 checkpoint: $SAM31_CHECKPOINT" >&2
   exit 1
@@ -21,6 +26,13 @@ fi
 if [[ ! -f externals/sam3/RELEASE_SAM3p1.md ]]; then
   echo "externals/sam3 is older than the SAM3.1 release; update the submodule" >&2
   exit 1
+fi
+
+if "$PYTHON_BIN" -c 'import pytest' >/dev/null 2>&1; then
+  PYTHONPATH=. "$PYTHON_BIN" -m pytest -q \
+    streaming_couping/tests/test_v6_geometry_segmentation.py
+else
+  echo "pytest is not installed; skipping optional local unit tests"
 fi
 
 # This is a cheap no-op when all caches are complete. It also validates cache
@@ -33,10 +45,36 @@ PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
   --geometry-device cuda:1 \
   --training-device cuda:1
 
+# Keep frozen caches, but remove every previous V6 segmentation artifact so
+# the CSV, masks, diagnostics, and visualizations all come from this run.
+rm -rf "$OUTPUT"
+mkdir -p "$OUTPUT"
+
 PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
   -m streaming_couping.scripts.run_v6_geometry_segmentation \
   --config "$V6_CONFIG" \
   --sam3-device cuda:3 \
-  --geometry-device cuda:1
+  --geometry-device cuda:1 \
+  2>&1 | tee "$OUTPUT/run.log"
+
+for required in \
+  "$OUTPUT/v6_segmentation_summary.csv" \
+  "$OUTPUT/v6_segmentation_frames.csv" \
+  "$OUTPUT/v6_geometry_prompt_diagnostics.csv"
+do
+  if [[ ! -s "$required" ]]; then
+    echo "missing or empty V6 result: $required" >&2
+    exit 1
+  fi
+done
+
+sha256sum \
+  "$V6_CONFIG" \
+  streaming_couping/commands_v6_geometry_segmentation.txt \
+  streaming_couping/scripts/run_v6_geometry_segmentation.py \
+  streaming_couping/src/streamvggt_geometry_prompt.py \
+  streaming_couping/src/v6_geometry_segmentation.py \
+  > "$OUTPUT/reproduction_inputs.sha256"
 
 echo "summary=$OUTPUT/v6_segmentation_summary.csv"
+sed -n '1,25p' "$OUTPUT/v6_segmentation_summary.csv"

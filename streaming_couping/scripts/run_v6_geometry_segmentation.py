@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -14,13 +14,13 @@ from PIL import Image, ImageDraw
 from streaming_couping.src.backbones.sam3_wrapper import SAM3Wrapper
 from streaming_couping.src.config import load_config
 from streaming_couping.src.external_repos import maybe_add_repo_to_path
-from streaming_couping.src.instance_observations import (
-    InstanceRefinementConfig,
-    load_instance_sequences,
-)
+from streaming_couping.src.instance_observations import load_instance_sequences
 from streaming_couping.src.learned_pose.cache import cache_path, load_feature_cache
 from streaming_couping.src.learned_pose.config import (
     load_learned_pose_config,
+)
+from streaming_couping.src.streamvggt_geometry_prompt import (
+    build_streamvggt_geometry_prompts,
 )
 from streaming_couping.src.types import TrackingSequence
 from streaming_couping.src.v6_geometry_segmentation import (
@@ -45,7 +45,8 @@ class V6SegmentationExperiment:
     output_dir: Path
     sam: SAMRuntimeConfig
     segmentation: V6GeometrySegmentationConfig
-    refinement: InstanceRefinementConfig
+    streamvggt_point_confidence_threshold: float
+    streamvggt_negative_exclusion_radius: int
 
 
 def main() -> None:
@@ -134,25 +135,31 @@ def main() -> None:
                 scores=payload["tracking_scores"][:, slot].float(),
                 selected_obj_id=None,
             )
-            result = segment_instance_with_geometry_prompts(
+            prompt_batch = build_streamvggt_geometry_prompts(
                 recovery=recovery,
                 sequence=sequence,
                 reference_mask=reference_mask,
-                raw_tracking=raw,
-                current_late_tracking=current,
                 world_points=payload["baseline_world_points"].float(),
                 confidence=payload["baseline_world_confidence"].float(),
                 world_to_camera=baseline_w2c[0].detach().float().cpu(),
                 intrinsics=intrinsics[0].detach().float().cpu(),
                 source_sizes=source_sizes,
                 processed_size=image_size,
-                sam3=sam3,
-                refinement=replace(
-                    experiment.refinement,
-                    compute_device=(
-                        args.geometry_device or base.geometry_device
-                    ),
+                point_confidence_threshold=(
+                    experiment.streamvggt_point_confidence_threshold
                 ),
+                negative_exclusion_radius=(
+                    experiment.streamvggt_negative_exclusion_radius
+                ),
+            )
+            result = segment_instance_with_geometry_prompts(
+                sequence=sequence,
+                reference_mask=reference_mask,
+                raw_tracking=raw,
+                current_late_tracking=current,
+                geometry_prompts=prompt_batch.prompts,
+                output_size=recovery.output_size,
+                sam3=sam3,
                 config=experiment.segmentation,
             )
             for variant, masks in result["masks"].items():
@@ -169,12 +176,16 @@ def main() -> None:
                         target=target_by_id[instance_id],
                     )
                 )
-            for row in result["diagnostics"]:
+            for row, backend_row in zip(
+                result["diagnostics"],
+                prompt_batch.diagnostics,
+            ):
                 diagnostic_rows.append(
                     {
                         "clip": clip.name,
                         "split": clip.split,
                         "instance_id": instance_id,
+                        **backend_row,
                         **row,
                     }
                 )
@@ -482,8 +493,11 @@ def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
     if not rows:
         raise ValueError(f"Refusing to write an empty V6 table: {path}.")
     path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(
+        dict.fromkeys(key for row in rows for key in row)
+    )
     with path.open("w", newline="", encoding="utf8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -498,7 +512,7 @@ def _load_experiment(path: str | Path) -> V6SegmentationExperiment:
     with source.open("r", encoding="utf8") as handle:
         raw = yaml.safe_load(handle) or {}
     model = raw.get("model", {})
-    refinement = raw.get("refinement", {})
+    geometry_backend = raw.get("geometry_backend", {})
     sam = raw.get("sam", {})
     return V6SegmentationExperiment(
         base_config=_resolve(source, raw["base_config"]),
@@ -510,15 +524,15 @@ def _load_experiment(path: str | Path) -> V6SegmentationExperiment:
             max_num_objects=int(sam.get("max_num_objects", 16)),
             multiplex_count=int(sam.get("multiplex_count", 16)),
         ),
+        streamvggt_point_confidence_threshold=float(
+            geometry_backend.get("point_confidence_threshold", 0.30)
+        ),
+        streamvggt_negative_exclusion_radius=int(
+            geometry_backend.get("negative_exclusion_radius", 5)
+        ),
         segmentation=V6GeometrySegmentationConfig(
-            point_confidence_threshold=float(
-                model.get("point_confidence_threshold", 0.30)
-            ),
-            min_support_recall=float(
-                model.get("min_support_recall", 0.25)
-            ),
-            min_box_precision=float(
-                model.get("min_box_precision", 0.50)
+            min_candidate_support_recall=float(
+                model.get("min_candidate_support_recall", 0.25)
             ),
             support_dilation=int(model.get("support_dilation", 5)),
             point_positive_samples=int(
@@ -527,34 +541,24 @@ def _load_experiment(path: str | Path) -> V6SegmentationExperiment:
             point_negative_samples=int(
                 model.get("point_negative_samples", 4)
             ),
-            point_negative_exclusion_radius=int(
-                model.get("point_negative_exclusion_radius", 5)
+            adaptive_raw_support_recall=float(
+                model.get("adaptive_raw_support_recall", 0.70)
             ),
-        ),
-        refinement=InstanceRefinementConfig(
-            min_instance_points=int(
-                refinement.get("min_instance_points", 128)
+            adaptive_raw_box_precision=float(
+                model.get("adaptive_raw_box_precision", 0.10)
             ),
-            icp_max_points=int(refinement.get("icp_max_points", 1024)),
-            map_max_points=int(refinement.get("map_max_points", 4096)),
-            icp_iterations=int(refinement.get("icp_iterations", 4)),
-            icp_trim_quantile=float(
-                refinement.get("icp_trim_quantile", 0.70)
+            adaptive_score_margin=float(
+                model.get("adaptive_score_margin", 0.05)
             ),
-            min_icp_fitness=float(
-                refinement.get("min_icp_fitness", 0.25)
+            adaptive_support_margin=float(
+                model.get("adaptive_support_margin", 0.05)
             ),
-            max_icp_rmse=float(refinement.get("max_icp_rmse", 0.03)),
-            correspondence_min_distance=float(
-                refinement.get("correspondence_min_distance", 0.02)
+            adaptive_min_area_ratio=float(
+                model.get("adaptive_min_area_ratio", 0.50)
             ),
-            correspondence_object_ratio=float(
-                refinement.get("correspondence_object_ratio", 0.05)
+            adaptive_max_area_ratio=float(
+                model.get("adaptive_max_area_ratio", 4.00)
             ),
-            max_proposal_translation=float(
-                refinement.get("max_proposal_translation", 0.15)
-            ),
-            compute_device="cpu",
         ),
     )
 

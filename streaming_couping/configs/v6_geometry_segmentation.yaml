@@ -12,28 +12,23 @@ sam:
   max_num_objects: 16
   multiplex_count: 16
 
-model:
+geometry_backend:
+  type: streamvggt_reference_projection
   point_confidence_threshold: 0.30
-  # The prompted SAM mask must cover the projected, pointmap-supported object.
-  min_support_recall: 0.25
-  # Penalize a large look-alike mask extending beyond the geometry box.
-  min_box_precision: 0.50
-  # Used only as a diagnostic for sparse support precision.
+  negative_exclusion_radius: 5
+
+model:
+  min_candidate_support_recall: 0.25
   support_dilation: 5
-  # SAM3.1 refinement: supported projections are positive clicks. Historical
-  # projections contradicted by the current pointmap become negative clicks.
   point_positive_samples: 6
   point_negative_samples: 4
-  point_negative_exclusion_radius: 5
 
-refinement:
-  min_instance_points: 128
-  icp_max_points: 1024
-  map_max_points: 4096
-  icp_iterations: 4
-  icp_trim_quantile: 0.70
-  min_icp_fitness: 0.25
-  max_icp_rmse: 0.03
-  correspondence_min_distance: 0.02
-  correspondence_object_ratio: 0.05
-  max_proposal_translation: 0.15
+  # Trigger geometry correction only when raw SAM3.1 disagrees with the hint.
+  adaptive_raw_support_recall: 0.70
+  adaptive_raw_box_precision: 0.10
+  # The prompted mask must improve both support and the total geometry score.
+  adaptive_support_margin: 0.05
+  adaptive_score_margin: 0.05
+  # Simple protection against replacing a mask with a fragment or huge region.
+  adaptive_min_area_ratio: 0.50
+  adaptive_max_area_ratio: 4.00
