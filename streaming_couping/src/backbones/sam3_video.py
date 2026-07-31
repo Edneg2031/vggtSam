@@ -8,6 +8,7 @@ case is validation and visualization, not training loss.
 from __future__ import annotations
 
 import contextlib
+import inspect
 import logging
 import os
 import shutil
@@ -89,23 +90,52 @@ def load_sam3_video_predictor(
                     "Update externals/sam3 to the release containing "
                     "build_sam3_predictor."
                 ) from exc
-            with torch.cuda.device(gpu_id):
-                return build_sam3_predictor(
-                    checkpoint_path=str(checkpoint_path),
-                    version="sam3.1",
-                    compile=False,
-                    warm_up=False,
-                    use_fa3=bool(use_fa3),
-                    max_num_objects=int(max_num_objects),
-                    multiplex_count=int(multiplex_count),
-                    async_loading_frames=async_loading_frames,
-                )
+            # The multiplex implementation still creates some tensors on bare
+            # ``cuda``. Keep its process-wide default on the requested device,
+            # not only during checkpoint construction.
+            torch.cuda.set_device(gpu_id)
+            predictor = build_sam3_predictor(
+                checkpoint_path=str(checkpoint_path),
+                version="sam3.1",
+                compile=False,
+                warm_up=False,
+                use_fa3=bool(use_fa3),
+                max_num_objects=int(max_num_objects),
+                multiplex_count=int(multiplex_count),
+                async_loading_frames=async_loading_frames,
+            )
+            _filter_init_state_kwargs(predictor)
+            return predictor
         return build_sam3_video_predictor(
             checkpoint_path=str(checkpoint_path),
             gpus_to_use=[gpu_id],
             compile=False,
             async_loading_frames=async_loading_frames,
         )
+
+
+def _filter_init_state_kwargs(predictor) -> None:
+    """Bridge SAM3.1 predictor/session signatures without editing externals."""
+
+    model = predictor.model
+    original = model.init_state
+    signature = inspect.signature(original)
+    if any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    ):
+        return
+    accepted = set(signature.parameters)
+
+    def compatible_init_state(*args, **kwargs):
+        filtered = {
+            key: value
+            for key, value in kwargs.items()
+            if key in accepted
+        }
+        return original(*args, **filtered)
+
+    model.init_state = compatible_init_state
 
 
 class SAM3VideoTrackerAdapter:

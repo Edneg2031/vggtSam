@@ -6,6 +6,9 @@ import numpy as np
 import torch
 from PIL import Image
 
+from streaming_couping.src.backbones.sam3_video import (
+    _filter_init_state_kwargs,
+)
 from streaming_couping.src.backbones.sam3_wrapper import SAM3Wrapper
 from streaming_couping.src.instance_observations import TranslationProposal
 from streaming_couping.src.types import SAM3MaskCandidate
@@ -31,6 +34,41 @@ def _proposal(*, accepted: bool, fitness: float) -> TranslationProposal:
         iterations=1,
         initialization="zero",
     )
+
+
+def test_sam31_session_filters_unsupported_init_state_kwargs() -> None:
+    class Model:
+        def init_state(
+            self,
+            resource_path,
+            offload_video_to_cpu=False,
+            async_loading_frames=False,
+        ):
+            return {
+                "resource_path": resource_path,
+                "offload_video_to_cpu": offload_video_to_cpu,
+                "async_loading_frames": async_loading_frames,
+            }
+
+    class Predictor:
+        def __init__(self) -> None:
+            self.model = Model()
+
+    predictor = Predictor()
+    _filter_init_state_kwargs(predictor)
+    state = predictor.model.init_state(
+        resource_path="/tmp/frames",
+        offload_video_to_cpu=True,
+        offload_state_to_cpu=True,
+        async_loading_frames=True,
+        video_loader_type="images",
+    )
+
+    assert state == {
+        "resource_path": "/tmp/frames",
+        "offload_video_to_cpu": True,
+        "async_loading_frames": True,
+    }
 
 
 def test_candidate_selection_rejects_large_low_purity_lookalike() -> None:
