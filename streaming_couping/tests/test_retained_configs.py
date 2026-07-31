@@ -68,5 +68,5 @@ def test_v6_long30_uses_two_stream_gpus_and_expected_frames() -> None:
     assert config.streamvggt_devices == ("cuda:0", "cuda:1")
     assert config.streamvggt_amp_dtype == "bfloat16"
     assert config.sam3_device == "cuda:2"
-    assert long_clip.frame_indices == tuple(range(90, 671, 20))
+    assert long_clip.frame_indices == tuple(range(90, 526, 15))
     assert len(long_clip.frame_indices) == 30

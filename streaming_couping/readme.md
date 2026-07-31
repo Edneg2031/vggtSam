@@ -36,7 +36,7 @@ V6 五帧 camera 消融：
 zsh streaming_couping/commands_v6_camera_overfit.txt
 ```
 
-V6 30 帧完整历史压力测试（`90:20:670`）：
+V6 30 帧完整历史压力测试（`90:15:525`）：
 
 ```bash
 zsh streaming_couping/commands_v6_sam31_long30.txt

@@ -30,7 +30,7 @@ export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Preflight validates frame 670 and every RGB path before loading either model.
+# Preflight validates frame 525 and every RGB path before loading either model.
 # The cache is independent from the retained short-sequence V6 cache.
 CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" \
 PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \

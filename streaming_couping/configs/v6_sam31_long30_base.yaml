@@ -24,39 +24,39 @@ dataset:
       allow_missing_reference_instances: true
       reference_sequence_index: 0
       split: validation
-    - name: 00a231a370_90_670_step20_37_68_54
+    - name: 00a231a370_90_525_step15_37_68_54
       scene_id: 00a231a370
       frame_indices:
         - 90
-        - 110
-        - 130
+        - 105
+        - 120
+        - 135
         - 150
-        - 170
-        - 190
+        - 165
+        - 180
+        - 195
         - 210
-        - 230
-        - 250
+        - 225
+        - 240
+        - 255
         - 270
-        - 290
-        - 310
+        - 285
+        - 300
+        - 315
         - 330
-        - 350
-        - 370
+        - 345
+        - 360
+        - 375
         - 390
-        - 410
-        - 430
+        - 405
+        - 420
+        - 435
         - 450
-        - 470
-        - 490
+        - 465
+        - 480
+        - 495
         - 510
-        - 530
-        - 550
-        - 570
-        - 590
-        - 610
-        - 630
-        - 650
-        - 670
+        - 525
       instance_ids: [37, 68, 54]
       reference_sequence_index: 0
       split: long_sequence_stress_test

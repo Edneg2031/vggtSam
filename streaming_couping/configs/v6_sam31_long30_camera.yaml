@@ -4,7 +4,7 @@
 base_config: streaming_couping/configs/v6_sam31_long30_base.yaml
 output_dir: outputs/streaming_couping_v6_sam31_long30/camera
 clip_name: 00a231a370_90_240_37_68_54
-test_clip_name: 00a231a370_90_670_step20_37_68_54
+test_clip_name: 00a231a370_90_525_step15_37_68_54
 validation_clip_name: 00a231a370_50_80_37_68_54
 device: cuda:0
 
