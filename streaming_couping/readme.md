@@ -42,6 +42,18 @@ V6 30 帧完整历史压力测试（`90:15:525`）：
 zsh streaming_couping/commands_v6_sam31_long30.txt
 ```
 
+30 帧追踪可视化默认不生成。主命令完成并已有 feature cache 后，只运行一次下面的 CPU
+后处理命令：
+
+```bash
+zsh streaming_couping/commands_v6_sam31_long30_tracking_visualization_once.txt
+```
+
+它不加载 SAM3.1、StreamVGGT 或相机模型，直接从 cache 生成
+`RGB | GT | V6 SAM3.1 final tracking` 三联图。`tracking_success_summary.csv`
+将非参考、GT 可见且 mask IoU ≥ 0.5 定义为追踪成功；GT 缺席帧的误检单独统计，
+不会抬高成功率。重复运行发现 `COMPLETE` 标记时直接复用，不重复渲染。
+
 长序列命令只占三张物理卡：StreamVGGT 的 24 层按连续区间分到两张卡，SAM3.1 单独使用
 第三张卡。每层 KV cache 保留完整因果历史，不切块、不重置；DPT/camera/depth/point
 输出逐帧卸载到 CPU。默认使用物理卡 `1,2,3`，可在命令前通过

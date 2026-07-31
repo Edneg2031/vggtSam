@@ -62,3 +62,5 @@ done
 echo "V6 LONG30 SHORT SUMMARY"
 cat "$OUTPUT/v6_cross_clip_summary.csv"
 echo "per-frame diagnostics=$OUTPUT/v6_frame_diagnostics.csv"
+echo "tracking visualization is disabled by default"
+echo "one-shot command=streaming_couping/commands_v6_sam31_long30_tracking_visualization_once.txt"
