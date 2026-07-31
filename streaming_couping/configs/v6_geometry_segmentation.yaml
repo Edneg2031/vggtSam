@@ -1,0 +1,39 @@
+# V6 now studies StreamVGGT geometry -> SAM3 segmentation.
+# V4/V5 and the historical V6 camera experiments remain unchanged.
+base_config: v6_camera_sweep_base.yaml
+output_dir: ../../outputs/streaming_couping_v6_geometry_segmentation
+
+sam:
+  version: sam3.1
+  # Official Hugging Face checkpoint expected by build_sam3_predictor.
+  checkpoint: /home/bod/86Nas/95_data_bak/FoundationModels/sam3.1/sam3.1_multiplex.pt
+  # Disabled for compatibility with the shared 24 GiB Ampere GPUs.
+  use_fa3: false
+  max_num_objects: 16
+  multiplex_count: 16
+
+model:
+  point_confidence_threshold: 0.30
+  # The prompted SAM mask must cover the projected, pointmap-supported object.
+  min_support_recall: 0.25
+  # Penalize a large look-alike mask extending beyond the geometry box.
+  min_box_precision: 0.50
+  # Used only as a diagnostic for sparse support precision.
+  support_dilation: 5
+  # SAM3.1 refinement: supported projections are positive clicks. Historical
+  # projections contradicted by the current pointmap become negative clicks.
+  point_positive_samples: 6
+  point_negative_samples: 4
+  point_negative_exclusion_radius: 5
+
+refinement:
+  min_instance_points: 128
+  icp_max_points: 1024
+  map_max_points: 4096
+  icp_iterations: 4
+  icp_trim_quantile: 0.70
+  min_icp_fitness: 0.25
+  max_icp_rmse: 0.03
+  correspondence_min_distance: 0.02
+  correspondence_object_ratio: 0.05
+  max_proposal_translation: 0.15

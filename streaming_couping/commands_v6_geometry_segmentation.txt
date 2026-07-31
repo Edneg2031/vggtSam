@@ -1,0 +1,42 @@
+set -euo pipefail
+
+if [[ -n "${STREAMING_COUPING_PYTHON:-}" ]]; then
+  PYTHON_BIN="$STREAMING_COUPING_PYTHON"
+elif [[ -x /home/huawei/miniconda3/envs/3am/bin/python ]]; then
+  PYTHON_BIN=/home/huawei/miniconda3/envs/3am/bin/python
+else
+  PYTHON_BIN="$(command -v python)"
+fi
+
+BASE_CONFIG=streaming_couping/configs/v6_camera_sweep_base.yaml
+V6_CONFIG=streaming_couping/configs/v6_geometry_segmentation.yaml
+OUTPUT=outputs/streaming_couping_v6_geometry_segmentation
+SAM31_CHECKPOINT=/home/bod/86Nas/95_data_bak/FoundationModels/sam3.1/sam3.1_multiplex.pt
+
+echo "streaming_couping python=$PYTHON_BIN"
+if [[ ! -f "$SAM31_CHECKPOINT" ]]; then
+  echo "missing SAM3.1 checkpoint: $SAM31_CHECKPOINT" >&2
+  exit 1
+fi
+if [[ ! -f externals/sam3/RELEASE_SAM3p1.md ]]; then
+  echo "externals/sam3 is older than the SAM3.1 release; update the submodule" >&2
+  exit 1
+fi
+
+# This is a cheap no-op when all caches are complete. It also validates cache
+# version, frame order, instance IDs, and reference protocol before evaluation.
+PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.run_instance_token_pose \
+  --config "$BASE_CONFIG" \
+  --stage cache \
+  --sam3-device cuda:3 \
+  --geometry-device cuda:1 \
+  --training-device cuda:1
+
+PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.run_v6_geometry_segmentation \
+  --config "$V6_CONFIG" \
+  --sam3-device cuda:3 \
+  --geometry-device cuda:1
+
+echo "summary=$OUTPUT/v6_segmentation_summary.csv"

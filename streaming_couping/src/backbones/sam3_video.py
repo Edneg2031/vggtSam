@@ -40,6 +40,10 @@ def load_sam3_video_predictor(
     repo_path: Optional[str | Path],
     checkpoint_path: str | Path,
     device: str,
+    version: str = "sam3",
+    use_fa3: bool = False,
+    max_num_objects: int = 16,
+    multiplex_count: int = 16,
     async_loading_frames: bool = False,
     quiet: bool = True,
 ):
@@ -57,6 +61,12 @@ def load_sam3_video_predictor(
             )
     if not str(device).startswith("cuda"):
         raise RuntimeError("SAM3 video predictor requires a CUDA device.")
+    version = str(version).strip().lower()
+    if version not in {"sam3", "sam3.1"}:
+        raise ValueError(
+            f"Unsupported SAM video version {version!r}; "
+            "expected 'sam3' or 'sam3.1'."
+        )
 
     with quiet_sam3_output(quiet):
         try:
@@ -70,6 +80,26 @@ def load_sam3_video_predictor(
             raise
 
         gpu_id = parse_cuda_device_index(device)
+        if version == "sam3.1":
+            try:
+                from sam3.model_builder import build_sam3_predictor
+            except ImportError as exc:
+                raise RuntimeError(
+                    "The configured SAM repository does not support SAM3.1. "
+                    "Update externals/sam3 to the release containing "
+                    "build_sam3_predictor."
+                ) from exc
+            with torch.cuda.device(gpu_id):
+                return build_sam3_predictor(
+                    checkpoint_path=str(checkpoint_path),
+                    version="sam3.1",
+                    compile=False,
+                    warm_up=False,
+                    use_fa3=bool(use_fa3),
+                    max_num_objects=int(max_num_objects),
+                    multiplex_count=int(multiplex_count),
+                    async_loading_frames=async_loading_frames,
+                )
         return build_sam3_video_predictor(
             checkpoint_path=str(checkpoint_path),
             gpus_to_use=[gpu_id],

@@ -1,5 +1,9 @@
 # StreamVGGT + SAM3：V4、V5 与 V6 camera 消融
 
+> 2026-07-31：本文件中的 V6 camera 内容保留为历史机制消融。当前 V6 主线已经改为
+> “StreamVGGT 几何前置提示 SAM3.1 分割”，实现、命令与评价协议见
+> `v6_geometry_guided_segmentation.md`；V4/V5 没有改动。
+
 当前代码保留两条完整方法和一条隔离的 camera-fusion 实验：
 
 | 版本 | 用途 | 核心选择 |

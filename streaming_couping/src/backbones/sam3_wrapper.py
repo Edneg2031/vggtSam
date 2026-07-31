@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import tempfile
-from typing import Sequence
+from collections.abc import Sequence
+from pathlib import Path
 
 import torch
 
+from ..types import SAM3MaskCandidate, TrackingSequence
 from .sam3_video import (
     SAM3VideoTrackerAdapter,
     collect_frame_objects,
@@ -21,8 +22,6 @@ from .sam3_video import (
     select_tracked_object_id,
 )
 
-from ..types import SAM3MaskCandidate, TrackingSequence
-
 
 class SAM3Wrapper:
     """Expose only the SAM3 operations used by the final tracking pipeline."""
@@ -35,20 +34,32 @@ class SAM3Wrapper:
         device: str,
         output_threshold: float,
         prompt_with_box: bool,
+        version: str = "sam3",
+        use_fa3: bool = False,
+        max_num_objects: int = 16,
+        multiplex_count: int = 16,
     ) -> None:
         self.repo_path = Path(repo_path)
         self.checkpoint_path = Path(checkpoint_path)
         self.device = str(device)
         self.output_threshold = float(output_threshold)
         self.prompt_with_box = bool(prompt_with_box)
+        self.version = str(version).strip().lower()
+        self.use_fa3 = bool(use_fa3)
+        self.max_num_objects = int(max_num_objects)
+        self.multiplex_count = int(multiplex_count)
         self.predictor = None
         self.adapter = None
 
-    def load(self) -> "SAM3Wrapper":
+    def load(self) -> SAM3Wrapper:
         self.predictor = load_sam3_video_predictor(
             repo_path=self.repo_path,
             checkpoint_path=self.checkpoint_path,
             device=self.device,
+            version=self.version,
+            use_fa3=self.use_fa3,
+            max_num_objects=self.max_num_objects,
+            multiplex_count=self.multiplex_count,
             quiet=True,
         )
         self.adapter = SAM3VideoTrackerAdapter(
@@ -96,8 +107,75 @@ class SAM3Wrapper:
     ) -> list[SAM3MaskCandidate]:
         """Return every full mask from one global-text query."""
 
+        return self._propose_masks(
+            image_path,
+            prompt=prompt,
+            output_size=output_size,
+            prompt_box=None,
+        )
+
+    def propose_geometry_prompt_masks(
+        self,
+        image_path: str | Path,
+        *,
+        prompt: str,
+        output_size: tuple[int, int],
+        geometry_prompt: torch.Tensor,
+    ) -> list[SAM3MaskCandidate]:
+        """Segment one frame from text plus a StreamVGGT-derived box."""
+
+        prompt_box = mask_to_normalized_box(
+            geometry_prompt.detach().cpu().bool(),
+            image_path=Path(image_path),
+        )
+        if prompt_box is None:
+            return []
+        return self._propose_masks(
+            image_path,
+            prompt=prompt,
+            output_size=output_size,
+            prompt_box=prompt_box,
+        )
+
+    def propose_geometry_point_refined_masks(
+        self,
+        image_path: str | Path,
+        *,
+        prompt: str,
+        output_size: tuple[int, int],
+        geometry_prompt: torch.Tensor,
+        positive_prompt: torch.Tensor,
+        negative_prompt: torch.Tensor | None = None,
+        max_positive_points: int = 6,
+        max_negative_points: int = 4,
+    ) -> list[SAM3MaskCandidate]:
+        """Run SAM3.1 text+box detection, then geometry-point refinement."""
+
+        if self.version != "sam3.1":
+            raise RuntimeError(
+                "Geometry point refinement requires a SAM3.1 predictor."
+            )
+        prompt_box = mask_to_normalized_box(
+            geometry_prompt.detach().cpu().bool(),
+            image_path=Path(image_path),
+        )
+        positive = _sample_normalized_points(
+            positive_prompt,
+            limit=max_positive_points,
+        )
+        if prompt_box is None or not positive:
+            return []
+        negative = _sample_normalized_points(
+            negative_prompt,
+            limit=max_negative_points,
+        )
+        points = [*positive, *negative]
+        labels = [1] * len(positive) + [0] * len(negative)
+
         predictor = self._require_predictor()
-        with tempfile.TemporaryDirectory(prefix="sam3_text_candidates_") as tmp:
+        with tempfile.TemporaryDirectory(
+            prefix="sam31_geometry_points_"
+        ) as tmp:
             video_dir = Path(tmp)
             materialize_video_dir([image_path], video_dir)
             with quiet_sam3_output(True):
@@ -110,7 +188,90 @@ class SAM3Wrapper:
                         session_id=session_id,
                         frame_idx=0,
                         text=prompt,
+                        bounding_boxes=[prompt_box],
+                        bounding_box_labels=[1],
                         output_prob_thresh=self.output_threshold,
+                    )
+                    detected_objects = collect_frame_objects(
+                        [detected],
+                        output_size=output_size,
+                    ).get(0, {})
+                    selected_obj_id = _select_geometry_prompted_object(
+                        detected_objects,
+                        positive_prompt=positive_prompt,
+                        geometry_prompt=geometry_prompt,
+                    )
+                    if selected_obj_id is None:
+                        selected_obj_id = (
+                            max(detected_objects, default=0) + 1
+                        )
+                    refined = predictor.add_prompt(
+                        session_id=session_id,
+                        frame_idx=0,
+                        points=points,
+                        point_labels=labels,
+                        clear_old_points=True,
+                        obj_id=int(selected_obj_id),
+                        rel_coordinates=True,
+                        output_prob_thresh=self.output_threshold,
+                    )
+                finally:
+                    predictor.close_session(session_id)
+
+        refined_objects = collect_frame_objects(
+            [refined],
+            output_size=output_size,
+        ).get(0, {})
+        mask = refined_objects.get(int(selected_obj_id))
+        if mask is None:
+            return []
+        refined_scores = collect_frame_scores([refined]).get(0, {})
+        detected_scores = collect_frame_scores([detected]).get(0, {})
+        score = float(
+            refined_scores.get(
+                int(selected_obj_id),
+                detected_scores.get(int(selected_obj_id), 0.0),
+            )
+        )
+        if score == 0.0 and mask.any():
+            score = 1.0
+        return [
+            SAM3MaskCandidate(
+                obj_id=int(selected_obj_id),
+                mask=mask.detach().cpu().bool(),
+                score=score,
+            )
+        ]
+
+    def _propose_masks(
+        self,
+        image_path: str | Path,
+        *,
+        prompt: str,
+        output_size: tuple[int, int],
+        prompt_box: list[float] | None,
+    ) -> list[SAM3MaskCandidate]:
+        predictor = self._require_predictor()
+        with tempfile.TemporaryDirectory(prefix="sam3_text_candidates_") as tmp:
+            video_dir = Path(tmp)
+            materialize_video_dir([image_path], video_dir)
+            with quiet_sam3_output(True):
+                session = predictor.start_session(
+                    resource_path=str(video_dir)
+                )
+                session_id = _session_id(session)
+                try:
+                    kwargs = {
+                        "session_id": session_id,
+                        "frame_idx": 0,
+                        "text": prompt,
+                        "output_prob_thresh": self.output_threshold,
+                    }
+                    if prompt_box is not None:
+                        kwargs["bounding_boxes"] = [prompt_box]
+                        kwargs["bounding_box_labels"] = [1]
+                    detected = predictor.add_prompt(
+                        **kwargs,
                     )
                 finally:
                     predictor.close_session(session_id)
@@ -367,6 +528,74 @@ class SAM3Wrapper:
         if self.predictor is None:
             raise RuntimeError("Call SAM3Wrapper.load() before inference.")
         return self.predictor
+
+
+def _sample_normalized_points(
+    mask: torch.Tensor | None,
+    *,
+    limit: int,
+) -> list[list[float]]:
+    if mask is None or int(limit) <= 0:
+        return []
+    mask = mask.detach().cpu().bool()
+    if mask.ndim != 2 or not mask.any():
+        return []
+    ys, xs = mask.nonzero(as_tuple=True)
+    coordinates = torch.stack([xs, ys], dim=-1).float()
+    count = min(int(limit), int(coordinates.shape[0]))
+    center = coordinates.mean(dim=0)
+    first = int(
+        torch.argmin(((coordinates - center) ** 2).sum(dim=-1))
+    )
+    selected = [first]
+    minimum_distance = (
+        (coordinates - coordinates[first]) ** 2
+    ).sum(dim=-1)
+    while len(selected) < count:
+        index = int(torch.argmax(minimum_distance))
+        selected.append(index)
+        current = ((coordinates - coordinates[index]) ** 2).sum(dim=-1)
+        minimum_distance = torch.minimum(minimum_distance, current)
+        minimum_distance[selected] = -1.0
+    height, width = mask.shape
+    return [
+        [
+            float((coordinates[index, 0] + 0.5) / width),
+            float((coordinates[index, 1] + 0.5) / height),
+        ]
+        for index in selected
+    ]
+
+
+def _select_geometry_prompted_object(
+    objects: dict[int, torch.Tensor],
+    *,
+    positive_prompt: torch.Tensor,
+    geometry_prompt: torch.Tensor,
+) -> int | None:
+    positive = positive_prompt.detach().cpu().bool()
+    geometry = geometry_prompt.detach().cpu().bool()
+    if not objects or not positive.any():
+        return None
+
+    def score(item: tuple[int, torch.Tensor]) -> tuple[float, float, int]:
+        obj_id, mask = item
+        mask = mask.detach().cpu().bool()
+        support_recall = float((positive & mask).sum()) / max(
+            int(positive.sum()),
+            1,
+        )
+        box_precision = float((geometry & mask).sum()) / max(
+            int(mask.sum()),
+            1,
+        )
+        return (
+            0.70 * support_recall + 0.30 * box_precision,
+            box_precision,
+            -int(obj_id),
+        )
+
+    return int(max(objects.items(), key=score)[0])
 
 
 def _session_id(session) -> str:

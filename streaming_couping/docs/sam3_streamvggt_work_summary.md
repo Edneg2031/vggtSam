@@ -1,6 +1,6 @@
 # SAM3 + StreamVGGT 实例引导几何与相机位姿优化总结
 
-> 本文总结 V1–V6 的方法演进、实验结果和当前结论。历史 V1–V3 用于说明设计来源；当前仓库正式保留 V4、V5，以及隔离的 V6 camera-fusion 消融。
+> 本文总结 V1–V6 的方法演进、实验结果和当前结论。历史 V1–V3 用于说明设计来源；当前仓库正式保留 V4、V5。原 V6 camera-fusion 作为历史机制消融保留；当前 V6 主线已改为 StreamVGGT 几何前置引导 SAM3.1 分割，见 `v6_geometry_guided_segmentation.md`。
 
 ## 1. 结论先行
 
