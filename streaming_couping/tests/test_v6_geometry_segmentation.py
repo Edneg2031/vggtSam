@@ -7,6 +7,7 @@ import torch
 from PIL import Image
 
 from streaming_couping.src.backbones.sam3_video import (
+    _bool_compatible_argsort,
     _filter_init_state_kwargs,
 )
 from streaming_couping.src.backbones.sam3_wrapper import SAM3Wrapper
@@ -69,6 +70,16 @@ def test_sam31_session_filters_unsupported_init_state_kwargs() -> None:
         "offload_video_to_cpu": True,
         "async_loading_frames": True,
     }
+
+
+def test_sam31_bool_argsort_compatibility_keeps_true_first() -> None:
+    values = torch.tensor([False, True, False, True])
+
+    indices = _bool_compatible_argsort(values, descending=True)
+
+    assert values[indices].tolist() == [True, True, False, False]
+    assert sorted(indices.tolist()) == [0, 1, 2, 3]
+    assert values.dtype == torch.bool
 
 
 def test_candidate_selection_rejects_large_low_purity_lookalike() -> None:

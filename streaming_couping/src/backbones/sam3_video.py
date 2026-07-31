@@ -13,9 +13,10 @@ import logging
 import os
 import shutil
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
@@ -23,6 +24,9 @@ import torch.nn.functional as F
 from PIL import Image
 
 from ..external_repos import maybe_add_repo_to_path
+
+_ORIGINAL_TENSOR_ARGSORT = torch.Tensor.argsort
+_BOOL_ARGSORT_COMPATIBILITY_INSTALLED = False
 
 
 @dataclass
@@ -82,6 +86,7 @@ def load_sam3_video_predictor(
 
         gpu_id = parse_cuda_device_index(device)
         if version == "sam3.1":
+            _install_bool_argsort_compatibility()
             try:
                 from sam3.model_builder import build_sam3_predictor
             except ImportError as exc:
@@ -136,6 +141,27 @@ def _filter_init_state_kwargs(predictor) -> None:
         return original(*args, **filtered)
 
     model.init_state = compatible_init_state
+
+
+def _bool_compatible_argsort(
+    tensor: torch.Tensor,
+    *args,
+    **kwargs,
+) -> torch.Tensor:
+    """Preserve False<True ordering where PyTorch rejects bool argsort."""
+
+    sortable = tensor.to(torch.uint8) if tensor.dtype == torch.bool else tensor
+    return _ORIGINAL_TENSOR_ARGSORT(sortable, *args, **kwargs)
+
+
+def _install_bool_argsort_compatibility() -> None:
+    """Install the narrow compatibility needed by SAM3.1 multiplex."""
+
+    global _BOOL_ARGSORT_COMPATIBILITY_INSTALLED
+    if _BOOL_ARGSORT_COMPATIBILITY_INSTALLED:
+        return
+    torch.Tensor.argsort = _bool_compatible_argsort
+    _BOOL_ARGSORT_COMPATIBILITY_INSTALLED = True
 
 
 class SAM3VideoTrackerAdapter:
