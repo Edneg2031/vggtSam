@@ -6,6 +6,9 @@ import numpy as np
 import torch
 from PIL import Image
 
+from streaming_couping.scripts.run_v6_geometry_segmentation import (
+    _policy_selection_rows,
+)
 from streaming_couping.src.backbones.sam3_video import (
     _bool_compatible_argsort,
     _filter_init_state_kwargs,
@@ -13,6 +16,7 @@ from streaming_couping.src.backbones.sam3_video import (
 from streaming_couping.src.backbones.sam3_wrapper import SAM3Wrapper
 from streaming_couping.src.types import SAM3MaskCandidate
 from streaming_couping.src.v6_geometry_segmentation import (
+    V6_ADAPTIVE_POLICIES,
     GeometrySegmentationPrompt,
     V6GeometrySegmentationConfig,
     select_adaptive_correction,
@@ -153,7 +157,67 @@ def test_adaptive_policy_applies_clear_geometry_improvement() -> None:
     )
 
     assert selected is prompted
-    assert reason == "apply_prompt:geometry_improved"
+    assert reason == "apply_prompt:raw_unreliable_geometry_improved"
+
+
+def test_competitive_policy_can_replace_reliable_raw_on_clear_gain() -> None:
+    mask = torch.ones(8, 8, dtype=torch.bool)
+    raw = {
+        "candidate": SAM3MaskCandidate(-1, mask, 0.90),
+        "support_recall": 0.80,
+        "box_precision": 0.50,
+        "support_precision": 0.60,
+        "geometry_score": 0.70,
+        "mask_pixels": 64,
+        "box_pixels": 64,
+    }
+    prompted = {
+        **raw,
+        "candidate": SAM3MaskCandidate(2, mask, 0.95),
+        "support_recall": 0.92,
+        "geometry_score": 0.82,
+    }
+
+    selected, reason = select_adaptive_correction(
+        raw_row=raw,
+        prompted_row=prompted,
+        config=V6GeometrySegmentationConfig(),
+        reliable_support_margin=0.10,
+        reliable_score_margin=0.10,
+    )
+
+    assert selected is prompted
+    assert reason == "apply_prompt:competitive_geometry_improved"
+
+
+def test_competitive_policy_keeps_reliable_raw_below_margin() -> None:
+    mask = torch.ones(8, 8, dtype=torch.bool)
+    raw = {
+        "candidate": SAM3MaskCandidate(-1, mask, 0.90),
+        "support_recall": 0.80,
+        "box_precision": 0.50,
+        "support_precision": 0.60,
+        "geometry_score": 0.70,
+        "mask_pixels": 64,
+        "box_pixels": 64,
+    }
+    prompted = {
+        **raw,
+        "candidate": SAM3MaskCandidate(2, mask, 0.95),
+        "support_recall": 0.88,
+        "geometry_score": 0.78,
+    }
+
+    selected, reason = select_adaptive_correction(
+        raw_row=raw,
+        prompted_row=prompted,
+        config=V6GeometrySegmentationConfig(),
+        reliable_support_margin=0.10,
+        reliable_score_margin=0.10,
+    )
+
+    assert selected is None
+    assert reason == "keep_raw:insufficient_support_gain"
 
 
 def test_adaptive_policy_rejects_huge_prompt_when_raw_is_missing() -> None:
@@ -201,6 +265,71 @@ def test_geometry_backend_contract_is_three_image_space_masks() -> None:
     assert prompt.positive_mask[1, 1]
     assert prompt.negative_mask[6, 6]
     assert not prompt.negative_mask[1, 1]
+
+
+def test_policy_selection_uses_development_splits_not_test() -> None:
+    development = {
+        V6_ADAPTIVE_POLICIES[0].variant: (0.10, 0),
+        V6_ADAPTIVE_POLICIES[1].variant: (0.05, 0),
+        V6_ADAPTIVE_POLICIES[2].variant: (0.20, 1),
+        V6_ADAPTIVE_POLICIES[3].variant: (0.15, 0),
+    }
+    test_delta = {
+        V6_ADAPTIVE_POLICIES[0].variant: 0.0,
+        V6_ADAPTIVE_POLICIES[1].variant: 1.0,
+        V6_ADAPTIVE_POLICIES[2].variant: 2.0,
+        V6_ADAPTIVE_POLICIES[3].variant: -1.0,
+    }
+    rows = []
+    for policy in V6_ADAPTIVE_POLICIES:
+        delta, worse = development[policy.variant]
+        for split in ("train", "validation"):
+            rows.append(
+                _summary_row(
+                    policy.variant,
+                    split,
+                    delta=delta,
+                    worse=worse if split == "validation" else 0,
+                )
+            )
+        rows.append(
+            _summary_row(
+                policy.variant,
+                "test",
+                delta=test_delta[policy.variant],
+                worse=0,
+            )
+        )
+
+    selected = _policy_selection_rows(rows)
+
+    best = [row for row in selected if int(row["development_best"])]
+    assert len(best) == 1
+    assert best[0]["variant"] == V6_ADAPTIVE_POLICIES[3].variant
+    unsafe = next(
+        row
+        for row in selected
+        if row["variant"] == V6_ADAPTIVE_POLICIES[2].variant
+    )
+    assert not int(unsafe["development_safe"])
+
+
+def _summary_row(
+    variant: str,
+    split: str,
+    *,
+    delta: float,
+    worse: int,
+) -> dict[str, object]:
+    return {
+        "variant": variant,
+        "split": split,
+        "evaluated_instance_frames": 10,
+        "mean_iou_delta_from_raw": delta,
+        "improved_frames": int(delta > 0),
+        "worse_frames": worse,
+        "changed_from_raw_frames": 1,
+    }
 
 
 def test_sam3_geometry_prompt_is_passed_as_text_plus_box(tmp_path: Path) -> None:
@@ -333,6 +462,7 @@ def test_v6_segmentation_command_and_config_are_retained() -> None:
 
     assert "run_v6_geometry_segmentation" in command
     assert "v6_segmentation_summary.csv" in command
+    assert "v6_policy_selection.csv" in command
     assert "sam3.1_multiplex.pt" in command
     assert "version: sam3.1" in config
     assert "type: streamvggt_reference_projection" in config

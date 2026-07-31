@@ -19,15 +19,6 @@ import torch.nn.functional as F
 from .backbones.sam3_wrapper import SAM3Wrapper
 from .types import SAM3MaskCandidate, TrackingSequence
 
-V6_SEGMENTATION_VARIANTS = (
-    "raw_sam31",
-    "current_sam3_late_geometry",
-    "v6_sam31_points_positive",
-    "v6_sam31_points_posneg",
-    "v6_sam31_adaptive_positive",
-    "v6_sam31_adaptive_posneg",
-)
-
 
 @dataclass(frozen=True)
 class GeometrySegmentationPrompt:
@@ -39,11 +30,50 @@ class GeometrySegmentationPrompt:
 
 
 @dataclass(frozen=True)
+class AdaptiveCorrectionPolicy:
+    """Optional margins for replacing an otherwise geometry-reliable raw mask."""
+
+    variant: str
+    reliable_support_margin: float | None
+    reliable_score_margin: float | None
+
+
+V6_ADAPTIVE_POLICIES = (
+    AdaptiveCorrectionPolicy(
+        variant="v6_sam31_adaptive_positive_safe",
+        reliable_support_margin=None,
+        reliable_score_margin=None,
+    ),
+    AdaptiveCorrectionPolicy(
+        variant="v6_sam31_adaptive_positive_compete_005",
+        reliable_support_margin=0.05,
+        reliable_score_margin=0.05,
+    ),
+    AdaptiveCorrectionPolicy(
+        variant="v6_sam31_adaptive_positive_compete_010",
+        reliable_support_margin=0.10,
+        reliable_score_margin=0.10,
+    ),
+    AdaptiveCorrectionPolicy(
+        variant="v6_sam31_adaptive_positive_compete_015",
+        reliable_support_margin=0.15,
+        reliable_score_margin=0.15,
+    ),
+)
+
+V6_SEGMENTATION_VARIANTS = (
+    "raw_sam31",
+    "current_sam3_late_geometry",
+    "v6_sam31_points_positive",
+    *(policy.variant for policy in V6_ADAPTIVE_POLICIES),
+)
+
+
+@dataclass(frozen=True)
 class V6GeometrySegmentationConfig:
     min_candidate_support_recall: float = 0.25
     support_dilation: int = 5
     point_positive_samples: int = 6
-    point_negative_samples: int = 4
     adaptive_raw_support_recall: float = 0.70
     adaptive_raw_box_precision: float = 0.10
     adaptive_score_margin: float = 0.05
@@ -107,7 +137,7 @@ def segment_instance_with_geometry_prompts(
                 _reference_diagnostic(
                     frame=frame,
                     frame_index=int(frame_index),
-                    available=bool(reference_mask.any()),
+                    reference_pixels=int(reference_mask.sum()),
                 )
             )
             continue
@@ -132,30 +162,16 @@ def segment_instance_with_geometry_prompts(
             prompt=prompt,
             config=config,
         )
-        positive_rows = _run_point_prompt(
+        positive_rows = _run_positive_point_prompt(
             sam3=sam3,
             image_path=Path(sequence.image_paths[frame]),
             label=str(sequence.label),
             output_size=output_size,
             prompt=prompt,
-            include_negative=False,
-            config=config,
-        )
-        posneg_rows = _run_point_prompt(
-            sam3=sam3,
-            image_path=Path(sequence.image_paths[frame]),
-            label=str(sequence.label),
-            output_size=output_size,
-            prompt=prompt,
-            include_negative=True,
             config=config,
         )
         selected_positive = select_geometry_prompt_candidate(
             positive_rows,
-            config=config,
-        )
-        selected_posneg = select_geometry_prompt_candidate(
-            posneg_rows,
             config=config,
         )
         _apply_selected(
@@ -165,38 +181,23 @@ def segment_instance_with_geometry_prompts(
             frame=frame,
             selected=selected_positive,
         )
-        _apply_selected(
-            masks_by_variant,
-            scores_by_variant,
-            variant="v6_sam31_points_posneg",
-            frame=frame,
-            selected=selected_posneg,
-        )
-
-        adaptive_positive, positive_reason = select_adaptive_correction(
-            raw_row=raw_row,
-            prompted_row=selected_positive,
-            config=config,
-        )
-        adaptive_posneg, posneg_reason = select_adaptive_correction(
-            raw_row=raw_row,
-            prompted_row=selected_posneg,
-            config=config,
-        )
-        _apply_selected(
-            masks_by_variant,
-            scores_by_variant,
-            variant="v6_sam31_adaptive_positive",
-            frame=frame,
-            selected=adaptive_positive,
-        )
-        _apply_selected(
-            masks_by_variant,
-            scores_by_variant,
-            variant="v6_sam31_adaptive_posneg",
-            frame=frame,
-            selected=adaptive_posneg,
-        )
+        adaptive_results = {}
+        for policy in V6_ADAPTIVE_POLICIES:
+            selected, reason = select_adaptive_correction(
+                raw_row=raw_row,
+                prompted_row=selected_positive,
+                config=config,
+                reliable_support_margin=policy.reliable_support_margin,
+                reliable_score_margin=policy.reliable_score_margin,
+            )
+            adaptive_results[policy.variant] = (selected, reason)
+            _apply_selected(
+                masks_by_variant,
+                scores_by_variant,
+                variant=policy.variant,
+                frame=frame,
+                selected=selected,
+            )
         diagnostics.append(
             _frame_diagnostic(
                 frame=frame,
@@ -204,11 +205,7 @@ def segment_instance_with_geometry_prompts(
                 prompt=prompt,
                 raw_row=raw_row,
                 selected_positive=selected_positive,
-                selected_posneg=selected_posneg,
-                adaptive_positive=adaptive_positive,
-                adaptive_posneg=adaptive_posneg,
-                positive_reason=positive_reason,
-                posneg_reason=posneg_reason,
+                adaptive_results=adaptive_results,
             )
         )
 
@@ -281,20 +278,30 @@ def select_adaptive_correction(
     raw_row: dict[str, object],
     prompted_row: dict[str, object] | None,
     config: V6GeometrySegmentationConfig,
+    reliable_support_margin: float | None = None,
+    reliable_score_margin: float | None = None,
 ) -> tuple[dict[str, object] | None, str]:
     """Use geometry as a conservative correction trigger, never a takeover."""
 
+    if (reliable_support_margin is None) != (
+        reliable_score_margin is None
+    ):
+        raise ValueError("Competitive margins must be both set or both None.")
     if prompted_row is None:
         return None, "keep_raw:no_prompt_candidate"
     raw_pixels = int(raw_row["mask_pixels"])
     raw_support = float(raw_row["support_recall"])
     raw_box_precision = float(raw_row["box_precision"])
-    trigger = (
+    raw_unreliable = (
         raw_pixels == 0
         or raw_support < float(config.adaptive_raw_support_recall)
         or raw_box_precision < float(config.adaptive_raw_box_precision)
     )
-    if not trigger:
+    competitive_enabled = (
+        reliable_support_margin is not None
+        and reliable_score_margin is not None
+    )
+    if not raw_unreliable and not competitive_enabled:
         return None, "keep_raw:raw_geometry_reliable"
 
     prompted_pixels = int(prompted_row["mask_pixels"])
@@ -318,23 +325,34 @@ def select_adaptive_correction(
         float(prompted_row["geometry_score"])
         - float(raw_row["geometry_score"])
     )
-    if raw_pixels > 0 and support_gain < float(
-        config.adaptive_support_margin
-    ):
+    support_margin = (
+        float(config.adaptive_support_margin)
+        if raw_unreliable
+        else float(reliable_support_margin)
+    )
+    score_margin = (
+        float(config.adaptive_score_margin)
+        if raw_unreliable
+        else float(reliable_score_margin)
+    )
+    if raw_pixels > 0 and support_gain < support_margin:
         return None, "keep_raw:insufficient_support_gain"
-    if score_gain < float(config.adaptive_score_margin):
+    if score_gain < score_margin:
         return None, "keep_raw:insufficient_score_gain"
-    return prompted_row, "apply_prompt:geometry_improved"
+    return prompted_row, (
+        "apply_prompt:raw_unreliable_geometry_improved"
+        if raw_unreliable
+        else "apply_prompt:competitive_geometry_improved"
+    )
 
 
-def _run_point_prompt(
+def _run_positive_point_prompt(
     *,
     sam3: SAM3Wrapper,
     image_path: Path,
     label: str,
     output_size: tuple[int, int],
     prompt: GeometrySegmentationPrompt,
-    include_negative: bool,
     config: V6GeometrySegmentationConfig,
 ) -> list[dict[str, object]]:
     candidates = sam3.propose_geometry_point_refined_masks(
@@ -343,15 +361,9 @@ def _run_point_prompt(
         output_size=output_size,
         geometry_prompt=prompt.box_mask,
         positive_prompt=prompt.positive_mask,
-        negative_prompt=(
-            prompt.negative_mask if include_negative else None
-        ),
+        negative_prompt=None,
         max_positive_points=int(config.point_positive_samples),
-        max_negative_points=(
-            int(config.point_negative_samples)
-            if include_negative
-            else 0
-        ),
+        max_negative_points=0,
     )
     return [
         evaluate_mask_against_geometry(
@@ -418,23 +430,27 @@ def _reference_diagnostic(
     *,
     frame: int,
     frame_index: int,
-    available: bool,
+    reference_pixels: int,
 ) -> dict[str, object]:
+    available = reference_pixels > 0
     return {
         "sequence_index": frame,
         "frame_index": frame_index,
         "prompt_available": int(available),
-        "box_pixels": int(available),
-        "positive_pixels": int(available),
+        "box_pixels": reference_pixels,
+        "positive_pixels": reference_pixels,
         "negative_pixels": 0,
         "raw_support_recall": 1.0 if available else 0.0,
         "raw_box_precision": 1.0 if available else 0.0,
+        "raw_geometry_score": 1.0 if available else 0.0,
+        "raw_mask_pixels": reference_pixels,
         "positive_support_recall": 1.0 if available else 0.0,
-        "posneg_support_recall": 1.0 if available else 0.0,
-        "adaptive_positive_applied": 0,
-        "adaptive_posneg_applied": 0,
-        "adaptive_positive_reason": "reference_mask",
-        "adaptive_posneg_reason": "reference_mask",
+        "positive_box_precision": 1.0 if available else 0.0,
+        "positive_geometry_score": 1.0 if available else 0.0,
+        "positive_mask_pixels": reference_pixels,
+        "positive_support_gain": 0.0,
+        "positive_score_gain": 0.0,
+        **_policy_diagnostics(default_reason="reference_mask"),
     }
 
 
@@ -453,12 +469,15 @@ def _fallback_diagnostic(
         "negative_pixels": 0,
         "raw_support_recall": float("nan"),
         "raw_box_precision": float("nan"),
+        "raw_geometry_score": float("nan"),
+        "raw_mask_pixels": 0,
         "positive_support_recall": float("nan"),
-        "posneg_support_recall": float("nan"),
-        "adaptive_positive_applied": 0,
-        "adaptive_posneg_applied": 0,
-        "adaptive_positive_reason": reason,
-        "adaptive_posneg_reason": reason,
+        "positive_box_precision": float("nan"),
+        "positive_geometry_score": float("nan"),
+        "positive_mask_pixels": 0,
+        "positive_support_gain": float("nan"),
+        "positive_score_gain": float("nan"),
+        **_policy_diagnostics(default_reason=reason),
     }
 
 
@@ -469,12 +488,19 @@ def _frame_diagnostic(
     prompt: GeometrySegmentationPrompt,
     raw_row: dict[str, object],
     selected_positive: dict[str, object] | None,
-    selected_posneg: dict[str, object] | None,
-    adaptive_positive: dict[str, object] | None,
-    adaptive_posneg: dict[str, object] | None,
-    positive_reason: str,
-    posneg_reason: str,
+    adaptive_results: dict[
+        str,
+        tuple[dict[str, object] | None, str],
+    ],
 ) -> dict[str, object]:
+    positive_support = _selected_value(
+        selected_positive,
+        "support_recall",
+    )
+    positive_score = _selected_value(
+        selected_positive,
+        "geometry_score",
+    )
     return {
         "sequence_index": frame,
         "frame_index": frame_index,
@@ -484,21 +510,47 @@ def _frame_diagnostic(
         "negative_pixels": int(prompt.negative_mask.sum()),
         "raw_support_recall": float(raw_row["support_recall"]),
         "raw_box_precision": float(raw_row["box_precision"]),
-        "positive_support_recall": _selected_value(
+        "raw_geometry_score": float(raw_row["geometry_score"]),
+        "raw_mask_pixels": int(raw_row["mask_pixels"]),
+        "positive_support_recall": positive_support,
+        "positive_box_precision": _selected_value(
             selected_positive,
-            "support_recall",
+            "box_precision",
         ),
-        "posneg_support_recall": _selected_value(
-            selected_posneg,
-            "support_recall",
+        "positive_geometry_score": positive_score,
+        "positive_mask_pixels": _selected_int(
+            selected_positive,
+            "mask_pixels",
         ),
-        "adaptive_positive_applied": int(
-            adaptive_positive is not None
+        "positive_support_gain": (
+            positive_support - float(raw_row["support_recall"])
         ),
-        "adaptive_posneg_applied": int(adaptive_posneg is not None),
-        "adaptive_positive_reason": positive_reason,
-        "adaptive_posneg_reason": posneg_reason,
+        "positive_score_gain": (
+            positive_score - float(raw_row["geometry_score"])
+        ),
+        **_policy_diagnostics(adaptive_results=adaptive_results),
     }
+
+
+def _policy_diagnostics(
+    *,
+    adaptive_results: dict[
+        str,
+        tuple[dict[str, object] | None, str],
+    ]
+    | None = None,
+    default_reason: str = "",
+) -> dict[str, object]:
+    output: dict[str, object] = {}
+    for policy in V6_ADAPTIVE_POLICIES:
+        selected, reason = (
+            adaptive_results[policy.variant]
+            if adaptive_results is not None
+            else (None, default_reason)
+        )
+        output[f"{policy.variant}_applied"] = int(selected is not None)
+        output[f"{policy.variant}_reason"] = reason
+    return output
 
 
 def _selected_value(
@@ -506,6 +558,13 @@ def _selected_value(
     key: str,
 ) -> float:
     return float(selected[key]) if selected is not None else float("nan")
+
+
+def _selected_int(
+    selected: dict[str, object] | None,
+    key: str,
+) -> int:
+    return int(selected[key]) if selected is not None else 0
 
 
 def _validate_inputs(

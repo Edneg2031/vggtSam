@@ -59,6 +59,7 @@ PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
 
 for required in \
   "$OUTPUT/v6_segmentation_summary.csv" \
+  "$OUTPUT/v6_policy_selection.csv" \
   "$OUTPUT/v6_segmentation_frames.csv" \
   "$OUTPUT/v6_geometry_prompt_diagnostics.csv"
 do
@@ -76,5 +77,6 @@ sha256sum \
   streaming_couping/src/v6_geometry_segmentation.py \
   > "$OUTPUT/reproduction_inputs.sha256"
 
-echo "summary=$OUTPUT/v6_segmentation_summary.csv"
-sed -n '1,25p' "$OUTPUT/v6_segmentation_summary.csv"
+echo "policy_summary=$OUTPUT/v6_policy_selection.csv"
+cat "$OUTPUT/v6_policy_selection.csv"
+echo "full_summary=$OUTPUT/v6_segmentation_summary.csv"

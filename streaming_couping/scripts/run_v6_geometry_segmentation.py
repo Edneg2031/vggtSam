@@ -24,6 +24,7 @@ from streaming_couping.src.streamvggt_geometry_prompt import (
 )
 from streaming_couping.src.types import TrackingSequence
 from streaming_couping.src.v6_geometry_segmentation import (
+    V6_ADAPTIVE_POLICIES,
     V6_SEGMENTATION_VARIANTS,
     V6GeometrySegmentationConfig,
     segment_instance_with_geometry_prompts,
@@ -162,6 +163,7 @@ def main() -> None:
                 sam3=sam3,
                 config=experiment.segmentation,
             )
+            raw_masks = result["masks"]["raw_sam31"]
             for variant, masks in result["masks"].items():
                 all_masks[variant][:, slot] = masks
                 metric_rows.extend(
@@ -173,6 +175,7 @@ def main() -> None:
                         frame_indices=clip.frame_indices,
                         reference_index=clip.reference_sequence_index,
                         predicted=masks,
+                        raw=raw_masks,
                         target=target_by_id[instance_id],
                     )
                 )
@@ -214,6 +217,8 @@ def main() -> None:
     summary_rows = _summarize_metrics(metric_rows)
     summary_path = output_dir / "v6_segmentation_summary.csv"
     _write_csv(summary_path, summary_rows)
+    policy_path = output_dir / "v6_policy_selection.csv"
+    _write_csv(policy_path, _policy_selection_rows(summary_rows))
     _write_csv(output_dir / "v6_segmentation_frames.csv", metric_rows)
     _write_csv(
         output_dir / "v6_geometry_prompt_diagnostics.csv",
@@ -221,6 +226,9 @@ def main() -> None:
     )
     print(summary_path)
     with summary_path.open("r", encoding="utf8") as handle:
+        print(handle.read().rstrip())
+    print(policy_path)
+    with policy_path.open("r", encoding="utf8") as handle:
         print(handle.read().rstrip())
     print("GT masks are used only for the CSV metrics and visualizations.")
 
@@ -257,12 +265,14 @@ def _mask_metric_rows(
     frame_indices: tuple[int, ...],
     reference_index: int,
     predicted: torch.Tensor,
+    raw: torch.Tensor,
     target: torch.Tensor,
 ) -> list[dict[str, object]]:
     rows = []
     reference_available = int(bool(target[reference_index].any()))
     for sequence_index, frame_index in enumerate(frame_indices):
         pred = predicted[sequence_index].bool()
+        raw_mask = raw[sequence_index].bool()
         gt = target[sequence_index].bool()
         intersection = int((pred & gt).sum())
         union = int((pred | gt).sum())
@@ -297,6 +307,9 @@ def _mask_metric_rows(
                 "predicted_visible": int(predicted_pixels > 0),
                 "gt_pixels": gt_pixels,
                 "predicted_pixels": predicted_pixels,
+                "mask_changed_from_raw": int(
+                    bool((pred != raw_mask).any())
+                ),
                 "iou": _short(iou),
                 "precision": _short(precision),
                 "recall": _short(recall),
@@ -379,6 +392,10 @@ def _summarize_metrics(
                 ),
                 "improved_frames": sum(value > 1e-8 for value in deltas),
                 "worse_frames": sum(value < -1e-8 for value in deltas),
+                "changed_from_raw_frames": sum(
+                    int(row["mask_changed_from_raw"])
+                    for row in evaluable
+                ),
             }
         )
     return sorted(
@@ -389,6 +406,99 @@ def _summarize_metrics(
             V6_SEGMENTATION_VARIANTS.index(str(row["variant"])),
         ),
     )
+
+
+def _policy_selection_rows(
+    summary_rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    variants = [policy.variant for policy in V6_ADAPTIVE_POLICIES]
+    rows_by_variant = {
+        variant: [
+            row
+            for row in summary_rows
+            if str(row["variant"]) == variant
+        ]
+        for variant in variants
+    }
+    output = []
+    for variant in variants:
+        train = _aggregate_policy_split(rows_by_variant[variant], "train")
+        validation = _aggregate_policy_split(
+            rows_by_variant[variant],
+            "validation",
+        )
+        test = _aggregate_policy_split(rows_by_variant[variant], "test")
+        development_frames = train["frames"] + validation["frames"]
+        development_delta = (
+            (
+                train["delta"] * train["frames"]
+                + validation["delta"] * validation["frames"]
+            )
+            / development_frames
+            if development_frames
+            else float("nan")
+        )
+        development_worse = train["worse"] + validation["worse"]
+        output.append(
+            {
+                "variant": variant,
+                "train_delta": _short(train["delta"]),
+                "validation_delta": _short(validation["delta"]),
+                "development_weighted_delta": _short(
+                    development_delta
+                ),
+                "development_improved_frames": (
+                    train["improved"] + validation["improved"]
+                ),
+                "development_worse_frames": development_worse,
+                "development_changed_frames": (
+                    train["changed"] + validation["changed"]
+                ),
+                "development_safe": int(
+                    development_frames > 0 and development_worse == 0
+                ),
+                "test_delta_report_only": _short(test["delta"]),
+                "test_improved_frames": test["improved"],
+                "test_worse_frames": test["worse"],
+                "test_changed_frames": test["changed"],
+                "development_best": 0,
+            }
+        )
+    safe = [row for row in output if int(row["development_safe"])]
+    if safe:
+        best = max(
+            safe,
+            key=lambda row: float(row["development_weighted_delta"]),
+        )
+        best["development_best"] = 1
+    return output
+
+
+def _aggregate_policy_split(
+    rows: list[dict[str, object]],
+    split: str,
+) -> dict[str, float | int]:
+    current = [row for row in rows if str(row["split"]) == split]
+    frames = sum(int(row["evaluated_instance_frames"]) for row in current)
+    delta = (
+        sum(
+            float(row["mean_iou_delta_from_raw"])
+            * int(row["evaluated_instance_frames"])
+            for row in current
+        )
+        / frames
+        if frames
+        else float("nan")
+    )
+    return {
+        "frames": frames,
+        "delta": delta,
+        "improved": sum(int(row["improved_frames"]) for row in current),
+        "worse": sum(int(row["worse_frames"]) for row in current),
+        "changed": sum(
+            int(row["changed_from_raw_frames"]) for row in current
+        ),
+    }
 
 
 def _write_visualizations(
@@ -537,9 +647,6 @@ def _load_experiment(path: str | Path) -> V6SegmentationExperiment:
             support_dilation=int(model.get("support_dilation", 5)),
             point_positive_samples=int(
                 model.get("point_positive_samples", 6)
-            ),
-            point_negative_samples=int(
-                model.get("point_negative_samples", 4)
             ),
             adaptive_raw_support_recall=float(
                 model.get("adaptive_raw_support_recall", 0.70)

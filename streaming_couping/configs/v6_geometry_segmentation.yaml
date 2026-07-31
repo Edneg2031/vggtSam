@@ -21,7 +21,6 @@ model:
   min_candidate_support_recall: 0.25
   support_dilation: 5
   point_positive_samples: 6
-  point_negative_samples: 4
 
   # Trigger geometry correction only when raw SAM3.1 disagrees with the hint.
   adaptive_raw_support_recall: 0.70
