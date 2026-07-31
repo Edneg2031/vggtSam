@@ -1,0 +1,40 @@
+# V7 isolates fusion architecture while reusing frozen SAM3.1/StreamVGGT
+# observations. Cross-clip and long30 are report-only, not model-selection data.
+base_config: streaming_couping/configs/v6_sam31_long30_base.yaml
+external_base_config: streaming_couping/configs/v6_camera_sweep_base.yaml
+output_dir: outputs/streaming_couping_v7_fusion_ablation
+
+training_clip_name: 00a231a370_90_240_37_68_54
+validation_clip_name: 00a231a370_50_80_37_68_54
+long_clip_name: 00a231a370_90_525_step15_37_68_54
+external_clip_name: 00a231a370_492_589_37_68_54
+device: cuda:0
+
+architectures:
+  - l0_camera_only
+  - l1_monolithic_weighted_pool
+  - l2_monolithic_cross_attention
+  - l3_identity_key_geometry_value
+  - l4_local32_hierarchical
+
+model:
+  hidden_dim: 256
+  num_heads: 8
+  dropout: 0.0
+  local_token_count: 32
+  memory_momentum: 0.90
+  min_track_confidence: 0.25
+  unknown_reliability: 0.50
+  softened_mismatch_reliability: 0.25
+  identity_gate_policy: soft_unknown_strict_memory
+  max_rotation_degrees: 15.0
+  max_translation_native: 0.50
+
+training:
+  steps: 1200
+  learning_rate: 0.001
+  weight_decay: 0.0
+  grad_clip_norm: 5.0
+  translation_weight: 10.0
+  seed: 0
+  log_every: 200

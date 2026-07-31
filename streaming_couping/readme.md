@@ -54,6 +54,20 @@ zsh streaming_couping/commands_v6_sam31_long30_tracking_visualization_once.txt
 将非参考、GT 可见且 mask IoU ≥ 0.5 定义为追踪成功；GT 缺席帧的误检单独统计，
 不会抬高成功率。重复运行发现 `COMPLETE` 标记时直接复用，不重复渲染。
 
+V7 从轻到重的 fusion 消融复用上述 SAM3.1/StreamVGGT cache，不重新运行 backbone：
+
+```bash
+zsh streaming_couping/commands_v7_fusion_ablation.txt
+```
+
+它依次比较 camera-only、monolithic weighted pooling、当前式 monolithic
+cross-attention、identity-Key/geometry-Value 解耦 attention，以及 32 个局部世界几何
+token 的分层匹配。所有 train、temporal holdout、validation、cross-clip、long30 指标及
+固定 checkpoint 输入扰动都写入一个
+`outputs/streaming_couping_v7_fusion_ablation/v7_ablation.csv`。模型选择只读取
+temporal holdout 与 validation；cross-clip 和 long30 只报告、不参与选择。CSV 已透视成
+每个结构一行，最终只有 raw 加五种结构共六行，便于直接复制。
+
 长序列命令只占三张物理卡：StreamVGGT 的 24 层按连续区间分到两张卡，SAM3.1 单独使用
 第三张卡。每层 KV cache 保留完整因果历史，不切块、不重置；DPT/camera/depth/point
 输出逐帧卸载到 CPU。默认使用物理卡 `1,2,3`，可在命令前通过
