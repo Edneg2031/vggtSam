@@ -102,6 +102,10 @@ V4/V5 最终输出包括 native pointcloud/pose、GT/raw/ours 对比 PLY、三�
 版本演进、结果对比和当前最终版本总结见
 `streaming_couping/docs/sam3_streamvggt_work_summary.md`。
 
+SAM3/SAM3.1 分别如何作用于 camera hidden、DPT patch token、pointmap 和 ray solver 的
+详细数据流见
+`streaming_couping/docs/current_sam_to_streamvggt_camera_pointcloud.md`。
+
 V4/V5/V6 的详细实现与实验约束见
 `streaming_couping/docs/final_joint_pointcloud_pose_method.md`。
 
