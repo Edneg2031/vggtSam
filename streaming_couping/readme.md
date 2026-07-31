@@ -36,6 +36,18 @@ V6 五帧 camera 消融：
 zsh streaming_couping/commands_v6_camera_overfit.txt
 ```
 
+V6 30 帧完整历史压力测试（`90:20:670`）：
+
+```bash
+zsh streaming_couping/commands_v6_sam31_long30.txt
+```
+
+长序列命令只占三张物理卡：StreamVGGT 的 24 层按连续区间分到两张卡，SAM3.1 单独使用
+第三张卡。每层 KV cache 保留完整因果历史，不切块、不重置；DPT/camera/depth/point
+输出逐帧卸载到 CPU。默认使用物理卡 `1,2,3`，可在命令前通过
+`V6_STREAM_GPU0、V6_STREAM_GPU1、V6_SAM_GPU` 覆盖。该序列复用 frame 90 作为参考帧，
+用于验证 30 帧容量和长历史稳定性，不作为未见序列泛化证据。
+
 V6 复用冻结 cache，不训练 SAM3/StreamVGGT，不训练 pointmap，也不运行 ray solver。
 一次命令会用相同 seed 和步数训练 `camera_only、instance_only、fusion` 三套 6DoF 对照，再用
 fusion checkpoint 评估 `instance_off、camera_off、shuffle_time、wrong_geometry、
@@ -63,8 +75,8 @@ mask 中读取训练使用的 `37/68/54`；哪个在第 50 帧可见就初始化
 ID 保留为空槽。后续帧只要仍有一个可用 persistent instance 就运行；全部失效时两个候选在
 该帧严格回退 raw。这里使用 GT reference mask，但 GT pose 仍只参与最终指标计算。
 
-V4/V5 两条命令优先迁移已有 checkpoint；V6 每次从相同 seed 训练十三个模型。它们共用
-冻结 feature cache，但 checkpoint、评估和最终导出目录完全分开。
+V4/V5 两条命令继续复用原始 SAM3 cache；V6 使用独立的 SAM3.1 cache，并从相同 seed
+训练十三个 camera/instance 消融模型。两代 cache、checkpoint 和输出目录完全隔离。
 
 ## 保留的入口
 
@@ -73,6 +85,9 @@ configs/v4_coverage_first.yaml
 configs/v5_adaptive_best.yaml
 configs/v6_camera_overfit.yaml
 configs/v6_camera_sweep_base.yaml
+configs/v6_sam31_long30_base.yaml
+configs/v6_sam31_long30_camera.yaml
+configs/recovery_sam31_050_025.yaml
 scripts/run_instance_token_pose.py
 scripts/run_v5_reference_pose.py
 scripts/run_v5_adaptive.py
@@ -89,3 +104,13 @@ V4/V5 最终输出包括 native pointcloud/pose、GT/raw/ours 对比 PLY、三�
 
 V4/V5/V6 的详细实现与实验约束见
 `streaming_couping/docs/final_joint_pointcloud_pose_method.md`。
+
+当前 V6 cache 的实际数据流是：
+
+```text
+SAM3.1 raw tracking
+  → StreamVGGT 参考物体投影生成 box + positive points
+  → adaptive_positive_compete_010
+  → SAM3.1 mask 内池化 detector_fpn2
+  → 实例几何、instance token、camera/pointmap 实验
+```

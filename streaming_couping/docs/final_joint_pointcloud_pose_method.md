@@ -1,7 +1,8 @@
 # StreamVGGT + SAM3：V4、V5 与 V6 camera 消融
 
-> 2026-07-31：本文件中的 V6 camera 内容保留为历史机制消融。当前 V6 主线已经改为
-> “StreamVGGT 几何前置提示 SAM3.1 分割”，实现、命令与评价协议见
+> 2026-07-31：V6 主链已统一为 SAM3.1。StreamVGGT 先生成轻量 box + positive-point
+> 几何提示，`adaptive_positive_compete_010` 选出最终 mask；该 mask 同时用于实例几何、
+> SAM3.1 appearance pooling 和后续 camera/pointmap 实验。实现与分割评价协议见
 > `v6_geometry_guided_segmentation.md`；V4/V5 没有改动。
 
 当前代码保留两条完整方法和一条隔离的 camera-fusion 实验：
@@ -10,7 +11,7 @@
 |---|---|---|
 | V4 coverage-first | 后续解决错检的研究主线 | 保留关联 mask 覆盖率，使用 appearance + additive pose |
 | V5 adaptive-best | 点云安全的最终对照 | residual + bounded SO(3)，按 ray support 选择 raw/learned pointmap |
-| V6 camera overfit | 三种结构的五帧公平拟合实验 | camera-only / instance-only / fusion，无点云/solver |
+| V6 SAM3.1 | 几何辅助分割 + camera/instance 消融 | SAM3.1 最终 mask 统一驱动实例几何和 appearance token |
 
 旧结构消融、historical-anchor、current-raw solver、joint BA 和 shared-SE(3) 已从代码删除。
 历史实验结论体现在这里的版本选择中，不再保留不可运行的实验实现。

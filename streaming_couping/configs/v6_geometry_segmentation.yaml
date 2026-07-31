@@ -1,5 +1,5 @@
-# V6 now studies StreamVGGT geometry -> SAM3 segmentation.
-# V4/V5 and the historical V6 camera experiments remain unchanged.
+# Selected V6 StreamVGGT geometry -> SAM3.1 segmentation policy.
+# V4/V5 remain unchanged.
 base_config: v6_camera_sweep_base.yaml
 output_dir: ../../outputs/streaming_couping_v6_geometry_segmentation
 
@@ -15,7 +15,6 @@ sam:
 geometry_backend:
   type: streamvggt_reference_projection
   point_confidence_threshold: 0.30
-  negative_exclusion_radius: 5
 
 model:
   min_candidate_support_recall: 0.25
@@ -28,6 +27,9 @@ model:
   # The prompted mask must improve both support and the total geometry score.
   adaptive_support_margin: 0.05
   adaptive_score_margin: 0.05
+  # Selected compete_010 margin for replacing an otherwise reliable raw mask.
+  reliable_support_margin: 0.10
+  reliable_score_margin: 0.10
   # Simple protection against replacing a mask with a fragment or huge region.
   adaptive_min_area_ratio: 0.50
   adaptive_max_area_ratio: 4.00

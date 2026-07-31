@@ -18,11 +18,24 @@ from streaming_couping.src.learned_pose.export import export_final_ray_pose_outp
 def main() -> None:
     args = _parse_args()
     config = load_learned_pose_config(args.config)
-    if args.sam3_device is not None or args.geometry_device is not None:
+    if (
+        args.sam3_device is not None
+        or args.geometry_device is not None
+        or args.streamvggt_devices is not None
+    ):
         config = replace(
             config,
             sam3_device=args.sam3_device or config.sam3_device,
             geometry_device=args.geometry_device or config.geometry_device,
+            streamvggt_devices=(
+                tuple(
+                    value.strip()
+                    for value in args.streamvggt_devices.split(",")
+                    if value.strip()
+                )
+                if args.streamvggt_devices is not None
+                else config.streamvggt_devices
+            ),
         )
     if args.training_device is not None:
         config = replace(
@@ -63,6 +76,13 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sam3-device")
     parser.add_argument("--geometry-device")
+    parser.add_argument(
+        "--streamvggt-devices",
+        help=(
+            "Comma-separated CUDA devices for layer-wise StreamVGGT model "
+            "parallelism, for example cuda:0,cuda:1."
+        ),
+    )
     parser.add_argument("--training-device")
     parser.add_argument("--rebuild-cache", action="store_true")
     parser.add_argument(

@@ -111,30 +111,6 @@ class SAM3Wrapper:
             image_path,
             prompt=prompt,
             output_size=output_size,
-            prompt_box=None,
-        )
-
-    def propose_geometry_prompt_masks(
-        self,
-        image_path: str | Path,
-        *,
-        prompt: str,
-        output_size: tuple[int, int],
-        geometry_prompt: torch.Tensor,
-    ) -> list[SAM3MaskCandidate]:
-        """Segment one frame from text plus a StreamVGGT-derived box."""
-
-        prompt_box = mask_to_normalized_box(
-            geometry_prompt.detach().cpu().bool(),
-            image_path=Path(image_path),
-        )
-        if prompt_box is None:
-            return []
-        return self._propose_masks(
-            image_path,
-            prompt=prompt,
-            output_size=output_size,
-            prompt_box=prompt_box,
         )
 
     def propose_geometry_point_refined_masks(
@@ -145,9 +121,7 @@ class SAM3Wrapper:
         output_size: tuple[int, int],
         geometry_prompt: torch.Tensor,
         positive_prompt: torch.Tensor,
-        negative_prompt: torch.Tensor | None = None,
         max_positive_points: int = 6,
-        max_negative_points: int = 4,
     ) -> list[SAM3MaskCandidate]:
         """Run SAM3.1 text+box detection, then geometry-point refinement."""
 
@@ -165,13 +139,6 @@ class SAM3Wrapper:
         )
         if prompt_box is None or not positive:
             return []
-        negative = _sample_normalized_points(
-            negative_prompt,
-            limit=max_negative_points,
-        )
-        points = [*positive, *negative]
-        labels = [1] * len(positive) + [0] * len(negative)
-
         predictor = self._require_predictor()
         with tempfile.TemporaryDirectory(
             prefix="sam31_geometry_points_"
@@ -208,8 +175,8 @@ class SAM3Wrapper:
                     refined = predictor.add_prompt(
                         session_id=session_id,
                         frame_idx=0,
-                        points=points,
-                        point_labels=labels,
+                        points=positive,
+                        point_labels=[1] * len(positive),
                         clear_old_points=True,
                         obj_id=int(selected_obj_id),
                         rel_coordinates=True,
@@ -249,7 +216,6 @@ class SAM3Wrapper:
         *,
         prompt: str,
         output_size: tuple[int, int],
-        prompt_box: list[float] | None,
     ) -> list[SAM3MaskCandidate]:
         predictor = self._require_predictor()
         with tempfile.TemporaryDirectory(prefix="sam3_text_candidates_") as tmp:
@@ -261,17 +227,11 @@ class SAM3Wrapper:
                 )
                 session_id = _session_id(session)
                 try:
-                    kwargs = {
-                        "session_id": session_id,
-                        "frame_idx": 0,
-                        "text": prompt,
-                        "output_prob_thresh": self.output_threshold,
-                    }
-                    if prompt_box is not None:
-                        kwargs["bounding_boxes"] = [prompt_box]
-                        kwargs["bounding_box_labels"] = [1]
                     detected = predictor.add_prompt(
-                        **kwargs,
+                        session_id=session_id,
+                        frame_idx=0,
+                        text=prompt,
+                        output_prob_thresh=self.output_threshold,
                     )
                 finally:
                     predictor.close_session(session_id)
@@ -531,11 +491,11 @@ class SAM3Wrapper:
 
 
 def _sample_normalized_points(
-    mask: torch.Tensor | None,
+    mask: torch.Tensor,
     *,
     limit: int,
 ) -> list[list[float]]:
-    if mask is None or int(limit) <= 0:
+    if int(limit) <= 0:
         return []
     mask = mask.detach().cpu().bool()
     if mask.ndim != 2 or not mask.any():

@@ -32,6 +32,7 @@ def load_sam3_image_model(
     repo_path: Optional[str | Path],
     checkpoint_path: str | Path,
     device: str,
+    version: str = "sam3",
     enable_segmentation: bool = False,
     enable_inst_interactivity: bool = False,
 ):
@@ -57,9 +58,20 @@ def load_sam3_image_model(
             ) from exc
         raise
 
+    version = str(version).strip().lower()
+    if version not in {"sam3", "sam3.1"}:
+        raise ValueError(
+            f"Unsupported SAM image version {version!r}; "
+            "expected 'sam3' or 'sam3.1'."
+        )
     build_device = "cuda" if str(device).startswith("cuda") else "cpu"
     model = build_sam3_image_model(
-        checkpoint_path=str(checkpoint_path),
+        # SAM3.1 multiplex checkpoints exist in both ``detector.*`` and
+        # ``sam3_model.*`` layouts. Load that version below so the appearance
+        # path cannot silently keep a randomly initialized detector.
+        checkpoint_path=(
+            None if version == "sam3.1" else str(checkpoint_path)
+        ),
         device=build_device,
         eval_mode=True,
         load_from_HF=False,
@@ -67,7 +79,55 @@ def load_sam3_image_model(
         enable_inst_interactivity=enable_inst_interactivity,
         compile=False,
     )
+    if version == "sam3.1":
+        _load_sam31_image_checkpoint(model, checkpoint_path)
     return model.to(device).eval()
+
+
+def _load_sam31_image_checkpoint(
+    model,
+    checkpoint_path: str | Path,
+) -> None:
+    """Load the detector half of either public SAM3.1 checkpoint layout."""
+
+    try:
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+    except TypeError:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if (
+        isinstance(checkpoint, dict)
+        and "model" in checkpoint
+        and isinstance(checkpoint["model"], dict)
+    ):
+        checkpoint = checkpoint["model"]
+    if not isinstance(checkpoint, dict):
+        raise TypeError(
+            "SAM3.1 checkpoint must contain a tensor state dictionary."
+        )
+
+    detector = {}
+    for key, value in checkpoint.items():
+        if key.startswith("detector."):
+            detector[key.removeprefix("detector.")] = value
+        elif key.startswith("sam3_model."):
+            detector[key.removeprefix("sam3_model.")] = value
+    if not detector or not any(
+        key.startswith("backbone.") for key in detector
+    ):
+        raise RuntimeError(
+            "SAM3.1 checkpoint contains no detector backbone weights in "
+            "detector.* or sam3_model.* layout."
+        )
+    incompatible = model.load_state_dict(detector, strict=False)
+    print(
+        "loaded SAM3.1 image backbone "
+        f"keys={len(detector)} missing={len(incompatible.missing_keys)} "
+        f"unexpected={len(incompatible.unexpected_keys)}"
+    )
 
 
 class SAM3IntermediateAdapter:

@@ -1,10 +1,8 @@
-"""Lightweight geometry-assisted SAM3.1 segmentation.
+"""Selected lightweight StreamVGGT-assisted SAM3.1 segmentation policy.
 
-The segmentation policy consumes only three image-space masks: a coarse box,
-positive support, and optional negative evidence. StreamVGGT is the current
-producer of those masks, but the policy has no dependency on its hidden
-features or on a specific 3D registration implementation. GT is evaluation
-only and is deliberately absent from this module.
+The deployed policy consumes only a coarse image-space box and positive
+geometry support. It never reads GT and does not depend on geometry-model
+hidden features, ICP, or an object-map implementation.
 """
 
 from __future__ import annotations
@@ -20,53 +18,20 @@ from .backbones.sam3_wrapper import SAM3Wrapper
 from .types import SAM3MaskCandidate, TrackingSequence
 
 
+RAW_SAM31_VARIANT = "raw_sam31"
+V6_DEPLOYED_VARIANT = "v6_sam31_adaptive_positive_compete_010"
+V6_SEGMENTATION_VARIANTS = (
+    RAW_SAM31_VARIANT,
+    V6_DEPLOYED_VARIANT,
+)
+
+
 @dataclass(frozen=True)
 class GeometrySegmentationPrompt:
     """Backend-neutral image-space contract consumed by SAM3.1."""
 
     box_mask: torch.Tensor
     positive_mask: torch.Tensor
-    negative_mask: torch.Tensor
-
-
-@dataclass(frozen=True)
-class AdaptiveCorrectionPolicy:
-    """Optional margins for replacing an otherwise geometry-reliable raw mask."""
-
-    variant: str
-    reliable_support_margin: float | None
-    reliable_score_margin: float | None
-
-
-V6_ADAPTIVE_POLICIES = (
-    AdaptiveCorrectionPolicy(
-        variant="v6_sam31_adaptive_positive_safe",
-        reliable_support_margin=None,
-        reliable_score_margin=None,
-    ),
-    AdaptiveCorrectionPolicy(
-        variant="v6_sam31_adaptive_positive_compete_005",
-        reliable_support_margin=0.05,
-        reliable_score_margin=0.05,
-    ),
-    AdaptiveCorrectionPolicy(
-        variant="v6_sam31_adaptive_positive_compete_010",
-        reliable_support_margin=0.10,
-        reliable_score_margin=0.10,
-    ),
-    AdaptiveCorrectionPolicy(
-        variant="v6_sam31_adaptive_positive_compete_015",
-        reliable_support_margin=0.15,
-        reliable_score_margin=0.15,
-    ),
-)
-
-V6_SEGMENTATION_VARIANTS = (
-    "raw_sam31",
-    "current_sam3_late_geometry",
-    "v6_sam31_points_positive",
-    *(policy.variant for policy in V6_ADAPTIVE_POLICIES),
-)
 
 
 @dataclass(frozen=True)
@@ -76,8 +41,10 @@ class V6GeometrySegmentationConfig:
     point_positive_samples: int = 6
     adaptive_raw_support_recall: float = 0.70
     adaptive_raw_box_precision: float = 0.10
-    adaptive_score_margin: float = 0.05
     adaptive_support_margin: float = 0.05
+    adaptive_score_margin: float = 0.05
+    reliable_support_margin: float = 0.10
+    reliable_score_margin: float = 0.10
     adaptive_min_area_ratio: float = 0.50
     adaptive_max_area_ratio: float = 4.00
 
@@ -88,13 +55,12 @@ def segment_instance_with_geometry_prompts(
     sequence,
     reference_mask: torch.Tensor,
     raw_tracking: TrackingSequence,
-    current_late_tracking: TrackingSequence,
     geometry_prompts: Sequence[GeometrySegmentationPrompt | None],
     output_size: tuple[int, int],
     sam3: SAM3Wrapper,
     config: V6GeometrySegmentationConfig,
 ) -> dict[str, object]:
-    """Refine one tracked instance from backend-neutral image-space prompts."""
+    """Return raw SAM3.1 and the single selected V6 correction."""
 
     sequence_length = len(sequence.frame_indices)
     output_size = tuple(int(value) for value in output_size)
@@ -103,34 +69,20 @@ def segment_instance_with_geometry_prompts(
         output_size=output_size,
         reference_mask=reference_mask,
         raw_tracking=raw_tracking,
-        current_late_tracking=current_late_tracking,
         geometry_prompts=geometry_prompts,
     )
     reference = int(sequence.reference_frame_idx)
     raw_masks = raw_tracking.masks.detach().cpu().bool().clone()
     raw_scores = raw_tracking.scores.detach().cpu().float().clone()
-    masks_by_variant = {
-        variant: raw_masks.clone()
-        for variant in V6_SEGMENTATION_VARIANTS
-    }
-    scores_by_variant = {
-        variant: raw_scores.clone()
-        for variant in V6_SEGMENTATION_VARIANTS
-    }
-    masks_by_variant["current_sam3_late_geometry"] = (
-        current_late_tracking.masks.detach().cpu().bool().clone()
-    )
-    scores_by_variant["current_sam3_late_geometry"] = (
-        current_late_tracking.scores.detach().cpu().float().clone()
-    )
-    for variant in V6_SEGMENTATION_VARIANTS:
-        masks_by_variant[variant][reference] = (
-            reference_mask.detach().cpu().bool()
-        )
-        scores_by_variant[variant][reference] = 1.0
+    corrected_masks = raw_masks.clone()
+    corrected_scores = raw_scores.clone()
+    reference_mask = reference_mask.detach().cpu().bool()
+    raw_masks[reference] = reference_mask
+    raw_scores[reference] = 1.0
+    corrected_masks[reference] = reference_mask
+    corrected_scores[reference] = 1.0
 
     diagnostics: list[dict[str, object]] = []
-
     for frame, frame_index in enumerate(sequence.frame_indices):
         if frame == reference:
             diagnostics.append(
@@ -147,12 +99,11 @@ def segment_instance_with_geometry_prompts(
                 _fallback_diagnostic(
                     frame=frame,
                     frame_index=int(frame_index),
-                    reason="geometry_prompt_unavailable",
+                    raw_pixels=int(raw_masks[frame].sum()),
                 )
             )
             continue
         prompt = _normalize_prompt(source_prompt)
-
         raw_row = evaluate_mask_against_geometry(
             SAM3MaskCandidate(
                 obj_id=-1,
@@ -162,56 +113,47 @@ def segment_instance_with_geometry_prompts(
             prompt=prompt,
             config=config,
         )
-        positive_rows = _run_positive_point_prompt(
-            sam3=sam3,
-            image_path=Path(sequence.image_paths[frame]),
-            label=str(sequence.label),
-            output_size=output_size,
-            prompt=prompt,
-            config=config,
-        )
-        selected_positive = select_geometry_prompt_candidate(
-            positive_rows,
-            config=config,
-        )
-        _apply_selected(
-            masks_by_variant,
-            scores_by_variant,
-            variant="v6_sam31_points_positive",
-            frame=frame,
-            selected=selected_positive,
-        )
-        adaptive_results = {}
-        for policy in V6_ADAPTIVE_POLICIES:
-            selected, reason = select_adaptive_correction(
-                raw_row=raw_row,
-                prompted_row=selected_positive,
+        prompted_row = select_geometry_prompt_candidate(
+            _run_positive_point_prompt(
+                sam3=sam3,
+                image_path=Path(sequence.image_paths[frame]),
+                label=str(sequence.label),
+                output_size=output_size,
+                prompt=prompt,
                 config=config,
-                reliable_support_margin=policy.reliable_support_margin,
-                reliable_score_margin=policy.reliable_score_margin,
-            )
-            adaptive_results[policy.variant] = (selected, reason)
-            _apply_selected(
-                masks_by_variant,
-                scores_by_variant,
-                variant=policy.variant,
-                frame=frame,
-                selected=selected,
-            )
+            ),
+            config=config,
+        )
+        selected, reason = select_adaptive_correction(
+            raw_row=raw_row,
+            prompted_row=prompted_row,
+            config=config,
+        )
+        if selected is not None:
+            candidate = selected["candidate"]
+            corrected_masks[frame] = candidate.mask
+            corrected_scores[frame] = float(candidate.score)
         diagnostics.append(
             _frame_diagnostic(
                 frame=frame,
                 frame_index=int(frame_index),
                 prompt=prompt,
                 raw_row=raw_row,
-                selected_positive=selected_positive,
-                adaptive_results=adaptive_results,
+                prompted_row=prompted_row,
+                correction_applied=selected is not None,
+                correction_reason=reason,
             )
         )
 
     return {
-        "masks": masks_by_variant,
-        "scores": scores_by_variant,
+        "masks": {
+            RAW_SAM31_VARIANT: raw_masks,
+            V6_DEPLOYED_VARIANT: corrected_masks,
+        },
+        "scores": {
+            RAW_SAM31_VARIANT: raw_scores,
+            V6_DEPLOYED_VARIANT: corrected_scores,
+        },
         "diagnostics": diagnostics,
     }
 
@@ -278,15 +220,9 @@ def select_adaptive_correction(
     raw_row: dict[str, object],
     prompted_row: dict[str, object] | None,
     config: V6GeometrySegmentationConfig,
-    reliable_support_margin: float | None = None,
-    reliable_score_margin: float | None = None,
 ) -> tuple[dict[str, object] | None, str]:
-    """Use geometry as a conservative correction trigger, never a takeover."""
+    """Apply the selected compete-0.10 policy without a strategy sweep."""
 
-    if (reliable_support_margin is None) != (
-        reliable_score_margin is None
-    ):
-        raise ValueError("Competitive margins must be both set or both None.")
     if prompted_row is None:
         return None, "keep_raw:no_prompt_candidate"
     raw_pixels = int(raw_row["mask_pixels"])
@@ -297,12 +233,6 @@ def select_adaptive_correction(
         or raw_support < float(config.adaptive_raw_support_recall)
         or raw_box_precision < float(config.adaptive_raw_box_precision)
     )
-    competitive_enabled = (
-        reliable_support_margin is not None
-        and reliable_score_margin is not None
-    )
-    if not raw_unreliable and not competitive_enabled:
-        return None, "keep_raw:raw_geometry_reliable"
 
     prompted_pixels = int(prompted_row["mask_pixels"])
     if raw_pixels > 0:
@@ -328,12 +258,12 @@ def select_adaptive_correction(
     support_margin = (
         float(config.adaptive_support_margin)
         if raw_unreliable
-        else float(reliable_support_margin)
+        else float(config.reliable_support_margin)
     )
     score_margin = (
         float(config.adaptive_score_margin)
         if raw_unreliable
-        else float(reliable_score_margin)
+        else float(config.reliable_score_margin)
     )
     if raw_pixels > 0 and support_gain < support_margin:
         return None, "keep_raw:insufficient_support_gain"
@@ -361,9 +291,7 @@ def _run_positive_point_prompt(
         output_size=output_size,
         geometry_prompt=prompt.box_mask,
         positive_prompt=prompt.positive_mask,
-        negative_prompt=None,
         max_positive_points=int(config.point_positive_samples),
-        max_negative_points=0,
     )
     return [
         evaluate_mask_against_geometry(
@@ -375,43 +303,23 @@ def _run_positive_point_prompt(
     ]
 
 
-def _apply_selected(
-    masks_by_variant: dict[str, torch.Tensor],
-    scores_by_variant: dict[str, torch.Tensor],
-    *,
-    variant: str,
-    frame: int,
-    selected: dict[str, object] | None,
-) -> None:
-    if selected is None:
-        return
-    candidate = selected["candidate"]
-    masks_by_variant[variant][frame] = candidate.mask
-    scores_by_variant[variant][frame] = float(candidate.score)
-
-
 def _normalize_prompt(
     prompt: GeometrySegmentationPrompt,
 ) -> GeometrySegmentationPrompt:
     return GeometrySegmentationPrompt(
         box_mask=prompt.box_mask.detach().cpu().bool(),
         positive_mask=prompt.positive_mask.detach().cpu().bool(),
-        negative_mask=prompt.negative_mask.detach().cpu().bool(),
     )
 
 
 def _coverage(evidence: torch.Tensor, mask: torch.Tensor) -> float:
     denominator = int(evidence.sum())
-    if denominator == 0:
-        return 0.0
-    return float((evidence & mask).sum()) / denominator
+    return float((evidence & mask).sum()) / denominator if denominator else 0.0
 
 
 def _precision(mask: torch.Tensor, region: torch.Tensor) -> float:
     denominator = int(mask.sum())
-    if denominator == 0:
-        return 0.0
-    return float((mask & region).sum()) / denominator
+    return float((mask & region).sum()) / denominator if denominator else 0.0
 
 
 def _dilate(mask: torch.Tensor, radius: int) -> torch.Tensor:
@@ -432,25 +340,16 @@ def _reference_diagnostic(
     frame_index: int,
     reference_pixels: int,
 ) -> dict[str, object]:
-    available = reference_pixels > 0
     return {
         "sequence_index": frame,
         "frame_index": frame_index,
-        "prompt_available": int(available),
+        "prompt_available": int(reference_pixels > 0),
         "box_pixels": reference_pixels,
         "positive_pixels": reference_pixels,
-        "negative_pixels": 0,
-        "raw_support_recall": 1.0 if available else 0.0,
-        "raw_box_precision": 1.0 if available else 0.0,
-        "raw_geometry_score": 1.0 if available else 0.0,
         "raw_mask_pixels": reference_pixels,
-        "positive_support_recall": 1.0 if available else 0.0,
-        "positive_box_precision": 1.0 if available else 0.0,
-        "positive_geometry_score": 1.0 if available else 0.0,
-        "positive_mask_pixels": reference_pixels,
-        "positive_support_gain": 0.0,
-        "positive_score_gain": 0.0,
-        **_policy_diagnostics(default_reason="reference_mask"),
+        "prompted_mask_pixels": reference_pixels,
+        "correction_applied": 0,
+        "correction_reason": "reference_mask",
     }
 
 
@@ -458,7 +357,7 @@ def _fallback_diagnostic(
     *,
     frame: int,
     frame_index: int,
-    reason: str,
+    raw_pixels: int,
 ) -> dict[str, object]:
     return {
         "sequence_index": frame,
@@ -466,18 +365,10 @@ def _fallback_diagnostic(
         "prompt_available": 0,
         "box_pixels": 0,
         "positive_pixels": 0,
-        "negative_pixels": 0,
-        "raw_support_recall": float("nan"),
-        "raw_box_precision": float("nan"),
-        "raw_geometry_score": float("nan"),
-        "raw_mask_pixels": 0,
-        "positive_support_recall": float("nan"),
-        "positive_box_precision": float("nan"),
-        "positive_geometry_score": float("nan"),
-        "positive_mask_pixels": 0,
-        "positive_support_gain": float("nan"),
-        "positive_score_gain": float("nan"),
-        **_policy_diagnostics(default_reason=reason),
+        "raw_mask_pixels": raw_pixels,
+        "prompted_mask_pixels": 0,
+        "correction_applied": 0,
+        "correction_reason": "keep_raw:geometry_prompt_unavailable",
     }
 
 
@@ -487,70 +378,39 @@ def _frame_diagnostic(
     frame_index: int,
     prompt: GeometrySegmentationPrompt,
     raw_row: dict[str, object],
-    selected_positive: dict[str, object] | None,
-    adaptive_results: dict[
-        str,
-        tuple[dict[str, object] | None, str],
-    ],
+    prompted_row: dict[str, object] | None,
+    correction_applied: bool,
+    correction_reason: str,
 ) -> dict[str, object]:
-    positive_support = _selected_value(
-        selected_positive,
-        "support_recall",
-    )
-    positive_score = _selected_value(
-        selected_positive,
-        "geometry_score",
-    )
     return {
         "sequence_index": frame,
         "frame_index": frame_index,
         "prompt_available": 1,
         "box_pixels": int(prompt.box_mask.sum()),
         "positive_pixels": int(prompt.positive_mask.sum()),
-        "negative_pixels": int(prompt.negative_mask.sum()),
         "raw_support_recall": float(raw_row["support_recall"]),
         "raw_box_precision": float(raw_row["box_precision"]),
         "raw_geometry_score": float(raw_row["geometry_score"]),
         "raw_mask_pixels": int(raw_row["mask_pixels"]),
-        "positive_support_recall": positive_support,
-        "positive_box_precision": _selected_value(
-            selected_positive,
+        "prompted_support_recall": _selected_value(
+            prompted_row,
+            "support_recall",
+        ),
+        "prompted_box_precision": _selected_value(
+            prompted_row,
             "box_precision",
         ),
-        "positive_geometry_score": positive_score,
-        "positive_mask_pixels": _selected_int(
-            selected_positive,
+        "prompted_geometry_score": _selected_value(
+            prompted_row,
+            "geometry_score",
+        ),
+        "prompted_mask_pixels": _selected_int(
+            prompted_row,
             "mask_pixels",
         ),
-        "positive_support_gain": (
-            positive_support - float(raw_row["support_recall"])
-        ),
-        "positive_score_gain": (
-            positive_score - float(raw_row["geometry_score"])
-        ),
-        **_policy_diagnostics(adaptive_results=adaptive_results),
+        "correction_applied": int(correction_applied),
+        "correction_reason": correction_reason,
     }
-
-
-def _policy_diagnostics(
-    *,
-    adaptive_results: dict[
-        str,
-        tuple[dict[str, object] | None, str],
-    ]
-    | None = None,
-    default_reason: str = "",
-) -> dict[str, object]:
-    output: dict[str, object] = {}
-    for policy in V6_ADAPTIVE_POLICIES:
-        selected, reason = (
-            adaptive_results[policy.variant]
-            if adaptive_results is not None
-            else (None, default_reason)
-        )
-        output[f"{policy.variant}_applied"] = int(selected is not None)
-        output[f"{policy.variant}_reason"] = reason
-    return output
 
 
 def _selected_value(
@@ -573,29 +433,21 @@ def _validate_inputs(
     output_size: tuple[int, int],
     reference_mask: torch.Tensor,
     raw_tracking: TrackingSequence,
-    current_late_tracking: TrackingSequence,
     geometry_prompts: Sequence[GeometrySegmentationPrompt | None],
 ) -> None:
-    expected_masks = (sequence_length, *output_size)
     if tuple(reference_mask.shape) != output_size:
         raise ValueError("V6 reference mask/output size mismatch.")
-    if tuple(raw_tracking.masks.shape) != expected_masks:
-        raise ValueError("V6 raw SAM3 mask shape mismatch.")
-    if tuple(current_late_tracking.masks.shape) != expected_masks:
-        raise ValueError("V6 current-late mask shape mismatch.")
+    if tuple(raw_tracking.masks.shape) != (sequence_length, *output_size):
+        raise ValueError("V6 raw SAM3.1 mask shape mismatch.")
     if tuple(raw_tracking.scores.shape) != (sequence_length,):
-        raise ValueError("V6 raw SAM3 score shape mismatch.")
-    if tuple(current_late_tracking.scores.shape) != (sequence_length,):
-        raise ValueError("V6 current-late score shape mismatch.")
+        raise ValueError("V6 raw SAM3.1 score shape mismatch.")
     if len(geometry_prompts) != sequence_length:
         raise ValueError("V6 geometry-prompt/frame count mismatch.")
     for prompt in geometry_prompts:
         if prompt is None:
             continue
-        shapes = {
+        if {
             tuple(prompt.box_mask.shape),
             tuple(prompt.positive_mask.shape),
-            tuple(prompt.negative_mask.shape),
-        }
-        if shapes != {output_size}:
+        } != {output_size}:
             raise ValueError("V6 geometry-prompt/output size mismatch.")

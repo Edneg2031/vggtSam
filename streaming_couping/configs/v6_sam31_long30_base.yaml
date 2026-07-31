@@ -1,6 +1,9 @@
-# V6-only SAM3.1 cache/evaluation base. V4/V5 remain frozen.
+# V6 SAM3.1 long-sequence stress test.
+# The 30-frame clip deliberately starts at the known frame-90 reference and
+# therefore measures long-history behavior/capacity, not unseen-sequence
+# generalization. V4/V5 and the short V6 configs are not modified.
 recovery_config: streaming_couping/configs/recovery_sam31_050_025.yaml
-output_dir: outputs/streaming_couping_v6_camera_sweep_base
+output_dir: outputs/streaming_couping_v6_sam31_long30/base
 
 dataset:
   manifest: data/processed/scannetpp_pinhole_2d/manifest.json
@@ -13,37 +16,69 @@ dataset:
       instance_ids: [37, 68, 54]
       reference_sequence_index: 0
       split: train
-    - name: 00a231a370_492_589_37_68_54
-      scene_id: 00a231a370
-      frame_indices: [492, 512, 520, 545, 561, 589]
-      instance_ids: [37, 68, 54]
-      reference_sequence_index: 0
-      split: test
     - name: 00a231a370_50_80_37_68_54
       scene_id: 00a231a370
-      # Stop before frame 90 to avoid exact and near-neighbor training leakage.
       frame_indices: [50, 60, 70, 80]
-      # Match the training landmarks. Any visible subset is sufficient; an ID
-      # absent at frame 50 stays an empty slot instead of aborting the clip.
       instance_ids: [37, 68, 54]
       instance_source: configured_gt_reference
       allow_missing_reference_instances: true
       reference_sequence_index: 0
       split: validation
+    - name: 00a231a370_90_670_step20_37_68_54
+      scene_id: 00a231a370
+      frame_indices:
+        - 90
+        - 110
+        - 130
+        - 150
+        - 170
+        - 190
+        - 210
+        - 230
+        - 250
+        - 270
+        - 290
+        - 310
+        - 330
+        - 350
+        - 370
+        - 390
+        - 410
+        - 430
+        - 450
+        - 470
+        - 490
+        - 510
+        - 530
+        - 550
+        - 570
+        - 590
+        - 610
+        - 630
+        - 650
+        - 670
+      instance_ids: [37, 68, 54]
+      reference_sequence_index: 0
+      split: long_sequence_stress_test
 
 runtime:
-  sam3_device: cuda:3
-  geometry_device: cuda:1
+  # The command exposes exactly three physical GPUs. These are logical IDs:
+  # StreamVGGT uses two GPUs; SAM3.1 uses the third.
+  sam3_device: cuda:2
+  geometry_device: cuda:0
+  streamvggt_devices: ["cuda:0", "cuda:1"]
+  streamvggt_amp_dtype: bfloat16
 
 features:
-  # Never reuse the historical V4/V5 SAM3 cache.
-  cache_dir: outputs/streaming_couping_v6_sam31/cache
+  # Independent cache: short-sequence V6 results remain byte-for-byte intact.
+  cache_dir: outputs/streaming_couping_v6_sam31_long30/cache
   rebuild: false
   sam_source: detector_fpn2
-  # Deployed V6 mask policy selected on train+validation. Test was report-only.
   sam_segmentation_variant: v6_sam31_adaptive_positive_compete_010
   sam_resolution: 1008
   sam_grid: [72, 72]
+  # Keep the 1008px SAM3.1 appearance backbone bounded on a 24 GiB card.
+  sam_batch_size: 2
   geometry_prompt_point_confidence_threshold: 0.30
   point_confidence_threshold: 0.30
   min_instance_points: 128
@@ -87,7 +122,7 @@ training:
   weight_decay: 0.0001
   grad_clip_norm: 1.0
   seed: 0
-  device: cuda:1
+  device: cuda:0
   amp: false
 
 evaluation:

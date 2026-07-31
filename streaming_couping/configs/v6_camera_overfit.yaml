@@ -5,7 +5,7 @@
 # It intentionally uses GT pose only as a training target. It does not train
 # pointmaps and does not call the analytic ray-pose solver.
 base_config: streaming_couping/configs/v6_camera_sweep_base.yaml
-output_dir: outputs/streaming_couping_v6_camera_overfit
+output_dir: outputs/streaming_couping_v6_sam31_camera_overfit
 clip_name: 00a231a370_90_240_37_68_54
 test_clip_name: 00a231a370_492_589_37_68_54
 validation_clip_name: 00a231a370_50_80_37_68_54

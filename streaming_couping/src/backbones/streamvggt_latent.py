@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 
+from .streamvggt_parallel import LayerShardedStreamVGGT
 from .tokens import GeometryTokens
 from .vggt_loader import load_streamvggt_model
 
@@ -50,6 +51,7 @@ class StreamVGGTLatentAdapter:
         layer_index: int = -1,
         dpt_layer_indices: Sequence[int] = (4, 11, 17, 23),
         image_mode: str = "crop",
+        parallel_runner: Optional[LayerShardedStreamVGGT] = None,
     ) -> None:
         self.model = model.eval()
         self.device = device
@@ -58,6 +60,7 @@ class StreamVGGTLatentAdapter:
         self.layer_index = int(layer_index)
         self.dpt_layer_indices = tuple(int(index) for index in dpt_layer_indices)
         self.image_mode = image_mode
+        self.parallel_runner = parallel_runner
 
     @torch.no_grad()
     def extract_from_paths(
@@ -72,10 +75,13 @@ class StreamVGGTLatentAdapter:
         images = load_and_preprocess_images(
             [str(path) for path in image_paths],
             mode=self.image_mode,
-        ).to(self.device)
+        )
         if streaming_cache:
             return self.extract_streaming(images, return_pointmap=return_pointmap)
-        return self.extract(images, return_pointmap=return_pointmap)
+        return self.extract(
+            images.to(self.device),
+            return_pointmap=return_pointmap,
+        )
 
     @torch.no_grad()
     def extract(
@@ -84,6 +90,11 @@ class StreamVGGTLatentAdapter:
         *,
         return_pointmap: bool = True,
     ) -> StreamVGGTLatentOutput:
+        if self.parallel_runner is not None:
+            raise ValueError(
+                "Layer-sharded StreamVGGT requires streaming_cache=true; "
+                "non-streaming aggregation cannot preserve bounded memory."
+            )
         if images.ndim != 4:
             raise ValueError(f"Expected images [T, 3, H, W], got {tuple(images.shape)}")
         images = images.to(self.device)
@@ -186,6 +197,11 @@ class StreamVGGTLatentAdapter:
     ) -> StreamVGGTLatentOutput:
         if images.ndim != 4:
             raise ValueError(f"Expected images [T, 3, H, W], got {tuple(images.shape)}")
+        if self.parallel_runner is not None:
+            return self._extract_streaming_parallel(
+                images,
+                return_pointmap=return_pointmap,
+            )
         images = images.to(self.device)
         past_key_values = [None] * self.model.aggregator.depth
         context_chunks = []
@@ -225,18 +241,36 @@ class StreamVGGTLatentAdapter:
                 aggregated_tokens_list, patch_start_idx = aggregator_output
 
             for layer_out, layer_index in zip(dpt_layer_chunks, self.dpt_layer_indices):
-                layer_out.append(aggregated_tokens_list[layer_index].float())
+                layer_out.append(
+                    aggregated_tokens_list[layer_index]
+                    .detach()
+                    .float()
+                    .cpu()
+                )
             # Cache the exact tensor consumed by CameraHead instead of
             # inferring it later from one of the DPT levels.
             camera_hidden_chunks.append(
-                aggregated_tokens_list[-1][:, :, 0].float()
+                aggregated_tokens_list[-1][:, :, 0]
+                .detach()
+                .float()
+                .cpu()
             )
 
             tokens = aggregated_tokens_list[self.layer_index].float()
             patch_tokens = tokens[:, :, patch_start_idx:, :]
             spatial_tokens = reshape_patch_tokens(patch_tokens, patch_shape)
-            context_chunks.append(resize_token_map(spatial_tokens, self.context_grid))
-            dense_chunks.append(resize_token_map(spatial_tokens, self.token_grid))
+            context_chunks.append(
+                resize_token_map(spatial_tokens, self.context_grid)
+                .detach()
+                .float()
+                .cpu()
+            )
+            dense_chunks.append(
+                resize_token_map(spatial_tokens, self.token_grid)
+                .detach()
+                .float()
+                .cpu()
+            )
 
             if getattr(self.model, "camera_head", None) is not None:
                 with torch.cuda.amp.autocast(enabled=False):
@@ -245,7 +279,9 @@ class StreamVGGTLatentAdapter:
                         past_key_values_camera=past_key_values_camera,
                         use_cache=True,
                     )
-                camera_chunks.append(pose_enc_list[-1].float())
+                camera_chunks.append(
+                    pose_enc_list[-1].detach().float().cpu()
+                )
 
             if return_pointmap and getattr(self.model, "point_head", None) is not None:
                 with torch.cuda.amp.autocast(enabled=False):
@@ -256,16 +292,26 @@ class StreamVGGTLatentAdapter:
                     )
                 pointmap_dense = ensure_thwc(pts3d[0]).float()
                 confidence_dense = ensure_thwc(pts3d_conf[0]).float()
-                pointmap_dense_chunks.append(pointmap_dense)
-                confidence_dense_chunks.append(confidence_dense)
+                pointmap_dense_chunks.append(
+                    pointmap_dense.detach().float().cpu()
+                )
+                confidence_dense_chunks.append(
+                    confidence_dense.detach().float().cpu()
+                )
                 pointmap_chunks.append(
                     resize_dense_map(pointmap_dense, self.token_grid)
+                    .detach()
+                    .float()
+                    .cpu()
                 )
                 confidence_chunks.append(
                     resize_dense_map(
                         confidence_dense,
                         self.token_grid,
                     )
+                    .detach()
+                    .float()
+                    .cpu()
                 )
 
             if return_pointmap and getattr(self.model, "depth_head", None) is not None:
@@ -275,11 +321,187 @@ class StreamVGGTLatentAdapter:
                         images=batch_frame,
                         patch_start_idx=patch_start_idx,
                     )
-                depth_dense_chunks.append(ensure_thwc(depth[0]).float())
+                depth_dense_chunks.append(
+                    ensure_thwc(depth[0]).detach().float().cpu()
+                )
                 depth_confidence_dense_chunks.append(
-                    ensure_thwc(depth_confidence[0]).float()
+                    ensure_thwc(depth_confidence[0])
+                    .detach()
+                    .float()
+                    .cpu()
                 )
 
+        return self._assemble_streaming_output(
+            images=images.detach().float().cpu(),
+            patch_shape=patch_shape,
+            patch_start_idx=patch_start_idx,
+            context_chunks=context_chunks,
+            dense_chunks=dense_chunks,
+            dpt_layer_chunks=dpt_layer_chunks,
+            camera_hidden_chunks=camera_hidden_chunks,
+            camera_chunks=camera_chunks,
+            pointmap_chunks=pointmap_chunks,
+            pointmap_dense_chunks=pointmap_dense_chunks,
+            confidence_chunks=confidence_chunks,
+            confidence_dense_chunks=confidence_dense_chunks,
+            depth_dense_chunks=depth_dense_chunks,
+            depth_confidence_dense_chunks=depth_confidence_dense_chunks,
+            parallel=False,
+        )
+
+    @torch.no_grad()
+    def _extract_streaming_parallel(
+        self,
+        images: torch.Tensor,
+        *,
+        return_pointmap: bool,
+    ) -> StreamVGGTLatentOutput:
+        runner = self.parallel_runner
+        if runner is None:
+            raise RuntimeError("StreamVGGT parallel runner is not configured.")
+        images = images.detach().float().cpu()
+        runner.reset()
+        context_chunks = []
+        dense_chunks = []
+        dpt_layer_chunks = [[] for _ in self.dpt_layer_indices]
+        camera_hidden_chunks = []
+        camera_chunks = []
+        pointmap_chunks = []
+        pointmap_dense_chunks = []
+        confidence_chunks = []
+        confidence_dense_chunks = []
+        depth_dense_chunks = []
+        depth_confidence_dense_chunks = []
+        patch_start_idx = runner.patch_start_idx
+        patch_shape = patch_grid_from_images(
+            images[:1],
+            patch_size=runner.aggregator.patch_size,
+        )
+        feature_layer = runner.resolved_layer_index(self.layer_index)
+
+        for frame_idx in range(images.shape[0]):
+            frame = images[frame_idx : frame_idx + 1]
+            batch_frame = frame.unsqueeze(0)
+            selected = runner.aggregate_frame(batch_frame, frame_idx)
+
+            for layer_out, layer_index in zip(
+                dpt_layer_chunks,
+                self.dpt_layer_indices,
+            ):
+                layer_out.append(
+                    selected[layer_index].detach().float().cpu()
+                )
+            camera_hidden_chunks.append(
+                selected[runner.aggregator.depth - 1][:, :, 0]
+                .detach()
+                .float()
+                .cpu()
+            )
+
+            tokens = selected[feature_layer].float()
+            patch_tokens = tokens[:, :, patch_start_idx:, :]
+            spatial_tokens = reshape_patch_tokens(
+                patch_tokens,
+                patch_shape,
+            )
+            context_chunks.append(
+                resize_token_map(spatial_tokens, self.context_grid)
+                .detach()
+                .float()
+                .cpu()
+            )
+            dense_chunks.append(
+                resize_token_map(spatial_tokens, self.token_grid)
+                .detach()
+                .float()
+                .cpu()
+            )
+
+            if getattr(self.model, "camera_head", None) is not None:
+                camera_chunks.append(
+                    runner.camera(selected).detach().float().cpu()
+                )
+
+            if return_pointmap and getattr(self.model, "point_head", None) is not None:
+                pts3d, pts3d_conf = runner.points(selected, batch_frame)
+                pointmap_dense = ensure_thwc(pts3d[0]).float()
+                confidence_dense = ensure_thwc(pts3d_conf[0]).float()
+                pointmap_dense_chunks.append(
+                    pointmap_dense.detach().float().cpu()
+                )
+                confidence_dense_chunks.append(
+                    confidence_dense.detach().float().cpu()
+                )
+                pointmap_chunks.append(
+                    resize_dense_map(pointmap_dense, self.token_grid)
+                    .detach()
+                    .float()
+                    .cpu()
+                )
+                confidence_chunks.append(
+                    resize_dense_map(confidence_dense, self.token_grid)
+                    .detach()
+                    .float()
+                    .cpu()
+                )
+
+            if return_pointmap and getattr(self.model, "depth_head", None) is not None:
+                depth, depth_confidence = runner.depth(
+                    selected,
+                    batch_frame,
+                )
+                depth_dense_chunks.append(
+                    ensure_thwc(depth[0]).detach().float().cpu()
+                )
+                depth_confidence_dense_chunks.append(
+                    ensure_thwc(depth_confidence[0])
+                    .detach()
+                    .float()
+                    .cpu()
+                )
+            del selected
+
+        output = self._assemble_streaming_output(
+            images=images,
+            patch_shape=patch_shape,
+            patch_start_idx=patch_start_idx,
+            context_chunks=context_chunks,
+            dense_chunks=dense_chunks,
+            dpt_layer_chunks=dpt_layer_chunks,
+            camera_hidden_chunks=camera_hidden_chunks,
+            camera_chunks=camera_chunks,
+            pointmap_chunks=pointmap_chunks,
+            pointmap_dense_chunks=pointmap_dense_chunks,
+            confidence_chunks=confidence_chunks,
+            confidence_dense_chunks=confidence_dense_chunks,
+            depth_dense_chunks=depth_dense_chunks,
+            depth_confidence_dense_chunks=depth_confidence_dense_chunks,
+            parallel=True,
+        )
+        # Every tensor retained by the adapter is now on CPU. Release the
+        # long-history KV tensors before registration runs on geometry_device.
+        runner.reset()
+        return output
+
+    def _assemble_streaming_output(
+        self,
+        *,
+        images: torch.Tensor,
+        patch_shape: Tuple[int, int],
+        patch_start_idx: int,
+        context_chunks: list[torch.Tensor],
+        dense_chunks: list[torch.Tensor],
+        dpt_layer_chunks: list[list[torch.Tensor]],
+        camera_hidden_chunks: list[torch.Tensor],
+        camera_chunks: list[torch.Tensor],
+        pointmap_chunks: list[torch.Tensor],
+        pointmap_dense_chunks: list[torch.Tensor],
+        confidence_chunks: list[torch.Tensor],
+        confidence_dense_chunks: list[torch.Tensor],
+        depth_dense_chunks: list[torch.Tensor],
+        depth_confidence_dense_chunks: list[torch.Tensor],
+        parallel: bool,
+    ) -> StreamVGGTLatentOutput:
         context_tokens = torch.cat(context_chunks, dim=1)
         dense_tokens = torch.cat(dense_chunks, dim=1)
         dpt_tokens = [torch.cat(chunks, dim=1) for chunks in dpt_layer_chunks]
@@ -328,6 +550,7 @@ class StreamVGGTLatentAdapter:
                 "depth_dense": depth_dense,
                 "depth_confidence_dense": depth_confidence_dense,
                 "streaming_cache": True,
+                "streamvggt_model_parallel": parallel,
             },
         )
         return StreamVGGTLatentOutput(
@@ -340,6 +563,7 @@ class StreamVGGTLatentAdapter:
                 "patch_shape": patch_shape,
                 "image_shape": tuple(int(v) for v in images.shape[-2:]),
                 "streaming_cache": True,
+                "streamvggt_model_parallel": parallel,
             },
         )
 

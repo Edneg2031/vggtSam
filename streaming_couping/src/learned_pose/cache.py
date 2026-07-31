@@ -17,6 +17,10 @@ from ..backbones.streamvggt_latent import (
     StreamVGGTLatentAdapter,
     load_streamvggt_latent_model,
 )
+from ..backbones.streamvggt_parallel import (
+    LayerShardedStreamVGGT,
+    assert_processed_key_cache_equivalence,
+)
 
 from ..backbones.sam3_wrapper import SAM3Wrapper
 from ..backbones.streamvggt_wrapper import StreamVGGTWrapper
@@ -32,8 +36,14 @@ from ..instance_observations import (
 from ..pointmap_alignment import prepare_map_evaluation
 from ..pose_evaluation import _load_ground_truth_sequence
 from ..recovery import output_mask_to_stream
+from ..streamvggt_geometry_prompt import build_streamvggt_geometry_prompts
 from ..tracking_recovery import run_natural_recovery_tracking
 from ..types import TrackingSequence
+from ..v6_geometry_segmentation import (
+    V6_DEPLOYED_VARIANT,
+    V6GeometrySegmentationConfig,
+    segment_instance_with_geometry_prompts,
+)
 from .config import ClipConfig, LearnedPoseConfig
 from .observations import (
     build_geometry_observations,
@@ -57,6 +67,7 @@ def build_feature_caches(config: LearnedPoseConfig) -> list[Path]:
         if config.features.rebuild
         or not _cache_complete(
             path,
+            config=config,
             clip=clip,
             require_identity=config.fusion.strict_identity_gate,
         )
@@ -65,17 +76,41 @@ def build_feature_caches(config: LearnedPoseConfig) -> list[Path]:
         print("learned-pose feature caches are complete")
         return paths
 
+    _preflight_pending_clips(config, pending)
+    recovery = load_config(config.recovery_config)
+    if config.streamvggt_devices and not recovery.streaming_cache:
+        raise ValueError(
+            "Layer-sharded StreamVGGT requires streamvggt.streaming_cache=true "
+            f"in {config.recovery_config}."
+        )
     stream_model = load_streamvggt_latent_model(
-        repo_path=load_config(config.recovery_config).streamvggt_repo,
-        checkpoint_path=load_config(config.recovery_config).streamvggt_checkpoint,
-        device=config.geometry_device,
+        repo_path=recovery.streamvggt_repo,
+        checkpoint_path=recovery.streamvggt_checkpoint,
+        device=("cpu" if config.streamvggt_devices else config.geometry_device),
         strict=True,
     )
+    parallel_runner = None
+    if config.streamvggt_devices:
+        assert_processed_key_cache_equivalence()
+        print("StreamVGGT processed-key cache equivalence passed")
+        parallel_runner = LayerShardedStreamVGGT(
+            stream_model,
+            config.streamvggt_devices,
+            selected_layer_indices=config.fusion.dpt_layer_indices,
+            amp_dtype=config.streamvggt_amp_dtype,
+        )
+        print(
+            "StreamVGGT full-history model parallelism "
+            f"amp={config.streamvggt_amp_dtype}"
+        )
+        for line in parallel_runner.layout_summary():
+            print(f"  {line}")
     stream_adapter = StreamVGGTLatentAdapter(
         stream_model,
         device=config.geometry_device,
-        image_mode=load_config(config.recovery_config).image_mode,
+        image_mode=recovery.image_mode,
         dpt_layer_indices=config.fusion.dpt_layer_indices,
+        parallel_runner=parallel_runner,
     )
     sam_video_holder: dict[str, SAM3Wrapper] = {}
     for clip, path in pending:
@@ -89,16 +124,20 @@ def build_feature_caches(config: LearnedPoseConfig) -> list[Path]:
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(partial, path)
 
+    del partial, stream_adapter, parallel_runner, stream_model
+    gc.collect()
+    _empty_cuda_cache()
+
     # The image model and video predictor are both large. Never keep both on
     # the SAM device while extracting pooled appearance descriptors.
     sam_video_holder.clear()
     gc.collect()
     _empty_cuda_cache()
-    recovery = load_config(config.recovery_config)
     sam_image_model = load_sam3_image_model(
         repo_path=recovery.sam3_repo,
         checkpoint_path=recovery.sam3_checkpoint,
         device=config.sam3_device,
+        version=recovery.sam3_version,
         enable_segmentation=False,
         enable_inst_interactivity=False,
     )
@@ -113,12 +152,13 @@ def build_feature_caches(config: LearnedPoseConfig) -> list[Path]:
     for clip, path in pending:
         print(f"pooling frozen SAM3 observations clip={clip.name}")
         payload = load_feature_cache(path, require_complete=False)
-        output = sam_adapter.extract_from_paths(
+        tokens = _extract_sam_tokens_batched(
+            sam_adapter,
             payload["image_paths"],
-            prompt="object",
+            token_grid=config.features.sam_grid,
+            batch_size=config.features.sam_batch_size,
         )
         height, width = config.features.sam_grid
-        tokens = output.semantic.tokens[0]
         sequence = len(payload["frame_indices"])
         if tokens.shape[0] != sequence * height * width:
             raise RuntimeError(
@@ -134,10 +174,70 @@ def build_feature_caches(config: LearnedPoseConfig) -> list[Path]:
         payload["appearance_dim"] = int(appearance.shape[-1])
         payload["complete"] = True
         torch.save(payload, path)
-    del sam_adapter, sam_image_model, stream_adapter, stream_model
+    del sam_adapter, sam_image_model
     gc.collect()
     _empty_cuda_cache()
     return paths
+
+
+def _extract_sam_tokens_batched(
+    adapter: SAM3IntermediateAdapter,
+    image_paths: list[str],
+    *,
+    token_grid: tuple[int, int],
+    batch_size: int,
+) -> torch.Tensor:
+    """Extract SAM appearance tokens without retaining all images on GPU."""
+
+    if not image_paths:
+        raise ValueError("SAM appearance extraction requires image paths.")
+    effective_batch = (
+        len(image_paths)
+        if int(batch_size) <= 0
+        else min(int(batch_size), len(image_paths))
+    )
+    height, width = token_grid
+    chunks = []
+    for start in range(0, len(image_paths), effective_batch):
+        paths = image_paths[start : start + effective_batch]
+        output = adapter.extract_from_paths(paths, prompt="object")
+        tokens = output.semantic.tokens[0].detach().float().cpu()
+        expected = len(paths) * height * width
+        if tokens.shape[0] != expected:
+            raise RuntimeError(
+                "SAM3 token count does not match appearance batch: "
+                f"{tokens.shape[0]} vs {len(paths)}*{height}*{width}."
+            )
+        chunks.append(tokens)
+        del output, tokens
+        _empty_cuda_cache()
+    return torch.cat(chunks, dim=0)
+
+
+def _preflight_pending_clips(
+    config: LearnedPoseConfig,
+    pending: list[tuple[ClipConfig, Path]],
+) -> None:
+    """Reject bad frame ranges and missing RGB files before model loading."""
+
+    for clip, _ in pending:
+        sequence = load_rgb_sequence(
+            config.manifest,
+            scene_id=clip.scene_id,
+            frame_indices=clip.frame_indices,
+        )
+        if len(sequence.image_paths) != len(clip.frame_indices):
+            raise RuntimeError(
+                f"Clip preflight returned {len(sequence.image_paths)} images "
+                f"for {len(clip.frame_indices)} requested frames: {clip.name}."
+            )
+    print(
+        "cache preflight passed: "
+        + ", ".join(
+            f"{clip.name}={len(clip.frame_indices)}"
+            for clip, _ in pending
+        )
+    )
 
 
 def cache_path(config: LearnedPoseConfig, clip: ClipConfig) -> Path:
@@ -202,7 +302,33 @@ def _build_geometry_cache(
         output,
         shared.image_paths,
     )
-    if clip.instance_source == "sam3_reference":
+    from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+    baseline_w2c, baseline_intrinsics = pose_encoding_to_extri_intri(
+        output.geometry.camera_tokens.detach().float(),
+        image_size_hw=geometry_sequence.processed_size,
+    )
+    segmentation_diagnostics: list[dict[str, object]] = []
+    if config.features.sam_segmentation_variant != "legacy_recovery":
+        if clip.instance_source != "configured_gt_reference":
+            raise ValueError(
+                "V6 SAM3.1 geometry prompting currently requires "
+                "instance_source=configured_gt_reference."
+            )
+        recovered, segmentation_diagnostics = (
+            _run_v6_sam31_geometry_prompt_tracking(
+                recovery,
+                config,
+                clip,
+                sequences=sequences,
+                target_masks=target_masks,
+                geometry=geometry_sequence,
+                world_to_camera=baseline_w2c[0].detach().float().cpu(),
+                intrinsics=baseline_intrinsics[0].detach().float().cpu(),
+                sam_video_holder=sam_video_holder,
+            )
+        )
+    elif clip.instance_source == "sam3_reference":
         recovered, target_masks = _load_or_run_sam3_reference_tracking(
             recovery,
             clip,
@@ -272,12 +398,6 @@ def _build_geometry_cache(
     )
     depth = output.geometry.aux["depth_dense"].detach().float().cpu()
     depth_confidence = output.geometry.aux["depth_confidence_dense"].detach().float().cpu()
-    from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
-
-    baseline_w2c, baseline_intrinsics = pose_encoding_to_extri_intri(
-        output.geometry.camera_tokens.detach().float(),
-        image_size_hw=geometry_sequence.processed_size,
-    )
     pose_observations = build_pose_residual_observations(
         world_points=geometry_sequence.world_points,
         confidence=geometry_sequence.confidence,
@@ -413,6 +533,21 @@ def _build_geometry_cache(
         ),
         "reference_sequence_index": clip.reference_sequence_index,
         "strict_identity_gate": bool(config.fusion.strict_identity_gate),
+        "sam_version": str(recovery.sam3_version),
+        "sam_checkpoint": str(recovery.sam3_checkpoint),
+        "sam_appearance_source": config.features.sam_source,
+        "sam_appearance_batch_size": config.features.sam_batch_size,
+        "sam_segmentation_variant": (
+            config.features.sam_segmentation_variant
+        ),
+        "streamvggt_execution": (
+            "layer_sharded_full_history"
+            if config.streamvggt_devices
+            else "single_device_full_history"
+        ),
+        "streamvggt_devices": list(config.streamvggt_devices),
+        "streamvggt_amp_dtype": config.streamvggt_amp_dtype,
+        "segmentation_diagnostics": segmentation_diagnostics,
         "image_paths": [str(path) for path in shared.image_paths],
         "image_size": list(geometry_sequence.processed_size),
         "patch_start_idx": int(output.geometry.aux["patch_start_idx"]),
@@ -475,6 +610,110 @@ def _build_geometry_cache(
     )
     payload["stream_images"] = output.geometry.aux["stream_images"].detach().float().cpu()
     return payload
+
+
+def _run_v6_sam31_geometry_prompt_tracking(
+    recovery,
+    config: LearnedPoseConfig,
+    clip: ClipConfig,
+    *,
+    sequences: Mapping[int, object],
+    target_masks: Mapping[int, torch.Tensor],
+    geometry,
+    world_to_camera: torch.Tensor,
+    intrinsics: torch.Tensor,
+    sam_video_holder: dict[str, SAM3Wrapper],
+) -> tuple[dict[int, TrackingSequence], list[dict[str, object]]]:
+    """Build the deployed V6 masks from SAM3.1 plus simple geometry prompts."""
+
+    variant = config.features.sam_segmentation_variant
+    if recovery.sam3_version != "sam3.1":
+        raise ValueError(
+            f"{variant} requires sam3.version=sam3.1, "
+            f"got {recovery.sam3_version!r}."
+        )
+    if variant != V6_DEPLOYED_VARIANT:
+        raise ValueError(
+            f"Unsupported V6 segmentation variant: {variant!r}."
+        )
+
+    sam3: SAM3Wrapper | None = None
+    recovered: dict[int, TrackingSequence] = {}
+    diagnostics: list[dict[str, object]] = []
+    segmentation_config = V6GeometrySegmentationConfig()
+    for instance_id in clip.instance_ids:
+        instance_id = int(instance_id)
+        reference = int(clip.reference_sequence_index)
+        reference_mask = target_masks[instance_id][reference].bool()
+        if not bool(reference_mask.any()):
+            recovered[instance_id] = _empty_tracking(
+                sequence=len(clip.frame_indices),
+                output_size=recovery.output_size,
+            )
+            diagnostics.append(
+                {
+                    "clip": clip.name,
+                    "instance_id": instance_id,
+                    "sequence_index": reference,
+                    "frame_index": int(clip.frame_indices[reference]),
+                    "selected_variant": variant,
+                    "status": "empty_reference_slot",
+                }
+            )
+            continue
+
+        if sam3 is None:
+            sam3 = _sam_video_model(recovery, sam_video_holder)
+        sequence = sequences[instance_id]
+        raw = sam3.track(
+            sequence.image_paths,
+            prompt=sequence.label,
+            output_size=recovery.output_size,
+            reference_frame_idx=reference,
+            reference_mask=reference_mask,
+        )
+        prompt_batch = build_streamvggt_geometry_prompts(
+            recovery=recovery,
+            sequence=sequence,
+            reference_mask=reference_mask,
+            world_points=geometry.world_points,
+            confidence=geometry.confidence,
+            world_to_camera=world_to_camera,
+            intrinsics=intrinsics,
+            source_sizes=geometry.source_sizes,
+            processed_size=geometry.processed_size,
+            point_confidence_threshold=(
+                config.features.geometry_prompt_point_confidence_threshold
+            ),
+        )
+        result = segment_instance_with_geometry_prompts(
+            sequence=sequence,
+            reference_mask=reference_mask,
+            raw_tracking=raw,
+            geometry_prompts=prompt_batch.prompts,
+            output_size=recovery.output_size,
+            sam3=sam3,
+            config=segmentation_config,
+        )
+        recovered[instance_id] = TrackingSequence(
+            masks=result["masks"][variant].bool(),
+            scores=result["scores"][variant].float(),
+            selected_obj_id=raw.selected_obj_id,
+        )
+        for segmentation_row, backend_row in zip(
+            result["diagnostics"],
+            prompt_batch.diagnostics,
+        ):
+            diagnostics.append(
+                {
+                    "clip": clip.name,
+                    "instance_id": instance_id,
+                    "selected_variant": variant,
+                    **backend_row,
+                    **segmentation_row,
+                }
+            )
+    return recovered, diagnostics
 
 
 def _load_or_run_tracking(
@@ -699,6 +938,10 @@ def _sam_video_model(
             device=recovery.sam3_device,
             output_threshold=recovery.sam3_output_threshold,
             prompt_with_box=recovery.prompt_with_box,
+            version=recovery.sam3_version,
+            use_fa3=recovery.sam3_use_fa3,
+            max_num_objects=recovery.sam3_max_num_objects,
+            multiplex_count=recovery.sam3_multiplex_count,
         ).load()
     return holder["model"]
 
@@ -837,6 +1080,7 @@ def _target_depth(
 def _cache_complete(
     path: Path,
     *,
+    config: LearnedPoseConfig | None = None,
     clip: ClipConfig | None = None,
     require_identity: bool = False,
 ) -> bool:
@@ -848,6 +1092,34 @@ def _cache_complete(
         return False
     if not bool(payload.get("complete", False)):
         return False
+    if (
+        config is not None
+        and config.features.sam_segmentation_variant != "legacy_recovery"
+    ):
+        recovery = load_config(config.recovery_config)
+        if (
+            str(payload.get("sam_version", "")) != recovery.sam3_version
+            or str(payload.get("sam_checkpoint", ""))
+            != str(recovery.sam3_checkpoint)
+            or str(payload.get("sam_appearance_source", ""))
+            != config.features.sam_source
+            or str(payload.get("sam_segmentation_variant", ""))
+            != config.features.sam_segmentation_variant
+        ):
+            return False
+    if config is not None and config.streamvggt_devices:
+        if (
+            str(payload.get("streamvggt_execution", ""))
+            != "layer_sharded_full_history"
+            or tuple(
+                str(value)
+                for value in payload.get("streamvggt_devices", ())
+            )
+            != config.streamvggt_devices
+            or str(payload.get("streamvggt_amp_dtype", ""))
+            != config.streamvggt_amp_dtype
+        ):
+            return False
     if require_identity and any(
         name not in payload
         for name in (

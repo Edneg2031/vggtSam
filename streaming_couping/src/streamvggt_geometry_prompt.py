@@ -6,7 +6,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 
 from .aggregation.mine_revisit_segments import mine_revisit_candidate
 from .aggregation.point_map_fusion import sample_masked_observation
@@ -36,7 +35,6 @@ def build_streamvggt_geometry_prompts(
     source_sizes: Sequence[tuple[int, int]],
     processed_size: tuple[int, int],
     point_confidence_threshold: float,
-    negative_exclusion_radius: int,
 ) -> StreamVGGTGeometryPromptBatch:
     """Project one reference object into each frame using StreamVGGT outputs."""
 
@@ -117,14 +115,7 @@ def build_streamvggt_geometry_prompts(
             support_relative_distance=recovery.support_relative_distance,
         )
         accepted = bool(geometry.accepted and geometry.supported_mask.any())
-        prompts.append(
-            _geometry_to_prompt(
-                geometry,
-                negative_exclusion_radius=negative_exclusion_radius,
-            )
-            if accepted
-            else None
-        )
+        prompts.append(_geometry_to_prompt(geometry) if accepted else None)
         diagnostics.append(
             _diagnostic(
                 frame=frame,
@@ -142,18 +133,10 @@ def build_streamvggt_geometry_prompts(
     )
 
 
-def _geometry_to_prompt(
-    geometry,
-    *,
-    negative_exclusion_radius: int,
-) -> GeometrySegmentationPrompt:
-    positive = geometry.supported_mask.detach().cpu().bool()
-    projected = geometry.projected_mask.detach().cpu().bool()
+def _geometry_to_prompt(geometry) -> GeometrySegmentationPrompt:
     return GeometrySegmentationPrompt(
         box_mask=geometry.mask.detach().cpu().bool(),
-        positive_mask=positive,
-        negative_mask=projected
-        & ~_dilate(positive, int(negative_exclusion_radius)),
+        positive_mask=geometry.supported_mask.detach().cpu().bool(),
     )
 
 
@@ -175,18 +158,6 @@ def _diagnostic(
         "projected_points": projected_points,
         "supported_points": supported_points,
     }
-
-
-def _dilate(mask: torch.Tensor, radius: int) -> torch.Tensor:
-    if radius <= 0:
-        return mask.bool()
-    kernel = 2 * radius + 1
-    return F.max_pool2d(
-        mask.float()[None, None],
-        kernel_size=kernel,
-        stride=1,
-        padding=radius,
-    )[0, 0].bool()
 
 
 def _validate_inputs(

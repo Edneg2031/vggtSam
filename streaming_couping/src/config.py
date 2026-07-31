@@ -23,6 +23,10 @@ class ExperimentConfig:
     sam3_device: str
     sam3_output_threshold: float
     prompt_with_box: bool
+    sam3_version: str
+    sam3_use_fa3: bool
+    sam3_max_num_objects: int
+    sam3_multiplex_count: int
 
     streamvggt_repo: Path
     streamvggt_checkpoint: Path
@@ -97,6 +101,10 @@ def load_config(
         sam3_device=str(overrides.get("sam3_device", sam3.get("device", "cuda:0"))),
         sam3_output_threshold=float(sam3.get("output_threshold", 0.5)),
         prompt_with_box=bool(sam3.get("prompt_with_box", True)),
+        sam3_version=str(sam3.get("version", "sam3")).strip().lower(),
+        sam3_use_fa3=bool(sam3.get("use_fa3", False)),
+        sam3_max_num_objects=int(sam3.get("max_num_objects", 16)),
+        sam3_multiplex_count=int(sam3.get("multiplex_count", 16)),
         streamvggt_repo=_path(stream.get("repo", "externals/streamvggt")),
         streamvggt_checkpoint=_path(stream.get("checkpoint")),
         geometry_device=str(
@@ -179,6 +187,12 @@ def load_config(
         raise ValueError(
             "point_cloud.confidence_threshold must be in [0, 1]."
         )
+    if config.sam3_version not in {"sam3", "sam3.1"}:
+        raise ValueError("sam3.version must be 'sam3' or 'sam3.1'.")
+    if config.sam3_max_num_objects < 1:
+        raise ValueError("sam3.max_num_objects must be positive.")
+    if config.sam3_multiplex_count < 1:
+        raise ValueError("sam3.multiplex_count must be positive.")
     if config.point_cloud_max_points < 1:
         raise ValueError("point_cloud.max_points must be positive.")
     if config.map_metric_max_points < 1:

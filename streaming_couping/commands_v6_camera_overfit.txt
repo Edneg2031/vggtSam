@@ -13,25 +13,16 @@ echo "streaming_couping python=$PYTHON_BIN"
 
 BASE_CONFIG=streaming_couping/configs/v6_camera_sweep_base.yaml
 V6_CONFIG=streaming_couping/configs/v6_camera_overfit.yaml
-OUTPUT=outputs/streaming_couping_v6_camera_overfit
-TRAIN_CACHE=outputs/streaming_couping_v5_ablation/cache/00a231a370_90_240_37_68_54.pt
-TEST_CACHE=outputs/streaming_couping_v5_ablation/cache/00a231a370_492_589_37_68_54.pt
-VALIDATION_CACHE=outputs/streaming_couping_v5_ablation/cache/00a231a370_50_80_37_68_54.pt
+OUTPUT=outputs/streaming_couping_v6_sam31_camera_overfit
 
-# Do not touch SAM3/StreamVGGT when all three frozen clip caches are present.
-# If one is absent, the retained cache builder creates only missing observations.
-if [[ -f "$TRAIN_CACHE" && -f "$TEST_CACHE" && -f "$VALIDATION_CACHE" ]]; then
-  echo "reusing frozen cache: $TRAIN_CACHE"
-  echo "reusing frozen cache: $TEST_CACHE"
-  echo "reusing frozen cache: $VALIDATION_CACHE"
-else
-  PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.run_instance_token_pose \
-    --config "$BASE_CONFIG" \
-    --stage cache \
-    --sam3-device cuda:3 \
-    --geometry-device cuda:1 \
-    --training-device cuda:1
-fi
+# Build or validate the isolated SAM3.1 cache. This is a cheap no-op after the
+# three clips are complete, but it also rejects stale SAM3/V5 cache metadata.
+PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.run_instance_token_pose \
+  --config "$BASE_CONFIG" \
+  --stage cache \
+  --sam3-device cuda:3 \
+  --geometry-device cuda:1 \
+  --training-device cuda:1
 
 # Retrain 3 controls, 7 component models and 3 extra auxiliary-loss models.
 export PYTHONHASHSEED=0
@@ -47,11 +38,7 @@ PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.run_v
   --warmup 20 \
   --repeats 200
 
+echo "V6 SAM3.1 SHORT SUMMARY (copy only these two tables)"
 sed -n '1,8p' "$OUTPUT/v6_cross_clip_summary.csv"
-sed -n '1,9p' "$OUTPUT/v6_frame_diagnostics.csv"
-sed -n '1,9p' "$OUTPUT/v6_component_sweep.csv"
-sed -n '1,12p' "$OUTPUT/v6_v63_sweep.csv"
-sed -n '1,7p' "$OUTPUT/v6_v64_aux_sweep.csv"
 sed -n '1,5p' "$OUTPUT/v6_validation_summary.csv"
-sed -n '1,10p' "$OUTPUT/v6_gate_summary.csv"
-sed -n '1,10p' "$OUTPUT/v6_inference_speed.csv"
+echo "full artifacts=$OUTPUT"

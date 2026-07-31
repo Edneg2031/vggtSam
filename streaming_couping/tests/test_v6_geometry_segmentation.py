@@ -6,8 +6,8 @@ import numpy as np
 import torch
 from PIL import Image
 
-from streaming_couping.scripts.run_v6_geometry_segmentation import (
-    _policy_selection_rows,
+from streaming_couping.src.backbones.sam3_intermediate import (
+    _load_sam31_image_checkpoint,
 )
 from streaming_couping.src.backbones.sam3_video import (
     _bool_compatible_argsort,
@@ -16,8 +16,9 @@ from streaming_couping.src.backbones.sam3_video import (
 from streaming_couping.src.backbones.sam3_wrapper import SAM3Wrapper
 from streaming_couping.src.types import SAM3MaskCandidate
 from streaming_couping.src.v6_geometry_segmentation import (
-    V6_ADAPTIVE_POLICIES,
     GeometrySegmentationPrompt,
+    V6_DEPLOYED_VARIANT,
+    V6_SEGMENTATION_VARIANTS,
     V6GeometrySegmentationConfig,
     select_adaptive_correction,
     select_geometry_prompt_candidate,
@@ -125,7 +126,7 @@ def test_adaptive_policy_keeps_geometry_reliable_raw_mask() -> None:
     )
 
     assert selected is None
-    assert reason == "keep_raw:raw_geometry_reliable"
+    assert reason == "keep_raw:insufficient_support_gain"
 
 
 def test_adaptive_policy_applies_clear_geometry_improvement() -> None:
@@ -182,8 +183,6 @@ def test_competitive_policy_can_replace_reliable_raw_on_clear_gain() -> None:
         raw_row=raw,
         prompted_row=prompted,
         config=V6GeometrySegmentationConfig(),
-        reliable_support_margin=0.10,
-        reliable_score_margin=0.10,
     )
 
     assert selected is prompted
@@ -212,8 +211,6 @@ def test_competitive_policy_keeps_reliable_raw_below_margin() -> None:
         raw_row=raw,
         prompted_row=prompted,
         config=V6GeometrySegmentationConfig(),
-        reliable_support_margin=0.10,
-        reliable_score_margin=0.10,
     )
 
     assert selected is None
@@ -252,136 +249,19 @@ def test_adaptive_policy_rejects_huge_prompt_when_raw_is_missing() -> None:
     assert reason == "keep_raw:prompt_too_large_for_box"
 
 
-def test_geometry_backend_contract_is_three_image_space_masks() -> None:
+def test_geometry_backend_contract_is_two_image_space_masks() -> None:
     prompt = GeometrySegmentationPrompt(
         box_mask=torch.ones(8, 8, dtype=torch.bool),
         positive_mask=torch.zeros(8, 8, dtype=torch.bool),
-        negative_mask=torch.zeros(8, 8, dtype=torch.bool),
     )
     prompt.positive_mask[1, 1] = True
-    prompt.negative_mask[6, 6] = True
 
     assert prompt.box_mask.shape == (8, 8)
     assert prompt.positive_mask[1, 1]
-    assert prompt.negative_mask[6, 6]
-    assert not prompt.negative_mask[1, 1]
-
-
-def test_policy_selection_uses_development_splits_not_test() -> None:
-    development = {
-        V6_ADAPTIVE_POLICIES[0].variant: (0.10, 0),
-        V6_ADAPTIVE_POLICIES[1].variant: (0.05, 0),
-        V6_ADAPTIVE_POLICIES[2].variant: (0.20, 1),
-        V6_ADAPTIVE_POLICIES[3].variant: (0.15, 0),
-    }
-    test_delta = {
-        V6_ADAPTIVE_POLICIES[0].variant: 0.0,
-        V6_ADAPTIVE_POLICIES[1].variant: 1.0,
-        V6_ADAPTIVE_POLICIES[2].variant: 2.0,
-        V6_ADAPTIVE_POLICIES[3].variant: -1.0,
-    }
-    rows = []
-    for policy in V6_ADAPTIVE_POLICIES:
-        delta, worse = development[policy.variant]
-        for split in ("train", "validation"):
-            rows.append(
-                _summary_row(
-                    policy.variant,
-                    split,
-                    delta=delta,
-                    worse=worse if split == "validation" else 0,
-                )
-            )
-        rows.append(
-            _summary_row(
-                policy.variant,
-                "test",
-                delta=test_delta[policy.variant],
-                worse=0,
-            )
-        )
-
-    selected = _policy_selection_rows(rows)
-
-    best = [row for row in selected if int(row["development_best"])]
-    assert len(best) == 1
-    assert best[0]["variant"] == V6_ADAPTIVE_POLICIES[3].variant
-    unsafe = next(
-        row
-        for row in selected
-        if row["variant"] == V6_ADAPTIVE_POLICIES[2].variant
+    assert V6_SEGMENTATION_VARIANTS == (
+        "raw_sam31",
+        V6_DEPLOYED_VARIANT,
     )
-    assert not int(unsafe["development_safe"])
-
-
-def _summary_row(
-    variant: str,
-    split: str,
-    *,
-    delta: float,
-    worse: int,
-) -> dict[str, object]:
-    return {
-        "variant": variant,
-        "split": split,
-        "evaluated_instance_frames": 10,
-        "mean_iou_delta_from_raw": delta,
-        "improved_frames": int(delta > 0),
-        "worse_frames": worse,
-        "changed_from_raw_frames": 1,
-    }
-
-
-def test_sam3_geometry_prompt_is_passed_as_text_plus_box(tmp_path: Path) -> None:
-    image_path = tmp_path / "frame.jpg"
-    Image.new("RGB", (100, 50), "black").save(image_path)
-
-    class Predictor:
-        def __init__(self) -> None:
-            self.kwargs = None
-
-        def start_session(self, *, resource_path):
-            assert Path(resource_path).is_dir()
-            return {"session_id": "test"}
-
-        def add_prompt(self, **kwargs):
-            self.kwargs = kwargs
-            return {
-                "frame_index": 0,
-                "outputs": {
-                    "out_obj_ids": np.asarray([7]),
-                    "out_binary_masks": np.ones((1, 1, 50, 100), dtype=bool),
-                    "out_probs": np.asarray([0.8]),
-                },
-            }
-
-        def close_session(self, session_id):
-            assert session_id == "test"
-
-    wrapper = SAM3Wrapper(
-        repo_path=tmp_path,
-        checkpoint_path=tmp_path / "unused.pt",
-        device="cuda:0",
-        output_threshold=0.5,
-        prompt_with_box=True,
-    )
-    predictor = Predictor()
-    wrapper.predictor = predictor
-    geometry = torch.zeros(50, 100, dtype=torch.bool)
-    geometry[10:30, 20:60] = True
-
-    candidates = wrapper.propose_geometry_prompt_masks(
-        image_path,
-        prompt="bed",
-        output_size=(50, 100),
-        geometry_prompt=geometry,
-    )
-
-    assert len(candidates) == 1
-    assert predictor.kwargs["text"] == "bed"
-    assert predictor.kwargs["bounding_box_labels"] == [1]
-    box = predictor.kwargs["bounding_boxes"][0]
-    np.testing.assert_allclose(box, [0.2, 0.2, 0.4, 0.4])
 
 
 def test_sam31_geometry_points_refine_the_box_selected_object(
@@ -429,16 +309,12 @@ def test_sam31_geometry_points_refine_the_box_selected_object(
     positive = torch.zeros_like(geometry)
     positive[15, 25] = True
     positive[25, 50] = True
-    negative = torch.zeros_like(geometry)
-    negative[5, 10] = True
-
     candidates = wrapper.propose_geometry_point_refined_masks(
         image_path,
         prompt="bed",
         output_size=(50, 100),
         geometry_prompt=geometry,
         positive_prompt=positive,
-        negative_prompt=negative,
     )
 
     assert len(candidates) == 1
@@ -447,8 +323,8 @@ def test_sam31_geometry_points_refine_the_box_selected_object(
     assert "points" not in predictor.calls[0]
     assert "text" not in predictor.calls[1]
     assert predictor.calls[1]["obj_id"] == 7
-    assert predictor.calls[1]["point_labels"] == [1, 1, 0]
-    assert len(predictor.calls[1]["points"]) == 3
+    assert predictor.calls[1]["point_labels"] == [1, 1]
+    assert len(predictor.calls[1]["points"]) == 2
 
 
 def test_v6_segmentation_command_and_config_are_retained() -> None:
@@ -462,11 +338,46 @@ def test_v6_segmentation_command_and_config_are_retained() -> None:
 
     assert "run_v6_geometry_segmentation" in command
     assert "v6_segmentation_summary.csv" in command
-    assert "v6_policy_selection.csv" in command
     assert "sam3.1_multiplex.pt" in command
     assert "version: sam3.1" in config
     assert "type: streamvggt_reference_projection" in config
     assert "min_candidate_support_recall: 0.25" in config
     assert "adaptive_raw_support_recall: 0.70" in config
     assert "adaptive_score_margin: 0.05" in config
+    assert "reliable_score_margin: 0.10" in config
     assert "point_positive_samples: 6" in config
+
+
+def test_sam31_image_checkpoint_accepts_internal_key_layout(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "sam31.pt"
+    torch.save(
+        {
+            "model": {
+                "sam3_model.backbone.weight": torch.ones(2),
+                "sam2_predictor.unused": torch.zeros(1),
+            }
+        },
+        checkpoint,
+    )
+
+    class Model:
+        def __init__(self) -> None:
+            self.state = None
+
+        def load_state_dict(self, state, *, strict):
+            assert not strict
+            self.state = state
+
+            class Incompatible:
+                missing_keys = []
+                unexpected_keys = []
+
+            return Incompatible()
+
+    model = Model()
+    _load_sam31_image_checkpoint(model, checkpoint)
+
+    assert list(model.state) == ["backbone.weight"]
+    assert torch.equal(model.state["backbone.weight"], torch.ones(2))

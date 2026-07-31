@@ -1272,7 +1272,16 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
                 "heldout_frames": list(heldout_frames),
                 "heldout_fusion_best": bool(heldout_fusion_best),
                 "cross_clip": test_clip.name,
-                "cross_clip_role": "development_after_component_analysis",
+                "cross_clip_role": (
+                    "long_sequence_stress_test_shared_reference"
+                    if test_clip.split == "long_sequence_stress_test"
+                    else "development_after_component_analysis"
+                ),
+                "cross_clip_split": test_clip.split,
+                "cross_clip_training_frame_overlap": sorted(
+                    set(test_clip.frame_indices)
+                    & set(clip.training_frame_indices or ())
+                ),
                 "validation_clip": validation_clip.name,
                 "validation_clip_role": "prelocked_final_comparison",
                 "validation_candidate_b_better_a": bool(
@@ -1336,7 +1345,14 @@ def run_v6_camera_overfit(config: V6ExperimentConfig) -> Path:
         f"trans={float(heldout_specialized_metrics['translation_native']):.6f}"
     )
     print(f"heldout_fusion_best={heldout_fusion_best}")
-    print(f"CROSS-CLIP {test_frame_text}")
+    print(
+        (
+            "LONG-SEQUENCE STRESS TEST"
+            if test_clip.split == "long_sequence_stress_test"
+            else "CROSS-CLIP"
+        )
+        + f" {test_frame_text}"
+    )
     print(
         "raw:          "
         f"rot={float(cross_raw['rotation_degrees']):.4f} deg  "

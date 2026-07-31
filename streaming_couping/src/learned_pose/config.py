@@ -29,8 +29,11 @@ class FeatureConfig:
     cache_dir: Path
     rebuild: bool = False
     sam_source: str = "detector_fpn2"
+    sam_segmentation_variant: str = "legacy_recovery"
     sam_resolution: int = 1008
     sam_grid: tuple[int, int] = (72, 72)
+    sam_batch_size: int = 0
+    geometry_prompt_point_confidence_threshold: float = 0.30
     point_confidence_threshold: float = 0.30
     min_instance_points: int = 128
     sampled_instance_points: int = 128
@@ -133,6 +136,8 @@ class LearnedPoseConfig:
     output_dir: Path
     sam3_device: str
     geometry_device: str
+    streamvggt_devices: tuple[str, ...]
+    streamvggt_amp_dtype: str
     clips: tuple[ClipConfig, ...]
     features: FeatureConfig
     fusion: FusionConfig
@@ -174,13 +179,32 @@ def load_learned_pose_config(path: str | Path) -> LearnedPoseConfig:
         output_dir=_path(raw.get("output_dir"), source.parent),
         sam3_device=str(runtime.get("sam3_device", "cuda:3")),
         geometry_device=str(runtime.get("geometry_device", "cuda:1")),
+        streamvggt_devices=_device_tuple(
+            runtime.get("streamvggt_devices", ())
+        ),
+        streamvggt_amp_dtype=str(
+            runtime.get("streamvggt_amp_dtype", "float32")
+        ).strip().lower(),
         clips=clips,
         features=FeatureConfig(
             cache_dir=_path(features.get("cache_dir"), source.parent),
             rebuild=bool(features.get("rebuild", False)),
             sam_source=str(features.get("sam_source", "detector_fpn2")),
+            sam_segmentation_variant=str(
+                features.get(
+                    "sam_segmentation_variant",
+                    "legacy_recovery",
+                )
+            ),
             sam_resolution=int(features.get("sam_resolution", 1008)),
             sam_grid=_pair(features.get("sam_grid", [72, 72]), "features.sam_grid"),
+            sam_batch_size=int(features.get("sam_batch_size", 0)),
+            geometry_prompt_point_confidence_threshold=float(
+                features.get(
+                    "geometry_prompt_point_confidence_threshold",
+                    0.30,
+                )
+            ),
             point_confidence_threshold=float(features.get("point_confidence_threshold", 0.30)),
             min_instance_points=int(features.get("min_instance_points", 128)),
             sampled_instance_points=int(features.get("sampled_instance_points", 128)),
@@ -335,6 +359,67 @@ def _parse_clip(value: dict[str, Any], base: Path) -> ClipConfig:
 
 
 def _validate(config: LearnedPoseConfig) -> None:
+    if config.streamvggt_devices:
+        if len(config.streamvggt_devices) < 2:
+            raise ValueError(
+                "runtime.streamvggt_devices requires at least two CUDA "
+                "devices for layer-wise model parallelism."
+            )
+        if len(set(config.streamvggt_devices)) != len(
+            config.streamvggt_devices
+        ):
+            raise ValueError(
+                "runtime.streamvggt_devices must contain distinct devices."
+            )
+        if any(
+            not device.startswith("cuda:")
+            for device in config.streamvggt_devices
+        ):
+            raise ValueError(
+                "runtime.streamvggt_devices must contain CUDA devices."
+            )
+        if config.sam3_device in config.streamvggt_devices:
+            raise ValueError(
+                "runtime.sam3_device must be separate from the StreamVGGT "
+                "model-parallel devices because both models are resident "
+                "during geometry-guided tracking."
+            )
+    if config.streamvggt_amp_dtype not in {
+        "float32",
+        "fp32",
+        "none",
+        "bfloat16",
+        "bf16",
+        "float16",
+        "fp16",
+    }:
+        raise ValueError(
+            "runtime.streamvggt_amp_dtype must be float32, bfloat16, "
+            "or float16."
+        )
+    allowed_segmentation_variants = {
+        "legacy_recovery",
+        "v6_sam31_adaptive_positive_compete_010",
+    }
+    if (
+        config.features.sam_segmentation_variant
+        not in allowed_segmentation_variants
+    ):
+        raise ValueError(
+            "features.sam_segmentation_variant must be legacy_recovery or "
+            "v6_sam31_adaptive_positive_compete_010."
+        )
+    if not (
+        0.0
+        <= config.features.geometry_prompt_point_confidence_threshold
+        <= 1.0
+    ):
+        raise ValueError(
+            "features.geometry_prompt_point_confidence_threshold must be "
+            "in [0, 1]."
+        )
+    if config.features.sam_batch_size < 0:
+        raise ValueError("features.sam_batch_size must be non-negative.")
     bad_perturbations = sorted(set(config.evaluation.perturbations) - VALID_PERTURBATIONS)
     if bad_perturbations:
         raise ValueError(f"Unknown evaluation perturbations: {bad_perturbations}")
@@ -549,3 +634,17 @@ def _optional_int_tuple(value: Any) -> tuple[int, ...] | None:
     if value is None:
         return None
     return tuple(int(item) for item in value)
+
+
+def _device_tuple(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        values = value.split(",")
+    else:
+        values = value
+    return tuple(
+        str(item).strip()
+        for item in values
+        if str(item).strip()
+    )
