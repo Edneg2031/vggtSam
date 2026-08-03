@@ -64,6 +64,7 @@ from streaming_couping.scripts.run_v73_long_capacity import (
     _gain,
     _make_l0,
     _short,
+    _signature as _v73_long_signature,
     _train,
 )
 
@@ -172,10 +173,21 @@ def run_temporal_scaling(
         v71_output=v71.output_dir,
         v72_output=v72.output_dir,
         v73_output=v73_config.output_dir,
+        v74_output=output_dir,
+        v73_long_output=Path(
+            "outputs/streaming_couping_v73_long_capacity"
+        ).resolve(),
         v71=v71,
         experiment=v71_experiment,
         batch=batch,
         device=device,
+    )
+    _retain_clean_l0(
+        model=base_model,
+        signature=frozen_signature,
+        source=frozen_source,
+        source_sha256=frozen_sha256,
+        destination=output_dir / "frozen_l0.pt",
     )
     with torch.no_grad():
         base_output = _forward_model(
@@ -432,6 +444,8 @@ def _load_available_l0(
     v71_output: Path,
     v72_output: Path,
     v73_output: Path,
+    v74_output: Path,
+    v73_long_output: Path,
     v71,
     experiment,
     batch,
@@ -446,6 +460,7 @@ def _load_available_l0(
     else:
         candidates = (
             v71_output / "frozen_l0.pt",
+            v74_output / "frozen_l0.pt",
             v73_output / "frozen_l0.pt",
             v72_output / "frozen_l0.pt",
         )
@@ -465,6 +480,15 @@ def _load_available_l0(
             failures.append(f"{candidate}: {error}")
             continue
         return model, signature, sha256, candidate
+    recovered = _recover_l0_from_v73_long(
+        output_dir=v73_long_output,
+        v71=v71,
+        experiment=experiment,
+        batch=batch,
+        device=device,
+    )
+    if recovered is not None:
+        return recovered
     if failures:
         details = "\n  ".join(failures)
         raise ValueError(
@@ -477,6 +501,113 @@ def _load_available_l0(
         f"{searched}\nRun commands_v71_instance_causality.txt only if none "
         "of these retained artifacts exists."
     )
+
+
+def _recover_l0_from_v73_long(
+    *, output_dir, v71, experiment, batch, device
+):
+    metadata_path = output_dir / "v73_long_capacity_metadata.json"
+    if not metadata_path.is_file():
+        return None
+    metadata = json.loads(metadata_path.read_text(encoding="utf8"))
+    expected_l0 = _v71_checkpoint_signature(
+        v71,
+        experiment,
+        architecture="frozen_l0",
+    )
+    if str(metadata.get("frozen_l0_signature", "")) != expected_l0:
+        raise ValueError(
+            "V7.3 long-capacity metadata does not originate from the "
+            f"required V7.1 L0: {metadata_path}"
+        )
+    token_count = int(metadata["token_count"])
+    steps = int(metadata["steps"])
+    seed = int(metadata["seed"])
+    frames = tuple(int(value) for value in metadata["supervised_frames"])
+    branches = tuple(str(value) for value in metadata["branches"])
+    long_experiment = replace(
+        experiment,
+        training=replace(experiment.training, seed=seed),
+    )
+    failures = []
+    for label in branches:
+        if label not in BRANCHES:
+            continue
+        architecture, train_variant = BRANCHES[label]
+        path = output_dir / f"{label}_k{token_count:02d}.pt"
+        if not path.is_file():
+            continue
+        expected_checkpoint = _v73_long_signature(
+            label=label,
+            architecture=architecture,
+            train_variant=train_variant,
+            token_count=token_count,
+            seed=seed,
+            steps=steps,
+            frozen_l0_signature=expected_l0,
+            frames=frames,
+            experiment=long_experiment,
+        )
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        if (
+            not isinstance(checkpoint, dict)
+            or checkpoint.get("signature") != expected_checkpoint
+            or not isinstance(checkpoint.get("model"), dict)
+        ):
+            failures.append(str(path))
+            continue
+        prefix = "base_model."
+        base_state = {
+            name[len(prefix) :]: value
+            for name, value in checkpoint["model"].items()
+            if name.startswith(prefix)
+        }
+        model = _make_l0(batch=batch, experiment=experiment, device=device)
+        try:
+            model.load_state_dict(base_state, strict=True)
+        except RuntimeError:
+            failures.append(str(path))
+            continue
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        model.eval()
+        sha256 = _sha256_file(path)
+        print(
+            "V7.4 recovered frozen L0 from signed V7.3 long checkpoint: "
+            f"{path} sha256={sha256}"
+        )
+        return model, expected_l0, sha256, path
+    if failures:
+        raise ValueError(
+            "V7.4 found V7.3 long checkpoints but their signatures or "
+            f"embedded L0 states are invalid: {failures}"
+        )
+    return None
+
+
+def _retain_clean_l0(
+    *, model, signature, source, source_sha256, destination
+) -> None:
+    if source.resolve() == destination.resolve() and destination.is_file():
+        return
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    torch.save(
+        {
+            "signature": signature,
+            "model": {
+                name: value.detach().cpu()
+                for name, value in model.state_dict().items()
+            },
+            "metadata": {
+                "source": str(source),
+                "source_signature": signature,
+                "source_sha256": source_sha256,
+            },
+        },
+        temporary,
+    )
+    temporary.replace(destination)
+    print(f"V7.4 retained clean frozen L0: {destination}")
 
 
 def _load_compatible_l0(*, v71, experiment, batch, device, source):

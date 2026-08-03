@@ -77,6 +77,11 @@ checked copies in V7.3 and V7.2. An explicit path can be supplied with
 `V74_FROZEN_L0=/path/to/frozen_l0.pt`; its V7.1 source signature is still
 validated before training.
 
+If those clean copies were deleted, V7.4 can recover `base_model.*` from a
+V7.3 long-capacity checkpoint. It first verifies both the long-run metadata
+and complete checkpoint signature against the required V7.1 signature. The
+recovered clean copy is retained as `V74_OUTPUT/frozen_l0.pt` for later runs.
+
 To change the budget or seed:
 
 ```bash
