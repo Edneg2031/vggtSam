@@ -209,3 +209,45 @@ outputs/streaming_couping_v73_multiseed/v73_seed_aggregate.csv
 It reports mean/std losses, selection/control win counts, perturbation damage
 fraction and strict causal-pass count per architecture/K. A single lucky seed
 is not treated as stable evidence.
+
+## 9. Full long-sequence capacity test
+
+To answer only whether the model can fit the complete sampled trajectory, run:
+
+```bash
+V73_GPU=1 zsh streaming_couping/commands_v73_long_capacity.txt
+```
+
+The command resumes matching branch checkpoints by default. To increase the
+capacity budget (which creates a new checkpoint signature) or force a clean
+rerun, use:
+
+```bash
+V73_GPU=1 V73_LONG_STEPS=5000 \
+  zsh streaming_couping/commands_v73_long_capacity.txt
+V73_GPU=1 V73_LONG_FRESH=1 \
+  zsh streaming_couping/commands_v73_long_capacity.txt
+```
+
+This experiment fixes frame 90 as reference and supervises every sampled
+non-reference frame from 105 through 525 (29 frames). It uses K=8 and compares
+uniform, geometry, SAM, SAM+geometry, plus a parameter-matched combined model
+whose SAM logits are disabled throughout training.
+
+Some long-sequence frames may not have usable instances. Training and
+`long_active_overfit_pass` therefore use only active frames; all 29 frames are
+also reported separately. Every active frame must have loss at most `1e-4`,
+the mean active loss must drop by at least 99%, and inactive frames must
+reproduce frozen L0 exactly. The CSV includes the worst active frame and its
+loss so that an average cannot hide an unfitted frame.
+The output is:
+
+```text
+outputs/streaming_couping_v73_long_capacity/v73_long_capacity.csv
+```
+
+Copy that CSV after the run; no other result file is needed for the first
+capacity diagnosis.
+
+This is deliberately labelled a capacity result. It has no held-out frame and
+cannot be cited as temporal or cross-scene generalization.
