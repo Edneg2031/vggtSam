@@ -1,4 +1,4 @@
-# V7/V7.2 server experiment checklist
+# V7/V7.2/V7.3 server experiment checklist
 
 ## Before occupying GPUs
 
@@ -24,6 +24,8 @@ v71_instance_causality.csv
 v71_frame_diagnostics.csv
 v72_local_token_ablation.csv
 v72_frame_diagnostics.csv
+v73_correspondence_ablation.csv
+v73_frame_diagnostics.csv
 cache_audit/cache_audit.csv
 cache_audit/cache_frame_audit.csv
 v7_result_summary.md
@@ -50,3 +52,14 @@ Do not select on future/cross and then call the same numbers generalization.
 Select architecture/K only with development plus validation. Future/cross are
 used once to report whether the preselected choice survives. Multi-seed is
 justified only after the one-seed report-only result is promising.
+# V7.3 correspondence stage
+
+After the corrected V7.2 formal run, V7.3 can be launched with:
+
+```bash
+V73_GPU=1 zsh streaming_couping/commands_v73_monday.txt
+```
+
+See `streaming_couping/docs/v73_correspondence_runbook.md`. V7.3 reloads V7.1
+L0 and V7.2 controls, uses cached features only, and writes one primary CSV at
+`outputs/streaming_couping_v73_correspondence/v73_correspondence_ablation.csv`.

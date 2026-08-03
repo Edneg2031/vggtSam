@@ -146,6 +146,30 @@ future/cross 同时优于两个 camera control，并且 `instance_off` 在四个
 `streaming_couping/docs/v72_local_token_runbook.md`，服务器执行检查表见
 `streaming_couping/docs/v7_server_experiment_checklist.md`。
 
+V7.3 不再把 SAM3.1 descriptor 直接作为位姿 Value，而只让它决定参考帧到当前帧的局部
+对应权重；被传输和送入相机 residual head 的 Value 始终是 StreamVGGT 局部几何。它从
+uniform、纯几何、纯 SAM 权重到 SAM+几何权重做 K=8/16 的轻量消融，并自动加载 V7.1
+精确 L0、V7.2 camera controls 和同 K 的 V7.2 纯几何强基线：
+
+```bash
+V73_GPU=1 zsh streaming_couping/commands_v73_monday.txt
+```
+
+主结果仍然只有一张可复制 CSV：
+
+```text
+outputs/streaming_couping_v73_correspondence/v73_correspondence_ablation.csv
+```
+
+只有 SAM 分支在四个 causal split 全部优于同 K 纯几何、report-only split 优于 camera
+capacity controls、`instance_off` 精确回到 L0，并在 SAM-off、uniform、错误 identity 和
+时间打乱下全部变差，才标记 `causal_sam_pass=1`。完整方法、命令和字段解释见
+`streaming_couping/docs/v73_correspondence_runbook.md`。
+
+单 seed 通过或接近因果判据后，可用
+`V73_SEEDS="0 1 2" zsh streaming_couping/commands_v73_multiseed.txt` 检查稳定性；不要在
+明显失败的结构上先消耗三倍训练时间。
+
 长序列命令只占三张物理卡：StreamVGGT 的 24 层按连续区间分到两张卡，SAM3.1 单独使用
 第三张卡。每层 KV cache 保留完整因果历史，不切块、不重置；DPT/camera/depth/point
 输出逐帧卸载到 CPU。默认使用物理卡 `1,2,3`，可在命令前通过
