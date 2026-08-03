@@ -116,6 +116,10 @@ interpretable rather than being reduced to one Boolean.
 
 V7.3 requires the corrected formal V7.2 checkpoints. It reuses the existing
 SAM3.1 local-token caches and only needs one GPU for the small fusion models.
+The smoke command uses pytest when it is installed in the selected
+`STREAMING_COUPING_PYTHON`; otherwise it automatically runs equivalent core
+Torch checks without pytest. Installing pytest into an unrelated active conda
+environment is therefore unnecessary.
 
 Run the full smoke and formal sweep:
 

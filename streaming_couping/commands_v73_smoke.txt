@@ -10,10 +10,16 @@ cd "$ROOT"
 [[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
 
 echo "V7.3 smoke 1/2: unit tests"
-PYTHONPATH=. "$PYTHON_BIN" -m pytest -q \
-  streaming_couping/tests/test_v73_correspondence_fusion.py \
-  streaming_couping/tests/test_v73_reporting.py \
-  streaming_couping/tests/test_v72_local_fusion.py
+if PYTHONPATH=. "$PYTHON_BIN" -c 'import pytest' >/dev/null 2>&1; then
+  PYTHONPATH=. "$PYTHON_BIN" -m pytest -q \
+    streaming_couping/tests/test_v73_correspondence_fusion.py \
+    streaming_couping/tests/test_v73_reporting.py \
+    streaming_couping/tests/test_v72_local_fusion.py
+else
+  echo "pytest is unavailable in $PYTHON_BIN; running dependency-free checks"
+  PYTHONPATH=. "$PYTHON_BIN" \
+    -m streaming_couping.scripts.smoke_v73_runtime
+fi
 
 echo "V7.3 smoke 2/2: two steps, complete K=8 mechanism ladder"
 CUDA_VISIBLE_DEVICES="$GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
