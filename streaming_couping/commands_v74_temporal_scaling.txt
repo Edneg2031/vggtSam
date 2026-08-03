@@ -14,10 +14,32 @@ LONG_CACHE=outputs/streaming_couping_v7_fusion_ablation/cache/00a231a370_90_525_
 
 cd "$ROOT"
 [[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
-[[ -s outputs/streaming_couping_v71_instance_causality/frozen_l0.pt ]] || {
-  echo "V7.4 requires the completed V7.1 frozen L0." >&2
-  exit 1
-}
+FROZEN_ARGS=()
+if [[ -n "${V74_FROZEN_L0:-}" ]]; then
+  [[ -s "$V74_FROZEN_L0" ]] || {
+    echo "missing explicit V74_FROZEN_L0: $V74_FROZEN_L0" >&2
+    exit 1
+  }
+  FROZEN_ARGS=(--frozen-l0 "$V74_FROZEN_L0")
+  echo "V7.4 explicit frozen L0=$V74_FROZEN_L0"
+else
+  FOUND_FROZEN_L0=0
+  for candidate in \
+    outputs/streaming_couping_v71_instance_causality/frozen_l0.pt \
+    outputs/streaming_couping_v73_correspondence/frozen_l0.pt \
+    outputs/streaming_couping_v72_local_token_ablation/frozen_l0.pt
+  do
+    if [[ -s "$candidate" ]]; then
+      FOUND_FROZEN_L0=1
+    fi
+  done
+  [[ "$FOUND_FROZEN_L0" == "1" ]] || {
+    echo "V7.4 could not find the retained frozen L0 in V7.1/V7.3/V7.2." >&2
+    echo "Run commands_v71_instance_causality.txt only if it was deleted." >&2
+    exit 1
+  }
+  echo "V7.4 will auto-select a provenance-compatible V7.1/V7.3/V7.2 L0"
+fi
 [[ -s "$LONG_CACHE" ]] || {
   echo "V7.4 requires the augmented V7.2 long cache: $LONG_CACHE" >&2
   exit 1
@@ -47,6 +69,7 @@ CUDA_VISIBLE_DEVICES="$GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
   --steps "$STEPS" \
   --seed "$SEED" \
   --branches "$BRANCHES" \
+  "${FROZEN_ARGS[@]}" \
   "${RESUME_ARGS[@]}"
 
 [[ -s "$OUTPUT/v74_temporal_scaling.csv" ]] || {

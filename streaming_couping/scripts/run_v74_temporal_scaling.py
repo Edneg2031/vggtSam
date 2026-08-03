@@ -42,12 +42,14 @@ from streaming_couping.scripts.run_v7_fusion_ablation import (
     load_v7_config,
 )
 from streaming_couping.scripts.run_v71_instance_causality import (
+    _checkpoint_signature as _v71_checkpoint_signature,
     _slice_batch_prefix,
     load_v71_config,
 )
 from streaming_couping.scripts.run_v72_local_token_ablation import (
     _limit_local_tokens,
     _prepare_payload,
+    _sha256_file,
     _validate_local_payload,
     load_v72_config,
 )
@@ -60,7 +62,7 @@ from streaming_couping.scripts.run_v73_long_capacity import (
     EVALUATION_VARIANTS,
     OVERFIT_LOSS_THRESHOLD,
     _gain,
-    _load_l0,
+    _make_l0,
     _short,
     _train,
 )
@@ -95,6 +97,11 @@ def main() -> None:
         seed=int(args.seed),
         branches=selected,
         resume=bool(args.resume),
+        frozen_l0_path=(
+            Path(args.frozen_l0).expanduser().resolve()
+            if args.frozen_l0
+            else None
+        ),
     )
     print(f"V7.4 temporal-scaling result={result}")
 
@@ -109,6 +116,7 @@ def run_temporal_scaling(
     seed: int,
     branches: tuple[str, ...],
     resume: bool,
+    frozen_l0_path: Path | None,
 ) -> Path:
     if token_count < 2 or steps < 1:
         raise ValueError("V7.4 requires token_count >= 2 and steps >= 1.")
@@ -154,7 +162,16 @@ def run_temporal_scaling(
     positions = {frame: index for index, frame in enumerate(frames)}
     validate_folds(FOLDS, available_frames=set(frames))
     output_dir.mkdir(parents=True, exist_ok=True)
-    base_model, frozen_signature, frozen_source, frozen_sha256 = _load_l0(
+    (
+        base_model,
+        frozen_signature,
+        frozen_sha256,
+        frozen_source,
+    ) = _load_available_l0(
+        explicit=frozen_l0_path,
+        v71_output=v71.output_dir,
+        v72_output=v72.output_dir,
+        v73_output=v73_config.output_dir,
         v71=v71,
         experiment=v71_experiment,
         batch=batch,
@@ -407,6 +424,93 @@ def _train_or_resume(
     )
     temporary.replace(path)
     return training
+
+
+def _load_available_l0(
+    *,
+    explicit: Path | None,
+    v71_output: Path,
+    v72_output: Path,
+    v73_output: Path,
+    v71,
+    experiment,
+    batch,
+    device,
+):
+    if explicit is not None:
+        if not explicit.is_file():
+            raise FileNotFoundError(
+                f"Explicit V7.4 frozen L0 does not exist: {explicit}"
+            )
+        candidates = (explicit,)
+    else:
+        candidates = (
+            v71_output / "frozen_l0.pt",
+            v73_output / "frozen_l0.pt",
+            v72_output / "frozen_l0.pt",
+        )
+    failures = []
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            model, signature, sha256 = _load_compatible_l0(
+                v71=v71,
+                experiment=experiment,
+                batch=batch,
+                device=device,
+                source=candidate,
+            )
+        except (RuntimeError, ValueError) as error:
+            failures.append(f"{candidate}: {error}")
+            continue
+        return model, signature, sha256, candidate
+    if failures:
+        details = "\n  ".join(failures)
+        raise ValueError(
+            "V7.4 found frozen L0 files, but none has compatible V7.1 "
+            f"provenance:\n  {details}"
+        )
+    searched = "\n  ".join(str(path) for path in candidates)
+    raise FileNotFoundError(
+        "V7.4 could not find a compatible frozen L0. Searched:\n  "
+        f"{searched}\nRun commands_v71_instance_causality.txt only if none "
+        "of these retained artifacts exists."
+    )
+
+
+def _load_compatible_l0(*, v71, experiment, batch, device, source):
+    model = _make_l0(batch=batch, experiment=experiment, device=device)
+    expected = _v71_checkpoint_signature(
+        v71,
+        experiment,
+        architecture="frozen_l0",
+    )
+    checkpoint = torch.load(source, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict) or "model" not in checkpoint:
+        raise ValueError(f"Invalid V7.4 frozen L0 checkpoint: {source}")
+    metadata = checkpoint.get("metadata", {})
+    source_signature = (
+        metadata.get("source_signature", "")
+        if isinstance(metadata, dict)
+        else ""
+    )
+    signatures = {
+        str(checkpoint.get("signature", "")),
+        str(source_signature),
+    }
+    if expected not in signatures:
+        raise ValueError(
+            "V7.4 frozen L0 provenance mismatch: "
+            f"{source}. Expected V7.1 signature={expected}."
+        )
+    model.load_state_dict(checkpoint["model"], strict=True)
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    model.eval()
+    sha256 = _sha256_file(source)
+    print(f"V7.4 loaded compatible frozen L0: {source} sha256={sha256}")
+    return model, expected, sha256
 
 
 def _model_row(
@@ -779,6 +883,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir")
     parser.add_argument("--device")
+    parser.add_argument("--frozen-l0")
     parser.add_argument("--token-count", type=int, default=8)
     parser.add_argument("--steps", type=int, default=3000)
     parser.add_argument("--seed", type=int, default=0)

@@ -72,6 +72,11 @@ V74_GPU=1 V74_FRESH=1 \
   zsh streaming_couping/commands_v74_temporal_scaling.txt
 ```
 
+The command searches for the exact retained L0 in V7.1, then the provenance-
+checked copies in V7.3 and V7.2. An explicit path can be supplied with
+`V74_FROZEN_L0=/path/to/frozen_l0.pt`; its V7.1 source signature is still
+validated before training.
+
 To change the budget or seed:
 
 ```bash
