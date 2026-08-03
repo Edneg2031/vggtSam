@@ -1,0 +1,57 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+GPU="${V74_GPU:-1}"
+STEPS="${V74_STEPS:-3000}"
+SEED="${V74_SEED:-0}"
+OUTPUT="${V74_OUTPUT:-outputs/streaming_couping_v74_temporal_scaling}"
+DEFAULT_BRANCHES=uniform_transport,geometry_transport,sam_transport
+DEFAULT_BRANCHES+=,sam_geometry_transport,sam_geometry_train_sam_off
+BRANCHES="${V74_BRANCHES:-$DEFAULT_BRANCHES}"
+LONG_CACHE=outputs/streaming_couping_v7_fusion_ablation/cache/00a231a370_90_525_step15_37_68_54.pt
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+[[ -s outputs/streaming_couping_v71_instance_causality/frozen_l0.pt ]] || {
+  echo "V7.4 requires the completed V7.1 frozen L0." >&2
+  exit 1
+}
+[[ -s "$LONG_CACHE" ]] || {
+  echo "V7.4 requires the augmented V7.2 long cache: $LONG_CACHE" >&2
+  exit 1
+}
+
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+echo "V7.4 temporal scaling: protocol and tensor checks"
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_v74_protocol
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_v73_runtime
+
+RESUME_ARGS=(--resume)
+if [[ "${V74_FRESH:-0}" == "1" ]]; then
+  RESUME_ARGS=()
+fi
+
+echo "V7.4 GPU=$GPU K=8 steps=$STEPS seed=$SEED"
+echo "Folds: 270-345->360-405; 270-405->420-465; 270-465->480-525"
+CUDA_VISIBLE_DEVICES="$GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.run_v74_temporal_scaling \
+  --config streaming_couping/configs/v73_correspondence_ablation.yaml \
+  --output-dir "$OUTPUT" \
+  --device cuda:0 \
+  --token-count 8 \
+  --steps "$STEPS" \
+  --seed "$SEED" \
+  --branches "$BRANCHES" \
+  "${RESUME_ARGS[@]}"
+
+[[ -s "$OUTPUT/v74_temporal_scaling.csv" ]] || {
+  echo "missing V7.4 temporal-scaling CSV" >&2
+  exit 1
+}
+echo "V7.4 COPY THIS CSV"
+cat "$OUTPUT/v74_temporal_scaling.csv"

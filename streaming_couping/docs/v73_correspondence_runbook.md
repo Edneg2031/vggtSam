@@ -251,3 +251,7 @@ capacity diagnosis.
 
 This is deliberately labelled a capacity result. It has no held-out frame and
 cannot be cited as temporal or cross-scene generalization.
+
+After the capacity test passes, continue with the locked future-frame
+experiment in `streaming_couping/docs/v74_temporal_scaling_runbook.md` rather
+than increasing the capacity model further.
