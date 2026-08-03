@@ -14,13 +14,12 @@ PYTHONPATH=. "$PYTHON_BIN" -m pytest -q \
   streaming_couping/tests/test_v72_local_fusion.py \
   streaming_couping/tests/test_v71_causal_fusion.py
 
-echo "V7.2 smoke: two steps, light and heavy paths, K=8/32"
+echo "V7.2 smoke: exact V7.1 L0 plus two residual steps, K=8/32"
 CUDA_VISIBLE_DEVICES="$GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
   -m streaming_couping.scripts.run_v72_local_token_ablation \
   --config streaming_couping/configs/v72_local_token_ablation.yaml \
   --output-dir "$OUTPUT" \
   --device cuda:0 \
-  --base-steps 2 \
   --residual-steps 2 \
   --architectures sam_local_match,dual_key_global_geometry \
   --token-counts 8,32

@@ -16,6 +16,18 @@ V7.2 is not intended to make a result look better by adding capacity. Its CSV
 contains two camera-only capacity controls trained on exactly the same Stage-B
 frames as all local-token branches.
 
+V7.2 does not retrain Stage A. It loads the signature-checked
+`outputs/streaming_couping_v71_instance_causality/frozen_l0.pt`, copies its
+SHA-256 provenance into V7.2 metadata, and verifies all six split metrics
+against the V7.1 CSV before any residual is trained. This makes V7.1/V7.2
+comparisons use one bit-identical camera baseline.
+
+Stage B also uses the V7.1 checkpoint-selection rule: evaluate at each logging
+boundary and restore the lowest-loss logged state instead of blindly keeping
+the final optimizer step. With the default seed/step count, both camera
+controls are checked against their V7.1 rotation, translation and loss on all
+six splits. A mismatch stops the formal run.
+
 ## 2. Frozen cache extension
 
 For every clip, frame and configured instance, the additive cache fields are:
@@ -63,8 +75,9 @@ The two automatic controls are:
 - `camera_extra_common_gate`: the same extra camera capacity only where the
   shared instance gate is active.
 
-The controls are trained and evaluated inside V7.2, so the decision does not
-depend on stale V7.1 checkpoints.
+The controls are trained and evaluated inside V7.2 over the exact verified
+V7.1 frozen L0. Every Stage-B checkpoint signature includes the V7.1 L0
+signature, so a residual trained over another baseline cannot be resumed.
 
 ## 4. Time protocol
 
@@ -98,9 +111,9 @@ zsh streaming_couping/commands_v72_monday.txt
 ```
 
 The stages are cache augmentation/audit, two-step smoke, formal resumable
-sweep, and report generation. If the V7.1 formal CSV is present, the report
-compares V7.1 and V7.2; otherwise it creates a valid V7.2-only bundle. To add
-the global V7.1 comparison first, run:
+sweep, and report generation. A completed V7.1 checkpoint and CSV are mandatory
+because they define and verify the shared Stage-A camera baseline. If either is
+missing, run:
 
 ```bash
 zsh streaming_couping/commands_v71_instance_causality.txt
@@ -122,6 +135,11 @@ ignore them:
 V72_FRESH=1 zsh streaming_couping/commands_v72_local_token_ablation.txt
 ```
 
+After the exact-L0 fix, old V7.2 Stage-B checkpoints are recognized by their
+old signature and retrained automatically. Newly written checkpoints resume
+normally on later invocations; `V72_FRESH=1` is not required for this one-time
+migration.
+
 To debug only one or two structures without changing YAML:
 
 ```bash
@@ -132,7 +150,6 @@ CUDA_VISIBLE_DEVICES=1 \
   --device cuda:0 \
   --architectures sam_local_match,sam_key_global_geometry \
   --token-counts 8,32 \
-  --base-steps 20 \
   --residual-steps 20
 ```
 
@@ -145,7 +162,7 @@ outputs/streaming_couping_v72_local_token_ablation/
 │   ├── cache_tensor_audit.csv
 │   ├── cache_frame_audit.csv
 │   └── cache_audit.json
-├── frozen_l0.pt
+├── frozen_l0.pt  # exact V7.1 copy with source signature/SHA-256 metadata
 ├── camera_extra_all.pt
 ├── camera_extra_common_gate.pt
 ├── *_k08.pt / *_k16.pt / *_k32.pt
@@ -236,7 +253,8 @@ control wins and number of strict causal passes per architecture/K pair.
   `cache_audit.csv` before accepting a costly rebuild.
 - no active residual-training frame: local tokens and the reference identity
   do not overlap the shared gate on `270–345`; inspect per-frame cache audit.
-- checkpoint mismatch: config, K, seed or step count changed. Use a new output
-  directory or deliberately set `V72_FRESH=1`.
-- missing V7.1 CSV: the report remains valid but is marked V7.2-only; rerun the
-  report command after V7.1 if a combined comparison is needed.
+- checkpoint mismatch from a pre-fix V7.2 run: the runner invalidates and
+  retrains that Stage-B checkpoint automatically. Other corruption still
+  stops the run instead of silently reusing an incompatible model.
+- missing V7.1 checkpoint/CSV: V7.2 stops before training. Complete the formal
+  V7.1 command first because V7.2 must verify and reuse its frozen L0.

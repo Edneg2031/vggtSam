@@ -10,7 +10,10 @@ zsh streaming_couping/commands_v71_preflight.txt
 ```
 
 The preflight must finish cache audit, tensor tests and the two-step V7.1 run.
-For V7.2, run `commands_v72_cache.txt` before `commands_v72_smoke.txt`.
+Before V7.2, the formal V7.1 `frozen_l0.pt` and
+`v71_instance_causality.csv` must exist. V7.2 loads that exact checkpoint and
+checks its six metrics against the CSV. Then run `commands_v72_cache.txt`
+before `commands_v72_smoke.txt`.
 
 ## Files to copy back after a run
 
@@ -47,4 +50,3 @@ Do not select on future/cross and then call the same numbers generalization.
 Select architecture/K only with development plus validation. Future/cross are
 used once to report whether the preselected choice survives. Multi-seed is
 justified only after the one-seed report-only result is promising.
-

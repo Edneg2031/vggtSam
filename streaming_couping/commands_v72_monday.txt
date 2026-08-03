@@ -4,6 +4,13 @@ set -euo pipefail
 ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 cd "$ROOT"
 
+V71_OUTPUT=outputs/streaming_couping_v71_instance_causality
+[[ -s "$V71_OUTPUT/frozen_l0.pt" && -s "$V71_OUTPUT/v71_instance_causality.csv" ]] || {
+  echo "V7.2 requires the exact completed V7.1 frozen L0 and result CSV." >&2
+  echo "Run: zsh streaming_couping/commands_v71_instance_causality.txt" >&2
+  exit 1
+}
+
 echo "V7.2 Monday 1/4: augment and audit true SAM3.1 local tokens"
 zsh streaming_couping/commands_v72_cache.txt
 

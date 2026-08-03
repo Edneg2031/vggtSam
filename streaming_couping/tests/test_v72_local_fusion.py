@@ -1,5 +1,13 @@
+import csv
+
+import pytest
 import torch
 
+from streaming_couping.scripts.run_v72_local_token_ablation import (
+    V72CheckpointSignatureMismatch,
+    _assert_v71_baseline_metrics,
+    _load_checkpoint,
+)
 from streaming_couping.src.learned_pose.config import load_learned_pose_config
 from streaming_couping.src.learned_pose.observations import (
     sample_sam_instance_tokens,
@@ -210,3 +218,57 @@ def test_v72_data_config_explicitly_enables_local_cache() -> None:
     assert config.features.cache_sam_local_tokens
     assert config.features.sam_local_token_count == 32
     assert config.features.sam_local_sampling == "farthest_uv"
+
+
+def test_v72_requires_metrics_from_the_exact_v71_frozen_l0(tmp_path) -> None:
+    splits = (
+        "base_train",
+        "residual_train",
+        "development",
+        "future",
+        "validation",
+        "cross",
+    )
+    metrics = {
+        split: {
+            "rotation_degrees": 1.0 + index,
+            "translation_native": 0.01 + index,
+            "loss": 0.1 + index,
+        }
+        for index, split in enumerate(splits)
+    }
+    row = {"architecture": "frozen_l0"}
+    for split, values in metrics.items():
+        row[f"{split}_rotation_deg"] = values["rotation_degrees"]
+        row[f"{split}_translation"] = values["translation_native"]
+        row[f"{split}_loss"] = values["loss"]
+    path = tmp_path / "v71_instance_causality.csv"
+    with path.open("w", encoding="utf8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row))
+        writer.writeheader()
+        writer.writerow(row)
+
+    _assert_v71_baseline_metrics(tmp_path, metrics)
+
+    mismatched = {
+        split: dict(values) for split, values in metrics.items()
+    }
+    mismatched["cross"]["loss"] += 0.01
+    with pytest.raises(RuntimeError, match="cross.loss"):
+        _assert_v71_baseline_metrics(tmp_path, mismatched)
+
+
+def test_v72_checkpoint_provenance_mismatch_is_distinct_from_corruption(
+    tmp_path,
+) -> None:
+    path = tmp_path / "checkpoint.pt"
+    torch.save(
+        {"signature": "old", "model": {"weight": torch.ones(1)}},
+        path,
+    )
+    with pytest.raises(V72CheckpointSignatureMismatch):
+        _load_checkpoint(path, "new")
+
+    torch.save({"signature": "new"}, path)
+    with pytest.raises(ValueError, match="Invalid V7.2 checkpoint"):
+        _load_checkpoint(path, "new")

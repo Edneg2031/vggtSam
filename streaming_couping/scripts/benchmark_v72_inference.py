@@ -25,7 +25,10 @@ from streaming_couping.scripts.run_v7_fusion_ablation import (
     _load_cache,
     load_v7_config,
 )
-from streaming_couping.scripts.run_v71_instance_causality import load_v71_config
+from streaming_couping.scripts.run_v71_instance_causality import (
+    _checkpoint_signature as _v71_checkpoint_signature,
+    load_v71_config,
+)
 from streaming_couping.scripts.run_v72_local_token_ablation import (
     CONTROL_ARCHITECTURES,
     _forward_model,
@@ -71,10 +74,24 @@ def benchmark(
     if not torch.cuda.is_available() and str(config.device).startswith("cuda"):
         raise RuntimeError("V7.2 CUDA benchmark requested without CUDA.")
     v71 = load_v71_config(config.v71_config)
-    base_v7 = load_v7_config(v71.v7_config)
+    source_v7 = load_v7_config(v71.v7_config)
     from dataclasses import replace
 
-    base_v7 = replace(base_v7, device=config.device)
+    v71_base_v7 = replace(
+        source_v7,
+        device=config.device,
+        training=replace(source_v7.training, seed=v71.seed),
+    )
+    base_v7 = replace(
+        source_v7,
+        device=config.device,
+        training=replace(source_v7.training, seed=config.seed),
+    )
+    frozen_l0_signature = _v71_checkpoint_signature(
+        v71,
+        v71_base_v7,
+        architecture="frozen_l0",
+    )
     data = load_learned_pose_config(config.data_config)
     recovery = load_config(data.recovery_config)
     maybe_add_repo_to_path(recovery.streamvggt_repo)
@@ -109,7 +126,13 @@ def benchmark(
     ).to(config.device)
     base_checkpoint = _load_checkpoint(
         config.output_dir / "frozen_l0.pt",
-        _signature(config, base_v7, "frozen_l0", token_count=0),
+        _signature(
+            config,
+            base_v7,
+            "frozen_l0",
+            token_count=0,
+            frozen_l0_signature=frozen_l0_signature,
+        ),
     )
     base_template.load_state_dict(base_checkpoint["model"])
     base_template.eval()
@@ -122,6 +145,7 @@ def benchmark(
             first_batch=prepared[0][2],
             config=config,
             experiment=base_v7,
+            frozen_l0_signature=frozen_l0_signature,
         )
         model.eval()
         parameters = sum(value.numel() for value in model.parameters())
@@ -183,7 +207,15 @@ def benchmark(
     return rows
 
 
-def _load_model(label, *, base, first_batch, config, experiment):
+def _load_model(
+    label,
+    *,
+    base,
+    first_batch,
+    config,
+    experiment,
+    frozen_l0_signature,
+):
     if label == "frozen_l0":
         return copy.deepcopy(base), 0
     if label in CONTROL_ARCHITECTURES:
@@ -214,7 +246,13 @@ def _load_model(label, *, base, first_batch, config, experiment):
         ).to(config.device)
     checkpoint = _load_checkpoint(
         config.output_dir / f"{label}.pt",
-        _signature(config, experiment, architecture, token_count=token_count),
+        _signature(
+            config,
+            experiment,
+            architecture,
+            token_count=token_count,
+            frozen_l0_signature=frozen_l0_signature,
+        ),
     )
     model.load_state_dict(checkpoint["model"])
     return model, token_count
@@ -289,4 +327,3 @@ def _parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     main()
-

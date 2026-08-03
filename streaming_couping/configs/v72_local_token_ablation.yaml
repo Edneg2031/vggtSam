@@ -1,5 +1,7 @@
-# V7.2 is self-contained: one frozen early-frame camera baseline, two camera
-# capacity controls, then true SAM3.1 mask-local token residuals.
+# V7.2 loads the exact frozen early-frame camera baseline produced by V7.1,
+# then trains two camera controls and true SAM3.1 mask-local token residuals.
+# This prevents Stage-A optimizer/checkpoint-selection differences from being
+# mistaken for a V7.1-to-V7.2 architecture effect.
 v71_config: streaming_couping/configs/v71_instance_causality.yaml
 data_config: streaming_couping/configs/v72_local_token_data.yaml
 output_dir: outputs/streaming_couping_v72_local_token_ablation
@@ -18,4 +20,3 @@ training:
   base_steps: 1200
   residual_steps: 1200
   seed: 0
-

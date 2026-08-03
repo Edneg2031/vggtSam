@@ -46,6 +46,8 @@ from streaming_couping.scripts.run_v7_fusion_ablation import (
 )
 from streaming_couping.scripts.run_v71_instance_causality import (
     EvaluationSpec,
+    _checkpoint_signature as _v71_checkpoint_signature,
+    _load_checkpoint as _load_v71_checkpoint,
     _make_spec,
     _slice_batch_prefix,
     _validate_temporal_partition,
@@ -57,6 +59,10 @@ CONTROL_ARCHITECTURES = (
     "camera_extra_all",
     "camera_extra_common_gate",
 )
+
+
+class V72CheckpointSignatureMismatch(ValueError):
+    """A valid V7.2 checkpoint belongs to another experiment provenance."""
 
 
 @dataclass(frozen=True)
@@ -122,12 +128,23 @@ def run_v72(config: V72Config, *, resume: bool) -> Path:
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     v71 = load_v71_config(config.v71_config)
-    base_v7 = load_v7_config(v71.v7_config)
-    base_v7 = replace(
-        base_v7,
+    source_v7 = load_v7_config(v71.v7_config)
+    v71_base_v7 = replace(
+        source_v7,
         device=config.device,
-        training=replace(base_v7.training, seed=config.seed),
+        training=replace(source_v7.training, seed=v71.seed),
     )
+    base_v7 = replace(
+        source_v7,
+        device=config.device,
+        training=replace(source_v7.training, seed=config.seed),
+    )
+    if config.base_steps != v71.base_steps:
+        raise ValueError(
+            "V7.2 must reuse the exact V7.1 frozen L0: "
+            f"V7.2 base_steps={config.base_steps}, "
+            f"V7.1 base_steps={v71.base_steps}."
+        )
     data = load_learned_pose_config(config.data_config)
     long_clip = _find_clip(data, v71.long_clip_name)
     validation_clip = _find_clip(data, v71.validation_clip_name)
@@ -235,35 +252,50 @@ def run_v72(config: V72Config, *, resume: bool) -> Path:
         local_feature_dim=int(long_batch["local_features"].shape[-1]),
         config=base_v7.fusion,
     ).to(config.device)
-    base_prefix = positions[max(v71.base_train_frames)] + 1
     residual_prefix = positions[max(v71.residual_train_frames)] + 1
-    base_signature = _signature(config, base_v7, "frozen_l0", token_count=0)
+    v71_base_path = v71.output_dir / "frozen_l0.pt"
+    if not v71_base_path.is_file():
+        raise FileNotFoundError(
+            "V7.2 requires the exact V7.1 frozen L0 checkpoint: "
+            f"{v71_base_path}. Run "
+            "`zsh streaming_couping/commands_v71_instance_causality.txt` "
+            "before V7.2."
+        )
+    v71_base_signature = _v71_checkpoint_signature(
+        v71,
+        v71_base_v7,
+        architecture="frozen_l0",
+    )
+    v71_base_checkpoint = _load_v71_checkpoint(
+        v71_base_path,
+        expected_signature=v71_base_signature,
+    )
+    base_model.load_state_dict(v71_base_checkpoint["model"], strict=True)
+    base_seconds = float(v71_base_checkpoint.get("training_seconds", 0.0))
+    v71_base_sha256 = _sha256_file(v71_base_path)
+    base_signature = _signature(
+        config,
+        base_v7,
+        "frozen_l0",
+        token_count=0,
+        frozen_l0_signature=v71_base_signature,
+    )
     base_path = output_dir / "frozen_l0.pt"
-    if resume and base_path.is_file():
-        checkpoint = _load_checkpoint(base_path, base_signature)
-        base_model.load_state_dict(checkpoint["model"])
-        base_seconds = float(checkpoint.get("training_seconds", 0.0))
-        print(f"V7.2 resumed frozen L0: {base_path}")
-    else:
-        print("V7.2 stage A: train one early-frame camera L0")
-        started = time.perf_counter()
-        _train(
-            base_model,
-            batch=_slice_batch_prefix(long_batch, length=base_prefix),
-            baseline=long_baseline[:, :base_prefix],
-            target=long_target[:, :base_prefix],
-            reference_index=reference_index,
-            training_indices=temporal_indices["base_train"],
-            steps=config.base_steps,
-            experiment=base_v7,
-        )
-        base_seconds = time.perf_counter() - started
-        _save_checkpoint(
-            base_path,
-            base_signature,
-            base_model,
-            training_seconds=base_seconds,
-        )
+    _save_checkpoint(
+        base_path,
+        base_signature,
+        base_model,
+        training_seconds=base_seconds,
+        metadata={
+            "source": str(v71_base_path),
+            "source_signature": v71_base_signature,
+            "source_sha256": v71_base_sha256,
+        },
+    )
+    print(
+        "V7.2 loaded exact V7.1 frozen L0: "
+        f"{v71_base_path} sha256={v71_base_sha256}"
+    )
     for parameter in base_model.parameters():
         parameter.requires_grad_(False)
     base_model.eval()
@@ -273,6 +305,7 @@ def run_v72(config: V72Config, *, resume: bool) -> Path:
         spec.name: _evaluate_model(base_model, spec, base_v7, variant="normal")
         for spec in specs
     }
+    _assert_v71_baseline_metrics(v71.output_dir, base_metrics)
     rows = [
         _result_row(
             architecture="raw_streamvggt",
@@ -335,6 +368,7 @@ def run_v72(config: V72Config, *, resume: bool) -> Path:
             model,
             architecture=architecture,
             token_count=0,
+            frozen_l0_signature=v71_base_signature,
             config=config,
             experiment=base_v7,
             output_dir=output_dir,
@@ -355,6 +389,18 @@ def run_v72(config: V72Config, *, resume: bool) -> Path:
             for spec in specs
         }
         controls[architecture] = metrics
+        if (
+            config.seed == v71.seed
+            and config.residual_steps == v71.residual_steps
+        ):
+            _assert_v71_metrics(
+                v71.output_dir,
+                architecture,
+                {
+                    name: values["normal"]
+                    for name, values in metrics.items()
+                },
+            )
         rows.append(
             _result_row(
                 architecture=architecture,
@@ -397,6 +443,7 @@ def run_v72(config: V72Config, *, resume: bool) -> Path:
                 model,
                 architecture=architecture,
                 token_count=token_count,
+                frozen_l0_signature=v71_base_signature,
                 config=config,
                 experiment=base_v7,
                 output_dir=output_dir,
@@ -461,10 +508,13 @@ def run_v72(config: V72Config, *, resume: bool) -> Path:
     (output_dir / "v72_run_metadata.json").write_text(
         json.dumps(
             {
-                "schema": 1,
+                "schema": 3,
                 "config": asdict(config),
                 "v71": asdict(v71),
                 "v7_fusion": asdict(base_v7.fusion),
+                "frozen_l0_source": str(v71_base_path),
+                "frozen_l0_source_signature": v71_base_signature,
+                "frozen_l0_source_sha256": v71_base_sha256,
                 "torch": torch.__version__,
                 "cuda_available": torch.cuda.is_available(),
                 "cuda_device": (
@@ -556,6 +606,7 @@ def _train_or_resume(
     *,
     architecture: str,
     token_count: int,
+    frozen_l0_signature: str,
     config: V72Config,
     experiment: V7ExperimentConfig,
     output_dir: Path,
@@ -567,16 +618,29 @@ def _train_or_resume(
     training_indices: list[int],
 ) -> float:
     label = architecture if not token_count else f"{architecture}_k{token_count:02d}"
-    signature = _signature(config, experiment, architecture, token_count=token_count)
+    signature = _signature(
+        config,
+        experiment,
+        architecture,
+        token_count=token_count,
+        frozen_l0_signature=frozen_l0_signature,
+    )
     path = output_dir / f"{label}.pt"
     if resume and path.is_file():
-        checkpoint = _load_checkpoint(path, signature)
-        model.load_state_dict(checkpoint["model"])
-        print(f"V7.2 resumed architecture={label}")
-        return float(checkpoint.get("training_seconds", 0.0))
+        try:
+            checkpoint = _load_checkpoint(path, signature)
+        except V72CheckpointSignatureMismatch:
+            print(
+                "V7.2 invalidating stale Stage-B checkpoint tied to a "
+                f"different frozen L0: {path}"
+            )
+        else:
+            model.load_state_dict(checkpoint["model"])
+            print(f"V7.2 resumed architecture={label}")
+            return float(checkpoint.get("training_seconds", 0.0))
     print(f"V7.2 stage B architecture={label}")
     started = time.perf_counter()
-    _train(
+    training_result = _train(
         model,
         batch=batch,
         baseline=baseline,
@@ -587,7 +651,16 @@ def _train_or_resume(
         experiment=experiment,
     )
     elapsed = time.perf_counter() - started
-    _save_checkpoint(path, signature, model, training_seconds=elapsed)
+    _save_checkpoint(
+        path,
+        signature,
+        model,
+        training_seconds=elapsed,
+        metadata={
+            "frozen_l0_signature": frozen_l0_signature,
+            "training_result": training_result,
+        },
+    )
     return elapsed
 
 
@@ -601,7 +674,7 @@ def _train(
     training_indices: list[int],
     steps: int,
     experiment: V7ExperimentConfig,
-) -> None:
+) -> dict[str, float | int]:
     parameters = [p for p in model.parameters() if p.requires_grad]
     if not parameters:
         raise ValueError("V7.2 model contains no trainable parameter.")
@@ -610,8 +683,34 @@ def _train(
         lr=float(experiment.training.learning_rate),
         weight_decay=float(experiment.training.weight_decay),
     )
+    model.eval()
+    with torch.no_grad():
+        initial_output = _forward_model(
+            model,
+            batch=batch,
+            baseline=baseline,
+            reference_index=reference_index,
+            variant="normal",
+        )
+        index = torch.tensor(training_indices, device=baseline.device)
+        if not bool(
+            initial_output["active_frames"].index_select(1, index).any()
+        ):
+            raise RuntimeError("V7.2 has no active residual-training frame.")
+        initial_loss = float(
+            _pose_loss(
+                initial_output["world_to_camera"],
+                target,
+                reference_index=reference_index,
+                translation_weight=experiment.training.translation_weight,
+                evaluation_indices=training_indices,
+            ).cpu()
+        )
+    best_loss = float("inf")
+    best_step = 0
+    best_state = None
     model.train()
-    for step in range(int(steps)):
+    for step in range(1, int(steps) + 1):
         optimizer.zero_grad(set_to_none=True)
         output = _forward_model(
             model,
@@ -620,14 +719,6 @@ def _train(
             reference_index=reference_index,
             variant="normal",
         )
-        if step == 0 and hasattr(model, "architecture") and isinstance(
-            model, V72FrozenLocalResidual
-        ):
-            index = torch.tensor(training_indices, device=baseline.device)
-            if not bool(output["active_frames"].index_select(1, index).any()):
-                raise RuntimeError(
-                    f"V7.2 {model.architecture} has no active residual-training frame."
-                )
         loss = _pose_loss(
             output["world_to_camera"],
             target,
@@ -635,13 +726,57 @@ def _train(
             translation_weight=experiment.training.translation_weight,
             evaluation_indices=training_indices,
         )
+        if not bool(torch.isfinite(loss)):
+            raise RuntimeError(f"Non-finite V7.2 loss at step {step}.")
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
+        grad_norm = torch.nn.utils.clip_grad_norm_(
             parameters, float(experiment.training.grad_clip_norm)
         )
+        if not bool(torch.isfinite(grad_norm)):
+            raise RuntimeError(f"Non-finite V7.2 gradient at step {step}.")
         optimizer.step()
-        if step == 0 or (step + 1) % int(experiment.training.log_every) == 0:
-            print(f"  step={step + 1}/{steps} loss={float(loss.detach()):.8f}")
+        if (
+            step % int(experiment.training.log_every) == 0
+            or step == int(steps)
+        ):
+            model.eval()
+            with torch.no_grad():
+                checked = _forward_model(
+                    model,
+                    batch=batch,
+                    baseline=baseline,
+                    reference_index=reference_index,
+                    variant="normal",
+                )
+                current = float(
+                    _pose_loss(
+                        checked["world_to_camera"],
+                        target,
+                        reference_index=reference_index,
+                        translation_weight=(
+                            experiment.training.translation_weight
+                        ),
+                        evaluation_indices=training_indices,
+                    ).cpu()
+                )
+            print(f"  step={step}/{steps} loss={current:.8f}")
+            if current < best_loss:
+                best_loss = current
+                best_step = step
+                best_state = {
+                    name: value.detach().cpu().clone()
+                    for name, value in model.state_dict().items()
+                }
+            model.train()
+    if best_state is None:
+        raise RuntimeError("V7.2 training produced no checkpoint candidate.")
+    model.load_state_dict(best_state)
+    model.eval()
+    return {
+        "initial_loss": initial_loss,
+        "best_logged_loss": best_loss,
+        "best_step": best_step,
+    }
 
 
 def _evaluate_model(
@@ -939,11 +1074,13 @@ def _signature(
     architecture: str,
     *,
     token_count: int,
+    frozen_l0_signature: str,
 ) -> str:
     value = {
-        "schema": 1,
+        "schema": 3,
         "architecture": architecture,
         "token_count": token_count,
+        "frozen_l0_signature": frozen_l0_signature,
         "seed": config.seed,
         "base_steps": config.base_steps,
         "residual_steps": config.residual_steps,
@@ -962,26 +1099,93 @@ def _save_checkpoint(
     model,
     *,
     training_seconds: float,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
-    torch.save(
-        {
-            "signature": signature,
-            "model": {name: value.detach().cpu() for name, value in model.state_dict().items()},
-            "training_seconds": training_seconds,
+    payload = {
+        "signature": signature,
+        "model": {
+            name: value.detach().cpu()
+            for name, value in model.state_dict().items()
         },
-        temporary,
-    )
+        "training_seconds": training_seconds,
+    }
+    if metadata is not None:
+        payload["metadata"] = metadata
+    torch.save(payload, temporary)
     temporary.replace(path)
 
 
 def _load_checkpoint(path: Path, signature: str) -> dict:
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    if not isinstance(payload, dict) or payload.get("signature") != signature:
-        raise ValueError(
-            f"V7.2 checkpoint mismatch: {path}. Use V72_FRESH=1 to retrain."
+    if not isinstance(payload, dict) or "model" not in payload:
+        raise ValueError(f"Invalid V7.2 checkpoint: {path}")
+    if payload.get("signature") != signature:
+        raise V72CheckpointSignatureMismatch(
+            f"V7.2 checkpoint provenance mismatch: {path}"
         )
     return payload
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _assert_v71_baseline_metrics(
+    v71_output_dir: Path,
+    base_metrics: dict[str, dict[str, float | int]],
+) -> None:
+    _assert_v71_metrics(v71_output_dir, "frozen_l0", base_metrics)
+
+
+def _assert_v71_metrics(
+    v71_output_dir: Path,
+    architecture: str,
+    metrics: dict[str, dict[str, float | int]],
+) -> None:
+    csv_path = v71_output_dir / "v71_instance_causality.csv"
+    if not csv_path.is_file():
+        raise FileNotFoundError(
+            "V7.2 requires the V7.1 result CSV to verify shared-model "
+            f"equivalence: {csv_path}"
+        )
+    with csv_path.open("r", encoding="utf8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    matches = [
+        row for row in rows if row.get("architecture") == architecture
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "V7.1 result must contain exactly one row for "
+            f"{architecture}: {csv_path}"
+        )
+    expected = matches[0]
+    metric_fields = {
+        "rotation_deg": "rotation_degrees",
+        "translation": "translation_native",
+        "loss": "loss",
+    }
+    mismatches = []
+    for split, current in metrics.items():
+        for csv_suffix, metric_name in metric_fields.items():
+            expected_value = float(expected[f"{split}_{csv_suffix}"])
+            current_value = float(current[metric_name])
+            tolerance = 5e-7 * max(1.0, abs(expected_value))
+            if abs(current_value - expected_value) > tolerance:
+                mismatches.append(
+                    f"{split}.{csv_suffix}: "
+                    f"V7.1={expected_value:.10g} V7.2={current_value:.10g}"
+                )
+    if mismatches:
+        raise RuntimeError(
+            f"V7.2 {architecture} does not reproduce V7.1 metrics:\n  "
+            + "\n  ".join(mismatches)
+        )
+    print(f"V7.2 {architecture} metrics exactly reproduce V7.1: {csv_path}")
 
 
 def load_v72_config(path: str | Path) -> V72Config:
