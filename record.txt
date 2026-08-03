@@ -26,3 +26,40 @@ python -m pip install \
 test -f externals/horizonstream/requirements.txt
 
 python -m pip install -r externals/horizonstream/requirements.txt
+
+
+/home/huawei/miniconda3/envs/3am/bin/python - <<'PY'
+import csv
+import sys
+
+path = "outputs/streaming_couping_v73_correspondence/v73_frame_diagnostics.csv"
+architectures = {
+    "sam_geometry_transport_k08",
+    "sam_geometry_transport_k16",
+}
+fields = [
+    "architecture",
+    "split",
+    "frame",
+    "usable_instances",
+    "sam_used_instances",
+    "transport_entropy_normalized",
+    "transport_max_probability",
+    "sam_affinity_delta",
+    "frozen_l0_loss",
+    "loss",
+    "gain_vs_l0_percent",
+]
+
+with open(path, newline="") as f:
+    rows = [
+        r for r in csv.DictReader(f)
+        if r["architecture"] in architectures
+        and r["split"] in {"development", "validation", "future", "cross"}
+    ]
+
+writer = csv.DictWriter(sys.stdout, fieldnames=fields)
+writer.writeheader()
+for row in rows:
+    writer.writerow({k: row[k] for k in fields})
+PY
