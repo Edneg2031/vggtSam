@@ -1,0 +1,13 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+cd "$ROOT"
+
+echo "V7.1 Monday stage 1/2: two-step smoke"
+zsh streaming_couping/commands_v71_smoke.txt
+
+echo "V7.1 Monday stage 2/2: resumable formal ablation"
+zsh streaming_couping/commands_v71_instance_causality.txt
+
+echo "V7.1 Monday pipeline complete"

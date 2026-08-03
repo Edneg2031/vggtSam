@@ -1,0 +1,36 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+OUTPUT_ROOT="${V71_MULTISEED_OUTPUT:-outputs/streaming_couping_v71_multiseed}"
+SEED_TEXT="${V71_SEEDS:-0 1 2}"
+SEEDS=(${=SEED_TEXT})
+
+cd "$ROOT"
+[[ ${#SEEDS[@]} -ge 2 ]] || {
+  echo "V71_SEEDS must contain at least two seeds" >&2
+  exit 1
+}
+
+for seed in "${SEEDS[@]}"
+do
+  echo "V7.1 multi-seed run seed=$seed"
+  V71_SEED="$seed" \
+  V71_OUTPUT_DIR="$OUTPUT_ROOT/seed_$seed" \
+  zsh streaming_couping/commands_v71_instance_causality.txt
+done
+
+INPUTS=()
+for seed in "${SEEDS[@]}"
+do
+  INPUTS+=("$OUTPUT_ROOT/seed_$seed/v71_instance_causality.csv")
+done
+
+PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.aggregate_v71_seeds \
+  --inputs "${INPUTS[@]}" \
+  --output "$OUTPUT_ROOT/v71_seed_aggregate.csv"
+
+echo "V7.1 MULTI-SEED AGGREGATE"
+cat "$OUTPUT_ROOT/v71_seed_aggregate.csv"

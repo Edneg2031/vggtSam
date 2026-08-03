@@ -360,9 +360,17 @@ def _train_model(
     target_w2c: torch.Tensor,
     reference_index: int,
     config: V7ExperimentConfig,
+    training_indices: list[int] | None = None,
 ) -> dict[str, float | int]:
+    trainable_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    ]
+    if not trainable_parameters:
+        raise ValueError("V7 training requires trainable parameters.")
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        trainable_parameters,
         lr=config.training.learning_rate,
         weight_decay=config.training.weight_decay,
     )
@@ -379,9 +387,22 @@ def _train_model(
             target_w2c,
             reference_index=reference_index,
             translation_weight=config.training.translation_weight,
+            evaluation_indices=training_indices,
         ).cpu()
     )
-    if not bool(initial["active_frames"].any()):
+    active_indices = _evaluation_indices(
+        initial["active_frames"].shape[1],
+        reference_index=reference_index,
+        evaluation_indices=training_indices,
+    )
+    active_index = torch.tensor(
+        active_indices,
+        dtype=torch.long,
+        device=initial["active_frames"].device,
+    )
+    if not bool(
+        initial["active_frames"].index_select(1, active_index).any()
+    ):
         raise RuntimeError(
             f"V7 {model.architecture} has no usable training frame."
         )
@@ -403,6 +424,7 @@ def _train_model(
             target_w2c,
             reference_index=reference_index,
             translation_weight=config.training.translation_weight,
+            evaluation_indices=training_indices,
         )
         if not bool(torch.isfinite(loss)):
             raise RuntimeError(
@@ -410,7 +432,7 @@ def _train_model(
             )
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
+            trainable_parameters,
             config.training.grad_clip_norm,
         )
         if not bool(torch.isfinite(grad_norm)):
@@ -437,6 +459,7 @@ def _train_model(
                     translation_weight=(
                         config.training.translation_weight
                     ),
+                    evaluation_indices=training_indices,
                 ).cpu()
             )
             print(

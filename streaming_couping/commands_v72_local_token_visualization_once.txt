@@ -1,0 +1,12 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+cd "$ROOT"
+
+PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.visualize_v72_local_tokens \
+  --config streaming_couping/configs/v72_local_token_data.yaml
+
+echo "open outputs/streaming_couping_v72_local_token_visualization/index.html"

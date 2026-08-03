@@ -1,0 +1,14 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+GPU="${V72_TRAIN_GPU:-1}"
+cd "$ROOT"
+
+CUDA_VISIBLE_DEVICES="$GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.benchmark_v72_inference \
+  --device cuda:0 \
+  --architectures "${V72_BENCHMARK_ARCHITECTURES:-best}" \
+  --warmup "${V72_BENCHMARK_WARMUP:-20}" \
+  --repeats "${V72_BENCHMARK_REPEATS:-200}"

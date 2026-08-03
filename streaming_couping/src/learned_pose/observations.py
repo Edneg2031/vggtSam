@@ -125,6 +125,125 @@ def pool_sam_instance_features(
 
 
 @torch.no_grad()
+def sample_sam_instance_tokens(
+    spatial_features: torch.Tensor,
+    masks: torch.Tensor,
+    *,
+    max_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample spatially distributed SAM descriptors inside each mask.
+
+    This is the V7.2 counterpart to global mean/std pooling.  It preserves a
+    set of local descriptor vectors and their normalized image coordinates,
+    allowing a non-degenerate cross-attention over more than one Key/Value.
+    Sampling is deterministic: start at the mask centroid and repeatedly take
+    the point farthest from the selected UV set.
+
+    Args:
+        spatial_features: ``[S,C,Hf,Wf]`` frozen SAM3.1 feature maps.
+        masks: ``[S,K,Hm,Wm]`` tracked instance masks.
+        max_tokens: fixed padded token count per frame/instance.
+    Returns:
+        descriptors ``[S,K,P,C]``, normalized UV ``[S,K,P,2]`` in
+        ``[-1,1]``, and validity ``[S,K,P]``.
+    """
+
+    if spatial_features.ndim != 4 or masks.ndim != 4:
+        raise ValueError("Expected SAM features [S,C,H,W] and masks [S,K,H,W].")
+    if spatial_features.shape[0] != masks.shape[0]:
+        raise ValueError("SAM feature and mask frame counts differ.")
+    if int(max_tokens) < 2:
+        raise ValueError("SAM local sampling requires at least two tokens.")
+
+    resized = F.interpolate(
+        masks.to(device=spatial_features.device, dtype=torch.float32),
+        size=spatial_features.shape[-2:],
+        mode="nearest",
+    ).bool()
+    sequence, instances = resized.shape[:2]
+    channels = int(spatial_features.shape[1])
+    height, width = (int(v) for v in spatial_features.shape[-2:])
+    descriptors = torch.zeros(
+        sequence,
+        instances,
+        int(max_tokens),
+        channels,
+        dtype=torch.float32,
+        device=spatial_features.device,
+    )
+    uv = torch.zeros(
+        sequence,
+        instances,
+        int(max_tokens),
+        2,
+        dtype=torch.float32,
+        device=spatial_features.device,
+    )
+    valid = torch.zeros(
+        sequence,
+        instances,
+        int(max_tokens),
+        dtype=torch.bool,
+        device=spatial_features.device,
+    )
+
+    for frame_index in range(sequence):
+        feature = spatial_features[frame_index].float()
+        for instance_index in range(instances):
+            coordinates = torch.nonzero(
+                resized[frame_index, instance_index],
+                as_tuple=False,
+            )
+            if not int(coordinates.shape[0]):
+                continue
+            normalized = torch.stack(
+                [
+                    2.0 * coordinates[:, 1].float() / max(width - 1, 1) - 1.0,
+                    2.0 * coordinates[:, 0].float() / max(height - 1, 1) - 1.0,
+                ],
+                dim=-1,
+            )
+            selected = _farthest_uv_indices(
+                normalized,
+                count=min(int(max_tokens), int(normalized.shape[0])),
+            )
+            chosen_coordinates = coordinates.index_select(0, selected)
+            chosen_uv = normalized.index_select(0, selected)
+            count = int(selected.numel())
+            descriptors[frame_index, instance_index, :count] = (
+                feature[
+                    :,
+                    chosen_coordinates[:, 0],
+                    chosen_coordinates[:, 1],
+                ].transpose(0, 1)
+            )
+            uv[frame_index, instance_index, :count] = chosen_uv
+            valid[frame_index, instance_index, :count] = True
+    return descriptors.cpu(), uv.cpu(), valid.cpu()
+
+
+def _farthest_uv_indices(uv: torch.Tensor, *, count: int) -> torch.Tensor:
+    """Deterministic 2-D farthest-point sampling for one small feature grid."""
+
+    if uv.ndim != 2 or uv.shape[-1] != 2:
+        raise ValueError("UV candidates must have shape [N,2].")
+    count = min(max(int(count), 0), int(uv.shape[0]))
+    if count == 0:
+        return torch.empty(0, dtype=torch.long, device=uv.device)
+    centroid = uv.mean(dim=0, keepdim=True)
+    first = torch.linalg.vector_norm(uv - centroid, dim=-1).argmin()
+    selected = torch.empty(count, dtype=torch.long, device=uv.device)
+    selected[0] = first
+    minimum_distance = (uv - uv[first]).square().sum(dim=-1)
+    for index in range(1, count):
+        current = minimum_distance.argmax()
+        selected[index] = current
+        distance = (uv - uv[current]).square().sum(dim=-1)
+        minimum_distance = torch.minimum(minimum_distance, distance)
+    return selected
+
+
+@torch.no_grad()
 def build_geometry_observations(
     *,
     world_points: torch.Tensor,

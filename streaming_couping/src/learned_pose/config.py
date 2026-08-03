@@ -33,6 +33,12 @@ class FeatureConfig:
     sam_resolution: int = 1008
     sam_grid: tuple[int, int] = (72, 72)
     sam_batch_size: int = 0
+    # Optional V7.2 cache extension.  The retained V7/V7.1 experiments keep
+    # this disabled, so their cache identity and runtime are unchanged.
+    cache_sam_local_tokens: bool = False
+    sam_local_token_count: int = 32
+    sam_local_sampling: str = "farthest_uv"
+    sam_local_storage_dtype: str = "float16"
     geometry_prompt_point_confidence_threshold: float = 0.30
     point_confidence_threshold: float = 0.30
     min_instance_points: int = 128
@@ -199,6 +205,18 @@ def load_learned_pose_config(path: str | Path) -> LearnedPoseConfig:
             sam_resolution=int(features.get("sam_resolution", 1008)),
             sam_grid=_pair(features.get("sam_grid", [72, 72]), "features.sam_grid"),
             sam_batch_size=int(features.get("sam_batch_size", 0)),
+            cache_sam_local_tokens=bool(
+                features.get("cache_sam_local_tokens", False)
+            ),
+            sam_local_token_count=int(
+                features.get("sam_local_token_count", 32)
+            ),
+            sam_local_sampling=str(
+                features.get("sam_local_sampling", "farthest_uv")
+            ).strip().lower(),
+            sam_local_storage_dtype=str(
+                features.get("sam_local_storage_dtype", "float16")
+            ).strip().lower(),
             geometry_prompt_point_confidence_threshold=float(
                 features.get(
                     "geometry_prompt_point_confidence_threshold",
@@ -420,6 +438,24 @@ def _validate(config: LearnedPoseConfig) -> None:
         )
     if config.features.sam_batch_size < 0:
         raise ValueError("features.sam_batch_size must be non-negative.")
+    if config.features.sam_local_token_count < 2:
+        raise ValueError(
+            "features.sam_local_token_count must be at least two."
+        )
+    if config.features.sam_local_sampling != "farthest_uv":
+        raise ValueError(
+            "features.sam_local_sampling currently supports only "
+            "farthest_uv."
+        )
+    if config.features.sam_local_storage_dtype not in {
+        "float16",
+        "fp16",
+        "float32",
+        "fp32",
+    }:
+        raise ValueError(
+            "features.sam_local_storage_dtype must be float16 or float32."
+        )
     bad_perturbations = sorted(set(config.evaluation.perturbations) - VALID_PERTURBATIONS)
     if bad_perturbations:
         raise ValueError(f"Unknown evaluation perturbations: {bad_perturbations}")

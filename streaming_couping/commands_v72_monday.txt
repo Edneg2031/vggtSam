@@ -1,0 +1,17 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+cd "$ROOT"
+
+echo "V7.2 Monday 1/4: augment and audit true SAM3.1 local tokens"
+zsh streaming_couping/commands_v72_cache.txt
+
+echo "V7.2 Monday 2/4: deterministic smoke (uses completed cache)"
+zsh streaming_couping/commands_v72_smoke.txt
+
+echo "V7.2 Monday 3/4: formal resumable token-count/modality sweep"
+zsh streaming_couping/commands_v72_local_token_ablation.txt
+
+echo "V7.2 Monday 4/4: render report bundle"
+zsh streaming_couping/commands_v72_report.txt

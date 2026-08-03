@@ -1,0 +1,44 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+GPU="${V72_TRAIN_GPU:-1}"
+OUTPUT_ROOT="${V72_MULTISEED_OUTPUT:-outputs/streaming_couping_v72_multiseed}"
+SEED_TEXT="${V72_SEEDS:-0 1 2}"
+SEEDS=(${=SEED_TEXT})
+
+cd "$ROOT"
+[[ ${#SEEDS[@]} -ge 2 ]] || {
+  echo "V72_SEEDS must contain at least two seeds" >&2
+  exit 1
+}
+
+# Local cache extraction is deterministic and shared by every seed.
+zsh streaming_couping/commands_v72_cache.txt
+
+for seed in "${SEEDS[@]}"
+do
+  echo "V7.2 multi-seed run seed=$seed"
+  CUDA_VISIBLE_DEVICES="$GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+    -m streaming_couping.scripts.run_v72_local_token_ablation \
+    --config streaming_couping/configs/v72_local_token_ablation.yaml \
+    --output-dir "$OUTPUT_ROOT/seed_$seed" \
+    --device cuda:0 \
+    --seed "$seed" \
+    --resume
+done
+
+INPUTS=()
+for seed in "${SEEDS[@]}"
+do
+  INPUTS+=("$OUTPUT_ROOT/seed_$seed/v72_local_token_ablation.csv")
+done
+
+PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.aggregate_v72_seeds \
+  --inputs "${INPUTS[@]}" \
+  --output "$OUTPUT_ROOT/v72_seed_aggregate.csv"
+
+echo "V7.2 MULTI-SEED AGGREGATE"
+cat "$OUTPUT_ROOT/v72_seed_aggregate.csv"

@@ -74,6 +74,78 @@ token 的分层匹配。所有 train、temporal holdout、validation、cross-cli
 temporal holdout 与 validation；cross-clip 和 long30 只报告、不参与选择。CSV 已透视成
 每个结构一行，最终只有 raw 加五种结构共六行，便于直接复制。
 
+V7.1 用来回答“instance 是否在 camera 模型之外提供了因果增量”，而不是再次比较谁更
+容易拟合五帧：
+
+```bash
+zsh streaming_couping/commands_v71_instance_causality.txt
+```
+
+它先用长序列早期 `105–255` 训练 L0 camera-only，然后冻结 L0；七种 residual 只用
+`270–345` 训练，`360–405` 与独立 validation 用于选择，`420–525` 和 cross-clip
+严格只报告。实例结构共享完全相同的 current-observation gate，并同时比较全帧额外
+camera 容量、相同 gate 的额外 camera 容量、gate-only、appearance、geometry、解耦
+全局 K/V 和 local32。唯一结果是
+`outputs/streaming_couping_v71_instance_causality/v71_instance_causality.csv`，
+共 raw、冻结 L0 和七种 residual 九行。
+只有 instance-content 分支在 development、validation、future 和 cross 全部优于冻结
+L0，同时优于额外 camera 容量控制，且 `instance_off` 精确回到冻结 L0，才会标记
+`causal_instance_pass=1`。
+
+周一正式占卡前先运行两步 smoke；它先校验/补齐 V7 cache，cache 完整时训练只在
+logical `cuda:0` 分配模型：
+
+```bash
+zsh streaming_couping/commands_v71_smoke.txt
+```
+
+也可以直接运行周一的一键入口，它会先 smoke，成功后才进入可续跑正式实验：
+
+```bash
+zsh streaming_couping/commands_v71_monday.txt
+```
+
+完整的续跑、产物和故障说明见
+`streaming_couping/docs/v71_monday_runbook.md`。
+
+正式命令默认根据带配置签名的 `frozen_l0.pt` 和七个 residual checkpoint 自动续跑，
+中断后重复同一命令即可；`V71_FRESH=1` 才会忽略续跑并覆盖训练。除九行主表外还输出：
+
+- `v71_frame_diagnostics.csv`：每帧 raw/L0/refined 误差、有效实例数、可靠性和修正幅度；
+- `run_metadata.json`：git commit、dirty 状态、随机种子、PyTorch/CUDA/GPU 和完整配置；
+- `v71_result_summary.md`：根据容量控制、门控控制和扰动实验自动生成的结论。
+
+单次结果有希望后再运行多随机种子稳定性实验，默认 seed 为 `0 1 2`：
+
+```bash
+zsh streaming_couping/commands_v71_multiseed.txt
+```
+
+可通过 `V71_SEEDS="0 1"` 缩减次数；聚合结果写入
+`outputs/streaming_couping_v71_multiseed/v71_seed_aggregate.csv`。多 seed 不作为首次
+排错命令，避免在明显无效的结构上浪费 GPU。
+
+V7.2 进一步修正了 V7 `local32` 的证据含义：旧 `local32` 只有 mask 内的
+StreamVGGT UVD/world geometry，并没有 SAM 的局部 descriptor。V7.2 会在现有 V7 cache
+上增量保存 SAM3.1 `detector_fpn2` mask-local feature、UV 和 valid mask，不重新运行
+StreamVGGT/追踪，然后对 K=8/16/32 做真正的局部 token 消融：
+
+```bash
+zsh streaming_couping/commands_v72_monday.txt
+```
+
+正式表同时包含 raw、冻结 L0、两个 camera-capacity control 和六类局部结构，共 22 行：
+
+```text
+outputs/streaming_couping_v72_local_token_ablation/v72_local_token_ablation.csv
+```
+
+`causal_local_pass=1` 要求 development、validation、future、cross 全部优于 L0，
+future/cross 同时优于两个 camera control，并且 `instance_off` 在四个 split 精确回到 L0。
+逐帧诊断、缓存审计、多 seed 聚合、论文 CSV/LaTeX、PNG 和打包命令也已保留。完整说明见
+`streaming_couping/docs/v72_local_token_runbook.md`，服务器执行检查表见
+`streaming_couping/docs/v7_server_experiment_checklist.md`。
+
 长序列命令只占三张物理卡：StreamVGGT 的 24 层按连续区间分到两张卡，SAM3.1 单独使用
 第三张卡。每层 KV cache 保留完整因果历史，不切块、不重置；DPT/camera/depth/point
 输出逐帧卸载到 CPU。默认使用物理卡 `1,2,3`，可在命令前通过

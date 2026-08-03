@@ -1,0 +1,62 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+STREAM_GPU0="${V72_STREAM_GPU0:-${V72_GPU:-1}}"
+STREAM_GPU1="${V72_STREAM_GPU1:-2}"
+SAM_GPU="${V72_SAM_GPU:-3}"
+VISIBLE_GPUS="$STREAM_GPU0,$STREAM_GPU1,$SAM_GPU"
+DATA_CONFIG=streaming_couping/configs/v72_local_token_data.yaml
+EXPERIMENT_CONFIG=streaming_couping/configs/v72_local_token_ablation.yaml
+OUTPUT=outputs/streaming_couping_v72_local_token_ablation
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+echo "V7.2 physical GPUs=$VISIBLE_GPUS"
+echo "V7.2 logical layout: StreamVGGT=cuda:0,cuda:1 SAM3.1=cuda:2 training=cuda:0"
+
+# With an existing V7 cache this stage loads only the SAM3.1 image backbone
+# and adds local FPN token fields. It does not rerun StreamVGGT or tracking.
+CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" \
+PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.run_instance_token_pose \
+  --config "$DATA_CONFIG" \
+  --stage cache \
+  --streamvggt-devices cuda:0,cuda:1 \
+  --sam3-device cuda:2 \
+  --geometry-device cuda:0 \
+  --training-device cuda:0
+
+PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.audit_v7_cache \
+  --config "$DATA_CONFIG" \
+  --output-dir "$OUTPUT/cache_audit" \
+  --require-local \
+  --strict
+
+RESUME_ARGS=(--resume)
+if [[ "${V72_FRESH:-0}" == "1" ]]; then
+  RESUME_ARGS=()
+  echo "V7.2 full retraining requested"
+fi
+
+CUDA_VISIBLE_DEVICES="$STREAM_GPU0" \
+PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.run_v72_local_token_ablation \
+  --config "$EXPERIMENT_CONFIG" \
+  --device cuda:0 \
+  "${RESUME_ARGS[@]}"
+
+[[ -s "$OUTPUT/v72_local_token_ablation.csv" ]] || {
+  echo "missing V7.2 CSV" >&2
+  exit 1
+}
+echo "V7.2 COPY THIS ONE CSV"
+cat "$OUTPUT/v72_local_token_ablation.csv"
+

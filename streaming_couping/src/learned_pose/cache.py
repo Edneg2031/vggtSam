@@ -49,6 +49,7 @@ from .observations import (
     build_geometry_observations,
     build_pose_residual_observations,
     pool_sam_instance_features,
+    sample_sam_instance_tokens,
     sample_instance_uvd,
 )
 
@@ -78,55 +79,76 @@ def build_feature_caches(config: LearnedPoseConfig) -> list[Path]:
 
     _preflight_pending_clips(config, pending)
     recovery = load_config(config.recovery_config)
-    if config.streamvggt_devices and not recovery.streaming_cache:
-        raise ValueError(
-            "Layer-sharded StreamVGGT requires streamvggt.streaming_cache=true "
-            f"in {config.recovery_config}."
+    geometry_pending = [
+        (clip, path)
+        for clip, path in pending
+        if config.features.rebuild
+        or not _geometry_cache_reusable(
+            path,
+            config=config,
+            clip=clip,
+            require_identity=config.fusion.strict_identity_gate,
         )
-    stream_model = load_streamvggt_latent_model(
-        repo_path=recovery.streamvggt_repo,
-        checkpoint_path=recovery.streamvggt_checkpoint,
-        device=("cpu" if config.streamvggt_devices else config.geometry_device),
-        strict=True,
-    )
-    parallel_runner = None
-    if config.streamvggt_devices:
-        assert_processed_key_cache_equivalence()
-        print("StreamVGGT processed-key cache equivalence passed")
-        parallel_runner = LayerShardedStreamVGGT(
-            stream_model,
-            config.streamvggt_devices,
-            selected_layer_indices=config.fusion.dpt_layer_indices,
-            amp_dtype=config.streamvggt_amp_dtype,
-        )
-        print(
-            "StreamVGGT full-history model parallelism "
-            f"amp={config.streamvggt_amp_dtype}"
-        )
-        for line in parallel_runner.layout_summary():
-            print(f"  {line}")
-    stream_adapter = StreamVGGTLatentAdapter(
-        stream_model,
-        device=config.geometry_device,
-        image_mode=recovery.image_mode,
-        dpt_layer_indices=config.fusion.dpt_layer_indices,
-        parallel_runner=parallel_runner,
-    )
+    ]
     sam_video_holder: dict[str, SAM3Wrapper] = {}
-    for clip, path in pending:
-        print(f"caching frozen geometry/tracking clip={clip.name}")
-        partial = _build_geometry_cache(
-            config,
-            clip,
-            stream_adapter=stream_adapter,
-            sam_video_holder=sam_video_holder,
+    if geometry_pending:
+        if config.streamvggt_devices and not recovery.streaming_cache:
+            raise ValueError(
+                "Layer-sharded StreamVGGT requires "
+                "streamvggt.streaming_cache=true in "
+                f"{config.recovery_config}."
+            )
+        stream_model = load_streamvggt_latent_model(
+            repo_path=recovery.streamvggt_repo,
+            checkpoint_path=recovery.streamvggt_checkpoint,
+            device=(
+                "cpu"
+                if config.streamvggt_devices
+                else config.geometry_device
+            ),
+            strict=True,
         )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(partial, path)
-
-    del partial, stream_adapter, parallel_runner, stream_model
-    gc.collect()
-    _empty_cuda_cache()
+        parallel_runner = None
+        if config.streamvggt_devices:
+            assert_processed_key_cache_equivalence()
+            print("StreamVGGT processed-key cache equivalence passed")
+            parallel_runner = LayerShardedStreamVGGT(
+                stream_model,
+                config.streamvggt_devices,
+                selected_layer_indices=config.fusion.dpt_layer_indices,
+                amp_dtype=config.streamvggt_amp_dtype,
+            )
+            print(
+                "StreamVGGT full-history model parallelism "
+                f"amp={config.streamvggt_amp_dtype}"
+            )
+            for line in parallel_runner.layout_summary():
+                print(f"  {line}")
+        stream_adapter = StreamVGGTLatentAdapter(
+            stream_model,
+            device=config.geometry_device,
+            image_mode=recovery.image_mode,
+            dpt_layer_indices=config.fusion.dpt_layer_indices,
+            parallel_runner=parallel_runner,
+        )
+        for clip, path in geometry_pending:
+            print(f"caching frozen geometry/tracking clip={clip.name}")
+            partial = _build_geometry_cache(
+                config,
+                clip,
+                stream_adapter=stream_adapter,
+                sam_video_holder=sam_video_holder,
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(partial, path)
+        del partial, stream_adapter, parallel_runner, stream_model
+        gc.collect()
+        _empty_cuda_cache()
+    else:
+        print(
+            "reusing frozen StreamVGGT/tracking observations; "
+            "only SAM appearance cache fields will be augmented"
+        )
 
     # The image model and video predictor are both large. Never keep both on
     # the SAM device while extracting pooled appearance descriptors.
@@ -172,6 +194,32 @@ def build_feature_caches(config: LearnedPoseConfig) -> list[Path]:
         )
         payload["appearance"] = appearance.float()
         payload["appearance_dim"] = int(appearance.shape[-1])
+        if config.features.cache_sam_local_tokens:
+            local, local_uv, local_valid = sample_sam_instance_tokens(
+                spatial,
+                payload["tracking_masks_output"],
+                max_tokens=config.features.sam_local_token_count,
+            )
+            storage_dtype = (
+                torch.float16
+                if config.features.sam_local_storage_dtype
+                in {"float16", "fp16"}
+                else torch.float32
+            )
+            payload["sam_local_features"] = local.to(storage_dtype)
+            payload["sam_local_uv"] = local_uv.float()
+            payload["sam_local_valid"] = local_valid.bool()
+            payload["sam_local_source"] = config.features.sam_source
+            payload["sam_local_sampling"] = (
+                config.features.sam_local_sampling
+            )
+            payload["sam_local_token_count"] = int(
+                config.features.sam_local_token_count
+            )
+            payload["sam_local_feature_dim"] = int(local.shape[-1])
+            payload["sam_local_storage_dtype"] = str(storage_dtype).replace(
+                "torch.", ""
+            )
         payload["complete"] = True
         torch.save(payload, path)
     del sam_adapter, sam_image_model
@@ -1092,6 +1140,31 @@ def _cache_complete(
         return False
     if not bool(payload.get("complete", False)):
         return False
+    if config is not None and config.features.cache_sam_local_tokens:
+        required_local = (
+            "sam_local_features",
+            "sam_local_uv",
+            "sam_local_valid",
+            "sam_local_feature_dim",
+        )
+        if any(name not in payload for name in required_local):
+            return False
+        if (
+            int(payload.get("sam_local_token_count", -1))
+            != config.features.sam_local_token_count
+            or str(payload.get("sam_local_source", ""))
+            != config.features.sam_source
+            or str(payload.get("sam_local_sampling", ""))
+            != config.features.sam_local_sampling
+            or str(payload.get("sam_local_storage_dtype", ""))
+            not in {
+                "float16"
+                if config.features.sam_local_storage_dtype
+                in {"float16", "fp16"}
+                else "float32"
+            }
+        ):
+            return False
     if (
         config is not None
         and config.features.sam_segmentation_variant != "legacy_recovery"
@@ -1159,6 +1232,84 @@ def _cache_complete(
         and int(payload.get("reference_sequence_index", -1))
         == clip.reference_sequence_index
     )
+
+
+def _geometry_cache_reusable(
+    path: Path,
+    *,
+    config: LearnedPoseConfig,
+    clip: ClipConfig,
+    require_identity: bool,
+) -> bool:
+    """Check whether only the SAM appearance extension needs refreshing.
+
+    In particular, changing V7.2 local-token count or storage dtype must not
+    rerun StreamVGGT, geometry-guided SAM tracking, or GT alignment.  This
+    validator intentionally ignores global/local appearance cache fields.
+    """
+
+    if not path.is_file():
+        return False
+    try:
+        payload = load_feature_cache(path, require_complete=False)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+    core_fields = {
+        "image_paths",
+        "image_size",
+        "camera_hidden",
+        "baseline_pose_encoding",
+        "baseline_world_points",
+        "baseline_world_confidence",
+        "pose_geometry",
+        "quality",
+        "observed",
+        "tracking_masks_output",
+        "target_pose_encoding",
+    }
+    if require_identity:
+        core_fields.update(
+            {
+                "identity_valid",
+                "identity_unknown",
+                "identity_mismatch",
+                "associated_instance_valid",
+            }
+        )
+    if any(name not in payload for name in core_fields):
+        return False
+    recovery = load_config(config.recovery_config)
+    if (
+        str(payload.get("sam_version", "")) != recovery.sam3_version
+        or str(payload.get("sam_checkpoint", ""))
+        != str(recovery.sam3_checkpoint)
+        or str(payload.get("sam_segmentation_variant", ""))
+        != config.features.sam_segmentation_variant
+        or str(payload.get("clip_name", "")) != clip.name
+        or str(payload.get("scene_id", "")) != clip.scene_id
+        or tuple(int(value) for value in payload.get("frame_indices", ()))
+        != clip.frame_indices
+        or tuple(int(value) for value in payload.get("instance_ids", ()))
+        != clip.instance_ids
+        or int(payload.get("reference_sequence_index", -1))
+        != clip.reference_sequence_index
+    ):
+        return False
+    expected_execution = (
+        "layer_sharded_full_history"
+        if config.streamvggt_devices
+        else "single_device_full_history"
+    )
+    if str(payload.get("streamvggt_execution", "")) != expected_execution:
+        return False
+    if config.streamvggt_devices and (
+        tuple(str(value) for value in payload.get("streamvggt_devices", ()))
+        != config.streamvggt_devices
+        or str(payload.get("streamvggt_amp_dtype", ""))
+        != config.streamvggt_amp_dtype
+    ):
+        return False
+    return True
 
 
 def _empty_cuda_cache() -> None:
