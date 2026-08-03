@@ -39,10 +39,10 @@ from streaming_couping.scripts.run_v7_fusion_ablation import (
     _load_cache,
     _pose_metrics,
     _seed_everything,
+    _train_model,
     load_v7_config,
 )
 from streaming_couping.scripts.run_v71_instance_causality import (
-    _checkpoint_signature as _v71_checkpoint_signature,
     _slice_batch_prefix,
     load_v71_config,
 )
@@ -64,7 +64,6 @@ from streaming_couping.scripts.run_v73_long_capacity import (
     _gain,
     _make_l0,
     _short,
-    _signature as _v73_long_signature,
     _train,
 )
 
@@ -98,11 +97,8 @@ def main() -> None:
         seed=int(args.seed),
         branches=selected,
         resume=bool(args.resume),
-        frozen_l0_path=(
-            Path(args.frozen_l0).expanduser().resolve()
-            if args.frozen_l0
-            else None
-        ),
+        data_config=Path(args.data_config).expanduser().resolve(),
+        base_steps=int(args.base_steps),
     )
     print(f"V7.4 temporal-scaling result={result}")
 
@@ -117,10 +113,13 @@ def run_temporal_scaling(
     seed: int,
     branches: tuple[str, ...],
     resume: bool,
-    frozen_l0_path: Path | None,
+    data_config: Path,
+    base_steps: int,
 ) -> Path:
-    if token_count < 2 or steps < 1:
-        raise ValueError("V7.4 requires token_count >= 2 and steps >= 1.")
+    if token_count < 2 or steps < 1 or base_steps < 1:
+        raise ValueError(
+            "V7.4 requires token_count >= 2 and positive training steps."
+        )
     v72 = load_v72_config(v73_config.v72_config)
     v71 = load_v71_config(v72.v71_config)
     source_v7 = load_v7_config(v71.v7_config)
@@ -129,12 +128,7 @@ def run_temporal_scaling(
         device=device,
         training=replace(source_v7.training, seed=seed),
     )
-    v71_experiment = replace(
-        source_v7,
-        device=device,
-        training=replace(source_v7.training, seed=v71.seed),
-    )
-    data = load_learned_pose_config(v72.data_config)
+    data = load_learned_pose_config(data_config)
     long_clip = _find_clip(data, v71.long_clip_name)
     payload = _load_cache(data, long_clip)
     _validate_local_payload(
@@ -163,31 +157,22 @@ def run_temporal_scaling(
     positions = {frame: index for index, frame in enumerate(frames)}
     validate_folds(FOLDS, available_frames=set(frames))
     output_dir.mkdir(parents=True, exist_ok=True)
-    (
-        base_model,
-        frozen_signature,
-        frozen_sha256,
-        frozen_source,
-    ) = _load_available_l0(
-        explicit=frozen_l0_path,
-        v71_output=v71.output_dir,
-        v72_output=v72.output_dir,
-        v73_output=v73_config.output_dir,
-        v74_output=output_dir,
-        v73_long_output=Path(
-            "outputs/streaming_couping_v73_long_capacity"
-        ).resolve(),
-        v71=v71,
-        experiment=v71_experiment,
-        batch=batch,
-        device=device,
-    )
-    _retain_clean_l0(
-        model=base_model,
-        signature=frozen_signature,
-        source=frozen_source,
-        source_sha256=frozen_sha256,
-        destination=output_dir / "frozen_l0.pt",
+    base_model, frozen_signature, frozen_source, frozen_sha256 = (
+        _train_or_resume_v74_l0(
+            output_dir=output_dir,
+            resume=resume,
+            batch=batch,
+            baseline=baseline,
+            target=target,
+            reference_index=reference_index,
+            positions=positions,
+            base_frames=v71.base_train_frames,
+            experiment=experiment,
+            base_steps=base_steps,
+            seed=seed,
+            data_config=data_config,
+            device=device,
+        )
     )
     with torch.no_grad():
         base_output = _forward_model(
@@ -342,6 +327,7 @@ def run_temporal_scaling(
         "reference_frame": 90,
         "folds": [asdict(fold) for fold in FOLDS],
         "token_count": token_count,
+        "base_steps": base_steps,
         "steps": steps,
         "seed": seed,
         "branches": branches,
@@ -438,159 +424,66 @@ def _train_or_resume(
     return training
 
 
-def _load_available_l0(
-    *,
-    explicit: Path | None,
-    v71_output: Path,
-    v72_output: Path,
-    v73_output: Path,
-    v74_output: Path,
-    v73_long_output: Path,
-    v71,
-    experiment,
-    batch,
+def _train_or_resume_v74_l0(
+    *, output_dir, resume, batch, baseline, target, reference_index,
+    positions, base_frames, experiment, base_steps, seed, data_config,
     device,
 ):
-    if explicit is not None:
-        if not explicit.is_file():
-            raise FileNotFoundError(
-                f"Explicit V7.4 frozen L0 does not exist: {explicit}"
-            )
-        candidates = (explicit,)
-    else:
-        candidates = (
-            v71_output / "frozen_l0.pt",
-            v74_output / "frozen_l0.pt",
-            v73_output / "frozen_l0.pt",
-            v72_output / "frozen_l0.pt",
-        )
-    failures = []
-    for candidate in candidates:
-        if not candidate.is_file():
-            continue
-        try:
-            model, signature, sha256 = _load_compatible_l0(
-                v71=v71,
-                experiment=experiment,
-                batch=batch,
-                device=device,
-                source=candidate,
-            )
-        except (RuntimeError, ValueError) as error:
-            failures.append(f"{candidate}: {error}")
-            continue
-        return model, signature, sha256, candidate
-    recovered = _recover_l0_from_v73_long(
-        output_dir=v73_long_output,
-        v71=v71,
+    missing = set(base_frames) - set(positions)
+    if missing:
+        raise ValueError(f"V7.4 L0 training lacks frames={sorted(missing)}.")
+    last_index = positions[max(base_frames)]
+    prefix_length = last_index + 1
+    training_indices = [positions[frame] for frame in base_frames]
+    signature = _l0_signature(
+        base_frames=base_frames,
+        base_steps=base_steps,
+        seed=seed,
+        data_config=data_config,
         experiment=experiment,
-        batch=batch,
-        device=device,
     )
-    if recovered is not None:
-        return recovered
-    if failures:
-        details = "\n  ".join(failures)
-        raise ValueError(
-            "V7.4 found frozen L0 files, but none has compatible V7.1 "
-            f"provenance:\n  {details}"
-        )
-    searched = "\n  ".join(str(path) for path in candidates)
-    raise FileNotFoundError(
-        "V7.4 could not find a compatible frozen L0. Searched:\n  "
-        f"{searched}\nRun commands_v71_instance_causality.txt only if none "
-        "of these retained artifacts exists."
-    )
-
-
-def _recover_l0_from_v73_long(
-    *, output_dir, v71, experiment, batch, device
-):
-    metadata_path = output_dir / "v73_long_capacity_metadata.json"
-    if not metadata_path.is_file():
-        return None
-    metadata = json.loads(metadata_path.read_text(encoding="utf8"))
-    expected_l0 = _v71_checkpoint_signature(
-        v71,
-        experiment,
-        architecture="frozen_l0",
-    )
-    if str(metadata.get("frozen_l0_signature", "")) != expected_l0:
-        raise ValueError(
-            "V7.3 long-capacity metadata does not originate from the "
-            f"required V7.1 L0: {metadata_path}"
-        )
-    token_count = int(metadata["token_count"])
-    steps = int(metadata["steps"])
-    seed = int(metadata["seed"])
-    frames = tuple(int(value) for value in metadata["supervised_frames"])
-    branches = tuple(str(value) for value in metadata["branches"])
-    long_experiment = replace(
-        experiment,
-        training=replace(experiment.training, seed=seed),
-    )
-    failures = []
-    for label in branches:
-        if label not in BRANCHES:
-            continue
-        architecture, train_variant = BRANCHES[label]
-        path = output_dir / f"{label}_k{token_count:02d}.pt"
-        if not path.is_file():
-            continue
-        expected_checkpoint = _v73_long_signature(
-            label=label,
-            architecture=architecture,
-            train_variant=train_variant,
-            token_count=token_count,
-            seed=seed,
-            steps=steps,
-            frozen_l0_signature=expected_l0,
-            frames=frames,
-            experiment=long_experiment,
-        )
+    path = output_dir / "frozen_l0.pt"
+    _seed_everything(seed)
+    model = _make_l0(batch=batch, experiment=experiment, device=device)
+    if resume and path.is_file():
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-        if (
-            not isinstance(checkpoint, dict)
-            or checkpoint.get("signature") != expected_checkpoint
-            or not isinstance(checkpoint.get("model"), dict)
-        ):
-            failures.append(str(path))
-            continue
-        prefix = "base_model."
-        base_state = {
-            name[len(prefix) :]: value
-            for name, value in checkpoint["model"].items()
-            if name.startswith(prefix)
-        }
-        model = _make_l0(batch=batch, experiment=experiment, device=device)
-        try:
-            model.load_state_dict(base_state, strict=True)
-        except RuntimeError:
-            failures.append(str(path))
-            continue
-        for parameter in model.parameters():
-            parameter.requires_grad_(False)
-        model.eval()
-        sha256 = _sha256_file(path)
-        print(
-            "V7.4 recovered frozen L0 from signed V7.3 long checkpoint: "
-            f"{path} sha256={sha256}"
-        )
-        return model, expected_l0, sha256, path
-    if failures:
-        raise ValueError(
-            "V7.4 found V7.3 long checkpoints but their signatures or "
-            f"embedded L0 states are invalid: {failures}"
-        )
-    return None
-
-
-def _retain_clean_l0(
-    *, model, signature, source, source_sha256, destination
-) -> None:
-    if source.resolve() == destination.resolve() and destination.is_file():
-        return
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
+        if checkpoint.get("signature") == signature and "model" in checkpoint:
+            model.load_state_dict(checkpoint["model"], strict=True)
+            for parameter in model.parameters():
+                parameter.requires_grad_(False)
+            model.eval()
+            sha256 = _sha256_file(path)
+            print(f"V7.4 resumed self-trained L0: {path} sha256={sha256}")
+            return model, signature, path, sha256
+        print(f"V7.4 invalidating stale self-trained L0: {path}")
+    print(
+        "V7.4 training fresh camera-only L0 on frames="
+        + " ".join(str(frame) for frame in base_frames)
+    )
+    training_batch = _slice_batch_prefix(batch, length=prefix_length)
+    training_config = replace(
+        experiment,
+        training=replace(
+            experiment.training,
+            steps=base_steps,
+            seed=seed,
+        ),
+    )
+    started = time.perf_counter()
+    training = _train_model(
+        model,
+        batch=training_batch,
+        baseline_w2c=baseline[:, :prefix_length],
+        target_w2c=target[:, :prefix_length],
+        reference_index=reference_index,
+        config=training_config,
+        training_indices=training_indices,
+    )
+    training_seconds = time.perf_counter() - started
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    model.eval()
+    temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(
         {
             "signature": signature,
@@ -598,50 +491,34 @@ def _retain_clean_l0(
                 name: value.detach().cpu()
                 for name, value in model.state_dict().items()
             },
-            "metadata": {
-                "source": str(source),
-                "source_signature": signature,
-                "source_sha256": source_sha256,
-            },
+            "training_frames": tuple(base_frames),
+            "training_seconds": training_seconds,
+            "training_result": training,
         },
         temporary,
     )
-    temporary.replace(destination)
-    print(f"V7.4 retained clean frozen L0: {destination}")
+    temporary.replace(path)
+    sha256 = _sha256_file(path)
+    print(f"V7.4 trained and retained fresh L0: {path} sha256={sha256}")
+    return model, signature, path, sha256
 
 
-def _load_compatible_l0(*, v71, experiment, batch, device, source):
-    model = _make_l0(batch=batch, experiment=experiment, device=device)
-    expected = _v71_checkpoint_signature(
-        v71,
-        experiment,
-        architecture="frozen_l0",
-    )
-    checkpoint = torch.load(source, map_location="cpu", weights_only=False)
-    if not isinstance(checkpoint, dict) or "model" not in checkpoint:
-        raise ValueError(f"Invalid V7.4 frozen L0 checkpoint: {source}")
-    metadata = checkpoint.get("metadata", {})
-    source_signature = (
-        metadata.get("source_signature", "")
-        if isinstance(metadata, dict)
-        else ""
-    )
-    signatures = {
-        str(checkpoint.get("signature", "")),
-        str(source_signature),
+def _l0_signature(
+    *, base_frames, base_steps, seed, data_config, experiment
+) -> str:
+    payload = {
+        "schema": 1,
+        "purpose": "v74_self_trained_camera_l0",
+        "base_frames": tuple(base_frames),
+        "base_steps": base_steps,
+        "seed": seed,
+        "data_config": str(data_config),
+        "fusion": asdict(experiment.fusion),
+        "training": asdict(experiment.training),
     }
-    if expected not in signatures:
-        raise ValueError(
-            "V7.4 frozen L0 provenance mismatch: "
-            f"{source}. Expected V7.1 signature={expected}."
-        )
-    model.load_state_dict(checkpoint["model"], strict=True)
-    for parameter in model.parameters():
-        parameter.requires_grad_(False)
-    model.eval()
-    sha256 = _sha256_file(source)
-    print(f"V7.4 loaded compatible frozen L0: {source} sha256={sha256}")
-    return model, expected, sha256
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode("utf8")
+    ).hexdigest()
 
 
 def _model_row(
@@ -1014,7 +891,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir")
     parser.add_argument("--device")
-    parser.add_argument("--frozen-l0")
+    parser.add_argument(
+        "--data-config",
+        default="streaming_couping/configs/v74_temporal_data.yaml",
+    )
+    parser.add_argument("--base-steps", type=int, default=1200)
     parser.add_argument("--token-count", type=int, default=8)
     parser.add_argument("--steps", type=int, default=3000)
     parser.add_argument("--seed", type=int, default=0)

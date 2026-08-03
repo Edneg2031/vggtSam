@@ -15,8 +15,10 @@ parameter-matched model trained without SAM logits.
 
 ## Locked temporal folds
 
-Frame 90 remains the reference. The exact frozen V7.1 L0, K=8 observations and
-optimization settings are shared by every branch.
+Frame 90 remains the reference. V7.4 builds its own 30-frame SAM3.1 and
+StreamVGGT cache, then trains a fresh camera-only L0 on frames 105 through 255.
+The resulting L0, K=8 observations and optimization settings are shared by
+every residual branch.
 
 | Fold | Residual training | Future test |
 |---|---|---|
@@ -24,10 +26,11 @@ optimization settings are shared by every branch.
 | `medium` | 270 through 405, step 15 | 420, 435, 450, 465 |
 | `long` | 270 through 465, step 15 | 480, 495, 510, 525 |
 
-Each fold starts from the same L0 and a fresh residual initialization. Training
-uses a tensor prefix ending at the last training frame, so future observations
-and targets do not enter its forward pass. Evaluation remains streaming: a
-future frame may use target-free memory accumulated from earlier observations.
+Each fold starts from that same V7.4-owned L0 and a fresh residual
+initialization. Training uses a tensor prefix ending at the last training
+frame, so future observations and targets do not enter its forward pass.
+Evaluation remains streaming: a future frame may use target-free memory
+accumulated from earlier observations.
 
 ## Controls
 
@@ -72,15 +75,10 @@ V74_GPU=1 V74_FRESH=1 \
   zsh streaming_couping/commands_v74_temporal_scaling.txt
 ```
 
-The command searches for the exact retained L0 in V7.1, then the provenance-
-checked copies in V7.3 and V7.2. An explicit path can be supplied with
-`V74_FROZEN_L0=/path/to/frozen_l0.pt`; its V7.1 source signature is still
-validated before training.
-
-If those clean copies were deleted, V7.4 can recover `base_model.*` from a
-V7.3 long-capacity checkpoint. It first verifies both the long-run metadata
-and complete checkpoint signature against the required V7.1 signature. The
-recovered clean copy is retained as `V74_OUTPUT/frozen_l0.pt` for later runs.
+V7.4 has no V7.1, V7.2 or V7.3 output dependency. Its cache, fresh L0,
+residual checkpoints and CSV all live under
+`outputs/streaming_couping_v74_temporal_scaling`. The default physical GPU
+layout is StreamVGGT on 1 and 2, SAM3.1 on 3, followed by training on 1.
 
 To change the budget or seed:
 
