@@ -174,6 +174,15 @@ def _smoke_coordinates_and_causality() -> None:
     transformed = transform_points(c2w, current)
     recovered = transform_points(invert_rigid(c2w), transformed)
     _require(torch.allclose(recovered, current, atol=1e-6), "pose round-trip failed")
+    mixed_precision = transform_points(c2w.double(), current.float())
+    _require(
+        mixed_precision.dtype == torch.float64,
+        "mixed-precision transform did not promote to a common dtype",
+    )
+    _require(
+        torch.allclose(mixed_precision, transformed.double(), atol=1e-8),
+        "mixed-precision transform changed coordinates",
+    )
     batched_c2w = c2w[None].repeat(sequence, 1, 1)
     batched_c2w[:, :3, 3] += torch.arange(sequence).float()[:, None] * 0.01
     world = transform_points(batched_c2w[:, None], camera)

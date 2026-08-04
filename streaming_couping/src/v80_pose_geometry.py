@@ -52,6 +52,16 @@ def transform_points(matrix: torch.Tensor, points: torch.Tensor) -> torch.Tensor
     if points.ndim < 1 or points.shape[-1] != 3:
         raise ValueError("Points must end in dimension three.")
     value = homogeneous(matrix)
+    if value.device != points.device:
+        raise ValueError(
+            "Pose and points must be on the same device: "
+            f"pose={value.device}, points={points.device}."
+        )
+    common_dtype = torch.promote_types(value.dtype, points.dtype)
+    if not (common_dtype.is_floating_point or common_dtype.is_complex):
+        common_dtype = torch.get_default_dtype()
+    value = value.to(dtype=common_dtype)
+    points = points.to(dtype=common_dtype)
     rotation = value[..., :3, :3]
     translation = value[..., :3, 3]
     matrix_leading = rotation.shape[:-2]

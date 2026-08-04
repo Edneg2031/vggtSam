@@ -48,6 +48,19 @@ def test_rigid_inverse_round_trip():
     )
 
 
+def test_transform_points_promotes_mixed_float_dtypes():
+    pose = torch.eye(4, dtype=torch.float64)
+    pose[:3, 3] = torch.tensor([0.2, -0.1, 0.3], dtype=torch.float64)
+    points = torch.randn(7, 3, dtype=torch.float32)
+    transformed = transform_points(pose, points)
+    assert transformed.dtype == torch.float64
+    assert torch.allclose(
+        transformed,
+        points.double() + pose[:3, 3],
+        atol=1e-10,
+    )
+
+
 def test_no_history_returns_shape_safe_empty_pairs():
     points = torch.zeros(2, 1, 4, 3)
     valid = torch.ones(2, 1, 4, dtype=torch.bool)
