@@ -233,8 +233,11 @@ def compute_v80_matching_loss(
     probability = output["transport_probability"].float()
     query_valid = output["transport_query_valid"].bool()
     key_valid = output["transport_key_valid"].bool()
-    if probability.ndim != 6:
-        raise ValueError("V8 probability must be [B,S,K,Q,R].")
+    if probability.ndim != 5:
+        raise ValueError(
+            "V8 probability must be [B,S,K,Q,R]; "
+            f"got shape={tuple(probability.shape)}."
+        )
     if query_valid.shape != probability.shape[:-1]:
         raise ValueError("V8 query validity has the wrong shape.")
     if key_valid.shape != (*probability.shape[:3], probability.shape[-1]):

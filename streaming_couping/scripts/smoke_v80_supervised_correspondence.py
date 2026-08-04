@@ -47,11 +47,22 @@ def main() -> None:
         value_mode="geometry_sam_dual",
     )
     output = _forward(model, values, baseline)
-    assert output["world_to_camera"].shape == (1, 3, 3, 4)
-    assert output["transport_probability"].shape == (1, 3, 1, 4, 4)
-    assert output["transported_geometry"].shape == (1, 3, 1, 4, 16)
-    assert output["transported_sam"].shape == (1, 3, 1, 4, 16)
-    assert torch.equal(output["world_to_camera"], output["base_world_to_camera"])
+    expected_shapes = {
+        "world_to_camera": (1, 3, 3, 4),
+        "transport_probability": (1, 3, 1, 4, 4),
+        "transported_geometry": (1, 3, 1, 4, 16),
+        "transported_sam": (1, 3, 1, 4, 16),
+    }
+    for name, expected in expected_shapes.items():
+        actual = tuple(output[name].shape)
+        if actual != expected:
+            raise RuntimeError(
+                f"V8 smoke {name} shape mismatch: expected={expected}, got={actual}."
+            )
+    if not torch.equal(
+        output["world_to_camera"], output["base_world_to_camera"]
+    ):
+        raise RuntimeError("V8 zero-initialized pose fallback is not exact.")
 
     matching = V80MatchingConfig(max_distance=0.05, temperature=0.01)
     result = _loss(model, values, baseline, gt, matching)
