@@ -353,16 +353,28 @@ def v80_memory_write(batch: dict[str, torch.Tensor], *, min_confidence: float) -
     )
 
 
-def affinity_health(output: dict[str, torch.Tensor]) -> dict[str, float]:
+def affinity_health(
+    output: dict[str, torch.Tensor],
+    *,
+    sequence_indices: list[int] | tuple[int, ...] | None = None,
+) -> dict[str, float]:
     """Report masked, centered affinity strength rather than raw logit norms."""
 
+    def selected(value: torch.Tensor) -> torch.Tensor:
+        if sequence_indices is None:
+            return value
+        index = torch.as_tensor(
+            sequence_indices, dtype=torch.long, device=value.device
+        )
+        return value.index_select(1, index)
+
     pair_valid = (
-        output["transport_query_valid"][..., :, None]
-        & output["transport_key_valid"][..., None, :]
+        selected(output["transport_query_valid"])[..., :, None]
+        & selected(output["transport_key_valid"])[..., None, :]
     )
 
     def rms(name: str) -> torch.Tensor:
-        value = output[name].float()
+        value = selected(output[name]).float()
         mask = pair_valid.to(value.dtype)
         mean = (value * mask).sum(dim=-1, keepdim=True) / mask.sum(
             dim=-1, keepdim=True
@@ -381,10 +393,10 @@ def affinity_health(output: dict[str, torch.Tensor]) -> dict[str, float]:
             (sam / geometry.clamp_min(1e-6)).detach().cpu()
         ),
         "transport_entropy": float(
-            output["transport_entropy"].float().mean().detach().cpu()
+            selected(output["transport_entropy"]).float().mean().detach().cpu()
         ),
         "sam_affinity_delta": float(
-            output["sam_affinity_delta"].float().mean().detach().cpu()
+            selected(output["sam_affinity_delta"]).float().mean().detach().cpu()
         ),
     }
 

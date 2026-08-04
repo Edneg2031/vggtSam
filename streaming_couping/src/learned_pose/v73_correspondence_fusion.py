@@ -219,16 +219,19 @@ class SAMWeightedGeometryMatcher(nn.Module):
                 )
             )
         if self.memory_mode == "causal_last_observation":
+            aligned_memory_write = local_valid.any(dim=-1)
+            if memory_write is not None:
+                aligned_memory_write = aligned_memory_write & memory_write.bool()
             reference_geometry, reference_valid = _causal_previous_memory(
                 geometry,
                 local_valid,
-                write_mask=memory_write,
+                source_write=aligned_memory_write,
             )
             if self.geometry_value_encoder is not None:
                 reference_geometry_value, _ = _causal_previous_memory(
                     geometry_value,
                     local_valid,
-                    write_mask=memory_write,
+                    source_write=aligned_memory_write,
                 )
             else:
                 reference_geometry_value = reference_geometry
@@ -237,7 +240,7 @@ class SAMWeightedGeometryMatcher(nn.Module):
                     _causal_previous_memory(
                         current_sam_identity,
                         current_sam_available,
-                        write_mask=memory_write,
+                        source_write=aligned_memory_write,
                     )
                 )
             else:
@@ -706,6 +709,7 @@ def _causal_previous_memory(
     valid: torch.Tensor,
     *,
     write_mask: torch.Tensor | None = None,
+    source_write: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Expose only the latest observation strictly before each frame.
 
@@ -718,6 +722,10 @@ def _causal_previous_memory(
         raise ValueError("Causal instance memory expects [B,S,K,P,D]/[B,S,K,P].")
     if write_mask is not None and write_mask.shape != values.shape[:3]:
         raise ValueError("Causal memory write mask must have shape [B,S,K].")
+    if source_write is not None and source_write.shape != values.shape[:3]:
+        raise ValueError("Causal source_write must have shape [B,S,K].")
+    if write_mask is not None and source_write is not None:
+        raise ValueError("Use either write_mask or source_write, not both.")
     memory = torch.zeros_like(values[:, 0])
     memory_valid = torch.zeros_like(valid[:, 0])
     value_rows = []
@@ -726,7 +734,11 @@ def _causal_previous_memory(
         value_rows.append(memory)
         valid_rows.append(memory_valid)
         current_valid = valid[:, frame]
-        write = current_valid.any(dim=-1)
+        write = (
+            source_write[:, frame].bool()
+            if source_write is not None
+            else current_valid.any(dim=-1)
+        )
         if write_mask is not None:
             write = write & write_mask[:, frame].bool()
         memory = torch.where(

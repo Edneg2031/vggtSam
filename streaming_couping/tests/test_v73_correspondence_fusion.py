@@ -12,6 +12,7 @@ from streaming_couping.src.learned_pose.v73_correspondence_fusion import (
     V73_ARCHITECTURES,
     SAMWeightedGeometryMatcher,
     V73FrozenCorrespondenceResidual,
+    _causal_previous_memory,
     _masked_transport_probability,
     perturb_v73_inputs,
 )
@@ -238,6 +239,22 @@ def test_causal_memory_accepts_late_birth_only_on_second_observation():
         prefix_output["world_to_camera"],
         output["world_to_camera"][:, :4],
     )
+
+
+def test_aligned_causal_memory_invalidates_stale_sam_on_geometry_write():
+    values = torch.tensor(
+        [[[[[1.0]]], [[[0.0]]], [[[3.0]]]]]
+    )
+    valid = torch.tensor([[[[True]], [[False]], [[True]]]])
+    source_write = torch.ones(1, 3, 1, dtype=torch.bool)
+    reference, reference_valid = _causal_previous_memory(
+        values,
+        valid,
+        source_write=source_write,
+    )
+    assert bool(reference_valid[0, 1, 0, 0])
+    assert not bool(reference_valid[0, 2, 0, 0])
+    assert torch.equal(reference[0, 2, 0, 0], values[0, 1, 0, 0])
 
 
 def test_identity_perturbations_preserve_common_gate_and_change_sam_evidence():

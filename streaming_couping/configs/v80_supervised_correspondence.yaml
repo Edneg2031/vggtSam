@@ -24,4 +24,5 @@ branches:
   - sam_match
   - sam_geometry_match
   - sam_geometry_train_sam_off
+  - sam_geometry_no_match_supervision
   - sam_geometry_dual_value

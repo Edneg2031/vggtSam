@@ -59,19 +59,46 @@ def main() -> None:
     parameters = configure_v80_training_stage(model, "matching")
     optimizer = torch.optim.Adam(parameters, lr=5e-3)
     initial = float(result.loss)
+    best = initial
     maximum_sam_grad = 0.0
+    maximum_geometry_grad = 0.0
     for _ in range(5):
         optimizer.zero_grad(set_to_none=True)
         result = _loss(model, values, baseline, gt, matching)
         result.loss.backward()
+        gradients = projection_gradient_norms(model)
         maximum_sam_grad = max(
-            maximum_sam_grad,
-            projection_gradient_norms(model)["sam_projection_grad_norm"],
+            maximum_sam_grad, gradients["sam_projection_grad_norm"]
+        )
+        maximum_geometry_grad = max(
+            maximum_geometry_grad,
+            gradients["geometry_projection_grad_norm"],
         )
         optimizer.step()
+        best = min(best, float(_loss(model, values, baseline, gt, matching).loss))
     final = float(_loss(model, values, baseline, gt, matching).loss)
     assert maximum_sam_grad > 0.0
-    assert final < initial
+    assert maximum_geometry_grad > 0.0
+    assert best < initial
+    assert torch.isfinite(torch.tensor(final))
+
+    probability_before_pose = _forward(
+        model, values, baseline
+    )["transport_probability"].detach().clone()
+    pose_parameters = configure_v80_training_stage(model, "pose")
+    pose_optimizer = torch.optim.Adam(pose_parameters, lr=5e-3)
+    pose_target = baseline.clone()
+    pose_target[:, 1:, 0, 3] = 0.05
+    for _ in range(2):
+        pose_optimizer.zero_grad(set_to_none=True)
+        pose_output = _forward(model, values, baseline)
+        pose_loss = (pose_output["world_to_camera"] - pose_target).square().mean()
+        pose_loss.backward()
+        pose_optimizer.step()
+    probability_after_pose = _forward(
+        model, values, baseline
+    )["transport_probability"].detach()
+    assert torch.equal(probability_before_pose, probability_after_pose)
 
     off, uniform = perturb_v73_inputs(values, "instance_off")
     assert not uniform

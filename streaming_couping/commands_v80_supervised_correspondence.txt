@@ -46,6 +46,12 @@ else
 fi
 
 [[ -s "$LONG_CACHE" ]] || { echo "missing V8 cache: $LONG_CACHE" >&2; exit 1; }
+PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.audit_v7_cache \
+  --config "$DATA_CONFIG" \
+  --output-dir "$OUTPUT/cache_audit" \
+  --require-local \
+  --strict
 
 RESUME_ARGS=(--resume)
 if [[ "${V80_FRESH:-0}" == "1" ]]; then

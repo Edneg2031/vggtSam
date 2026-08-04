@@ -40,6 +40,9 @@ StreamVGGT
 ```
 
 物体可在 frame 90 之后出生。出生帧只写 memory，下一次可靠观测才允许参与修正。
+SAM Key、geometry Key/Value 与训练期 GT correspondence target 使用同一个 causal write
+事件；如果当前 geometry 写入但 SAM descriptor 缺失，SAM memory 会同步写成 invalid，不会继续
+保留一个来自更老帧、与 geometry Value 错位的 Key。
 
 ## 3. 两阶段训练
 
@@ -79,6 +82,11 @@ pose head 使用 `evidence_only`：不再把 frozen L0 camera hidden 送入 resi
 帧特定 camera feature 绕过匹配。L0 只提供需要被修正的基础位姿。pose loss 仍为旋转矩阵
 MSE 与 camera-center SmoothL1 的组合。
 
+阶段 B 使用各分支共同的 inference-time active support，不用“是否存在 GT match”再次筛选
+pose 训练帧。训练前后的 `p_ij` 必须 bit-exact，CSV 中对应
+`matching_frozen_exact=1`；主候选与 geometry/SAM-off 控制还必须满足
+`control_support_exact=1`。
+
 无 mature instance 时 `active_frames=False`，refined pose 必须逐元素等于 frozen L0；frame 90
 始终保持 gauge 不变。
 
@@ -90,6 +98,7 @@ MSE 与 camera-center SmoothL1 的组合。
 | `sam_match` | SAM | geometry | 只看 SAM affinity |
 | `sam_geometry_match` | SAM + geometry | geometry | V8.0 主候选 |
 | `sam_geometry_train_sam_off` | geometry（SAM 关闭） | geometry | 同结构 trained-off 控制 |
+| `sam_geometry_no_match_supervision` | 未训练的 SAM + geometry | geometry | 同初始化 `λ_match=0` 控制 |
 | `sam_geometry_dual_value` | SAM + geometry | geometry + SAM | V8.1 report-only 容量消融 |
 
 V8.1 双 Value 的 point evidence 额外包含：
@@ -110,7 +119,9 @@ V8.1 双 Value 的 point evidence 额外包含：
 error、pose loss 和相对 frozen L0 的提升。
 
 因果控制包括 `sam_off`、`wrong_sam_identity`、`shuffle_sam_time`、纯 geometry、同结构
-trained-SAM-off，以及 reference/inactive bit-exact fallback。
+trained-SAM-off、同初始化但不训练 matcher 的 `λ_match=0` 分支，以及
+reference/inactive bit-exact fallback。主候选还必须在 held-out matching 和 pose 上同时超过
+这个 no-match-supervision 控制。
 
 注意：geometry-only 分支仍使用 SAM tracking mask 和 persistent slot 来规定实例区域；它隔离的
 是“局部 SAM descriptor 是否在相同区域和身份支持下提供额外对应信息”，不是完全移除 SAM

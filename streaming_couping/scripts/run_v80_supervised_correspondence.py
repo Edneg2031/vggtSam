@@ -55,6 +55,7 @@ from streaming_couping.scripts.run_v73_correspondence_ablation import (
     load_v73_config,
 )
 from streaming_couping.scripts.run_v74_temporal_scaling import (
+    _observation_signature,
     _train_or_resume_v74_l0,
 )
 
@@ -64,6 +65,7 @@ class V80Branch:
     architecture: str
     value_mode: str
     train_variant: str = "normal"
+    train_matching: bool = True
 
 
 BRANCHES = {
@@ -75,6 +77,9 @@ BRANCHES = {
     "sam_geometry_train_sam_off": V80Branch(
         "sam_geometry_transport", "geometry_only", "sam_off"
     ),
+    "sam_geometry_no_match_supervision": V80Branch(
+        "sam_geometry_transport", "geometry_only", "normal", False
+    ),
     # V8.1 capacity check. It is report-only and never defines V8.0 success.
     "sam_geometry_dual_value": V80Branch(
         "sam_geometry_transport", "geometry_sam_dual"
@@ -84,6 +89,7 @@ BRANCHES = {
 PRIMARY = "sam_geometry_match"
 GEOMETRY_CONTROL = "geometry_match"
 SAM_OFF_CONTROL = "sam_geometry_train_sam_off"
+NO_MATCH_CONTROL = "sam_geometry_no_match_supervision"
 EVALUATION_VARIANTS = ("normal", "sam_off", "wrong_sam_identity", "shuffle_sam_time")
 
 
@@ -158,6 +164,10 @@ def run_v80(config: V80Config, *, resume: bool) -> Path:
             f"got reference={reference_index}, frames={frames}."
         )
     positions = {frame: index for index, frame in enumerate(frames)}
+    observation_signature = _observation_signature(
+        payload=payload,
+        data_config=config.data_config,
+    )
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
     base_model, l0_signature, l0_source, l0_sha256 = _train_or_resume_v74_l0(
@@ -224,19 +234,22 @@ def run_v80(config: V80Config, *, resume: bool) -> Path:
                 experiment=experiment,
                 matching=config.matching,
                 variant=spec.train_variant,
-                signature_context=l0_signature,
+                signature_context=(
+                    f"{l0_signature}:{observation_signature}:"
+                    f"k{config.token_count}:{spec.architecture}:"
+                    f"{spec.value_mode}:{spec.train_variant}"
+                ),
                 seed=config.seed,
             )
-            match_train = _evaluate_matching(
-                model,
-                batch=training_batch,
-                baseline=training_baseline,
-                reference_index=reference_index,
-                indices=train_indices,
-                matching=config.matching,
-                variant=spec.train_variant,
-            )
-            match_test = _evaluate_matching(
+            with torch.no_grad():
+                pose_support, _ = _forward_v80(
+                    model,
+                    batch=training_batch,
+                    baseline=training_baseline,
+                    reference_index=reference_index,
+                    variant=spec.train_variant,
+                )
+            pre_pose_match = _evaluate_matching(
                 model,
                 batch=batch,
                 baseline=baseline,
@@ -248,11 +261,11 @@ def run_v80(config: V80Config, *, resume: bool) -> Path:
             pose_train_indices = [
                 index
                 for index in train_indices
-                if bool(match_train["result"].active_frames[0, index].cpu())
+                if bool(pose_support["active_frames"][0, index].cpu())
             ]
             if not pose_train_indices:
                 raise RuntimeError(
-                    f"V8 fold={fold.name} branch={label} has no GT-matched pose frame."
+                    f"V8 fold={fold.name} branch={label} has no active pose frame."
                 )
             pose_training = _train_or_resume_pose(
                 model=model,
@@ -270,6 +283,24 @@ def run_v80(config: V80Config, *, resume: bool) -> Path:
                 signature_context=match_training["checkpoint_signature"],
                 seed=config.seed,
             )
+            post_pose_match = _evaluate_matching(
+                model,
+                batch=batch,
+                baseline=baseline,
+                reference_index=reference_index,
+                indices=test_indices,
+                matching=config.matching,
+                variant=spec.train_variant,
+            )
+            matching_frozen_exact = torch.equal(
+                pre_pose_match["output"]["transport_probability"],
+                post_pose_match["output"]["transport_probability"],
+            )
+            if not matching_frozen_exact:
+                raise RuntimeError(
+                    f"V8 fold={fold.name} branch={label} pose stage changed p_ij."
+                )
+            pose_training["matching_frozen_exact"] = 1
             row = _result_row(
                 fold=fold,
                 label=label,
@@ -300,6 +331,7 @@ def run_v80(config: V80Config, *, resume: bool) -> Path:
         "config": _jsonable_config(config),
         "l0_source": str(l0_source),
         "l0_sha256": l0_sha256,
+        "observation_signature": observation_signature,
         "pose_input_mode": "evidence_only",
         "matching_gt": "mesh_rasterized_world_pointmap_sampled_at_local_token_uv",
         "unmatched_query_policy": "excluded",
@@ -392,7 +424,9 @@ def _evaluate_matching(model, **kwargs):
         "output": output,
         "result": result,
         "metrics": result.detached_metrics(),
-        "health": affinity_health(output),
+        "health": affinity_health(
+            output, sequence_indices=kwargs.get("indices")
+        ),
     }
 
 
@@ -409,6 +443,35 @@ def _train_or_resume_matching(
     resumed = _maybe_resume(model, path=path, signature=signature, resume=resume)
     if resumed is not None:
         return resumed
+    if not BRANCHES[label].train_matching:
+        model.eval()
+        with torch.no_grad():
+            _, initial_result = _matching_result(
+                model, batch=batch, baseline=baseline,
+                reference_index=reference_index, indices=indices,
+                matching=matching, variant=variant,
+            )
+        if int(initial_result.supervised_queries) == 0:
+            raise RuntimeError(
+                f"V8 fold={fold} branch={label} has no GT matches."
+            )
+        initial_loss = float(initial_result.loss.cpu())
+        training = {
+            "checkpoint_signature": signature,
+            "match_steps": 0,
+            "initial_match_loss": initial_loss,
+            "step20_match_loss": initial_loss,
+            "best_match_loss": initial_loss,
+            "best_match_step": 0,
+            "matching_seconds": 0.0,
+            "geometry_projection_grad_norm": 0.0,
+            "sam_projection_grad_norm": 0.0,
+            "sam_to_geometry_grad_ratio": 0.0,
+        }
+        _save_checkpoint(
+            model, path=path, signature=signature, training=training
+        )
+        return training
     parameters = configure_v80_training_stage(model, "matching")
     optimizer = torch.optim.AdamW(
         parameters,
@@ -483,6 +546,20 @@ def _train_or_resume_matching(
     } and variant != "sam_off"
     if uses_sam and maximum_grads["sam_projection_grad_norm"] <= 0.0:
         raise RuntimeError(f"V8 fold={fold} branch={label} SAM gradient is zero.")
+    uses_geometry = BRANCHES[label].architecture in {
+        "geometry_transport", "sam_geometry_transport"
+    }
+    if uses_geometry and maximum_grads["geometry_projection_grad_norm"] <= 0.0:
+        raise RuntimeError(
+            f"V8 fold={fold} branch={label} geometry gradient is zero."
+        )
+    uses_geometry = BRANCHES[label].architecture in {
+        "geometry_transport", "sam_geometry_transport"
+    }
+    if uses_geometry and maximum_grads["geometry_projection_grad_norm"] <= 0.0:
+        raise RuntimeError(
+            f"V8 fold={fold} branch={label} geometry gradient is zero."
+        )
     training = {
         "checkpoint_signature": signature,
         "match_steps": steps,
@@ -644,6 +721,9 @@ def _result_row(
         )
         variant_metrics[variant] = (current_match, pose)
     inactive = ~normal["active_frames"]
+    active_test_indices = [
+        index for index in test_indices if bool(normal["active_frames"][0, index])
+    ]
     fallback_exact = torch.equal(
         normal["world_to_camera"][inactive],
         base_output["world_to_camera"][inactive],
@@ -663,6 +743,12 @@ def _result_row(
         "best_match_step": match_training["best_match_step"],
         "initial_match_loss": _short(match_training["initial_match_loss"]),
         "step20_match_loss": _short(match_training["step20_match_loss"]),
+        "step20_match_drop_percent": _short(
+            _gain(
+                match_training["initial_match_loss"],
+                match_training["step20_match_loss"],
+            )
+        ),
         "best_train_match_loss": _short(match_training["best_match_loss"]),
         "train_match_loss": _short(train_match["metrics"]["match_loss"]),
         "train_match_coverage": _short(train_match["metrics"]["match_coverage"]),
@@ -684,6 +770,8 @@ def _result_row(
         "sam_to_geometry_grad_ratio": _short(match_training["sam_to_geometry_grad_ratio"]),
         "pose_steps": pose_training.get("pose_steps", ""),
         "pose_train_frames": _indices_to_frames(pose_train_indices),
+        "test_active_frames": len(active_test_indices),
+        "test_active_frame_indices": _indices_to_frames(active_test_indices),
         "initial_pose_loss": _short(pose_training["initial_pose_loss"]),
         "best_train_pose_loss": _short(pose_training["best_pose_loss"]),
         "train_pose_loss": _short(train_pose["loss"]),
@@ -703,6 +791,8 @@ def _result_row(
         "shuffle_time_test_pose_loss": _short(variant_metrics["shuffle_sam_time"][1]["loss"]),
         "reference_exact": int(torch.equal(normal["world_to_camera"][:, reference_index], base_output["world_to_camera"][:, reference_index])),
         "inactive_fallback_exact": int(fallback_exact),
+        "matching_frozen_exact": int(pose_training["matching_frozen_exact"]),
+        "control_support_exact": 0,
         "parameters": sum(p.numel() for p in model.parameters()),
         "matching_seconds": _short(match_training["matching_seconds"]),
         "pose_seconds": _short(pose_training["pose_seconds"]),
@@ -710,10 +800,13 @@ def _result_row(
         "sam_off_control_match_loss": "",
         "geometry_control_pose_loss": "",
         "sam_off_control_pose_loss": "",
+        "no_match_control_match_loss": "",
+        "no_match_control_pose_loss": "",
         "match_gain_vs_geometry_percent": "",
         "pose_gain_vs_geometry_percent": "",
         "match_beats_geometry": 0,
         "pose_beats_geometry": 0,
+        "beats_no_match_supervision": 0,
         "sam_perturbations_hurt_matching": 0,
         "fold_sam_causal_pass": 0,
         "all_folds_sam_causal_pass": 0,
@@ -727,7 +820,9 @@ def _annotate_decisions(rows):
     all_passes = []
     for fold in FOLDS:
         group = {row["architecture"]: row for row in rows if row["fold"] == fold.name}
-        required = {PRIMARY, GEOMETRY_CONTROL, SAM_OFF_CONTROL}
+        required = {
+            PRIMARY, GEOMETRY_CONTROL, SAM_OFF_CONTROL, NO_MATCH_CONTROL
+        }
         missing = required - set(group)
         if missing:
             raise ValueError(f"V8 fold={fold.name} lacks controls={sorted(missing)}.")
@@ -735,16 +830,36 @@ def _annotate_decisions(rows):
         geometry_pose = float(group[GEOMETRY_CONTROL]["test_pose_loss"])
         off_match = float(group[SAM_OFF_CONTROL]["test_match_loss"])
         off_pose = float(group[SAM_OFF_CONTROL]["test_pose_loss"])
+        no_match_loss = float(group[NO_MATCH_CONTROL]["test_match_loss"])
+        no_match_pose = float(group[NO_MATCH_CONTROL]["test_pose_loss"])
         for row in group.values():
             row["geometry_control_match_loss"] = _short(geometry_match)
             row["sam_off_control_match_loss"] = _short(off_match)
             row["geometry_control_pose_loss"] = _short(geometry_pose)
             row["sam_off_control_pose_loss"] = _short(off_pose)
+            row["no_match_control_match_loss"] = _short(no_match_loss)
+            row["no_match_control_pose_loss"] = _short(no_match_pose)
             row["match_gain_vs_geometry_percent"] = _short(_gain(geometry_match, float(row["test_match_loss"])))
             row["pose_gain_vs_geometry_percent"] = _short(_gain(geometry_pose, float(row["test_pose_loss"])))
             row["match_beats_geometry"] = int(float(row["test_match_loss"]) < geometry_match)
             row["pose_beats_geometry"] = int(float(row["test_pose_loss"]) < geometry_pose)
+            row["beats_no_match_supervision"] = int(
+                float(row["test_pose_loss"]) < no_match_pose
+            )
         primary = group[PRIMARY]
+        support_fields = (
+            "pose_train_frames",
+            "test_active_frame_indices",
+            "test_supervised_queries",
+            "test_match_coverage",
+        )
+        support_exact = all(
+            primary[field] == group[GEOMETRY_CONTROL][field]
+            == group[SAM_OFF_CONTROL][field]
+            == group[NO_MATCH_CONTROL][field]
+            for field in support_fields
+        )
+        primary["control_support_exact"] = int(support_exact)
         perturb = all(
             float(primary[name]) < float(primary["test_top1_within_radius"])
             for name in ("sam_off_test_top1", "wrong_id_test_top1", "shuffle_time_test_top1")
@@ -753,8 +868,12 @@ def _annotate_decisions(rows):
         passed = int(
             int(primary["reference_exact"])
             and int(primary["inactive_fallback_exact"])
+            and int(primary["matching_frozen_exact"])
+            and support_exact
             and float(primary["test_match_loss"]) < min(geometry_match, off_match)
             and float(primary["test_pose_loss"]) < min(geometry_pose, off_pose)
+            and float(primary["test_match_loss"]) < no_match_loss
+            and float(primary["test_pose_loss"]) < no_match_pose
             and perturb
         )
         primary["fold_sam_causal_pass"] = passed
@@ -772,7 +891,7 @@ def _annotate_decisions(rows):
 
 def _stage_signature(*, stage, label, fold, steps, seed, context, matching):
     payload = {
-        "schema": 1, "stage": stage, "label": label, "fold": fold,
+        "schema": 2, "stage": stage, "label": label, "fold": fold,
         "steps": steps, "seed": seed, "context": context,
         "matching": asdict(matching) if matching is not None else None,
     }
@@ -858,7 +977,9 @@ def load_v80_config(path) -> V80Config:
 
 def _validate_config(config):
     unknown = set(config.branches) - set(BRANCHES)
-    required = {PRIMARY, GEOMETRY_CONTROL, SAM_OFF_CONTROL}
+    required = {
+        PRIMARY, GEOMETRY_CONTROL, SAM_OFF_CONTROL, NO_MATCH_CONTROL
+    }
     if unknown or not required.issubset(config.branches):
         raise ValueError(
             f"V8 branches invalid: unknown={sorted(unknown)}, "
