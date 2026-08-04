@@ -11,6 +11,21 @@ zsh streaming_couping/commands_v74_temporal_scaling.txt
 当前方法的唯一总说明见
 [`docs/current_sam31_streamvggt_v74_method.md`](docs/current_sam31_streamvggt_v74_method.md)。
 
+当前 V7.4 的 learned token-to-pose 路线没有通过 SAM 因果判据后，新增了一个不训练任何
+pose head 的 V7.5 判别实验。它复用 V7.4 动态实例 cache，将 bounded instance ICP 显式
+接回 V5 angular-Huber ray-centre solver，同时比较全图、bbox、同面积随机区域、过期 mask、
+错误 ID 和 GT oracle：
+
+```bash
+zsh streaming_couping/commands_v75_explicit_pose_causality.txt
+```
+
+主结果为
+`outputs/streaming_couping_v75_explicit_pose_causality/v75_explicit_pose_causality.csv`；
+完整协议见
+[`docs/v75_explicit_pose_causality.md`](docs/v75_explicit_pose_causality.md)。V7.5 只解析修正
+camera center，rotation 保持 raw；它是 SAM mask/track 的因果诊断，不替代当前 V7.4 方法说明。
+
 V7.4 使用 `90:15:525` 长序列和 short/medium/long 三个时间前缀 fold，同时比较纯几何、
 SAM-off trained control 以及 identity/时间扰动。主结果和动态实例覆盖诊断分别写入：
 
