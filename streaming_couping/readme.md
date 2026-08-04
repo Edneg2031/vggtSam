@@ -1,15 +1,15 @@
 # streaming_couping
 
-当前研究主线是 V7.4：SAM3.1 做 forward-only 动态实例发现并提供局部 identity affinity，
-StreamVGGT 提供被 transport 的局部 geometry Value，最后在冻结 camera-only L0 之上预测
-有界 SE(3) residual。第 90 帧只作为相机 gauge，不再要求物体出现在固定参考帧。
+当前研究主线是 V8.0：先用 mesh-rasterized GT world pointmap 显式监督 SAM3.1/geometry
+correspondence，再冻结匹配矩阵，用 evidence-only pose residual 验证未来帧位姿。V8.1 双
+SAM/geometry Value 只作为独立 report-only 消融。
 
 ```bash
-zsh streaming_couping/commands_v74_temporal_scaling.txt
+zsh streaming_couping/commands_v80_supervised_correspondence.txt
 ```
 
 当前方法的唯一总说明见
-[`docs/current_sam31_streamvggt_v74_method.md`](docs/current_sam31_streamvggt_v74_method.md)。
+[`docs/current_sam31_streamvggt_v80_method.md`](docs/current_sam31_streamvggt_v80_method.md)。
 
 当前 V7.4 的 learned token-to-pose 路线没有通过 SAM 因果判据后，新增了一个不训练任何
 pose head 的 V7.5 判别实验。它复用 V7.4 动态实例 cache，将 bounded instance ICP 显式
@@ -24,7 +24,7 @@ zsh streaming_couping/commands_v75_explicit_pose_causality.txt
 `outputs/streaming_couping_v75_explicit_pose_causality/v75_explicit_pose_causality.csv`；
 完整协议见
 [`docs/v75_explicit_pose_causality.md`](docs/v75_explicit_pose_causality.md)。V7.5 只解析修正
-camera center，rotation 保持 raw；它是 SAM mask/track 的因果诊断，不替代当前 V7.4 方法说明。
+camera center，rotation 保持 raw；它是 SAM mask/track 的历史因果诊断，不替代当前 V8 方法。
 
 V7.4 使用 `90:15:525` 长序列和 short/medium/long 三个时间前缀 fold，同时比较纯几何、
 SAM-off trained control 以及 identity/时间扰动。主结果和动态实例覆盖诊断分别写入：
@@ -262,9 +262,9 @@ scripts/plot_pose_comparison.py
 V4/V5 最终输出包括 native pointcloud/pose、GT/raw/ours 对比 PLY、三套 mask、位姿 PNG/PDF、
 指标 CSV、checkpoint 哈希和 artifact manifest。
 
-旧 V4/V5/V6 的命令、配置和版本 runbook 仍可用于复现实验，但不再代表当前架构。当前 V7.4
+旧 V4–V7.5 的命令、配置和版本 runbook 仍可用于复现实验，但不再代表当前架构。当前 V8
 的完整数据流、损失与验证协议统一记录在
-[`docs/current_sam31_streamvggt_v74_method.md`](docs/current_sam31_streamvggt_v74_method.md)。
+[`docs/current_sam31_streamvggt_v80_method.md`](docs/current_sam31_streamvggt_v80_method.md)。
 
 历史 V6 cache 的数据流是：
 

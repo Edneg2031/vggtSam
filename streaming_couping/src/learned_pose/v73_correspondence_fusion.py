@@ -35,6 +35,16 @@ V73_INPUT_VARIANTS = (
     "wrong_local_geometry",
 )
 
+V73_VALUE_MODES = (
+    "geometry_only",
+    "geometry_sam_dual",
+)
+
+V73_POSE_INPUT_MODES = (
+    "camera_evidence",
+    "evidence_only",
+)
+
 
 @dataclass(frozen=True)
 class V73ArchitectureDescription:
@@ -83,6 +93,9 @@ class SAMWeightedGeometryMatcher(nn.Module):
         geometry_feature_dim: int,
         config: V6FusionConfig,
         memory_mode: str = "fixed_reference",
+        value_mode: str = "geometry_only",
+        return_transport_details: bool = False,
+        separate_geometry_value_encoder: bool = False,
     ) -> None:
         super().__init__()
         if architecture not in V73_ARCHITECTURES:
@@ -92,9 +105,20 @@ class SAMWeightedGeometryMatcher(nn.Module):
             raise ValueError(f"Unknown V7.3 memory mode: {memory_mode!r}.")
         self.memory_mode = memory_mode
         self.description = V73_DESCRIPTIONS[architecture]
+        if value_mode not in V73_VALUE_MODES:
+            raise ValueError(f"Unknown V7.3 Value mode: {value_mode!r}.")
+        if value_mode == "geometry_sam_dual" and not self.description.uses_sam:
+            raise ValueError("Dual SAM/geometry Values require a SAM architecture.")
+        self.value_mode = value_mode
+        self.return_transport_details = bool(return_transport_details)
         hidden = int(config.hidden_dim)
         self.hidden_dim = hidden
         self.geometry_encoder = _mlp(int(geometry_feature_dim), hidden)
+        self.geometry_value_encoder = (
+            _mlp(int(geometry_feature_dim), hidden)
+            if separate_geometry_value_encoder
+            else None
+        )
         self.geometry_query = (
             nn.Linear(hidden, hidden, bias=False)
             if self.description.uses_geometry_affinity
@@ -124,9 +148,10 @@ class SAMWeightedGeometryMatcher(nn.Module):
             if self.description.uses_sam
             else None
         )
+        evidence_multiplier = 8 if value_mode == "geometry_sam_dual" else 4
         self.residual_encoder = nn.Sequential(
-            nn.LayerNorm(4 * hidden),
-            nn.Linear(4 * hidden, 2 * hidden),
+            nn.LayerNorm(evidence_multiplier * hidden),
+            nn.Linear(evidence_multiplier * hidden, 2 * hidden),
             nn.GELU(),
             nn.Linear(2 * hidden, hidden),
             nn.LayerNorm(hidden),
@@ -167,6 +192,11 @@ class SAMWeightedGeometryMatcher(nn.Module):
             raise ValueError("V7.3 memory_write must have shape [B,S,K].")
 
         geometry = self.geometry_encoder(local_features.float())
+        geometry_value = (
+            self.geometry_value_encoder(local_features.float())
+            if self.geometry_value_encoder is not None
+            else geometry
+        )
         geometry_uv = local_features[..., 3:5].float().clamp(-1.0, 1.0)
         batch, sequence, instances, points, hidden = geometry.shape
         reference = int(reference_index)
@@ -194,6 +224,14 @@ class SAMWeightedGeometryMatcher(nn.Module):
                 local_valid,
                 write_mask=memory_write,
             )
+            if self.geometry_value_encoder is not None:
+                reference_geometry_value, _ = _causal_previous_memory(
+                    geometry_value,
+                    local_valid,
+                    write_mask=memory_write,
+                )
+            else:
+                reference_geometry_value = reference_geometry
             if current_sam_identity is not None:
                 reference_sam_identity, reference_sam_available = (
                     _causal_previous_memory(
@@ -209,6 +247,9 @@ class SAMWeightedGeometryMatcher(nn.Module):
             reference_geometry = geometry[:, reference][:, None].expand(
                 batch, sequence, instances, points, hidden
             )
+            reference_geometry_value = geometry_value[:, reference][
+                :, None
+            ].expand(batch, sequence, instances, points, hidden)
             reference_valid = local_valid[:, reference][:, None].expand(
                 batch, sequence, instances, points
             )
@@ -224,6 +265,10 @@ class SAMWeightedGeometryMatcher(nn.Module):
 
         flat_geometry = geometry.reshape(-1, points, hidden)
         flat_reference_geometry = reference_geometry.reshape_as(flat_geometry)
+        flat_geometry_value = geometry_value.reshape_as(flat_geometry)
+        flat_reference_geometry_value = reference_geometry_value.reshape_as(
+            flat_geometry
+        )
         flat_current_valid = local_valid.reshape(-1, points)
         flat_reference_valid = reference_valid.reshape(-1, points)
         flat_sam_current = (
@@ -294,17 +339,28 @@ class SAMWeightedGeometryMatcher(nn.Module):
             query_valid=query_valid,
             key_valid=key_valid,
         )
-        matched = probability @ flat_reference_geometry
-        point_residual = self.residual_encoder(
-            torch.cat(
+        matched = probability @ flat_reference_geometry_value
+        evidence_parts = [
+            flat_geometry_value,
+            matched,
+            flat_geometry_value - matched,
+            flat_geometry_value * matched,
+        ]
+        matched_sam = None
+        if self.value_mode == "geometry_sam_dual":
+            if flat_sam_current is None or flat_sam_reference is None:
+                raise RuntimeError("Dual SAM/geometry Values are unavailable.")
+            matched_sam = probability @ flat_sam_reference
+            evidence_parts.extend(
                 [
-                    flat_geometry,
-                    matched,
-                    flat_geometry - matched,
-                    flat_geometry * matched,
-                ],
-                dim=-1,
+                    flat_sam_current,
+                    matched_sam,
+                    flat_sam_current - matched_sam,
+                    flat_sam_current * matched_sam,
+                ]
             )
+        point_residual = self.residual_encoder(
+            torch.cat(evidence_parts, dim=-1)
         )
         point_weight = query_valid.to(point_residual.dtype)
         # The final cached geometry channel is normalized point confidence.
@@ -350,7 +406,7 @@ class SAMWeightedGeometryMatcher(nn.Module):
             )
 
         shape = (batch, sequence, instances)
-        return {
+        output = {
             "instance_evidence": pooled.reshape(*shape, hidden),
             "available": active.reshape(shape),
             "transport_entropy": entropy.reshape(shape),
@@ -359,6 +415,26 @@ class SAMWeightedGeometryMatcher(nn.Module):
             "sam_used": sam_used.reshape(shape),
             "memory_mature": reference_valid.any(dim=-1),
         }
+        if self.return_transport_details:
+            pair_shape = (*shape, points, points)
+            point_shape = (*shape, points)
+            output.update(
+                {
+                    "transport_probability": probability.reshape(pair_shape),
+                    "transport_query_valid": query_valid.reshape(point_shape),
+                    "transport_key_valid": key_valid.reshape(point_shape),
+                    "geometry_affinity_logits": geometry_logits.reshape(pair_shape),
+                    "sam_affinity_logits": sam_logits.reshape(pair_shape),
+                    "transported_geometry": matched.reshape(
+                        *shape, points, hidden
+                    ),
+                }
+            )
+            if matched_sam is not None:
+                output["transported_sam"] = matched_sam.reshape(
+                    *shape, points, hidden
+                )
+        return output
 
     def _interpolate_sam_to_geometry(
         self,
@@ -421,6 +497,10 @@ class V73FrozenCorrespondenceResidual(nn.Module):
         geometry_local_dim: int,
         config: V6FusionConfig,
         memory_mode: str = "fixed_reference",
+        value_mode: str = "geometry_only",
+        pose_input_mode: str = "camera_evidence",
+        return_transport_details: bool = False,
+        separate_geometry_value_encoder: bool = False,
     ) -> None:
         super().__init__()
         if architecture not in V73_ARCHITECTURES:
@@ -430,6 +510,9 @@ class V73FrozenCorrespondenceResidual(nn.Module):
         self.base_model = base_model
         self.architecture = architecture
         self.memory_mode = memory_mode
+        if pose_input_mode not in V73_POSE_INPUT_MODES:
+            raise ValueError(f"Unknown V7.3 pose input mode: {pose_input_mode!r}.")
+        self.pose_input_mode = pose_input_mode
         self.config = config
         for parameter in self.base_model.parameters():
             parameter.requires_grad_(False)
@@ -441,8 +524,14 @@ class V73FrozenCorrespondenceResidual(nn.Module):
             geometry_feature_dim=geometry_local_dim,
             config=config,
             memory_mode=memory_mode,
+            value_mode=value_mode,
+            return_transport_details=return_transport_details,
+            separate_geometry_value_encoder=separate_geometry_value_encoder,
         )
-        self.camera_merger = _mlp(4 * hidden, hidden)
+        self.camera_merger = _mlp(
+            4 * hidden if pose_input_mode == "camera_evidence" else hidden,
+            hidden,
+        )
         self.se3_head = nn.Sequential(
             nn.Linear(hidden, hidden),
             nn.GELU(),
@@ -525,12 +614,14 @@ class V73FrozenCorrespondenceResidual(nn.Module):
         evidence = torch.where(
             active[..., None], evidence, torch.zeros_like(evidence)
         )
-        fused = self.camera_merger(
-            torch.cat(
+        if self.pose_input_mode == "camera_evidence":
+            pose_input = torch.cat(
                 [camera, evidence, camera * evidence, camera - evidence],
                 dim=-1,
             )
-        )
+        else:
+            pose_input = evidence
+        fused = self.camera_merger(pose_input)
         raw_delta = self.se3_head(fused)
         update_mask = active.clone()
         update_mask[:, int(reference_index)] = False

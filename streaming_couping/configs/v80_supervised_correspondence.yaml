@@ -1,0 +1,27 @@
+# V8 first trains correspondence itself, then freezes p_ij and trains an
+# evidence-only pose residual.  The dual SAM Value branch is report-only.
+v73_config: streaming_couping/configs/v73_correspondence_ablation.yaml
+data_config: streaming_couping/configs/v74_temporal_data.yaml
+output_dir: outputs/streaming_couping_v80_supervised_correspondence
+device: cuda:0
+token_count: 8
+
+matching:
+  # GT pointmaps are metric world coordinates. Queries with no mutual match
+  # inside this radius are excluded instead of receiving a false label.
+  max_distance: 0.10
+  temperature: 0.025
+  require_mutual_nearest: true
+
+training:
+  base_steps: 1200
+  match_steps: 1200
+  pose_steps: 1200
+  seed: 0
+
+branches:
+  - geometry_match
+  - sam_match
+  - sam_geometry_match
+  - sam_geometry_train_sam_off
+  - sam_geometry_dual_value
