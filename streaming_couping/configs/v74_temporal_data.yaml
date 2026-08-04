@@ -43,7 +43,10 @@ dataset:
       # permanently when a new SAM3.1 persistent ID first becomes visible.
       instance_ids: [0, 1, 2, 3, 4, 5, 6, 7]
       instance_source: sam31_online
-      instance_prompt: object
+      # SAM3.1 is open-vocabulary but not a class-agnostic "all objects"
+      # detector. Run concrete, static indoor concepts and merge their tracks.
+      # All instances of either concept may be born at any later frame.
+      instance_prompts: [bed, wardrobe]
       reference_sequence_index: 0
       split: temporal_scaling
 

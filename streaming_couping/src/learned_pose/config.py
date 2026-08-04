@@ -22,6 +22,10 @@ class ClipConfig:
     evaluation_frame_indices: tuple[int, ...] | None = None
     instance_source: str = "configured_gt_reference"
     instance_prompt: str = "object"
+    # SAM3.1 is concept-prompted rather than class agnostic.  Online clips may
+    # therefore run several concrete noun phrases and merge their causal
+    # tracks into the same exchangeable slot bank.
+    instance_prompts: tuple[str, ...] = ()
     allow_missing_reference_instances: bool = False
 
 
@@ -354,6 +358,21 @@ def _parse_clip(value: dict[str, Any], base: Path) -> ClipConfig:
     if not frames or not instances:
         raise ValueError("Each clip requires frame_indices and instance_ids.")
     cache_value = value.get("tracking_cache")
+    legacy_prompt = str(value.get("instance_prompt", "object")).strip()
+    raw_prompts = value.get("instance_prompts")
+    if raw_prompts is None:
+        prompts = (legacy_prompt,) if legacy_prompt else ()
+    else:
+        if not isinstance(raw_prompts, (list, tuple)):
+            raise TypeError("dataset.clips.instance_prompts must be a list.")
+        prompts = tuple(
+            dict.fromkeys(
+                str(prompt).strip()
+                for prompt in raw_prompts
+                if str(prompt).strip()
+            )
+        )
+    primary_prompt = prompts[0] if prompts else legacy_prompt
     return ClipConfig(
         name=str(value.get("name") or f"{value.get('scene_id')}_{frames[0]}_{frames[-1]}"),
         scene_id=str(value.get("scene_id")),
@@ -371,7 +390,8 @@ def _parse_clip(value: dict[str, Any], base: Path) -> ClipConfig:
         instance_source=str(
             value.get("instance_source", "configured_gt_reference")
         ),
-        instance_prompt=str(value.get("instance_prompt", "object")).strip(),
+        instance_prompt=primary_prompt,
+        instance_prompts=prompts,
         allow_missing_reference_instances=bool(
             value.get("allow_missing_reference_instances", False)
         ),
@@ -579,9 +599,13 @@ def _validate(config: LearnedPoseConfig) -> None:
                 f"Clip {clip.name!r} may allow missing reference instances "
                 "only with configured_gt_reference."
             )
-        if clip.instance_source == "sam31_online" and not clip.instance_prompt:
+        if (
+            clip.instance_source == "sam31_online"
+            and not (clip.instance_prompts or clip.instance_prompt.strip())
+        ):
             raise ValueError(
-                f"Clip {clip.name!r} sam31_online requires instance_prompt."
+                f"Clip {clip.name!r} sam31_online requires at least one "
+                "instance_prompt or instance_prompts entry."
             )
         if (
             clip.instance_source == "sam31_online"

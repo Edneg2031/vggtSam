@@ -22,11 +22,13 @@ observations and optimization settings are shared by every residual branch.
 
 ## Dynamic instances and causal memory
 
-SAM3.1 receives one `object` text prompt and runs its multiplex tracker only in
-the forward direction. It may create a new persistent ID on any frame. The
-first eight IDs are assigned permanent logical slots in order of first
+SAM3.1 is concept-prompted, not a class-agnostic proposal model. The current
+scene runs independent `bed` and `wardrobe` prompts, then causally merges their
+forward-only tracks. A new persistent ID may be created on any frame. The first
+eight non-duplicate IDs are assigned permanent logical slots in order of first
 appearance; the values `[0..7]` in the data YAML are capacities, not GT object
-IDs. No GT instance mask is used to create these slots.
+IDs. No GT instance mask is used to create these slots. A different scene must
+configure its own static-anchor noun phrases in `instance_prompts`.
 
 For each slot, the first geometry-supported observation is a birth event. That
 frame writes SAM local tokens and StreamVGGT local geometry to instance memory,

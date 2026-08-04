@@ -1,6 +1,25 @@
 # streaming_couping
 
-仓库保留两个完整方法和一个独立 camera-fusion 实验：
+当前研究主线是 V7.4：SAM3.1 做 forward-only 动态实例发现并提供局部 identity affinity，
+StreamVGGT 提供被 transport 的局部 geometry Value，最后在冻结 camera-only L0 之上预测
+有界 SE(3) residual。第 90 帧只作为相机 gauge，不再要求物体出现在固定参考帧。
+
+```bash
+zsh streaming_couping/commands_v74_temporal_scaling.txt
+```
+
+当前方法的唯一总说明见
+[`docs/current_sam31_streamvggt_v74_method.md`](docs/current_sam31_streamvggt_v74_method.md)。
+
+V7.4 使用 `90:15:525` 长序列和 short/medium/long 三个时间前缀 fold，同时比较纯几何、
+SAM-off trained control 以及 identity/时间扰动。主结果和动态实例覆盖诊断分别写入：
+
+```text
+outputs/streaming_couping_v74_temporal_scaling/v74_temporal_scaling.csv
+outputs/streaming_couping_v74_temporal_scaling/v74_dynamic_instance_diagnostics.csv
+```
+
+V4–V7.3 仍作为历史方法、消融和复现入口保留。早期三个版本的定位是：
 
 ```text
 V4 coverage-first
@@ -16,7 +35,7 @@ V6 camera overfit
   rotation/center 的 token 来源与坐标参数化 sweep
 ```
 
-## 运行
+## 历史版本运行
 
 V4：
 
@@ -170,6 +189,8 @@ capacity controls、`instance_off` 精确回到 L0，并在 SAM-off、uniform、
 `V73_SEEDS="0 1 2" zsh streaming_couping/commands_v73_multiseed.txt` 检查稳定性；不要在
 明显失败的结构上先消耗三倍训练时间。
 
+### 历史 V6 长序列说明
+
 长序列命令只占三张物理卡：StreamVGGT 的 24 层按连续区间分到两张卡，SAM3.1 单独使用
 第三张卡。每层 KV cache 保留完整因果历史，不切块、不重置；DPT/camera/depth/point
 输出逐帧卸载到 CPU。默认使用物理卡 `1,2,3`，可在命令前通过
@@ -206,7 +227,7 @@ ID 保留为空槽。后续帧只要仍有一个可用 persistent instance 就�
 V4/V5 两条命令继续复用原始 SAM3 cache；V6 使用独立的 SAM3.1 cache，并从相同 seed
 训练十三个 camera/instance 消融模型。两代 cache、checkpoint 和输出目录完全隔离。
 
-## 保留的入口
+## 历史 V4/V5/V6 入口
 
 ```text
 configs/v4_coverage_first.yaml
@@ -221,23 +242,16 @@ scripts/run_v5_reference_pose.py
 scripts/run_v5_adaptive.py
 scripts/run_v6_camera_overfit.py
 scripts/plot_pose_comparison.py
-docs/final_joint_pointcloud_pose_method.md
 ```
 
 V4/V5 最终输出包括 native pointcloud/pose、GT/raw/ours 对比 PLY、三套 mask、位姿 PNG/PDF、
 指标 CSV、checkpoint 哈希和 artifact manifest。
 
-版本演进、结果对比和当前最终版本总结见
-`streaming_couping/docs/sam3_streamvggt_work_summary.md`。
+旧 V4/V5/V6 的命令、配置和版本 runbook 仍可用于复现实验，但不再代表当前架构。当前 V7.4
+的完整数据流、损失与验证协议统一记录在
+[`docs/current_sam31_streamvggt_v74_method.md`](docs/current_sam31_streamvggt_v74_method.md)。
 
-SAM3/SAM3.1 分别如何作用于 camera hidden、DPT patch token、pointmap 和 ray solver 的
-详细数据流见
-`streaming_couping/docs/current_sam_to_streamvggt_camera_pointcloud.md`。
-
-V4/V5/V6 的详细实现与实验约束见
-`streaming_couping/docs/final_joint_pointcloud_pose_method.md`。
-
-当前 V6 cache 的实际数据流是：
+历史 V6 cache 的数据流是：
 
 ```text
 SAM3.1 raw tracking

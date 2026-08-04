@@ -116,6 +116,27 @@ def audit_caches(
                 tuple(int(v) for v in payload.get("instance_ids", ())),
                 clip.instance_ids,
             )
+            if clip.instance_source == "sam31_online":
+                expected_prompts = tuple(clip.instance_prompts) or (
+                    clip.instance_prompt,
+                )
+                cached_prompt_values = payload.get("instance_prompts")
+                if isinstance(cached_prompt_values, str):
+                    cached_prompts = (cached_prompt_values,)
+                elif isinstance(cached_prompt_values, (list, tuple)):
+                    cached_prompts = tuple(
+                        str(value) for value in cached_prompt_values
+                    )
+                else:
+                    cached_prompts = (
+                        str(payload.get("instance_prompt", "")),
+                    )
+                _check_equal(
+                    errors,
+                    "instance_prompts",
+                    cached_prompts,
+                    expected_prompts,
+                )
             if not bool(payload.get("complete", False)):
                 errors.append("cache_incomplete")
             for field in CRITICAL_TENSORS:
@@ -239,6 +260,8 @@ def audit_caches(
 
             if has_local and not bool(torch.as_tensor(payload["sam_local_valid"]).any()):
                 warnings.append("sam_local_tokens_all_empty")
+            if clip.instance_source == "sam31_online" and not bool(observed.any()):
+                errors.append("sam31_online_no_observed_tracks")
 
         has_local_payload = bool(
             payload is not None
@@ -313,11 +336,7 @@ def _tensor_health(value: Any, *, full_scan: bool) -> dict[str, Any]:
     tensor = value.detach().cpu()
     flat = tensor.reshape(-1)
     if not full_scan and flat.numel() > 1_000_000:
-        indices = torch.linspace(
-            0,
-            flat.numel() - 1,
-            steps=1_000_000,
-        ).round().long()
+        indices = _uniform_sample_indices(flat.numel(), 1_000_000)
         sample = flat.index_select(0, indices)
     else:
         sample = flat
@@ -338,6 +357,28 @@ def _tensor_health(value: Any, *, full_scan: bool) -> dict[str, Any]:
         "min": float(numeric.min()) if numeric.numel() else "",
         "max": float(numeric.max()) if numeric.numel() else "",
     }
+
+
+def _uniform_sample_indices(elements: int, samples: int) -> torch.Tensor:
+    """Return bounded uniform indices even beyond float32 integer precision."""
+
+    elements = int(elements)
+    samples = min(int(samples), elements)
+    if elements < 1 or samples < 1:
+        return torch.empty(0, dtype=torch.long)
+    # float32 cannot represent every integer once a mask exceeds 2**24
+    # elements, and may round the last linspace value to ``elements``.
+    return (
+        torch.linspace(
+            0,
+            elements - 1,
+            steps=samples,
+            dtype=torch.float64,
+        )
+        .round()
+        .long()
+        .clamp_(0, elements - 1)
+    )
 
 
 def _bool_tensor(value: Any, sequence: int, instances: int) -> torch.Tensor:

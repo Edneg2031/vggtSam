@@ -553,6 +553,14 @@ def _build_geometry_cache(
         )
         for instance_id in clip.instance_ids
     ]
+    prompt_by_instance = {
+        int(row.get("instance_id", -1)): str(row.get("instance_prompt", ""))
+        for row in segmentation_diagnostics
+    }
+    sam_track_prompts = [
+        prompt_by_instance.get(int(instance_id), "")
+        for instance_id in clip.instance_ids
+    ]
     sam_birth_indices = []
     for instance_id in clip.instance_ids:
         visible = recovered[int(instance_id)].masks.flatten(1).any(dim=1)
@@ -602,11 +610,18 @@ def _build_geometry_cache(
                     "birth_sam_track_ids": " ".join(
                         str(sam_track_ids[slot]) for slot in born_slots
                     ),
+                    "birth_prompts": " ".join(
+                        sam_track_prompts[slot] for slot in born_slots
+                    ),
                     "geometry_birth_slots": " ".join(
                         str(slot) for slot in geometry_born_slots
                     ),
                     "geometry_birth_sam_track_ids": " ".join(
                         str(sam_track_ids[slot])
+                        for slot in geometry_born_slots
+                    ),
+                    "geometry_birth_prompts": " ".join(
+                        sam_track_prompts[slot]
                         for slot in geometry_born_slots
                     ),
                 }
@@ -656,7 +671,9 @@ def _build_geometry_cache(
         "instance_ids": list(clip.instance_ids),
         "instance_source": clip.instance_source,
         "instance_prompt": clip.instance_prompt,
+        "instance_prompts": list(_clip_instance_prompts(clip)),
         "sam_track_ids": sam_track_ids,
+        "sam_track_prompts": sam_track_prompts,
         "sam_birth_indices": sam_birth_indices,
         "instance_birth_indices": geometry_birth_indices,
         "dynamic_instance_diagnostics": dynamic_instance_diagnostics,
@@ -941,7 +958,13 @@ def _load_or_run_sam31_online_tracking(
     shared,
     sam_video_holder: dict[str, SAM3Wrapper],
 ) -> tuple[dict[int, TrackingSequence], list[dict[str, object]]]:
-    """Discover persistent SAM3.1 IDs throughout a forward-only sequence."""
+    """Discover persistent SAM3.1 IDs for several concrete concepts.
+
+    SAM3.1 exhaustively detects instances of a prompted noun phrase; it is not
+    a class-agnostic proposal model.  Each prompt therefore gets an independent
+    forward-only session.  Their tracks are merged chronologically into one
+    exchangeable slot bank without consulting future masks or GT identity.
+    """
 
     if recovery.sam3_version != "sam3.1":
         raise ValueError("instance_source=sam31_online requires SAM3.1.")
@@ -954,8 +977,10 @@ def _load_or_run_sam31_online_tracking(
         instance_ids=clip.instance_ids,
         frame_indices=clip.frame_indices,
     )
+    prompts = tuple(clip.instance_prompts) or (clip.instance_prompt,)
+    prompt_signature = "|".join(prompts)
     if cached is not None and all(
-        str(row.get("instance_prompt", "")) == clip.instance_prompt
+        str(row.get("configured_prompts", "")) == prompt_signature
         and str(row.get("propagation_direction", "")) == "forward"
         and int(row.get("causal_confirmation", 0)) == 1
         for row in cached[2]
@@ -964,28 +989,75 @@ def _load_or_run_sam31_online_tracking(
         return cached[1], [dict(row) for row in cached[2]]
 
     sam3 = _sam_video_model(recovery, sam_video_holder)
-    tracked = sam3.track_all_forward(
-        shared.image_paths,
-        prompt=clip.instance_prompt,
-        output_size=recovery.output_size,
-        max_objects=max(
-            int(recovery.sam3_max_num_objects),
-            len(clip.instance_ids),
-        ),
+    raw_candidates: list[dict[str, object]] = []
+    detected_count = 0
+    per_prompt_limit = max(
+        int(recovery.sam3_max_num_objects),
+        len(clip.instance_ids),
     )
-    candidates = []
-    for source_slot, obj_id in enumerate(tracked.obj_ids):
-        masks = tracked.masks[:, source_slot]
-        birth = int(tracked.birth_indices[source_slot])
-        birth_pixels = int(masks[birth].sum())
-        birth_ratio = float(masks[birth].float().mean())
-        # Slot admission consults only the birth frame. Later observations
-        # may diagnose the track but can never retroactively create its slot.
-        if birth_pixels < int(recovery.min_pixels) or birth_ratio > 0.90:
+    for prompt_index, prompt in enumerate(prompts):
+        tracked = sam3.track_all_forward(
+            shared.image_paths,
+            prompt=prompt,
+            output_size=recovery.output_size,
+            max_objects=per_prompt_limit,
+        )
+        detected_count += len(tracked.obj_ids)
+        print(
+            "SAM3.1 online prompt "
+            f"clip={clip.name} concept={prompt!r} "
+            f"discovered={len(tracked.obj_ids)}"
+        )
+        for source_slot, obj_id in enumerate(tracked.obj_ids):
+            masks = tracked.masks[:, source_slot].detach().cpu().bool()
+            birth = int(tracked.birth_indices[source_slot])
+            birth_pixels = int(masks[birth].sum())
+            birth_ratio = float(masks[birth].float().mean())
+            # Slot admission consults only the birth frame. Later observations
+            # may diagnose the track but can never retroactively create it.
+            if birth_pixels < int(recovery.min_pixels) or birth_ratio > 0.90:
+                continue
+            raw_candidates.append(
+                {
+                    "prompt_index": int(prompt_index),
+                    "prompt": str(prompt),
+                    "source_obj_id": int(obj_id),
+                    "track_id": int((prompt_index << 32) + int(obj_id)),
+                    "birth": int(birth),
+                    "masks": masks,
+                    "scores": tracked.scores[:, source_slot]
+                    .detach()
+                    .cpu()
+                    .float(),
+                }
+            )
+
+    raw_candidates.sort(
+        key=lambda item: (
+            int(item["birth"]),
+            int(item["prompt_index"]),
+            int(item["source_obj_id"]),
+        )
+    )
+    candidates: list[dict[str, object]] = []
+    duplicate_count = 0
+    for candidate in raw_candidates:
+        if any(
+            _online_tracks_duplicate_at_birth(candidate, accepted)
+            for accepted in candidates
+        ):
+            duplicate_count += 1
             continue
-        candidates.append(source_slot)
+        candidates.append(candidate)
         if len(candidates) == len(clip.instance_ids):
             break
+    if not candidates:
+        raise RuntimeError(
+            "SAM3.1 online discovery found no usable instance for concrete "
+            f"prompts={prompts!r} in clip={clip.name}. Raw detections="
+            f"{detected_count}; verify the noun phrases and lower the SAM "
+            "detection threshold only after inspecting prompt-specific output."
+        )
 
     originals: dict[int, TrackingSequence] = {}
     recovered: dict[int, TrackingSequence] = {}
@@ -999,13 +1071,17 @@ def _load_or_run_sam31_online_tracking(
             )
             birth = -1
             sam_obj_id = -1
+            source_obj_id = -1
+            instance_prompt = ""
         else:
-            source_slot = candidates[slot]
-            sam_obj_id = int(tracked.obj_ids[source_slot])
-            birth = int(tracked.birth_indices[source_slot])
+            candidate = candidates[slot]
+            sam_obj_id = int(candidate["track_id"])
+            source_obj_id = int(candidate["source_obj_id"])
+            instance_prompt = str(candidate["prompt"])
+            birth = int(candidate["birth"])
             sequence = TrackingSequence(
-                masks=tracked.masks[:, source_slot].detach().cpu().bool(),
-                scores=tracked.scores[:, source_slot].detach().cpu().float(),
+                masks=torch.as_tensor(candidate["masks"]).bool(),
+                scores=torch.as_tensor(candidate["scores"]).float(),
                 selected_obj_id=sam_obj_id,
             )
         originals[instance_id] = sequence
@@ -1014,8 +1090,10 @@ def _load_or_run_sam31_online_tracking(
             {
                 "instance_id": instance_id,
                 "instance_source": "sam31_online",
-                "instance_prompt": clip.instance_prompt,
+                "instance_prompt": instance_prompt,
+                "configured_prompts": prompt_signature,
                 "sam_track_id": sam_obj_id,
+                "sam_source_obj_id": source_obj_id,
                 "birth_sequence_index": birth,
                 "birth_frame_index": (
                     int(clip.frame_indices[birth]) if birth >= 0 else -1
@@ -1032,7 +1110,8 @@ def _load_or_run_sam31_online_tracking(
         )
     print(
         "SAM3.1 online instances "
-        f"clip={clip.name} discovered={len(tracked.obj_ids)} "
+        f"clip={clip.name} prompts={prompts!r} discovered={detected_count} "
+        f"eligible={len(raw_candidates)} duplicates={duplicate_count} "
         f"retained={len(candidates)} slots={len(clip.instance_ids)}"
     )
     save_tracking_cache(
@@ -1045,6 +1124,36 @@ def _load_or_run_sam31_online_tracking(
         tracking_rows=rows,
     )
     return recovered, rows
+
+
+def _online_tracks_duplicate_at_birth(
+    candidate: Mapping[str, object],
+    accepted: Mapping[str, object],
+    *,
+    minimum_intersection_over_smaller: float = 0.90,
+) -> bool:
+    """Causally suppress synonymous prompts that find the same object.
+
+    Only the new candidate's birth frame is inspected.  This prevents a later
+    overlap from retroactively changing which tracks existed in earlier frames.
+    """
+
+    frame = int(candidate["birth"])
+    candidate_masks = torch.as_tensor(candidate["masks"]).bool()
+    accepted_masks = torch.as_tensor(accepted["masks"]).bool()
+    if frame < 0 or frame >= accepted_masks.shape[0]:
+        return False
+    left = candidate_masks[frame]
+    right = accepted_masks[frame]
+    left_area = int(left.sum())
+    right_area = int(right.sum())
+    if not left_area or not right_area:
+        return False
+    intersection = int((left & right).sum())
+    return (
+        float(intersection) / float(min(left_area, right_area))
+        >= float(minimum_intersection_over_smaller)
+    )
 
 
 def _load_or_run_sam3_reference_tracking(
@@ -1417,6 +1526,7 @@ def _cache_complete(
         name not in payload
         for name in (
             "sam_track_ids",
+            "sam_track_prompts",
             "sam_birth_indices",
             "instance_birth_indices",
             "dynamic_instance_diagnostics",
@@ -1434,8 +1544,7 @@ def _cache_complete(
             payload.get("instance_source", "configured_gt_reference")
         )
         == clip.instance_source
-        and str(payload.get("instance_prompt", "object"))
-        == clip.instance_prompt
+        and _payload_instance_prompts(payload) == _clip_instance_prompts(clip)
         and bool(payload.get("allow_missing_reference_instances", False))
         == bool(clip.allow_missing_reference_instances)
         and int(payload.get("reference_sequence_index", -1))
@@ -1489,6 +1598,7 @@ def _geometry_cache_reusable(
         core_fields.update(
             {
                 "sam_track_ids",
+                "sam_track_prompts",
                 "sam_birth_indices",
                 "instance_birth_indices",
                 "dynamic_instance_diagnostics",
@@ -1511,8 +1621,7 @@ def _geometry_cache_reusable(
         != clip.instance_ids
         or str(payload.get("instance_source", "configured_gt_reference"))
         != clip.instance_source
-        or str(payload.get("instance_prompt", "object"))
-        != clip.instance_prompt
+        or _payload_instance_prompts(payload) != _clip_instance_prompts(clip)
         or int(payload.get("reference_sequence_index", -1))
         != clip.reference_sequence_index
     ):
@@ -1532,6 +1641,18 @@ def _geometry_cache_reusable(
     ):
         return False
     return True
+
+
+def _clip_instance_prompts(clip: ClipConfig) -> tuple[str, ...]:
+    return tuple(clip.instance_prompts) or (str(clip.instance_prompt),)
+
+
+def _payload_instance_prompts(payload: Mapping[str, object]) -> tuple[str, ...]:
+    raw = payload.get("instance_prompts")
+    if isinstance(raw, (list, tuple)):
+        return tuple(str(value) for value in raw)
+    legacy = str(payload.get("instance_prompt", "object"))
+    return (legacy,) if legacy else ()
 
 
 def _empty_cuda_cache() -> None:

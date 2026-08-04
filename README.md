@@ -1,14 +1,10 @@
-# StreamVGGT + SAM3 instance refinement
+# SAM3.1-assisted StreamVGGT
 
-This repository contains one project package, `streaming_couping`, with two
-retained methods and one focused camera-fusion experiment:
-
-- V4 coverage-first: the strongest two-sequence pose result and the main line
-  for future false-association work.
-- V5 adaptive-best: the conservative pose/pointmap method that falls back to
-  the raw pointmap when geometric ray support is insufficient.
-- V6 camera overfit: a fair five-frame camera-only / instance-only / fusion
-  capacity ablation; it is not a deployment result.
+The current research path is V7.4: SAM3.1 dynamically discovers persistent
+instances and supplies local identity affinity, while StreamVGGT supplies the
+geometry Values. Causal multi-instance evidence predicts a bounded SE(3)
+residual on top of a frozen camera-only baseline. V4-V7.3 remain as historical
+ablations and reproduction paths.
 
 Initialize the two upstream model repositories once:
 
@@ -16,18 +12,16 @@ Initialize the two upstream model repositories once:
 git submodule update --init --recursive
 ```
 
-Run either retained method from the repository root:
+Run the current V7.4 temporal experiment from the repository root:
 
 ```bash
-zsh streaming_couping/commands_v4_coverage_first.txt
-zsh streaming_couping/commands_v5_adaptive_best.txt
-zsh streaming_couping/commands_v6_camera_overfit.txt
+zsh streaming_couping/commands_v74_temporal_scaling.txt
 ```
 
 The commands use `externals/sam3` and `externals/streamvggt`, while datasets,
 checkpoints, caches, and generated evaluations remain local under `data/` and
 `outputs/`.
 
-See [the package README](streaming_couping/readme.md) for the output layout and
-[the method record](streaming_couping/docs/final_joint_pointcloud_pose_method.md)
-for the retained architecture and metrics.
+See [the package README](streaming_couping/readme.md) for historical commands
+and output layouts. The single current method description is
+[SAM3.1 + StreamVGGT V7.4](streaming_couping/docs/current_sam31_streamvggt_v74_method.md).

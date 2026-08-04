@@ -136,6 +136,10 @@ def run_temporal_scaling(
             "V7.4 now requires instance_source=sam31_online so instances may "
             "be born after the camera reference frame. Rebuild its cache."
         )
+    observation_signature = _observation_signature(
+        payload=payload,
+        data_config=data_config,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     dynamic_diagnostics = output_dir / "v74_dynamic_instance_diagnostics.csv"
     _write_dynamic_instance_diagnostics(payload, dynamic_diagnostics)
@@ -296,6 +300,7 @@ def run_temporal_scaling(
                 token_count=token_count,
                 seed=seed,
                 frozen_l0_signature=frozen_signature,
+                observation_signature=observation_signature,
             )
             with torch.no_grad():
                 primary = _forward_model(
@@ -362,6 +367,7 @@ def run_temporal_scaling(
         "frozen_l0_source": str(frozen_source),
         "frozen_l0_signature": frozen_signature,
         "frozen_l0_sha256": frozen_sha256,
+        "observation_signature": observation_signature,
         "result_csv": str(result),
         "dynamic_instance_diagnostics_csv": str(dynamic_diagnostics),
     }
@@ -395,6 +401,7 @@ def _train_or_resume(
     token_count,
     seed,
     frozen_l0_signature,
+    observation_signature,
 ) -> dict[str, float | int]:
     signature = _signature(
         fold=fold,
@@ -405,6 +412,8 @@ def _train_or_resume(
         seed=seed,
         steps=steps,
         frozen_l0_signature=frozen_l0_signature,
+        observation_signature=observation_signature,
+        active_indices=active_indices,
         experiment=experiment,
     )
     checkpoint_dir = output_dir / "checkpoints" / fold.name
@@ -877,6 +886,8 @@ def _signature(
     seed,
     steps,
     frozen_l0_signature,
+    observation_signature,
+    active_indices,
     experiment,
 ) -> str:
     payload = {
@@ -891,6 +902,8 @@ def _signature(
         "seed": seed,
         "steps": steps,
         "frozen_l0_signature": frozen_l0_signature,
+        "observation_signature": observation_signature,
+        "active_indices": tuple(int(value) for value in active_indices),
         "fusion": asdict(experiment.fusion),
         "training": asdict(experiment.training),
     }
@@ -901,6 +914,31 @@ def _signature(
         default=str,
     ).encode("utf8")
     return hashlib.sha256(serialized).hexdigest()
+
+
+def _observation_signature(*, payload: dict, data_config: Path) -> str:
+    """Bind residual checkpoints to the dynamic tracks they were trained on."""
+
+    identity = {
+        "schema": 1,
+        "data_config_sha256": _sha256_file(data_config),
+        "clip_name": payload.get("clip_name"),
+        "frame_indices": payload.get("frame_indices"),
+        "instance_prompts": payload.get("instance_prompts"),
+        "sam_checkpoint": payload.get("sam_checkpoint"),
+        "sam_track_ids": payload.get("sam_track_ids"),
+        "sam_track_prompts": payload.get("sam_track_prompts"),
+        "sam_birth_indices": payload.get("sam_birth_indices"),
+        "instance_birth_indices": payload.get("instance_birth_indices"),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            identity,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf8")
+    ).hexdigest()
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -928,8 +966,10 @@ def _write_dynamic_instance_diagnostics(payload: dict, path: Path) -> None:
         "associated_tracks",
         "birth_slots",
         "birth_sam_track_ids",
+        "birth_prompts",
         "geometry_birth_slots",
         "geometry_birth_sam_track_ids",
+        "geometry_birth_prompts",
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf8", newline="") as handle:
