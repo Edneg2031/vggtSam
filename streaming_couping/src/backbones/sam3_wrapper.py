@@ -10,6 +10,7 @@ import torch
 
 from ..types import SAM3MaskCandidate, TrackingSequence
 from .sam3_video import (
+    SAM3MultiTrackOutput,
     SAM3VideoTrackerAdapter,
     collect_frame_objects,
     collect_frame_scores,
@@ -96,6 +97,26 @@ class SAM3Wrapper:
             masks=output.masks.detach().cpu().bool(),
             scores=scores.detach().cpu().float(),
             selected_obj_id=output.selected_obj_id,
+        )
+
+    def track_all_forward(
+        self,
+        image_paths: Sequence[str | Path],
+        *,
+        prompt: str,
+        output_size: tuple[int, int],
+        max_objects: int,
+    ) -> SAM3MultiTrackOutput:
+        """Return dynamically born SAM3.1 tracks from one forward-only run."""
+
+        if self.version != "sam3.1":
+            raise RuntimeError("Dynamic forward discovery requires SAM3.1.")
+        return self._require_adapter().track_all_forward_from_paths(
+            image_paths,
+            prompt=prompt,
+            output_size=output_size,
+            max_objects=max_objects,
+            quiet=True,
         )
 
     def propose_text_masks(

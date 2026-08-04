@@ -258,6 +258,7 @@ def build_geometry_observations(
     sampled_instance_points: int,
     hard_mismatch_min_points: int = 512,
     hard_mismatch_max_fitness: float = 0.02,
+    causal_instance_memory: bool = False,
 ) -> dict[str, object]:
     """Create geometry descriptors and camera-local samples without GT gates.
 
@@ -287,6 +288,7 @@ def build_geometry_observations(
     identity_unknown = torch.zeros(sequence, instances, dtype=torch.bool)
     identity_mismatch = torch.zeros(sequence, instances, dtype=torch.bool)
     point_counts = torch.zeros(sequence, instances, dtype=torch.long)
+    birth_indices = torch.full((instances,), -1, dtype=torch.long)
     identity_rows: list[dict[str, object]] = []
 
     selected_points: list[list[torch.Tensor]] = [
@@ -322,19 +324,21 @@ def build_geometry_observations(
 
     object_maps: dict[int, torch.Tensor] = {}
     reference_shapes: dict[int, torch.Tensor] = {}
-    for slot, instance_id in enumerate(instance_ids):
-        reference_points = selected_points[int(reference_index)][slot]
-        if reference_points.shape[0] >= refinement.min_instance_points:
-            object_maps[int(instance_id)] = reference_points
-            reference_shapes[int(instance_id)] = stats[int(reference_index)][slot][
-                "log_eigenvalues"
-            ]
+    if not causal_instance_memory:
+        for slot, instance_id in enumerate(instance_ids):
+            reference_points = selected_points[int(reference_index)][slot]
+            if reference_points.shape[0] >= refinement.min_instance_points:
+                object_maps[int(instance_id)] = reference_points
+                reference_shapes[int(instance_id)] = stats[int(reference_index)][slot][
+                    "log_eigenvalues"
+                ]
+                birth_indices[slot] = int(reference_index)
 
     previous_frame = int(frame_indices[int(reference_index)])
     for frame in range(sequence):
         proposals: list[TranslationProposal] = []
         proposal_by_slot: dict[int, TranslationProposal] = {}
-        if frame != int(reference_index):
+        if causal_instance_memory or frame != int(reference_index):
             for slot, instance_id in enumerate(instance_ids):
                 current = selected_points[frame][slot]
                 if int(instance_id) not in object_maps:
@@ -376,13 +380,30 @@ def build_geometry_observations(
             consensus_ratio = 2.0
             geometry_confidence = 0.0
             static_score = 0.0
+            is_causal_birth = (
+                causal_instance_memory
+                and bool(observed[frame, slot])
+                and int(instance_id) not in object_maps
+                and int(point_counts[frame, slot])
+                >= int(refinement.min_instance_points)
+            )
             if not bool(observed[frame, slot]):
                 current_identity_valid = False
                 current_identity_unknown = False
                 current_identity_mismatch = False
                 identity_state = "ABSENT"
                 identity_reason = "absent_tracker_mask"
-            elif frame == int(reference_index):
+            elif is_causal_birth:
+                # A persistent SAM ID is accepted as a new track at its first
+                # geometry-supported observation.  It may initialize memory,
+                # but the matcher has no historical Key/Value yet, so this
+                # frame cannot alter the camera pose.
+                current_identity_valid = True
+                current_identity_unknown = False
+                current_identity_mismatch = False
+                identity_state = "BIRTH"
+                identity_reason = "accepted_online_track_birth"
+            elif frame == int(reference_index) and not causal_instance_memory:
                 current_identity_valid = int(instance_id) in object_maps
                 current_identity_unknown = not current_identity_valid
                 current_identity_mismatch = False
@@ -429,7 +450,9 @@ def build_geometry_observations(
             identity_valid[frame, slot] = current_identity_valid
             identity_unknown[frame, slot] = current_identity_unknown
             identity_mismatch[frame, slot] = current_identity_mismatch
-            if frame == int(reference_index):
+            if is_causal_birth or (
+                frame == int(reference_index) and not causal_instance_memory
+            ):
                 geometry_confidence = 1.0
                 static_score = 1.0
                 rmse_ratio = 0.0
@@ -507,6 +530,7 @@ def build_geometry_observations(
                     "frame_index": int(frame_indices[frame]),
                     "instance_id": int(instance_id),
                     "is_reference": int(frame == int(reference_index)),
+                    "is_instance_birth": int(is_causal_birth),
                     "mask_observed": int(observed[frame, slot]),
                     "track_confidence": float(scores[frame, slot]),
                     "point_count": int(point_counts[frame, slot]),
@@ -542,6 +566,11 @@ def build_geometry_observations(
                 }
             )
 
+            if is_causal_birth:
+                object_maps[int(instance_id)] = selected_points[frame][slot]
+                reference_shapes[int(instance_id)] = item["log_eigenvalues"]
+                birth_indices[slot] = int(frame)
+
         if shared is not None:
             for slot, instance_id in enumerate(instance_ids):
                 if int(instance_id) not in participating_set:
@@ -566,6 +595,7 @@ def build_geometry_observations(
         "identity_mismatch": identity_mismatch,
         "identity_diagnostics": identity_rows,
         "point_counts": point_counts,
+        "instance_birth_indices": birth_indices,
         "scene_origin": origin,
         "scene_scale": float(scene_scale),
         "geometry_feature_names": list(GEOMETRY_FEATURE_NAMES),
@@ -590,6 +620,7 @@ def build_pose_residual_observations(
     scene_scale: float,
     min_geometry_confidence: float,
     min_static_score: float,
+    causal_instance_memory: bool = False,
 ) -> dict[str, object]:
     """Build causal mask-versus-history projection residuals for pose fusion."""
 
@@ -629,7 +660,11 @@ def build_pose_residual_observations(
                 confidence_threshold=confidence_threshold,
                 max_points=max_map_points,
             )
-            if frame == 0 and current_points.shape[0] >= min_instance_points:
+            if (
+                not causal_instance_memory
+                and frame == 0
+                and current_points.shape[0] >= min_instance_points
+            ):
                 object_maps[slot] = current_points
 
             observed_xy = _normalized_mask_coordinates(
@@ -705,7 +740,20 @@ def build_pose_residual_observations(
                 and float(quality[frame, slot, 2])
                 >= float(min_static_score)
             )
-            if memory_write and frame > 0:
+            is_birth = (
+                causal_instance_memory
+                and historical.shape[0] < min_instance_points
+                and bool(identity_valid[frame, slot])
+                and current_points.shape[0] >= min_instance_points
+            )
+            if is_birth:
+                # Initialize after feature construction so a new instance
+                # cannot provide a pose residual on its own birth frame.
+                object_maps[slot] = deterministic_limit(
+                    current_points,
+                    max_map_points,
+                )
+            elif memory_write and frame > 0:
                 # The geometry descriptor stores the accepted ICP translation
                 # normalized by scene_scale at indices 9:12.
                 corrected = (

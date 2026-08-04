@@ -40,6 +40,18 @@ class SAM3TrackOutput:
     aux: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class SAM3MultiTrackOutput:
+    """Fixed-slot view of every object discovered by a forward SAM3.1 run."""
+
+    masks: torch.Tensor
+    scores: torch.Tensor
+    obj_ids: tuple[int, ...]
+    birth_indices: tuple[int, ...]
+    frame_objects: Dict[int, Dict[int, torch.Tensor]] = field(default_factory=dict)
+    aux: Dict[str, Any] = field(default_factory=dict)
+
+
 def load_sam3_video_predictor(
     *,
     repo_path: Optional[str | Path],
@@ -280,6 +292,96 @@ class SAM3VideoTrackerAdapter:
             },
         )
 
+    @torch.no_grad()
+    def track_all_forward_from_paths(
+        self,
+        image_paths: Sequence[str | Path],
+        *,
+        prompt: str,
+        output_size: tuple[int, int],
+        max_objects: int,
+        quiet: bool = True,
+    ) -> SAM3MultiTrackOutput:
+        """Discover and track object IDs in temporal order without backtracking.
+
+        SAM3.1's text prompt applies to every frame.  Its multiplex tracker can
+        therefore create a persistent object ID when an object first becomes
+        visible after frame zero.  The detector/tracker is forced into a
+        no-lookahead mode here: outputs are propagated only forward, hot-start
+        buffering is disabled, and one detection is sufficient to confirm a
+        new masklet.  Slots are assigned by first appearance and never reused.
+        """
+
+        if not image_paths:
+            raise ValueError("At least one image path is required for SAM3 tracking.")
+        if int(max_objects) < 1:
+            raise ValueError("max_objects must be positive.")
+
+        with tempfile.TemporaryDirectory(prefix="sam31_track_all_") as tmp:
+            tmp_dir = Path(tmp)
+            materialize_video_dir(image_paths, tmp_dir)
+            with quiet_sam3_output(quiet):
+                session = self.predictor.start_session(resource_path=str(tmp_dir))
+                session_id = session["session_id"] if isinstance(session, dict) else session
+                causal_settings = _set_causal_multiplex_settings(self.predictor)
+                try:
+                    prompted = self.predictor.add_prompt(
+                        session_id=session_id,
+                        frame_idx=0,
+                        text=prompt,
+                        output_prob_thresh=self.output_prob_thresh,
+                    )
+                    propagated = list(
+                        self.predictor.propagate_in_video(
+                            session_id=session_id,
+                            propagation_direction="forward",
+                            start_frame_idx=0,
+                            max_frame_num_to_track=len(image_paths),
+                            output_prob_thresh=self.output_prob_thresh,
+                        )
+                    )
+                finally:
+                    _restore_multiplex_settings(self.predictor, causal_settings)
+                    self.predictor.close_session(session_id)
+
+        results = [prompted, *propagated]
+        frame_objects = collect_frame_objects(results, output_size=output_size)
+        frame_scores = collect_frame_scores(results)
+        first_seen: Dict[int, int] = {}
+        for frame_idx in range(len(image_paths)):
+            for obj_id, mask in sorted(frame_objects.get(frame_idx, {}).items()):
+                if bool(mask.any()):
+                    first_seen.setdefault(int(obj_id), int(frame_idx))
+        ordered = sorted(first_seen, key=lambda obj_id: (first_seen[obj_id], obj_id))
+        selected = tuple(ordered[: int(max_objects)])
+        sequence = len(image_paths)
+        height, width = (int(value) for value in output_size)
+        masks = torch.zeros(sequence, len(selected), height, width, dtype=torch.bool)
+        scores = torch.zeros(sequence, len(selected), dtype=torch.float32)
+        for slot, obj_id in enumerate(selected):
+            for frame_idx in range(sequence):
+                mask = frame_objects.get(frame_idx, {}).get(obj_id)
+                if mask is None or not bool(mask.any()):
+                    continue
+                masks[frame_idx, slot] = mask.detach().cpu().bool()
+                score = frame_scores.get(frame_idx, {}).get(obj_id)
+                scores[frame_idx, slot] = 1.0 if score is None else float(score)
+        return SAM3MultiTrackOutput(
+            masks=masks,
+            scores=scores,
+            obj_ids=selected,
+            birth_indices=tuple(first_seen[obj_id] for obj_id in selected),
+            frame_objects=frame_objects,
+            aux={
+                "prompt": str(prompt),
+                "propagation_direction": "forward",
+                "causal_confirmation": True,
+                "detected_object_count": len(ordered),
+                "retained_object_count": len(selected),
+                "dropped_object_ids": tuple(ordered[int(max_objects) :]),
+            },
+        )
+
 
 @contextlib.contextmanager
 def quiet_sam3_output(enabled: bool = True):
@@ -295,6 +397,33 @@ def quiet_sam3_output(enabled: bool = True):
                 yield
             finally:
                 restore_loggers(previous_levels)
+
+
+def _set_causal_multiplex_settings(predictor) -> dict[str, Any]:
+    """Temporarily remove SAM3.1 output buffering that consults future frames."""
+
+    model = getattr(predictor, "model", None)
+    saved: dict[str, Any] = {}
+    if model is None:
+        return saved
+    replacements = {
+        "hotstart_delay": 0,
+        "masklet_confirmation_consecutive_det_thresh": 1,
+        "postprocess_batch_size": 1,
+    }
+    for name, value in replacements.items():
+        if hasattr(model, name):
+            saved[name] = getattr(model, name)
+            setattr(model, name, value)
+    return saved
+
+
+def _restore_multiplex_settings(predictor, saved: Dict[str, Any]) -> None:
+    model = getattr(predictor, "model", None)
+    if model is None:
+        return
+    for name, value in saved.items():
+        setattr(model, name, value)
 
 
 def set_sam3_loggers(level: int, previous_levels: Dict[str, int]) -> None:

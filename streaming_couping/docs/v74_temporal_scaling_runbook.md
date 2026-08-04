@@ -15,10 +15,26 @@ parameter-matched model trained without SAM logits.
 
 ## Locked temporal folds
 
-Frame 90 remains the reference. V7.4 builds its own 30-frame SAM3.1 and
-StreamVGGT cache, then trains a fresh camera-only L0 on frames 105 through 255.
-The resulting L0, K=8 observations and optimization settings are shared by
-every residual branch.
+Frame 90 remains only the camera-coordinate gauge. It is no longer an object
+reference frame. V7.4 builds its own 30-frame SAM3.1 and StreamVGGT cache, then
+trains a fresh camera-only L0 on frames 105 through 255. The resulting L0, K=8
+observations and optimization settings are shared by every residual branch.
+
+## Dynamic instances and causal memory
+
+SAM3.1 receives one `object` text prompt and runs its multiplex tracker only in
+the forward direction. It may create a new persistent ID on any frame. The
+first eight IDs are assigned permanent logical slots in order of first
+appearance; the values `[0..7]` in the data YAML are capacities, not GT object
+IDs. No GT instance mask is used to create these slots.
+
+For each slot, the first geometry-supported observation is a birth event. That
+frame writes SAM local tokens and StreamVGGT local geometry to instance memory,
+but cannot update the pose because no historical Key/Value exists yet. From the
+second observation onward, current tokens match only the most recent earlier
+observation. Memory is updated after matching, so later detections cannot alter
+an already-computed prefix. If no mature instance is visible, output falls back
+exactly to frozen L0.
 
 | Fold | Residual training | Future test |
 |---|---|---|
@@ -93,6 +109,15 @@ Copy only this first:
 ```text
 outputs/streaming_couping_v74_temporal_scaling/v74_temporal_scaling.csv
 ```
+
+If tracking coverage looks suspicious, also copy:
+
+```text
+outputs/streaming_couping_v74_temporal_scaling/v74_dynamic_instance_diagnostics.csv
+```
+
+That short table reports newly born SAM IDs, all discovered slots, currently
+observed slots, mature slots and geometry-associated slots frame by frame.
 
 The command first checks the locked folds, decision thresholds, 54-column CSV
 schema and V7.3 tensor behavior without requiring `pytest`.

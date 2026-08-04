@@ -82,11 +82,15 @@ class SAMWeightedGeometryMatcher(nn.Module):
         sam_feature_dim: int,
         geometry_feature_dim: int,
         config: V6FusionConfig,
+        memory_mode: str = "fixed_reference",
     ) -> None:
         super().__init__()
         if architecture not in V73_ARCHITECTURES:
             raise ValueError(f"Unknown V7.3 architecture: {architecture!r}.")
         self.architecture = architecture
+        if memory_mode not in {"fixed_reference", "causal_last_observation"}:
+            raise ValueError(f"Unknown V7.3 memory mode: {memory_mode!r}.")
+        self.memory_mode = memory_mode
         self.description = V73_DESCRIPTIONS[architecture]
         hidden = int(config.hidden_dim)
         self.hidden_dim = hidden
@@ -143,6 +147,7 @@ class SAMWeightedGeometryMatcher(nn.Module):
         sam_local_valid: torch.Tensor,
         reference_index: int,
         uniform_sam: bool = False,
+        memory_write: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if local_features.ndim != 5 or local_valid.shape != local_features.shape[:-1]:
             raise ValueError(
@@ -158,6 +163,8 @@ class SAMWeightedGeometryMatcher(nn.Module):
             raise ValueError("V7.3 SAM and geometry sequence/instance shapes differ.")
         if local_features.shape[-1] < 5:
             raise ValueError("V7.3 geometry tokens must contain normalized UV.")
+        if memory_write is not None and memory_write.shape != local_features.shape[:3]:
+            raise ValueError("V7.3 memory_write must have shape [B,S,K].")
 
         geometry = self.geometry_encoder(local_features.float())
         geometry_uv = local_features[..., 3:5].float().clamp(-1.0, 1.0)
@@ -166,16 +173,8 @@ class SAMWeightedGeometryMatcher(nn.Module):
         if reference < 0 or reference >= sequence:
             raise ValueError("V7.3 reference index is outside the sequence.")
 
-        reference_geometry = geometry[:, reference][:, None].expand(
-            batch, sequence, instances, points, hidden
-        )
-        reference_valid = local_valid[:, reference][:, None].expand(
-            batch, sequence, instances, points
-        )
         current_sam_identity = None
         current_sam_available = torch.zeros_like(local_valid)
-        reference_sam_identity = None
-        reference_sam_available = torch.zeros_like(reference_valid)
         if self.description.uses_sam:
             if self.sam_encoder is None:
                 raise RuntimeError("V7.3 SAM encoder is unavailable.")
@@ -189,12 +188,39 @@ class SAMWeightedGeometryMatcher(nn.Module):
                     local_valid,
                 )
             )
-            reference_sam_identity = current_sam_identity[:, reference][
-                :, None
-            ].expand(batch, sequence, instances, points, hidden)
-            reference_sam_available = current_sam_available[:, reference][
-                :, None
-            ].expand(batch, sequence, instances, points)
+        if self.memory_mode == "causal_last_observation":
+            reference_geometry, reference_valid = _causal_previous_memory(
+                geometry,
+                local_valid,
+                write_mask=memory_write,
+            )
+            if current_sam_identity is not None:
+                reference_sam_identity, reference_sam_available = (
+                    _causal_previous_memory(
+                        current_sam_identity,
+                        current_sam_available,
+                        write_mask=memory_write,
+                    )
+                )
+            else:
+                reference_sam_identity = None
+                reference_sam_available = torch.zeros_like(reference_valid)
+        else:
+            reference_geometry = geometry[:, reference][:, None].expand(
+                batch, sequence, instances, points, hidden
+            )
+            reference_valid = local_valid[:, reference][:, None].expand(
+                batch, sequence, instances, points
+            )
+            reference_sam_identity = None
+            reference_sam_available = torch.zeros_like(reference_valid)
+            if current_sam_identity is not None:
+                reference_sam_identity = current_sam_identity[:, reference][
+                    :, None
+                ].expand(batch, sequence, instances, points, hidden)
+                reference_sam_available = current_sam_available[:, reference][
+                    :, None
+                ].expand(batch, sequence, instances, points)
 
         flat_geometry = geometry.reshape(-1, points, hidden)
         flat_reference_geometry = reference_geometry.reshape_as(flat_geometry)
@@ -331,6 +357,7 @@ class SAMWeightedGeometryMatcher(nn.Module):
             "transport_max": maximum.reshape(shape),
             "sam_affinity_delta": affinity_delta.reshape(shape),
             "sam_used": sam_used.reshape(shape),
+            "memory_mature": reference_valid.any(dim=-1),
         }
 
     def _interpolate_sam_to_geometry(
@@ -393,6 +420,7 @@ class V73FrozenCorrespondenceResidual(nn.Module):
         sam_local_dim: int,
         geometry_local_dim: int,
         config: V6FusionConfig,
+        memory_mode: str = "fixed_reference",
     ) -> None:
         super().__init__()
         if architecture not in V73_ARCHITECTURES:
@@ -401,6 +429,7 @@ class V73FrozenCorrespondenceResidual(nn.Module):
             raise ValueError("V7.3 requires a V7 L0 camera-only base model.")
         self.base_model = base_model
         self.architecture = architecture
+        self.memory_mode = memory_mode
         self.config = config
         for parameter in self.base_model.parameters():
             parameter.requires_grad_(False)
@@ -411,6 +440,7 @@ class V73FrozenCorrespondenceResidual(nn.Module):
             sam_feature_dim=sam_local_dim,
             geometry_feature_dim=geometry_local_dim,
             config=config,
+            memory_mode=memory_mode,
         )
         self.camera_merger = _mlp(4 * hidden, hidden)
         self.se3_head = nn.Sequential(
@@ -478,6 +508,14 @@ class V73FrozenCorrespondenceResidual(nn.Module):
             sam_local_valid=sam_local_valid,
             reference_index=reference_index,
             uniform_sam=uniform_sam,
+            memory_write=(
+                observed.bool()
+                & identity_valid.bool()
+                & (
+                    quality[..., 0]
+                    >= float(self.config.min_track_confidence)
+                )
+            ),
         )
         valid = state.valid & matched["available"]
         evidence = _weighted_instance_pool(
@@ -570,6 +608,47 @@ def perturb_v73_inputs(
             changed[:, 1:] = torch.roll(batch[name][:, 1:], shifts=1, dims=2)
             output[name] = changed
     return output, uniform_sam
+
+
+def _causal_previous_memory(
+    values: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    write_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expose only the latest observation strictly before each frame.
+
+    The update is intentionally performed after appending the current memory.
+    Consequently an instance birth has no Key/Value and cannot change that
+    frame's pose; its first possible contribution is its next observation.
+    """
+
+    if values.ndim != 5 or valid.shape != values.shape[:-1]:
+        raise ValueError("Causal instance memory expects [B,S,K,P,D]/[B,S,K,P].")
+    if write_mask is not None and write_mask.shape != values.shape[:3]:
+        raise ValueError("Causal memory write mask must have shape [B,S,K].")
+    memory = torch.zeros_like(values[:, 0])
+    memory_valid = torch.zeros_like(valid[:, 0])
+    value_rows = []
+    valid_rows = []
+    for frame in range(values.shape[1]):
+        value_rows.append(memory)
+        valid_rows.append(memory_valid)
+        current_valid = valid[:, frame]
+        write = current_valid.any(dim=-1)
+        if write_mask is not None:
+            write = write & write_mask[:, frame].bool()
+        memory = torch.where(
+            write[..., None, None],
+            values[:, frame],
+            memory,
+        )
+        memory_valid = torch.where(
+            write[..., None],
+            current_valid,
+            memory_valid,
+        )
+    return torch.stack(value_rows, dim=1), torch.stack(valid_rows, dim=1)
 
 
 def _masked_transport_probability(

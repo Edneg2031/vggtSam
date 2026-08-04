@@ -131,6 +131,27 @@ def run_temporal_scaling(
     data = load_learned_pose_config(data_config)
     long_clip = _find_clip(data, v71.long_clip_name)
     payload = _load_cache(data, long_clip)
+    if str(payload.get("instance_source", "")) != "sam31_online":
+        raise ValueError(
+            "V7.4 now requires instance_source=sam31_online so instances may "
+            "be born after the camera reference frame. Rebuild its cache."
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dynamic_diagnostics = output_dir / "v74_dynamic_instance_diagnostics.csv"
+    _write_dynamic_instance_diagnostics(payload, dynamic_diagnostics)
+    if not any(int(value) >= 0 for value in payload.get("sam_track_ids", ())):
+        raise RuntimeError(
+            "SAM3.1 discovered no retained object track. Inspect "
+            f"{dynamic_diagnostics}."
+        )
+    if not any(
+        int(value) >= 0 for value in payload.get("instance_birth_indices", ())
+    ):
+        raise RuntimeError(
+            "SAM3.1 masks were found, but no track had enough StreamVGGT "
+            "geometry to initialize instance memory. Inspect "
+            f"{dynamic_diagnostics}."
+        )
     _validate_local_payload(
         payload,
         name="v74_temporal_scaling",
@@ -156,7 +177,6 @@ def run_temporal_scaling(
         )
     positions = {frame: index for index, frame in enumerate(frames)}
     validate_folds(FOLDS, available_frames=set(frames))
-    output_dir.mkdir(parents=True, exist_ok=True)
     base_model, frozen_signature, frozen_source, frozen_sha256 = (
         _train_or_resume_v74_l0(
             output_dir=output_dir,
@@ -237,6 +257,7 @@ def run_temporal_scaling(
                 sam_local_dim=int(batch["sam_local_features"].shape[-1]),
                 geometry_local_dim=int(batch["local_features"].shape[-1]),
                 config=experiment.fusion,
+                memory_mode="causal_last_observation",
             ).to(device)
             model.eval()
             with torch.no_grad():
@@ -323,6 +344,9 @@ def run_temporal_scaling(
     metadata = {
         "schema": 1,
         "purpose": "same_scene_temporal_prefix_generalization",
+        "instance_memory": "causal_last_observation",
+        "instance_reference_frame": None,
+        "camera_gauge_reference_frame": 90,
         "cross_scene_generalization": False,
         "reference_frame": 90,
         "folds": [asdict(fold) for fold in FOLDS],
@@ -339,6 +363,7 @@ def run_temporal_scaling(
         "frozen_l0_signature": frozen_signature,
         "frozen_l0_sha256": frozen_sha256,
         "result_csv": str(result),
+        "dynamic_instance_diagnostics_csv": str(dynamic_diagnostics),
     }
     (output_dir / "v74_temporal_scaling_metadata.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True, default=str) + "\n",
@@ -346,6 +371,8 @@ def run_temporal_scaling(
     )
     print("V7.4 TEMPORAL SCALING (COPY THIS CSV)")
     print(result.read_text(encoding="utf8").rstrip())
+    print("V7.4 DYNAMIC INSTANCE DIAGNOSTICS (COPY IF NEEDED)")
+    print(dynamic_diagnostics.read_text(encoding="utf8").rstrip())
     return result
 
 
@@ -855,6 +882,7 @@ def _signature(
     payload = {
         "schema": 1,
         "purpose": "v74_temporal_prefix_generalization",
+        "instance_memory": "causal_last_observation",
         "fold": asdict(fold),
         "label": label,
         "architecture": architecture,
@@ -881,6 +909,36 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=V74_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _write_dynamic_instance_diagnostics(payload: dict, path: Path) -> None:
+    rows = payload.get("dynamic_instance_diagnostics")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError(
+            "V7.4 sam31_online cache lacks dynamic instance diagnostics."
+        )
+    columns = (
+        "clip",
+        "sequence_index",
+        "frame_index",
+        "discovered_tracks",
+        "observed_tracks",
+        "mature_tracks",
+        "identity_valid_tracks",
+        "associated_tracks",
+        "birth_slots",
+        "birth_sam_track_ids",
+        "geometry_birth_slots",
+        "geometry_birth_sam_track_ids",
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("Dynamic instance diagnostic rows must be mappings.")
+            writer.writerow({name: row.get(name, "") for name in columns})
 
 
 def _parse_args() -> argparse.Namespace:

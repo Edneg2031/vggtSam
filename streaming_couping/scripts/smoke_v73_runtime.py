@@ -5,6 +5,10 @@ from __future__ import annotations
 
 import torch
 
+from streaming_couping.src.instance_observations import InstanceRefinementConfig
+from streaming_couping.src.learned_pose.observations import (
+    build_geometry_observations,
+)
 from streaming_couping.src.learned_pose.v6_camera_fusion import V6FusionConfig
 from streaming_couping.src.learned_pose.v7_fusion import V7PoseFusion
 from streaming_couping.src.learned_pose.v73_correspondence_fusion import (
@@ -20,6 +24,8 @@ def main() -> None:
     _check_zero_initialization(values, baseline)
     _check_instance_off(values, baseline)
     _check_sam_fallback(values, baseline)
+    _check_causal_dynamic_birth(values, baseline)
+    _check_dynamic_geometry_birth()
     _check_masked_transport()
     _check_frozen_backward(values, baseline)
     print("V7.3 dependency-free tensor smoke passed")
@@ -85,7 +91,8 @@ def _base(values: dict[str, torch.Tensor]) -> V7PoseFusion:
 
 
 def _model(
-    values: dict[str, torch.Tensor], architecture: str
+    values: dict[str, torch.Tensor], architecture: str, *,
+    memory_mode: str = "fixed_reference",
 ) -> V73FrozenCorrespondenceResidual:
     return V73FrozenCorrespondenceResidual(
         base_model=_base(values),
@@ -93,6 +100,7 @@ def _model(
         sam_local_dim=int(values["sam_local_features"].shape[-1]),
         geometry_local_dim=int(values["local_features"].shape[-1]),
         config=_config(),
+        memory_mode=memory_mode,
     )
 
 
@@ -199,6 +207,94 @@ def _check_sam_fallback(values, baseline) -> None:
     _require(
         not bool(combined["sam_used"].any()),
         "combined transport reports SAM use after sam_off",
+    )
+
+
+def _check_causal_dynamic_birth(values, baseline) -> None:
+    dynamic = {name: value.clone() for name, value in values.items()}
+    # Keep only instance 0 and make it first appear at sequence index 2.
+    for name in ("observed", "identity_valid"):
+        dynamic[name][:] = False
+        dynamic[name][:, 2:, 0] = True
+    dynamic["identity_unknown"][:] = False
+    dynamic["local_valid"][:] = False
+    dynamic["local_valid"][:, 2:, 0] = True
+    dynamic["sam_local_valid"][:] = False
+    dynamic["sam_local_valid"][:, 2:, 0] = True
+    model = _model(
+        dynamic,
+        "sam_geometry_transport",
+        memory_mode="causal_last_observation",
+    )
+    output = _forward(model, dynamic, baseline)
+    _require(
+        not bool(output["active_frames"][0, 2]),
+        "dynamic instance changed pose on its birth frame",
+    )
+    _require(
+        bool(output["active_frames"][0, 3]),
+        "dynamic instance was not active on its second observation",
+    )
+    _require(
+        not bool(output["memory_mature"][0, 2, 0])
+        and bool(output["memory_mature"][0, 3, 0]),
+        "causal matcher memory maturity is incorrect",
+    )
+
+    prefix_values = {name: value[:, :4] for name, value in dynamic.items()}
+    prefix_output = _forward(model, prefix_values, baseline[:, :4])
+    _require(
+        torch.equal(
+            prefix_output["world_to_camera"],
+            output["world_to_camera"][:, :4],
+        ),
+        "future observations changed a causal prefix",
+    )
+
+
+def _check_dynamic_geometry_birth() -> None:
+    sequence, height, width = 4, 4, 4
+    y, x = torch.meshgrid(
+        torch.arange(height, dtype=torch.float32),
+        torch.arange(width, dtype=torch.float32),
+        indexing="ij",
+    )
+    points = torch.stack([x * 0.01, y * 0.01, torch.ones_like(x)], dim=-1)
+    world = points[None].repeat(sequence, 1, 1, 1)
+    confidence = torch.ones(sequence, height, width)
+    masks = torch.zeros(sequence, 2, height, width, dtype=torch.bool)
+    masks[:, 0] = True
+    masks[2:, 1, :2, :2] = True
+    observations = build_geometry_observations(
+        world_points=world,
+        confidence=confidence,
+        masks=masks,
+        scores=torch.ones(sequence, 2),
+        instance_ids=(0, 1),
+        frame_indices=(90, 105, 120, 135),
+        reference_index=0,
+        confidence_threshold=0.1,
+        refinement=InstanceRefinementConfig(
+            min_instance_points=4,
+            icp_max_points=16,
+            map_max_points=32,
+            min_participating_instances=1,
+            compute_device="cpu",
+        ),
+        sampled_instance_points=8,
+        causal_instance_memory=True,
+    )
+    _require(
+        observations["instance_birth_indices"].tolist() == [0, 2],
+        "late geometry-supported instance birth was not recorded",
+    )
+    _require(
+        bool(observations["identity_valid"][2, 1]),
+        "late birth did not initialize its persistent identity",
+    )
+    _require(
+        not bool(observations["observed"][1, 1]),
+        "late instance leaked into a frame before birth",
     )
 
 

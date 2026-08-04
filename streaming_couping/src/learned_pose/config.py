@@ -21,6 +21,7 @@ class ClipConfig:
     training_frame_indices: tuple[int, ...] | None = None
     evaluation_frame_indices: tuple[int, ...] | None = None
     instance_source: str = "configured_gt_reference"
+    instance_prompt: str = "object"
     allow_missing_reference_instances: bool = False
 
 
@@ -370,6 +371,7 @@ def _parse_clip(value: dict[str, Any], base: Path) -> ClipConfig:
         instance_source=str(
             value.get("instance_source", "configured_gt_reference")
         ),
+        instance_prompt=str(value.get("instance_prompt", "object")).strip(),
         allow_missing_reference_instances=bool(
             value.get("allow_missing_reference_instances", False)
         ),
@@ -418,14 +420,16 @@ def _validate(config: LearnedPoseConfig) -> None:
     allowed_segmentation_variants = {
         "legacy_recovery",
         "v6_sam31_adaptive_positive_compete_010",
+        "sam31_online_forward",
     }
     if (
         config.features.sam_segmentation_variant
         not in allowed_segmentation_variants
     ):
         raise ValueError(
-            "features.sam_segmentation_variant must be legacy_recovery or "
-            "v6_sam31_adaptive_positive_compete_010."
+            "features.sam_segmentation_variant must be legacy_recovery, "
+            "v6_sam31_adaptive_positive_compete_010, or "
+            "sam31_online_forward."
         )
     if not (
         0.0
@@ -557,10 +561,11 @@ def _validate(config: LearnedPoseConfig) -> None:
         if clip.instance_source not in {
             "configured_gt_reference",
             "sam3_reference",
+            "sam31_online",
         }:
             raise ValueError(
                 f"Clip {clip.name!r} instance_source must be "
-                "configured_gt_reference or sam3_reference."
+                "configured_gt_reference, sam3_reference, or sam31_online."
             )
         if clip.instance_source == "sam3_reference" and clip.split.lower() == "train":
             raise ValueError(
@@ -573,6 +578,28 @@ def _validate(config: LearnedPoseConfig) -> None:
             raise ValueError(
                 f"Clip {clip.name!r} may allow missing reference instances "
                 "only with configured_gt_reference."
+            )
+        if clip.instance_source == "sam31_online" and not clip.instance_prompt:
+            raise ValueError(
+                f"Clip {clip.name!r} sam31_online requires instance_prompt."
+            )
+        if (
+            clip.instance_source == "sam31_online"
+            and config.features.sam_segmentation_variant
+            != "sam31_online_forward"
+        ):
+            raise ValueError(
+                f"Clip {clip.name!r} sam31_online requires "
+                "features.sam_segmentation_variant=sam31_online_forward."
+            )
+        if (
+            config.features.sam_segmentation_variant
+            == "sam31_online_forward"
+            and clip.instance_source != "sam31_online"
+        ):
+            raise ValueError(
+                "sam31_online_forward requires instance_source=sam31_online "
+                f"for clip {clip.name!r}."
             )
         if clip.reference_sequence_index != 0:
             raise ValueError("Learned causal pose refinement requires reference_sequence_index=0.")

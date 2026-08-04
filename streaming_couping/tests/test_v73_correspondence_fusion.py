@@ -208,6 +208,38 @@ def test_pure_sam_transport_is_inactive_without_sam_but_combined_is_not():
     assert not bool(combined["sam_used"].any())
 
 
+def test_causal_memory_accepts_late_birth_only_on_second_observation():
+    values, baseline = _inputs()
+    for name in ("observed", "identity_valid"):
+        values[name][:] = False
+        values[name][:, 2:, 0] = True
+    values["identity_unknown"][:] = False
+    values["local_valid"][:] = False
+    values["local_valid"][:, 2:, 0] = True
+    values["sam_local_valid"][:] = False
+    values["sam_local_valid"][:, 2:, 0] = True
+    model = V73FrozenCorrespondenceResidual(
+        base_model=_base(values),
+        architecture="sam_geometry_transport",
+        sam_local_dim=values["sam_local_features"].shape[-1],
+        geometry_local_dim=values["local_features"].shape[-1],
+        config=_config(),
+        memory_mode="causal_last_observation",
+    )
+    output = _forward(model, values, baseline)
+    assert not bool(output["active_frames"][0, 2])
+    assert bool(output["active_frames"][0, 3])
+    assert not bool(output["memory_mature"][0, 2, 0])
+    assert bool(output["memory_mature"][0, 3, 0])
+
+    prefix = {name: value[:, :4] for name, value in values.items()}
+    prefix_output = _forward(model, prefix, baseline[:, :4])
+    assert torch.equal(
+        prefix_output["world_to_camera"],
+        output["world_to_camera"][:, :4],
+    )
+
+
 def test_identity_perturbations_preserve_common_gate_and_change_sam_evidence():
     values, baseline = _inputs()
     model = _model(values, "sam_geometry_transport")

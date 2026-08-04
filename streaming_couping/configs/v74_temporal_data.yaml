@@ -1,5 +1,5 @@
-# Standalone V7.4 observations. This cache belongs only to V7.4 and contains
-# the one 30-frame temporal sequence used by the experiment.
+# Standalone V7.4 observations. Camera frame 90 remains the coordinate gauge,
+# but object slots are populated dynamically by forward-only SAM3.1 tracking.
 recovery_config: streaming_couping/configs/recovery_v7_sam31.yaml
 output_dir: outputs/streaming_couping_v74_temporal_scaling/data_stage
 
@@ -39,7 +39,11 @@ dataset:
         - 495
         - 510
         - 525
-      instance_ids: [37, 68, 54]
+      # Logical capacity slots, not ScanNet GT instance IDs. A slot is assigned
+      # permanently when a new SAM3.1 persistent ID first becomes visible.
+      instance_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+      instance_source: sam31_online
+      instance_prompt: object
       reference_sequence_index: 0
       split: temporal_scaling
 
@@ -53,7 +57,7 @@ features:
   cache_dir: outputs/streaming_couping_v74_temporal_scaling/cache
   rebuild: false
   sam_source: detector_fpn2
-  sam_segmentation_variant: v6_sam31_adaptive_positive_compete_010
+  sam_segmentation_variant: sam31_online_forward
   sam_resolution: 1008
   sam_grid: [72, 72]
   sam_batch_size: 2

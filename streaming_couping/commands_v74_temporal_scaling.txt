@@ -26,7 +26,7 @@ export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-echo "V7.4 temporal scaling: protocol and tensor checks"
+echo "V7.4 dynamic-instance temporal scaling: protocol and tensor checks"
 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_v74_protocol
 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_v73_runtime
 
@@ -39,6 +39,7 @@ fi
 
 echo "V7.4 standalone cache physical GPUs=$VISIBLE_GPUS"
 echo "V7.4 logical layout: StreamVGGT=cuda:0,cuda:1 SAM3.1=cuda:2"
+echo "V7.4 instances: SAM3.1 forward discovery, 8 persistent slots, no fixed object reference"
 CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" \
 PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
   -m streaming_couping.scripts.run_instance_token_pose \
@@ -80,5 +81,11 @@ CUDA_VISIBLE_DEVICES="$GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
   echo "missing V7.4 temporal-scaling CSV" >&2
   exit 1
 }
+[[ -s "$OUTPUT/v74_dynamic_instance_diagnostics.csv" ]] || {
+  echo "missing V7.4 dynamic-instance diagnostics CSV" >&2
+  exit 1
+}
 echo "V7.4 COPY THIS CSV"
 cat "$OUTPUT/v74_temporal_scaling.csv"
+echo "V7.4 COPY THIS INSTANCE DIAGNOSTIC IF TRACK COVERAGE LOOKS WRONG"
+cat "$OUTPUT/v74_dynamic_instance_diagnostics.csv"

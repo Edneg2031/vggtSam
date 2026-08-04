@@ -323,7 +323,7 @@ def _build_geometry_cache(
             "output_dir": config.features.cache_dir / clip.name,
         },
     )
-    if clip.instance_source == "sam3_reference":
+    if clip.instance_source in {"sam3_reference", "sam31_online"}:
         sequences: dict[int, object] = {}
         target_masks: dict[int, torch.Tensor] = {}
         shared = load_rgb_sequence(
@@ -357,7 +357,16 @@ def _build_geometry_cache(
         image_size_hw=geometry_sequence.processed_size,
     )
     segmentation_diagnostics: list[dict[str, object]] = []
-    if config.features.sam_segmentation_variant != "legacy_recovery":
+    if clip.instance_source == "sam31_online":
+        recovered, segmentation_diagnostics = (
+            _load_or_run_sam31_online_tracking(
+                recovery,
+                clip,
+                shared=shared,
+                sam_video_holder=sam_video_holder,
+            )
+        )
+    elif config.features.sam_segmentation_variant != "legacy_recovery":
         if clip.instance_source != "configured_gt_reference":
             raise ValueError(
                 "V6 SAM3.1 geometry prompting currently requires "
@@ -398,13 +407,14 @@ def _build_geometry_cache(
         geometry=geometry_sequence,
         image_mode=recovery.image_mode,
     )
-    for instance_id in clip.instance_ids:
-        grid_masks_by_id[int(instance_id)][clip.reference_sequence_index] = output_mask_to_stream(
-            target_masks[int(instance_id)][clip.reference_sequence_index],
-            source_size=geometry_sequence.source_sizes[clip.reference_sequence_index],
-            processed_size=geometry_sequence.processed_size,
-            image_mode=recovery.image_mode,
-        )
+    if clip.instance_source != "sam31_online":
+        for instance_id in clip.instance_ids:
+            grid_masks_by_id[int(instance_id)][clip.reference_sequence_index] = output_mask_to_stream(
+                target_masks[int(instance_id)][clip.reference_sequence_index],
+                source_size=geometry_sequence.source_sizes[clip.reference_sequence_index],
+                processed_size=geometry_sequence.processed_size,
+                image_mode=recovery.image_mode,
+            )
     grid_masks = torch.stack(
         [grid_masks_by_id[int(instance_id)] for instance_id in clip.instance_ids],
         dim=1,
@@ -413,11 +423,12 @@ def _build_geometry_cache(
         [recovered[int(instance_id)].masks for instance_id in clip.instance_ids],
         dim=1,
     )
-    for slot, instance_id in enumerate(clip.instance_ids):
-        tracking_masks_output[
-            clip.reference_sequence_index,
-            slot,
-        ] = target_masks[int(instance_id)][clip.reference_sequence_index]
+    if clip.instance_source != "sam31_online":
+        for slot, instance_id in enumerate(clip.instance_ids):
+            tracking_masks_output[
+                clip.reference_sequence_index,
+                slot,
+            ] = target_masks[int(instance_id)][clip.reference_sequence_index]
     scores = torch.stack(
         [recovered[int(instance_id)].scores for instance_id in clip.instance_ids],
         dim=1,
@@ -443,6 +454,7 @@ def _build_geometry_cache(
         hard_mismatch_max_fitness=(
             config.fusion.identity_hard_mismatch_max_fitness
         ),
+        causal_instance_memory=(clip.instance_source == "sam31_online"),
     )
     depth = output.geometry.aux["depth_dense"].detach().float().cpu()
     depth_confidence = output.geometry.aux["depth_confidence_dense"].detach().float().cpu()
@@ -461,6 +473,7 @@ def _build_geometry_cache(
         scene_scale=float(observations["scene_scale"]),
         min_geometry_confidence=config.fusion.min_geometry_confidence,
         min_static_score=config.fusion.min_static_score,
+        causal_instance_memory=(clip.instance_source == "sam31_online"),
     )
     instance_uvd, uvd_valid, rigid_weight = sample_instance_uvd(
         depth,
@@ -532,6 +545,72 @@ def _build_geometry_cache(
             else observations["observed"][frame, slot]
         )
         identity_diagnostics.append(current)
+    sam_track_ids = [
+        (
+            -1
+            if recovered[int(instance_id)].selected_obj_id is None
+            else int(recovered[int(instance_id)].selected_obj_id)
+        )
+        for instance_id in clip.instance_ids
+    ]
+    sam_birth_indices = []
+    for instance_id in clip.instance_ids:
+        visible = recovered[int(instance_id)].masks.flatten(1).any(dim=1)
+        positions = torch.nonzero(visible, as_tuple=False).flatten()
+        sam_birth_indices.append(int(positions[0]) if positions.numel() else -1)
+    geometry_birth_indices = [
+        int(value) for value in observations["instance_birth_indices"]
+    ]
+    dynamic_instance_diagnostics = []
+    if clip.instance_source == "sam31_online":
+        for frame, frame_index in enumerate(clip.frame_indices):
+            born_slots = [
+                slot
+                for slot, birth in enumerate(sam_birth_indices)
+                if birth == frame
+            ]
+            geometry_born_slots = [
+                slot
+                for slot, birth in enumerate(geometry_birth_indices)
+                if birth == frame
+            ]
+            discovered = sum(
+                birth >= 0 and birth <= frame for birth in sam_birth_indices
+            )
+            observed_count = int(observations["observed"][frame].sum())
+            mature = sum(
+                birth >= 0
+                and birth < frame
+                and bool(observations["observed"][frame, slot])
+                for slot, birth in enumerate(geometry_birth_indices)
+            )
+            dynamic_instance_diagnostics.append(
+                {
+                    "clip": clip.name,
+                    "sequence_index": frame,
+                    "frame_index": int(frame_index),
+                    "discovered_tracks": int(discovered),
+                    "observed_tracks": observed_count,
+                    "mature_tracks": int(mature),
+                    "identity_valid_tracks": int(
+                        observations["identity_valid"][frame].sum()
+                    ),
+                    "associated_tracks": int(
+                        associated_instance_valid[frame].sum()
+                    ),
+                    "birth_slots": " ".join(str(slot) for slot in born_slots),
+                    "birth_sam_track_ids": " ".join(
+                        str(sam_track_ids[slot]) for slot in born_slots
+                    ),
+                    "geometry_birth_slots": " ".join(
+                        str(slot) for slot in geometry_born_slots
+                    ),
+                    "geometry_birth_sam_track_ids": " ".join(
+                        str(sam_track_ids[slot])
+                        for slot in geometry_born_slots
+                    ),
+                }
+            )
     ground_truth = _load_ground_truth_sequence(
         config.manifest,
         scene_id=clip.scene_id,
@@ -576,6 +655,11 @@ def _build_geometry_cache(
         "frame_indices": list(clip.frame_indices),
         "instance_ids": list(clip.instance_ids),
         "instance_source": clip.instance_source,
+        "instance_prompt": clip.instance_prompt,
+        "sam_track_ids": sam_track_ids,
+        "sam_birth_indices": sam_birth_indices,
+        "instance_birth_indices": geometry_birth_indices,
+        "dynamic_instance_diagnostics": dynamic_instance_diagnostics,
         "allow_missing_reference_instances": bool(
             clip.allow_missing_reference_instances
         ),
@@ -848,6 +932,119 @@ def _load_or_run_tracking(
         tracking_rows=rows,
     )
     return recovered
+
+
+def _load_or_run_sam31_online_tracking(
+    recovery,
+    clip: ClipConfig,
+    *,
+    shared,
+    sam_video_holder: dict[str, SAM3Wrapper],
+) -> tuple[dict[int, TrackingSequence], list[dict[str, object]]]:
+    """Discover persistent SAM3.1 IDs throughout a forward-only sequence."""
+
+    if recovery.sam3_version != "sam3.1":
+        raise ValueError("instance_source=sam31_online requires SAM3.1.")
+    path = clip.tracking_cache or (
+        recovery.output_dir / "tracking_cache_sam31_online.npz"
+    )
+    cached = load_tracking_cache(
+        path,
+        config=recovery,
+        instance_ids=clip.instance_ids,
+        frame_indices=clip.frame_indices,
+    )
+    if cached is not None and all(
+        str(row.get("instance_prompt", "")) == clip.instance_prompt
+        and str(row.get("propagation_direction", "")) == "forward"
+        and int(row.get("causal_confirmation", 0)) == 1
+        for row in cached[2]
+    ):
+        print(f"reusing SAM3.1 online tracking cache: {path}")
+        return cached[1], [dict(row) for row in cached[2]]
+
+    sam3 = _sam_video_model(recovery, sam_video_holder)
+    tracked = sam3.track_all_forward(
+        shared.image_paths,
+        prompt=clip.instance_prompt,
+        output_size=recovery.output_size,
+        max_objects=max(
+            int(recovery.sam3_max_num_objects),
+            len(clip.instance_ids),
+        ),
+    )
+    candidates = []
+    for source_slot, obj_id in enumerate(tracked.obj_ids):
+        masks = tracked.masks[:, source_slot]
+        birth = int(tracked.birth_indices[source_slot])
+        birth_pixels = int(masks[birth].sum())
+        birth_ratio = float(masks[birth].float().mean())
+        # Slot admission consults only the birth frame. Later observations
+        # may diagnose the track but can never retroactively create its slot.
+        if birth_pixels < int(recovery.min_pixels) or birth_ratio > 0.90:
+            continue
+        candidates.append(source_slot)
+        if len(candidates) == len(clip.instance_ids):
+            break
+
+    originals: dict[int, TrackingSequence] = {}
+    recovered: dict[int, TrackingSequence] = {}
+    rows: list[dict[str, object]] = []
+    for slot, instance_id in enumerate(clip.instance_ids):
+        instance_id = int(instance_id)
+        if slot >= len(candidates):
+            sequence = _empty_tracking(
+                sequence=len(clip.frame_indices),
+                output_size=recovery.output_size,
+            )
+            birth = -1
+            sam_obj_id = -1
+        else:
+            source_slot = candidates[slot]
+            sam_obj_id = int(tracked.obj_ids[source_slot])
+            birth = int(tracked.birth_indices[source_slot])
+            sequence = TrackingSequence(
+                masks=tracked.masks[:, source_slot].detach().cpu().bool(),
+                scores=tracked.scores[:, source_slot].detach().cpu().float(),
+                selected_obj_id=sam_obj_id,
+            )
+        originals[instance_id] = sequence
+        recovered[instance_id] = sequence
+        rows.append(
+            {
+                "instance_id": instance_id,
+                "instance_source": "sam31_online",
+                "instance_prompt": clip.instance_prompt,
+                "sam_track_id": sam_obj_id,
+                "birth_sequence_index": birth,
+                "birth_frame_index": (
+                    int(clip.frame_indices[birth]) if birth >= 0 else -1
+                ),
+                "observed_frames": int(
+                    sequence.masks.flatten(1).any(dim=1).sum()
+                ),
+                "maximum_pixels": int(
+                    sequence.masks.flatten(1).sum(dim=1).max()
+                ),
+                "propagation_direction": "forward",
+                "causal_confirmation": 1,
+            }
+        )
+    print(
+        "SAM3.1 online instances "
+        f"clip={clip.name} discovered={len(tracked.obj_ids)} "
+        f"retained={len(candidates)} slots={len(clip.instance_ids)}"
+    )
+    save_tracking_cache(
+        path,
+        config=recovery,
+        instance_ids=clip.instance_ids,
+        frame_indices=clip.frame_indices,
+        original=originals,
+        recovered=recovered,
+        tracking_rows=rows,
+    )
+    return recovered, rows
 
 
 def _load_or_run_sam3_reference_tracking(
@@ -1216,6 +1413,16 @@ def _cache_complete(
         return False
     if clip is None:
         return True
+    if clip.instance_source == "sam31_online" and any(
+        name not in payload
+        for name in (
+            "sam_track_ids",
+            "sam_birth_indices",
+            "instance_birth_indices",
+            "dynamic_instance_diagnostics",
+        )
+    ):
+        return False
     return (
         str(payload.get("clip_name")) == clip.name
         and str(payload.get("scene_id")) == clip.scene_id
@@ -1227,6 +1434,8 @@ def _cache_complete(
             payload.get("instance_source", "configured_gt_reference")
         )
         == clip.instance_source
+        and str(payload.get("instance_prompt", "object"))
+        == clip.instance_prompt
         and bool(payload.get("allow_missing_reference_instances", False))
         == bool(clip.allow_missing_reference_instances)
         and int(payload.get("reference_sequence_index", -1))
@@ -1276,6 +1485,15 @@ def _geometry_cache_reusable(
                 "associated_instance_valid",
             }
         )
+    if clip.instance_source == "sam31_online":
+        core_fields.update(
+            {
+                "sam_track_ids",
+                "sam_birth_indices",
+                "instance_birth_indices",
+                "dynamic_instance_diagnostics",
+            }
+        )
     if any(name not in payload for name in core_fields):
         return False
     recovery = load_config(config.recovery_config)
@@ -1291,6 +1509,10 @@ def _geometry_cache_reusable(
         != clip.frame_indices
         or tuple(int(value) for value in payload.get("instance_ids", ()))
         != clip.instance_ids
+        or str(payload.get("instance_source", "configured_gt_reference"))
+        != clip.instance_source
+        or str(payload.get("instance_prompt", "object"))
+        != clip.instance_prompt
         or int(payload.get("reference_sequence_index", -1))
         != clip.reference_sequence_index
     ):
