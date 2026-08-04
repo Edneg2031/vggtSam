@@ -1,8 +1,21 @@
 # streaming_couping
 
-当前研究主线是 V8.0：先用 mesh-rasterized GT world pointmap 显式监督 SAM3.1/geometry
-correspondence，再冻结匹配矩阵，用 evidence-only pose residual 验证未来帧位姿。V8.1 双
-SAM/geometry Value 只作为独立 report-only 消融。
+V8.0 matcher-first 已完成三段时间 fold 实验，但没有通过 SAM 因果判据：匹配泛化不稳定，
+pose MLP 仍能在 no-match 等控制上过拟合，long fold 的 learned refinement 还差于 frozen L0。
+当前优先运行不训练网络的坐标审计与 O1/O2 显式位姿验证，先判断 StreamVGGT 预测几何是否
+具备可用的 SE(3) 修正能力：
+
+```bash
+zsh streaming_couping/commands_v80_theory_validation.txt
+```
+
+它复用 V7.4 cache，在 CPU 上比较 GT camera geometry 与 StreamVGGT depth-backprojected
+camera geometry，并用 weighted/trimmed Kabsch 输出逐 pair 和汇总 CSV。完整说明见
+[`docs/v80_theory_validation.md`](docs/v80_theory_validation.md)。
+
+原 V8.0 仍保留为 predicted-correspondence 诊断：先用 mesh-rasterized GT world pointmap 显式
+监督 SAM3.1/geometry correspondence，再冻结匹配矩阵，用 evidence-only pose residual 验证
+未来帧位姿。V8.1 双 SAM/geometry Value 只作为 report-only 消融。
 
 ```bash
 zsh streaming_couping/commands_v80_supervised_correspondence.txt

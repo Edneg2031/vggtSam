@@ -1,0 +1,38 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+CONFIG=streaming_couping/configs/v80_theory_validation.yaml
+OUTPUT="${V80_THEORY_OUTPUT:-outputs/streaming_couping_v80_theory_validation}"
+CACHE=outputs/streaming_couping_v74_temporal_scaling/cache/00a231a370_90_525_step15_37_68_54.pt
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+[[ -s "$CACHE" ]] || {
+  echo "V8 theory validation requires the retained V7.4 cache: $CACHE" >&2
+  echo "It deliberately does not rerun SAM3.1 or StreamVGGT." >&2
+  exit 1
+}
+
+echo "V8 theory smoke: weighted Kabsch, coordinates, causality and fallback"
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_v80_theory_validation
+
+echo "V8 theory validation: CPU-only cache audit + O1/O2 explicit pose"
+PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.run_v80_theory_validation \
+  --config "$CONFIG" \
+  --output-dir "$OUTPUT"
+
+SUMMARY="$OUTPUT/v80_oracle_pose_summary.csv"
+PAIRS="$OUTPUT/v80_oracle_pose_pairs.csv"
+AUDIT="$OUTPUT/v80_coordinate_audit.csv"
+[[ -s "$SUMMARY" ]] || { echo "missing summary CSV: $SUMMARY" >&2; exit 1; }
+[[ -s "$PAIRS" ]] || { echo "missing pair CSV: $PAIRS" >&2; exit 1; }
+[[ -s "$AUDIT" ]] || { echo "missing audit CSV: $AUDIT" >&2; exit 1; }
+
+echo "V8 THEORY COPY THIS SUMMARY CSV"
+cat "$SUMMARY"
+echo "V8 detailed pair diagnostics: $PAIRS"
+echo "V8 coordinate audit: $AUDIT"
+echo "V8 decision: $OUTPUT/v80_theory_decision.md"

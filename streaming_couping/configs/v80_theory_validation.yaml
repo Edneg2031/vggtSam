@@ -1,0 +1,30 @@
+# No-training coordinate audit and explicit-pose O1/O2 validation.
+# Both backbones stay unloaded; all tensors come from the retained V7.4 cache.
+data_config: streaming_couping/configs/v74_temporal_data.yaml
+output_dir: outputs/streaming_couping_v80_theory_validation
+clip_name: 00a231a370_90_525_step15_37_68_54
+
+# V8 used K=8. The explicit solver uses more of the already cached mask/depth
+# samples because six-DoF registration needs spatial support, not model capacity.
+token_count: 32
+translation_weight: 10.0
+minimum_gain_percent: 1.0
+
+matching:
+  # GT-world proximity is a diagnostic pseudo-correspondence, not a material
+  # surface-point label. The output reports its actual distance distribution.
+  max_distance_metric: 0.10
+  weight_temperature_metric: 0.025
+  require_mutual_nearest: true
+
+solvers:
+  min_points: 6
+  min_secondary_eigenvalue_ratio: 0.0001
+  trim_quantile: 0.70
+  trim_iterations: 3
+
+gating:
+  max_fit_rmse_metric: 0.10
+  min_source_extent_metric: 0.02
+  max_rotation_correction_degrees: 15.0
+  max_center_shift_native: 0.50
