@@ -9,7 +9,7 @@ SAM_GPU="${V90_SAM_GPU:-3}"
 VISIBLE_GPUS="$STREAM_GPU0,$STREAM_GPU1,$SAM_GPU"
 CONFIG=streaming_couping/configs/v90_epipolar_oracle.yaml
 DATA_CONFIG=streaming_couping/configs/v74_temporal_data.yaml
-OUTPUT="${V90_OUTPUT:-outputs/streaming_couping_v90_epipolar_token_causality}"
+OUTPUT="${V90_OUTPUT:-outputs/streaming_couping_v90_epipolar_token_causality_solver_corrected}"
 CACHE=outputs/streaming_couping_v74_temporal_scaling/cache/00a231a370_90_525_step15_37_68_54.pt
 
 cd "$ROOT"
@@ -19,7 +19,7 @@ export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-echo "V9 Stage O: deterministic visibility/epipolar smoke"
+echo "V9 Stage O-R1: deterministic visibility/epipolar smoke"
 PYTHONPATH=. "$PYTHON_BIN" \
   -m streaming_couping.scripts.smoke_v90_epipolar_oracle
 
@@ -68,7 +68,7 @@ PYTHONPATH=. "$PYTHON_BIN" \
   --output-dir "$OUTPUT/cache_audit" \
   --strict
 
-echo "V9 Stage O: GT-visible 2D correspondence + fixed calibrated solver"
+echo "V9 Stage O-R1: dual-init epipolar solver + bounded L0-scale fusion"
 PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
   -m streaming_couping.scripts.run_v90_epipolar_oracle \
   --config "$CONFIG" \

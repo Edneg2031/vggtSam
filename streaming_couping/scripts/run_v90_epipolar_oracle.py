@@ -115,6 +115,9 @@ DIAGNOSTIC_COLUMNS = (
     "inlier_ratio",
     "cheirality_fraction",
     "refinement_iterations",
+    "initialization",
+    "eight_point_sampson_rmse",
+    "l0_local_sampson_rmse",
     "edge_success",
     "edge_reason",
 )
@@ -519,6 +522,9 @@ def _surface_diagnostic(
         "inlier_ratio": "",
         "cheirality_fraction": "",
         "refinement_iterations": "",
+        "initialization": "",
+        "eight_point_sampson_rmse": "",
+        "l0_local_sampson_rmse": "",
         "edge_success": "",
         "edge_reason": "",
     }
@@ -565,6 +571,9 @@ def _edge_diagnostic(
         "inlier_ratio": estimate.inlier_ratio,
         "cheirality_fraction": estimate.cheirality_fraction,
         "refinement_iterations": estimate.refinement_iterations,
+        "initialization": estimate.initialization,
+        "eight_point_sampson_rmse": estimate.eight_point_sampson_rmse,
+        "l0_local_sampson_rmse": estimate.l0_local_sampson_rmse,
         "edge_success": int(estimate.success),
         "edge_reason": estimate.reason,
     }
@@ -619,7 +628,7 @@ def _summarize(
         rows.append(
             {
                 "fold": fold.name,
-                "oracle_level": "V9-O",
+                "oracle_level": "V9-O-R1",
                 "correspondence_source": "gt_visible_surface_reprojection",
                 "pose_history_source": "frozen_streamvggt_l0",
                 "intrinsics_source": "calibrated_gt_k",
@@ -670,7 +679,7 @@ def _summarize(
 def _decision_markdown(rows: Sequence[dict[str, object]]) -> str:
     all_pass = int(bool(rows) and all(int(row["fold_oracle_pass"]) for row in rows))
     lines = [
-        "# V9 Stage-O 2D epipolar oracle decision",
+        "# V9 Stage-O-R1 2D epipolar oracle decision",
         "",
         "No model is trained. GT mesh/pose is used only for visible 2D correspondence labels and scoring.",
         "Pose recovery uses calibrated K, a fixed epipolar solver and frozen StreamVGGT L0 history.",
@@ -716,7 +725,7 @@ def load_v90_config(path: str | Path) -> V90Config:
     output = Path(
         raw.get(
             "output_dir",
-            "outputs/streaming_couping_v90_epipolar_token_causality",
+            "outputs/streaming_couping_v90_epipolar_token_causality_solver_corrected",
         )
     )
     if not output.is_absolute():
@@ -766,9 +775,6 @@ def load_v90_config(path: str | Path) -> V90Config:
             cheirality_max_points=int(
                 solver_raw.get("cheirality_max_points", 128)
             ),
-            ray_intersection_max_condition=float(
-                solver_raw.get("ray_intersection_max_condition", 1e8)
-            ),
         ),
     )
     _validate_config(config)
@@ -790,7 +796,6 @@ def _validate_config(config: V90Config) -> None:
         config.epipolar.refinement_damping,
         config.epipolar.refinement_step_epsilon,
         config.epipolar.max_refinement_step,
-        config.epipolar.ray_intersection_max_condition,
     )
     if any(not math.isfinite(value) or value <= 0.0 for value in positive):
         raise ValueError("V9 positive numeric settings must be finite.")
@@ -899,7 +904,7 @@ def _write_metadata(
 ) -> None:
     config_hash = hashlib.sha256(config.source_path.read_bytes()).hexdigest()
     metadata = {
-        "experiment": "V9 Stage-O 2D epipolar oracle",
+        "experiment": "V9 Stage-O-R1 2D epipolar oracle solver correction",
         "configuration": {
             "source_path": str(config.source_path),
             "sha256": config_hash,

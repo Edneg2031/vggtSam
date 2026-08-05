@@ -1,6 +1,6 @@
 # V9：SAM3.1 local-token 二维极几何位姿因果实验
 
-> 状态：`E0 Stage O 已实现，尚未在服务器运行；Stage A/B 受 oracle 停止门约束`  
+> 状态：`E0 Stage O 初始 solver 已运行失败；O-R1 solver 修正已实现待复跑；Stage A/B 继续停止`
 > 日期：2026-08-05  
 > 核心目标：验证 SAM3.1 local descriptor 是否能通过真实 2D–2D 对应改善 StreamVGGT 的
 > 相机 rotation 与 translation direction，而不使用 predicted depth、pointmap Kabsch 或
@@ -289,6 +289,44 @@ outputs/streaming_couping_v90_epipolar_token_causality/
 
 如果 Stage O 失败，仍写出完整 oracle CSV 和 decision，然后正常停止；不创建空 matcher
 checkpoint，也不自动进入下一种模型。
+
+### 12.1 Stage O 初次结果（保留，不覆盖）
+
+初次运行使用 eight-point 单初始化、按 effective correspondence 融合 rotation，并对多历史中心做
+无限射线交会。结果为：
+
+| fold | rotation gain | direction gain | active worse frames | pass |
+|---|---:|---:|---:|---:|
+| short | +17.5365% | +27.7961% | 1 | 0 |
+| medium | -338.383% | -623.514% | 3 | 0 |
+| long | +18.8190% | -230.401% | 2 | 0 |
+
+`all_folds_oracle_pass=0`。所有 test frame 均 active，平均可见对应为 267–569，因此不是 coverage
+不足。逐 edge 诊断定位出两类 solver 问题：
+
+- 435/480/510 等帧的 GT surface label 深度残差仍只有毫米到厘米级，但 eight-point essential 的
+  Sampson RMSE 达 `0.02–0.43`，平面/低视差 nullspace 选择在 absolute 合成前已经失败；
+- 405/420 的 edge Sampson RMSE 约 `4e-4` 且 relative pose 良好，但无限射线交会仍放大 frozen
+  L0 history center 的误差。
+
+该结果不涉及 SAM descriptor，因此只能否定初始 solver，不能写成 SAM token 失败。
+
+### 12.2 O-R1 solver 修正（待运行）
+
+O-R1 不改变数据、fold、correspondence 或主指标，仅修正已定位的求解器：
+
+1. 同时从 eight-point decomposition 与 frozen L0 relative pose 初始化固定 Gauss–Newton；
+2. 只按同一批 observed correspondence 的 robust Sampson objective 选候选，绝不读取 GT pose
+   error，也不增加效果阈值；
+3. 输出 `initialization/eight_point_sampson_rmse/l0_local_sampson_rmse`；
+4. 每条 edge 仍保留自己的 L0 edge length；多历史 center 改用带 inlier/Sampson 质量的有界凸
+   融合，不再做可能发散的无限射线交会；rotation 使用同一质量权重。
+
+为保留初次失败结果，O-R1 默认写入新目录：
+
+```text
+outputs/streaming_couping_v90_epipolar_token_causality_solver_corrected/
+```
 
 已实现文件：
 

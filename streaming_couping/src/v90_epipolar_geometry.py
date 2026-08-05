@@ -40,7 +40,6 @@ class EpipolarConfig:
     refinement_step_epsilon: float = 1e-6
     max_refinement_step: float = 0.10
     cheirality_max_points: int = 128
-    ray_intersection_max_condition: float = 1e8
 
 
 @dataclass
@@ -74,6 +73,9 @@ class EpipolarEstimate:
     correspondences: int
     effective_correspondences: float
     refinement_iterations: int
+    initialization: str
+    eight_point_sampson_rmse: float
+    l0_local_sampson_rmse: float
     success: bool
     reason: str
 
@@ -87,6 +89,19 @@ class AbsolutePoseEstimate:
     used_ray_intersection: bool
     success: bool
     reason: str
+
+
+@dataclass
+class _RelativeCandidate:
+    rotation: torch.Tensor
+    translation: torch.Tensor
+    essential: torch.Tensor
+    sampson_rmse: float
+    robust_objective: float
+    inlier_ratio: float
+    cheirality_fraction: float
+    refinement_iterations: int
+    initialization: str
 
 
 def causal_mask_history_indices(
@@ -324,41 +339,80 @@ def estimate_relative_epipolar_pose(
         l0,
         max_points=int(config.cheirality_max_points),
     )
-    if selected is None:
-        failure.reason = "essential_decomposition_failed"
-        return failure
-    rotation, translation, cheirality = selected
-    if cheirality < float(config.min_cheirality_fraction):
-        failure.cheirality_fraction = float(cheirality)
-        failure.reason = "cheirality_failed"
+    candidates: list[_RelativeCandidate] = []
+    eight_point_rmse = float("nan")
+    if selected is not None:
+        rotation, translation, _ = selected
+        eight_candidate = _build_relative_candidate(
+            rotation,
+            translation,
+            current,
+            history,
+            weights,
+            initialization="eight_point",
+            config=config,
+        )
+        eight_point_rmse = eight_candidate.sampson_rmse
+        if (
+            math.isfinite(eight_candidate.robust_objective)
+            and eight_candidate.cheirality_fraction
+            >= float(config.min_cheirality_fraction)
+        ):
+            candidates.append(eight_candidate)
+
+    l0_translation = l0[:3, 3]
+    l0_local_rmse = float("nan")
+    if (
+        torch.isfinite(l0).all()
+        and float(torch.linalg.vector_norm(l0_translation)) > 1e-12
+    ):
+        l0_candidate = _build_relative_candidate(
+            l0[:3, :3],
+            l0_translation,
+            current,
+            history,
+            weights,
+            initialization="l0_local",
+            config=config,
+        )
+        l0_local_rmse = l0_candidate.sampson_rmse
+        if (
+            math.isfinite(l0_candidate.robust_objective)
+            and l0_candidate.cheirality_fraction
+            >= float(config.min_cheirality_fraction)
+        ):
+            candidates.append(l0_candidate)
+    if not candidates:
+        failure.reason = "no_cheirality_valid_initialization"
+        failure.eight_point_sampson_rmse = eight_point_rmse
+        failure.l0_local_sampson_rmse = l0_local_rmse
         return failure
 
-    rotation, translation, iterations = _refine_bearing_pose(
-        rotation,
-        translation,
-        current,
-        history,
-        weights,
-        config=config,
+    # This is solver-internal model selection on the observed epipolar
+    # objective.  It never reads a GT pose error and introduces no accept
+    # threshold.  L0 distance only provides a deterministic numerical tie.
+    candidates.sort(
+        key=lambda candidate: (
+            candidate.robust_objective,
+            _candidate_l0_distance(candidate, l0),
+        )
     )
-    essential = _skew(translation) @ rotation
-    residual = _signed_sampson_residual(essential, current, history)
-    normalized_weights = weights / weights.sum().clamp_min(1e-12)
-    rmse = torch.sqrt((normalized_weights * residual.square()).sum())
-    inlier = residual.abs().le(float(config.refinement_huber_delta))
-    inlier_ratio = float((normalized_weights * inlier.double()).sum())
+    candidate = candidates[0]
     return EpipolarEstimate(
-        rotation_current_to_history=rotation,
-        translation_current_origin_in_history=translation,
-        essential=essential,
-        sampson_rmse=float(rmse),
-        inlier_ratio=inlier_ratio,
-        cheirality_fraction=float(cheirality),
+        rotation_current_to_history=candidate.rotation,
+        translation_current_origin_in_history=candidate.translation,
+        essential=candidate.essential,
+        sampson_rmse=candidate.sampson_rmse,
+        inlier_ratio=candidate.inlier_ratio,
+        cheirality_fraction=candidate.cheirality_fraction,
         design_rank_ratio=float(ratio),
         design_condition=float(condition),
         correspondences=count,
         effective_correspondences=_effective_count(weights),
-        refinement_iterations=iterations,
+        refinement_iterations=candidate.refinement_iterations,
+        initialization=candidate.initialization,
+        eight_point_sampson_rmse=eight_point_rmse,
+        l0_local_sampson_rmse=l0_local_rmse,
         success=True,
         reason="ok",
     )
@@ -396,8 +450,6 @@ def recover_absolute_pose(
     centers = camera_centers(baseline)
     l0_current_center = centers[current]
     rotations = []
-    history_centers = []
-    directions = []
     edge_centers = []
     edge_weights = []
     for history, estimate in valid:
@@ -414,20 +466,13 @@ def recover_absolute_pose(
             l0_current_center - centers[history]
         )
         rotations.append(absolute_rotation)
-        history_centers.append(centers[history])
-        directions.append(direction)
         edge_centers.append(centers[history] + edge_length * direction)
-        edge_weights.append(max(float(estimate.effective_correspondences), 1e-12))
+        edge_weights.append(_absolute_edge_weight(estimate))
 
     weight_tensor = torch.tensor(edge_weights, dtype=torch.float64)
     rotation = _weighted_rotation_average(torch.stack(rotations), weight_tensor)
-    center, used_intersection = _recover_center_from_rays(
-        torch.stack(history_centers),
-        torch.stack(directions),
-        torch.stack(edge_centers),
-        weight_tensor,
-        max_condition=float(config.ray_intersection_max_condition),
-    )
+    normalized_weights = weight_tensor / weight_tensor.sum().clamp_min(1e-12)
+    center = (normalized_weights[:, None] * torch.stack(edge_centers)).sum(dim=0)
     if not torch.isfinite(rotation).all() or not torch.isfinite(center).all():
         return AbsolutePoseEstimate(
             world_to_camera=fallback,
@@ -446,7 +491,7 @@ def recover_absolute_pose(
         edge_estimates=tuple(edge_estimates),
         edge_history_indices=tuple(int(value) for value in edge_history_indices),
         edge_weights=tuple(edge_weights),
-        used_ray_intersection=used_intersection,
+        used_ray_intersection=False,
         success=True,
         reason="ok",
     )
@@ -623,6 +668,67 @@ def _select_essential_solution(
     return rotation, direction, float(cheirality)
 
 
+def _build_relative_candidate(
+    rotation: torch.Tensor,
+    translation: torch.Tensor,
+    current: torch.Tensor,
+    history: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    initialization: str,
+    config: EpipolarConfig,
+) -> _RelativeCandidate:
+    translation = translation.double()
+    translation = translation / torch.linalg.vector_norm(translation).clamp_min(1e-12)
+    rotation, translation, iterations = _refine_bearing_pose(
+        rotation.double(),
+        translation,
+        current,
+        history,
+        weights,
+        config=config,
+    )
+    essential = _skew(translation) @ rotation
+    residual = _signed_sampson_residual(essential, current, history)
+    normalized_weights = weights / weights.sum().clamp_min(1e-12)
+    rmse = torch.sqrt((normalized_weights * residual.square()).sum())
+    inlier = residual.abs().le(float(config.refinement_huber_delta))
+    inlier_ratio = float((normalized_weights * inlier.double()).sum())
+    return _RelativeCandidate(
+        rotation=rotation,
+        translation=translation,
+        essential=essential,
+        sampson_rmse=float(rmse),
+        robust_objective=float(
+            _huber_objective(
+                residual,
+                weights,
+                config.refinement_huber_delta,
+            )
+        ),
+        inlier_ratio=inlier_ratio,
+        cheirality_fraction=_cheirality_fraction(
+            rotation,
+            translation,
+            current,
+            history,
+            max_points=int(config.cheirality_max_points),
+        ),
+        refinement_iterations=iterations,
+        initialization=initialization,
+    )
+
+
+def _candidate_l0_distance(
+    candidate: _RelativeCandidate, l0_current_to_history: torch.Tensor
+) -> float:
+    return _rotation_distance_degrees(
+        candidate.rotation, l0_current_to_history[:3, :3]
+    ) + _vector_angle_degrees(
+        candidate.translation, l0_current_to_history[:3, 3]
+    )
+
+
 def _cheirality_fraction(
     rotation: torch.Tensor,
     translation: torch.Tensor,
@@ -782,34 +888,14 @@ def _huber_objective(
     return (weights * value).sum() / weights.sum().clamp_min(1e-12)
 
 
-def _recover_center_from_rays(
-    origins: torch.Tensor,
-    directions: torch.Tensor,
-    edge_centers: torch.Tensor,
-    weights: torch.Tensor,
-    *,
-    max_condition: float,
-) -> tuple[torch.Tensor, bool]:
-    normalized = weights / weights.sum().clamp_min(1e-12)
-    fallback = (normalized[:, None] * edge_centers).sum(dim=0)
-    if origins.shape[0] < 2:
-        return fallback, False
-    identity = torch.eye(3, dtype=torch.float64)
-    projectors = identity[None] - directions[:, :, None] * directions[:, None, :]
-    matrix = (weights[:, None, None] * projectors).sum(dim=0)
-    rhs = torch.einsum("n,nij,nj->i", weights, projectors, origins)
-    singular = torch.linalg.svdvals(matrix)
-    condition = float(singular[0] / singular[-1].clamp_min(1e-15))
-    if not math.isfinite(condition) or condition > float(max_condition):
-        return fallback, False
-    try:
-        center = torch.linalg.solve(matrix, rhs)
-    except RuntimeError:
-        return fallback, False
-    forward = torch.einsum("ni,ni->n", center[None] - origins, directions)
-    if not torch.isfinite(center).all() or bool((forward <= 0.0).any()):
-        return fallback, False
-    return center, True
+def _absolute_edge_weight(estimate: EpipolarEstimate) -> float:
+    """Bounded-fusion quality from correspondence evidence, never GT error."""
+
+    support = max(float(estimate.effective_correspondences), 1e-12)
+    inlier = max(float(estimate.inlier_ratio), 1e-6)
+    residual = max(float(estimate.sampson_rmse), 1e-6)
+    value = support * inlier / residual
+    return value if math.isfinite(value) and value > 0.0 else 1e-12
 
 
 def _weighted_rotation_average(
@@ -957,6 +1043,9 @@ def _failed_epipolar(count: int) -> EpipolarEstimate:
         correspondences=int(count),
         effective_correspondences=0.0,
         refinement_iterations=0,
+        initialization="none",
+        eight_point_sampson_rmse=float("nan"),
+        l0_local_sampson_rmse=float("nan"),
         success=False,
         reason="not_solved",
     )

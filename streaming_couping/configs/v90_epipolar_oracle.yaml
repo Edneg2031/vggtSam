@@ -1,7 +1,7 @@
 # V9 Stage O: visible 2D surface correspondence + fixed calibrated epipolar solver.
 # This file intentionally contains one locked configuration, not a sweep.
 data_config: streaming_couping/configs/v74_temporal_data.yaml
-output_dir: outputs/streaming_couping_v90_epipolar_token_causality
+output_dir: outputs/streaming_couping_v90_epipolar_token_causality_solver_corrected
 clip_name: 00a231a370_90_525_step15_37_68_54
 
 # Each dynamic SAM3.1 slot reads only its two latest strictly earlier masks.
@@ -24,5 +24,3 @@ solver:
   refinement_step_epsilon: 0.000001
   max_refinement_step: 0.10
   cheirality_max_points: 128
-  ray_intersection_max_condition: 100000000.0
-
