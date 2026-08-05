@@ -216,17 +216,61 @@ def causal_history_indices(
 ) -> torch.Tensor:
     """Return the exact preceding frame read by V8 causal geometry memory."""
 
+    return causal_history_bank_indices(
+        memory_write,
+        local_valid,
+        max_history=1,
+    )[..., 0]
+
+
+def causal_history_bank_indices(
+    memory_write: torch.Tensor,
+    local_valid: torch.Tensor,
+    *,
+    max_history: int,
+) -> torch.Tensor:
+    """Return up to ``max_history`` previous writes, newest first.
+
+    The current frame always reads the bank before its own observation is
+    written, so every returned index is strictly causal.
+    """
+
     if memory_write.ndim != 2 or local_valid.ndim != 3:
         raise ValueError("Causal history expects [S,K] write and [S,K,P] valid.")
     if memory_write.shape != local_valid.shape[:2]:
         raise ValueError("Causal history write/local shapes disagree.")
+    if int(max_history) < 1:
+        raise ValueError("Causal history bank size must be positive.")
     sequence, instances = memory_write.shape
-    last = torch.full((instances,), -1, dtype=torch.long, device=memory_write.device)
-    output = torch.full_like(memory_write, -1, dtype=torch.long)
+    bank = torch.full(
+        (instances, int(max_history)),
+        -1,
+        dtype=torch.long,
+        device=memory_write.device,
+    )
+    output = torch.full(
+        (sequence, instances, int(max_history)),
+        -1,
+        dtype=torch.long,
+        device=memory_write.device,
+    )
     for frame in range(sequence):
-        output[frame] = last
+        output[frame] = bank
         write = memory_write[frame].bool() & local_valid[frame].any(dim=-1)
-        last = torch.where(write, torch.full_like(last, frame), last)
+        if bool(write.any()):
+            shifted = torch.cat(
+                [
+                    torch.full(
+                        (instances, 1),
+                        int(frame),
+                        dtype=torch.long,
+                        device=memory_write.device,
+                    ),
+                    bank[:, :-1],
+                ],
+                dim=-1,
+            )
+            bank = torch.where(write[:, None], shifted, bank)
     return output
 
 
@@ -241,6 +285,29 @@ def causal_gt_nearest_pairs(
 ) -> CausalPairIndices:
     """Build per-slot GT-world proximity pseudo-correspondences."""
 
+    if history_indices.ndim != 1:
+        raise ValueError("Current causal history indices must be [K].")
+    return causal_gt_nearest_pairs_multi_history(
+        current_frame=current_frame,
+        history_indices=history_indices[:, None],
+        gt_world_metric=gt_world_metric,
+        gt_valid=gt_valid,
+        max_distance_metric=max_distance_metric,
+        require_mutual_nearest=require_mutual_nearest,
+    )
+
+
+def causal_gt_nearest_pairs_multi_history(
+    *,
+    current_frame: int,
+    history_indices: torch.Tensor,
+    gt_world_metric: torch.Tensor,
+    gt_valid: torch.Tensor,
+    max_distance_metric: float,
+    require_mutual_nearest: bool,
+) -> CausalPairIndices:
+    """Build GT-world pseudo-matches against a causal per-slot history bank."""
+
     if gt_world_metric.ndim != 4 or gt_world_metric.shape[-1] != 3:
         raise ValueError("GT correspondence points must be [S,K,P,3].")
     if gt_valid.shape != gt_world_metric.shape[:-1]:
@@ -253,43 +320,62 @@ def causal_gt_nearest_pairs(
         or float(max_distance_metric) <= 0.0
     ):
         raise ValueError("GT correspondence radius must be finite and positive.")
-    if history_indices.shape != (instances,):
-        raise ValueError("Current causal history indices must be [K].")
-    rows: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    if history_indices.ndim != 2 or history_indices.shape[0] != instances:
+        raise ValueError("Current causal history bank must be [K,M].")
+    rows: list[
+        tuple[int, int, torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = []
     for slot in range(instances):
-        history = int(history_indices[slot])
-        if history < 0:
-            continue
-        if history >= sequence:
-            raise IndexError("Causal history frame is out of range.")
         current_valid = (
             gt_valid[int(current_frame), slot]
             & torch.isfinite(gt_world_metric[int(current_frame), slot]).all(dim=-1)
         )
-        history_valid = (
-            gt_valid[history, slot]
-            & torch.isfinite(gt_world_metric[history, slot]).all(dim=-1)
-        )
-        if not bool(current_valid.any()) or not bool(history_valid.any()):
+        if not bool(current_valid.any()):
             continue
         current_index = torch.nonzero(current_valid, as_tuple=False).flatten()
-        history_index = torch.nonzero(history_valid, as_tuple=False).flatten()
         current = gt_world_metric[int(current_frame), slot].index_select(
             0, current_index
         )
-        previous = gt_world_metric[history, slot].index_select(0, history_index)
-        distance = torch.cdist(current.float(), previous.float())
-        nearest_distance, nearest_local = distance.min(dim=-1)
-        keep = nearest_distance.le(float(max_distance_metric))
-        if require_mutual_nearest:
-            reverse = distance.min(dim=0).indices
-            query = torch.arange(distance.shape[0], device=distance.device)
-            keep = keep & reverse.index_select(0, nearest_local).eq(query)
-        if not bool(keep.any()):
-            continue
-        query_index = current_index[keep]
-        key_index = history_index[nearest_local[keep]]
-        rows.append((slot, query_index, key_index, nearest_distance[keep]))
+        seen_history: set[int] = set()
+        for value in history_indices[slot].tolist():
+            history = int(value)
+            if history < 0 or history in seen_history:
+                continue
+            if history >= sequence or history >= int(current_frame):
+                raise IndexError("Causal history frame is out of range or not causal.")
+            seen_history.add(history)
+            history_valid = (
+                gt_valid[history, slot]
+                & torch.isfinite(gt_world_metric[history, slot]).all(dim=-1)
+            )
+            if not bool(history_valid.any()):
+                continue
+            history_index = torch.nonzero(
+                history_valid, as_tuple=False
+            ).flatten()
+            previous = gt_world_metric[history, slot].index_select(
+                0, history_index
+            )
+            distance = torch.cdist(current.float(), previous.float())
+            nearest_distance, nearest_local = distance.min(dim=-1)
+            keep = nearest_distance.le(float(max_distance_metric))
+            if require_mutual_nearest:
+                reverse = distance.min(dim=0).indices
+                query = torch.arange(distance.shape[0], device=distance.device)
+                keep = keep & reverse.index_select(0, nearest_local).eq(query)
+            if not bool(keep.any()):
+                continue
+            query_index = current_index[keep]
+            key_index = history_index[nearest_local[keep]]
+            rows.append(
+                (
+                    slot,
+                    history,
+                    query_index,
+                    key_index,
+                    nearest_distance[keep],
+                )
+            )
     if not rows:
         empty = torch.empty(0, dtype=torch.long, device=gt_world_metric.device)
         return CausalPairIndices(
@@ -303,22 +389,24 @@ def causal_gt_nearest_pairs(
     slots = torch.cat(
         [
             torch.full_like(query, int(slot))
-            for slot, query, _, _ in rows
+            for slot, _, query, _, _ in rows
         ]
     )
     histories = torch.cat(
         [
-            torch.full_like(query, int(history_indices[slot]))
-            for slot, query, _, _ in rows
+            torch.full_like(query, int(history))
+            for _, history, query, _, _ in rows
         ]
     )
     return CausalPairIndices(
         current_slots=slots,
-        current_points=torch.cat([query for _, query, _, _ in rows]),
+        current_points=torch.cat([query for _, _, query, _, _ in rows]),
         history_frames=histories,
         history_slots=slots.clone(),
-        history_points=torch.cat([key for _, _, key, _ in rows]),
-        gt_distances_metric=torch.cat([distance for _, _, _, distance in rows]),
+        history_points=torch.cat([key for _, _, _, key, _ in rows]),
+        gt_distances_metric=torch.cat(
+            [distance for _, _, _, _, distance in rows]
+        ),
     )
 
 

@@ -1,5 +1,17 @@
 # streaming_couping
 
+V8 O1/O2 已确认坐标审计 30/30 帧通过，同时定位出 medium 对应不足和 depth/point-head
+几何不一致。下一步用不训练网络的 O2.5 一次性消融局部点数、因果历史长度、匹配方式、半径和
+几何来源：
+
+```bash
+zsh streaming_couping/commands_v80_geometry_support_ablation.txt
+```
+
+需要复制的紧凑主表为
+`outputs/streaming_couping_v80_geometry_support_ablation/v80_o25_geometry_ablation.csv`；
+完整协议见 [`docs/v80_o25_geometry_support_ablation.md`](docs/v80_o25_geometry_support_ablation.md)。
+
 V8.0 matcher-first 已完成三段时间 fold 实验，但没有通过 SAM 因果判据：匹配泛化不稳定，
 pose MLP 仍能在 no-match 等控制上过拟合，long fold 的 learned refinement 还差于 frozen L0。
 当前优先运行不训练网络的坐标审计与 O1/O2 显式位姿验证，先判断 StreamVGGT 预测几何是否

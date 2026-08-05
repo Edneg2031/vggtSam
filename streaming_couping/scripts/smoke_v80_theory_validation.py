@@ -12,6 +12,8 @@ from streaming_couping.src.solvers.weighted_kabsch import (
 from streaming_couping.src.v80_pose_geometry import (
     backproject_depth_at_local_tokens,
     causal_gt_nearest_pairs,
+    causal_gt_nearest_pairs_multi_history,
+    causal_history_bank_indices,
     causal_history_indices,
     gather_pair_points,
     invert_rigid,
@@ -135,6 +137,11 @@ def _smoke_coordinates_and_causality() -> None:
     write = torch.tensor([[True], [False], [True]])
     history = causal_history_indices(write, valid)
     _require(history[:, 0].tolist() == [-1, 0, 0], "causal history is not previous-only")
+    history_bank = causal_history_bank_indices(write, valid, max_history=2)
+    _require(
+        history_bank[:, 0].tolist() == [[-1, -1], [0, -1], [0, -1]],
+        "causal history bank is not previous-only/newest-first",
+    )
     world = camera.clone()
     pairs = causal_gt_nearest_pairs(
         current_frame=2,
@@ -150,6 +157,19 @@ def _smoke_coordinates_and_causality() -> None:
     )
     _require(bool(pair_valid.all()), "gathered causal pair became invalid")
     _require(torch.equal(current, previous), "causal point gathering is misaligned")
+
+    multi_pairs = causal_gt_nearest_pairs_multi_history(
+        current_frame=2,
+        history_indices=torch.tensor([[1, 0]]),
+        gt_world_metric=world,
+        gt_valid=valid,
+        max_distance_metric=0.01,
+        require_mutual_nearest=True,
+    )
+    _require(
+        multi_pairs.count == 2 * points,
+        "multi-history GT pseudo-match count mismatch",
+    )
 
     no_pairs = causal_gt_nearest_pairs(
         current_frame=0,

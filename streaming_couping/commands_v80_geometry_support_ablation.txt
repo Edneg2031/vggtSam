@@ -1,0 +1,38 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+CONFIG=streaming_couping/configs/v80_geometry_support_ablation.yaml
+OUTPUT="${V80_O25_OUTPUT:-outputs/streaming_couping_v80_geometry_support_ablation}"
+CACHE=outputs/streaming_couping_v74_temporal_scaling/cache/00a231a370_90_525_step15_37_68_54.pt
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+[[ -s "$CACHE" ]] || {
+  echo "V8 O2.5 requires the retained V7.4 cache: $CACHE" >&2
+  echo "It deliberately does not rerun SAM3.1 or StreamVGGT." >&2
+  exit 1
+}
+
+echo "V8 O2.5 smoke: multi-history causality, coordinates and Kabsch"
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_v80_theory_validation
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_v80_geometry_support_ablation
+
+echo "V8 O2.5: support sweep + fixed-support geometry ablation"
+PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.run_v80_geometry_support_ablation \
+  --config "$CONFIG" \
+  --output-dir "$OUTPUT"
+
+PRIMARY="$OUTPUT/v80_o25_geometry_ablation.csv"
+SUPPORT="$OUTPUT/v80_o25_support_ablation.csv"
+FRAMES="$OUTPUT/v80_o25_frame_diagnostics.csv"
+[[ -s "$PRIMARY" ]] || { echo "missing primary CSV: $PRIMARY" >&2; exit 1; }
+[[ -s "$SUPPORT" ]] || { echo "missing support CSV: $SUPPORT" >&2; exit 1; }
+[[ -s "$FRAMES" ]] || { echo "missing frame CSV: $FRAMES" >&2; exit 1; }
+
+echo "V8 O2.5 primary CSV validated: $PRIMARY"
+echo "V8 O2.5 support sweep: $SUPPORT"
+echo "V8 O2.5 frame diagnostics: $FRAMES"
+echo "V8 O2.5 decision: $OUTPUT/v80_o25_decision.md"

@@ -2,6 +2,8 @@ import torch
 
 from streaming_couping.src.v80_pose_geometry import (
     causal_gt_nearest_pairs,
+    causal_gt_nearest_pairs_multi_history,
+    causal_history_bank_indices,
     causal_history_indices,
     gather_pair_points,
     invert_rigid,
@@ -14,6 +16,18 @@ def test_causal_history_reads_before_writing_current_frame():
     valid = torch.ones(3, 2, 4, dtype=torch.bool)
     history = causal_history_indices(write, valid)
     assert history.tolist() == [[-1, -1], [0, -1], [1, 1]]
+
+
+def test_causal_history_bank_is_newest_first_and_previous_only():
+    write = torch.tensor([[True], [True], [False], [True]])
+    valid = torch.ones(4, 1, 4, dtype=torch.bool)
+    history = causal_history_bank_indices(write, valid, max_history=3)
+    assert history[:, 0].tolist() == [
+        [-1, -1, -1],
+        [0, -1, -1],
+        [1, 0, -1],
+        [1, 0, -1],
+    ]
 
 
 def test_mutual_gt_pairs_respect_instance_and_history():
@@ -35,6 +49,28 @@ def test_mutual_gt_pairs_respect_instance_and_history():
     assert pairs.count == 2
     assert pairs.current_points.tolist() == [0, 1]
     assert pairs.history_points.tolist() == [0, 1]
+
+
+def test_multi_history_pairs_keep_each_causal_anchor():
+    points = torch.tensor(
+        [
+            [[[0.00, 0.0, 1.0], [1.00, 0.0, 1.0]]],
+            [[[0.01, 0.0, 1.0], [1.01, 0.0, 1.0]]],
+            [[[0.02, 0.0, 1.0], [1.02, 0.0, 1.0]]],
+        ]
+    )
+    valid = torch.ones(3, 1, 2, dtype=torch.bool)
+    pairs = causal_gt_nearest_pairs_multi_history(
+        current_frame=2,
+        history_indices=torch.tensor([[1, 0]]),
+        gt_world_metric=points,
+        gt_valid=valid,
+        max_distance_metric=0.05,
+        require_mutual_nearest=True,
+    )
+    assert pairs.count == 4
+    assert pairs.history_frames.tolist() == [1, 1, 0, 0]
+    assert pairs.current_points.tolist() == [0, 1, 0, 1]
 
 
 def test_rigid_inverse_round_trip():
