@@ -27,7 +27,10 @@ zsh streaming_couping/commands_v80_geometry_support_ablation.txt
 
 ## 固定支持下的几何来源
 
-主表预先固定 `K=64、history=4、one-way、radius=0.15m`，不会根据三个 test fold 选择配置：
+主表只根据 O1 support sweep 自动选择同时通过三个 fold、两种 solver 的最轻配置；排序依次优先
+更少 token、更短历史、mutual 和更小半径。这个选择完全不读取 O2 depth/point-head 的结果。
+若没有任何配置通过，才使用 YAML 中的 fallback。当前 fallback 为
+`K=64、history=2、mutual、radius=0.10m`。
 
 | 分支 | 当前/历史 camera point | 历史位姿 | 定位 |
 |---|---|---|---|

@@ -11,10 +11,13 @@ support_sweep:
 # Predeclared high-coverage setting used by the compact geometry table. The
 # full support sweep remains report-only and does not select this setting.
 primary_support:
+  # Select the lightest configuration that passes O1 in every fold with both
+  # solvers. The explicit values below are only a fallback if none passes.
+  auto_select_from_support: true
   token_count: 64
-  history_count: 4
-  match_mode: one_way
-  radius_metric: 0.15
+  history_count: 2
+  match_mode: mutual
+  radius_metric: 0.10
 
 gating:
   # Reliable gate = original bounded fit + effective support + agreement

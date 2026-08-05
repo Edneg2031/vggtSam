@@ -127,6 +127,7 @@ class O25Config:
     match_modes: tuple[str, ...]
     radii_metric: tuple[float, ...]
     primary: SupportSpec
+    auto_select_primary: bool
     gates: O25GateConfig
 
 
@@ -272,7 +273,20 @@ def run_o25_ablation(config: O25Config) -> Path:
                         )
                     )
 
-    spec = config.primary
+    support_rows = _summarize(
+        [row for row in frame_rows if row["phase"] == "support_sweep"],
+        config=config,
+    )
+    spec = (
+        _select_primary_support(support_rows, config=config)
+        if config.auto_select_primary
+        else config.primary
+    )
+    print(
+        "V8 O2.5 selected primary support: "
+        f"K={spec.token_count} history={spec.history_count} "
+        f"mode={spec.match_mode} radius={spec.radius_metric:g}m"
+    )
     for fold in FOLDS:
         for frame in fold.test_frames:
             current = positions[int(frame)]
@@ -305,10 +319,6 @@ def run_o25_ablation(config: O25Config) -> Path:
                         )
                     )
 
-    support_rows = _summarize(
-        [row for row in frame_rows if row["phase"] == "support_sweep"],
-        config=config,
-    )
     geometry_rows = _summarize(
         [row for row in frame_rows if row["phase"] == "geometry_ablation"],
         config=config,
@@ -342,6 +352,8 @@ def run_o25_ablation(config: O25Config) -> Path:
         "cache": str(path),
         "frames": list(frames),
         "config": _jsonable(config),
+        "configured_primary_support": asdict(config.primary),
+        "selected_primary_support": asdict(spec),
         "important_boundary": (
             "point_head_camera uses L0 W2C and is pose-entangled diagnostic only"
         ),
@@ -1015,6 +1027,50 @@ def _summarize(
     return output
 
 
+def _select_primary_support(
+    rows: Sequence[dict[str, object]],
+    *,
+    config: O25Config,
+) -> SupportSpec:
+    names = (
+        "token_count",
+        "history_count",
+        "match_mode",
+        "radius_metric",
+    )
+    groups: dict[tuple, list[dict[str, object]]] = {}
+    for row in rows:
+        groups.setdefault(tuple(row[name] for name in names), []).append(row)
+    expected = len(FOLDS) * len(config.theory.solvers)
+    eligible = [
+        key
+        for key, current in groups.items()
+        if len(current) == expected
+        and all(int(row["reliable_robust_pass"]) for row in current)
+    ]
+    if not eligible:
+        print(
+            "V8 O2.5 warning: no support setting passed all folds/solvers; "
+            "using configured fallback primary."
+        )
+        return config.primary
+    selected = min(
+        eligible,
+        key=lambda key: (
+            int(key[0]),
+            int(key[1]),
+            0 if str(key[2]) == "mutual" else 1,
+            float(key[3]),
+        ),
+    )
+    return SupportSpec(
+        token_count=int(selected[0]),
+        history_count=int(selected[1]),
+        match_mode=str(selected[2]),
+        radius_metric=float(selected[3]),
+    )
+
+
 def _decision_markdown(
     support: Sequence[dict[str, object]],
     geometry: Sequence[dict[str, object]],
@@ -1045,6 +1101,38 @@ def _decision_markdown(
         if len(rows) == len(FOLDS)
         and all(int(row["reliable_robust_pass"]) for row in rows)
     ]
+    branch_pass = {
+        key: int(
+            len(rows) == len(FOLDS)
+            and all(int(row["reliable_robust_pass"]) for row in rows)
+        )
+        for key, rows in by_geometry.items()
+    }
+    selected_primary = (
+        (
+            geometry[0]["token_count"],
+            geometry[0]["history_count"],
+            geometry[0]["match_mode"],
+            geometry[0]["radius_metric"],
+        )
+        if geometry
+        else None
+    )
+    o1_pass = any(
+        value
+        for (branch, _), value in branch_pass.items()
+        if str(branch).startswith("o1_")
+    )
+    depth_gt_pass = any(
+        value
+        for (branch, _), value in branch_pass.items()
+        if branch == "o2_depth_camera_gt_history"
+    )
+    depth_l0_pass = any(
+        value
+        for (branch, _), value in branch_pass.items()
+        if branch == "o2_depth_camera_l0_history"
+    )
     lines = [
         "# V8 O2.5 geometry-support decision",
         "",
@@ -1052,6 +1140,10 @@ def _decision_markdown(
         "",
         f"- all-fold reliable support configurations: `{len(all_fold_support)}`",
         f"- all-fold reliable primary geometry branches: `{len(all_fold_geometry)}`",
+        f"- automatically selected primary support: `{selected_primary}`",
+        f"- selected-support O1 pass: `{int(bool(o1_pass))}`",
+        f"- selected-support depth O2 GT-history pass: `{int(bool(depth_gt_pass))}`",
+        f"- selected-support depth O2 L0-history pass: `{int(bool(depth_l0_pass))}`",
         "",
         "All-fold support configurations:",
         "",
@@ -1065,15 +1157,30 @@ def _decision_markdown(
         [f"- `{key}`" for key in all_fold_geometry]
         or ["- none"]
     )
+    lines.extend(["", "Interpretation:", ""])
+    if not all_fold_support:
+        lines.append(
+            "- No O1 support setting passes all folds: instance overlap/history remains insufficient."
+        )
+    elif not o1_pass:
+        lines.append(
+            "- Support sweep has valid settings, but selected-support O1 failed; do not diagnose depth."
+        )
+    elif not depth_gt_pass:
+        lines.append(
+            "- O1 passes while depth O2 with GT history fails: predicted camera geometry is the bottleneck."
+        )
+    elif not depth_l0_pass:
+        lines.append(
+            "- Depth O2 passes with GT history but fails with L0 history: history pose drift is the bottleneck."
+        )
+    else:
+        lines.append(
+            "- Depth O2 passes with GT and L0 history: proceed to SAM correspondence O3."
+        )
     lines.extend(
         [
-            "",
-            "Interpretation:",
-            "",
-            "- O1 support fails: instance overlap/history support remains insufficient.",
-            "- O1 passes but depth O2 fails: predicted camera geometry is the bottleneck.",
-            "- point-head O2P is diagnostic only because its camera points use L0 W2C.",
-            "- Only after a depth O2 branch passes all folds should SAM correspondence O3 begin.",
+            "- point-head O2P remains diagnostic only because its camera points use L0 W2C.",
             "",
         ]
     )
@@ -1143,6 +1250,9 @@ def load_o25_config(path: str | Path) -> O25Config:
         match_modes=match_modes,
         radii_metric=radii,
         primary=primary_spec,
+        auto_select_primary=bool(
+            primary.get("auto_select_from_support", True)
+        ),
         gates=gates,
     )
     _validate_o25_config(config)
