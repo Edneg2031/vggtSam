@@ -1,21 +1,24 @@
 # streaming_couping
 
-V8 O1/O2 已确认坐标审计 30/30 帧通过，同时定位出 medium 对应不足和 depth/point-head
-几何不一致。下一步用不训练网络的 O2.5 一次性消融局部点数、因果历史长度、匹配方式、半径和
-几何来源：
+实验实际结果、已失败的因果结论、禁止重复的消融和后续实验准入规则，以
+[`docs/sam31_streamvggt_experiment_ledger.md`](docs/sam31_streamvggt_experiment_ledger.md)
+为唯一历史账本。设计新版本前必须先查该文件；下面保留的是各版本复现入口，不代表需要重新运行。
 
-```bash
-zsh streaming_couping/commands_v80_geometry_support_ablation.txt
-```
+截至 2026-08-05，V8 O2.5/O2.6/O2.7 均已完成：GT geometry + GT K 的显式位姿上界可行，
+predicted depth、predicted K、scale/affine/Sim3 和固定 K 尚不能形成 all-fold 可靠上界；
+SAM instance-region affine 优于全图 affine，但仍未全 fold 通过。不要再次从 O2.5 开始扫相同
+support/depth/K 组合。
 
-需要复制的紧凑主表为
-`outputs/streaming_couping_v80_geometry_support_ablation/v80_o25_geometry_ablation.csv`；
-完整协议见 [`docs/v80_o25_geometry_support_ablation.md`](docs/v80_o25_geometry_support_ablation.md)。
+O2.5 的完整协议保留在
+[`docs/v80_o25_geometry_support_ablation.md`](docs/v80_o25_geometry_support_ablation.md)，
+O2.6/O2.7 分别见
+[`docs/v80_o26_geometry_factorization.md`](docs/v80_o26_geometry_factorization.md) 和
+[`docs/v80_o27_instance_geometry.md`](docs/v80_o27_instance_geometry.md)。
 
 V8.0 matcher-first 已完成三段时间 fold 实验，但没有通过 SAM 因果判据：匹配泛化不稳定，
 pose MLP 仍能在 no-match 等控制上过拟合，long fold 的 learned refinement 还差于 frozen L0。
-当前优先运行不训练网络的坐标审计与 O1/O2 显式位姿验证，先判断 StreamVGGT 预测几何是否
-具备可用的 SE(3) 修正能力：
+随后进行的不训练网络坐标审计与 O1/O2 显式位姿验证也已完成。下面命令仅用于复现，不是下一步
+实验入口：
 
 ```bash
 zsh streaming_couping/commands_v80_theory_validation.txt

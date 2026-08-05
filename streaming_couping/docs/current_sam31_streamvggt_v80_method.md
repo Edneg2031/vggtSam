@@ -3,6 +3,10 @@
 > 当前实现更新于 2026-08-04。V8 不再用单一 pose loss 同时训练 matcher 和 pose head，
 > 而是先证明 SAM 是否改善跨视角对应，再验证冻结对应关系能否改善未来帧位姿。
 
+> 历史实验、实际结果、失败结论和后续实验准入规则统一记录在
+> [SAM3.1 × StreamVGGT 实验验证账本](sam31_streamvggt_experiment_ledger.md)。设计新分支前必须先
+> 检查该账本；本文件描述实现方法，不覆盖账本中的实际 pass/fail 结论。
+
 ## 1. V8 要回答的问题
 
 V7.3/V7.4 已证明不同 fusion head 都可以把训练帧 pose loss 拟合到接近零，但没有证明
