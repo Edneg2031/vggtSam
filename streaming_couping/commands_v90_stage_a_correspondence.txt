@@ -1,0 +1,87 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+STREAM_GPU0="${V90_STREAM_GPU0:-1}"
+STREAM_GPU1="${V90_STREAM_GPU1:-2}"
+SAM_GPU="${V90_SAM_GPU:-3}"
+MATCH_GPU="${V90_MATCH_GPU:-1}"
+VISIBLE_GPUS="$STREAM_GPU0,$STREAM_GPU1,$SAM_GPU"
+CONFIG=streaming_couping/configs/v90_local_token_matcher.yaml
+DATA_CONFIG=streaming_couping/configs/v74_temporal_data.yaml
+OUTPUT="${V90_STAGE_A_OUTPUT:-outputs/streaming_couping_v90_epipolar_token_stage_a}"
+CACHE=outputs/streaming_couping_v74_temporal_scaling/cache/00a231a370_90_525_step15_37_68_54.pt
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+echo "V9 Stage A smoke: local32 labels, dustbin, Q/K gradients and fallback"
+PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.smoke_v90_local_token_matcher
+
+NEED_REBUILD=0
+if [[ "${V90_REBUILD_CACHE:-0}" == "1" || ! -s "$CACHE" ]]; then
+  NEED_REBUILD=1
+else
+  echo "V9 Stage A validating the existing observation cache"
+  if ! PYTHONPATH=. "$PYTHON_BIN" \
+    -m streaming_couping.scripts.audit_v7_cache \
+    --config "$DATA_CONFIG" \
+    --output-dir "$OUTPUT/cache_audit_preflight" \
+    --strict; then
+    echo "V9 Stage A cache is stale/incomplete; rebuilding it"
+    NEED_REBUILD=1
+  fi
+fi
+
+if (( NEED_REBUILD )); then
+  echo "V9 Stage A rebuilding frozen 30-frame SAM3.1/StreamVGGT cache"
+  echo "physical GPUs=$VISIBLE_GPUS"
+  CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" \
+  PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+    -m streaming_couping.scripts.run_instance_token_pose \
+    --config "$DATA_CONFIG" \
+    --stage cache \
+    --streamvggt-devices cuda:0,cuda:1 \
+    --sam3-device cuda:2 \
+    --geometry-device cuda:0 \
+    --training-device cuda:0 \
+    --rebuild-cache
+else
+  echo "V9 Stage A reuses cache; SAM3.1 and StreamVGGT stay unloaded"
+fi
+
+[[ -s "$CACHE" ]] || { echo "missing V9 Stage A cache: $CACHE" >&2; exit 1; }
+
+echo "V9 Stage A0 -> hard gate -> A1 explicit matcher"
+echo "A0 uses fixed local32 UV; A1 trains Q/K only on physical GPU=$MATCH_GPU"
+CUDA_VISIBLE_DEVICES="$MATCH_GPU" \
+PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.run_v90_local_token_matcher \
+  --config "$CONFIG" \
+  --output-dir "$OUTPUT" \
+  --stage all
+
+SUMMARY="$OUTPUT/v90_stage_a_summary.csv"
+FRAMES="$OUTPUT/v90_stage_a_frames.csv"
+TRAINING="$OUTPUT/v90_stage_a_training.csv"
+PAIRS="$OUTPUT/v90_stage_a_pairs.csv"
+DECISION="$OUTPUT/v90_stage_a_decision.md"
+METADATA="$OUTPUT/v90_stage_a_metadata.json"
+for file in "$SUMMARY" "$FRAMES" "$TRAINING" "$PAIRS" "$DECISION" "$METADATA"; do
+  [[ -s "$file" ]] || { echo "missing V9 Stage A output: $file" >&2; exit 1; }
+done
+
+echo "V9 STAGE A COPY THIS SUMMARY"
+cat "$SUMMARY"
+echo "V9 STAGE A COPY THIS DECISION"
+cat "$DECISION"
+echo "V9 Stage A detailed frames: $FRAMES"
+echo "V9 Stage A training health: $TRAINING"
+echo "V9 Stage A local32 pair/support diagnostics: $PAIRS"
+echo "V9 Stage A provenance: $METADATA"

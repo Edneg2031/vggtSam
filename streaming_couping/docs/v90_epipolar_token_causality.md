@@ -1,6 +1,6 @@
 # V9：SAM3.1 local-token 二维极几何位姿因果实验
 
-> 状态：`E0 Stage O 初始 solver 已运行失败；O-R1 solver 修正已实现待复跑；Stage A/B 继续停止`
+> 状态：`Stage O-R1 relative oracle 已全折通过；Stage A0/A1 已实现待运行；absolute trajectory 不作为 token 主命题`
 > 日期：2026-08-05  
 > 核心目标：验证 SAM3.1 local descriptor 是否能通过真实 2D–2D 对应改善 StreamVGGT 的
 > 相机 rotation 与 translation direction，而不使用 predicted depth、pointmap Kabsch 或
@@ -131,10 +131,12 @@ b = K^{-1}[u,v,1]^T / \|K^{-1}[u,v,1]^T\|_2
 若 oracle 不通过，V9 立即停止，不训练 SAM matcher。此时结论是二维实例支持或 solver 不足，
 不是 SAM token 失败。
 
-Stage O 将 aggregate pose 指标预先固定为
-`absolute rotation error (deg) + reference-to-current center-direction error (deg)`；两个量单位相同，
-不引入事后调权。fold pass 同时要求 rotation 与 direction 的均值各自改善，并且没有 active frame
-的该 aggregate 指标恶化。center distance 只报告，不参与 pass。
+Stage O 的核心物理输出是每条 current-history essential edge 的 `relative rotation + relative
+translation direction`；center distance 只报告，不参与该 relative pass。首版 runner 额外把
+`absolute rotation + reference-to-current center direction` 误作为唯一 `fold_oracle_pass`，从而把
+单目不可恢复的 edge scale 与 frozen L0 history-center error 混入停止门。该旧字段和失败结果继续
+保留为更强的 `absolute trajectory pass`，不能删除或改写；O-R1 另行输出与原始 V9 命题一致的
+`fold_relative_oracle_pass`，relative aggregate 固定为两个角度之和，不做调权。
 
 ## 6. Stage A：显式 2D correspondence 监督
 
@@ -145,7 +147,7 @@ Stage O 通过后，训练小型 matcher。SAM3.1、StreamVGGT 和 pose solver �
 每个 slot/frame 固定采样 32 个位置；所有分支读取相同 query/key UV、valid mask、slot、history
 和帧 support。只允许 descriptor 内容不同，防止 active coverage 造成虚假提升。
 
-SAM descriptor 用固定 UV interpolation 对齐到这 32 个位置。StreamVGGT appearance control 从
+SAM descriptor 直接读取缓存中与 `sam_local_uv` 同时采样的 32 个 local feature。StreamVGGT appearance control 从
 相同位置采样 frozen patch token。UV 不拼入 descriptor projection，防止绝对位置成为 frame code；
 它只用于 label 和 control support。
 
@@ -168,8 +170,8 @@ SAM descriptor 用固定 UV interpolation 对齐到这 32 个位置。StreamVGGT
 
 ```text
 visibility-aware soft target q_ij
-predicted entropic-OT probability p_ij
-L_match = KL(q || p)
+predicted row-softmax probability p_ij + dustbin
+L_match = cross_entropy(q, p)
         + cycle-consistency
         + dustbin/non-visible supervision
 ```
@@ -182,11 +184,11 @@ query 监督到 dustbin，不强迫错误匹配。禁止把 pose loss 接回 mat
 ### 6.4 Held-out matching 指标
 
 - valid visible query coverage；
-- PCK@1/2 feature cells；
-- normalized image EPE；
-- cycle-consistent inlier ratio；
-- expected Sampson error；
-- dustbin precision/recall；
+- PCK@8px（首次实验锁定，不扫描阈值）；
+- mean pixel EPE（拒配 visible query 以图像对角线作有限报告惩罚）；
+- soft-target cross-entropy 与 cycle loss；
+- fixed solver Sampson RMSE；
+- dustbin accuracy；
 - descriptor projector gradient norm；
 - matching-frozen exact。
 
@@ -212,8 +214,9 @@ Stage B 不训练任何参数。将各分支的 `p_ij` 直接作为固定 solver
 | medium | 270–405 | 420–465 |
 | long | 270–465 | 480–525 |
 
-固定训练步数并保留最后 checkpoint，不根据 test 选择 best step。未来帧 target、descriptor 和
-memory 不进入训练前缀。所有 fold 使用同一 frozen L0 和同一 solver 配置。
+固定训练步数并保留最后 checkpoint；`best_step` 只作 train log，不选择 checkpoint，更不会根据
+test 选择模型。未来帧 target、descriptor 和 memory 不进入训练前缀。所有 fold 使用同一 frozen
+L0 和同一 solver 配置。
 
 本实验是同场景时间外推，不是跨场景泛化。
 
@@ -267,7 +270,7 @@ SAM matching 与 pose 均通过，但 predicted K 行失败
   → 首次得到“正确 SAM local token → 2D correspondence → 固定几何 → pose”的因果证据
 ```
 
-## 12. Stage O 已实现入口与输出
+## 12. 已实现入口与输出
 
 Stage O 只保留一条正式命令；缓存不存在时会先重建 V7.4 的 30 帧动态实例观测缓存，存在时不会
 加载 SAM3.1 或 StreamVGGT：
@@ -311,7 +314,7 @@ checkpoint，也不自动进入下一种模型。
 
 该结果不涉及 SAM descriptor，因此只能否定初始 solver，不能写成 SAM token 失败。
 
-### 12.2 O-R1 solver 修正（待运行）
+### 12.2 O-R1 solver 修正结果
 
 O-R1 不改变数据、fold、correspondence 或主指标，仅修正已定位的求解器：
 
@@ -327,6 +330,21 @@ O-R1 不改变数据、fold、correspondence 或主指标，仅修正已定位�
 ```text
 outputs/streaming_couping_v90_epipolar_token_causality_solver_corrected/
 ```
+
+O-R1 已运行。双初始化把初版失败 edge 的 Sampson RMSE 从 `0.02–0.43` 降至通常
+`3e-4–8e-4`；12 个 test frame 的 relative aggregate 均未恶化：
+
+| fold | relative rotation gain | relative direction gain | relative worse frames | relative pass |
+|---|---:|---:|---:|---:|
+| short | +75.6472% | +91.9972% | 0 | 1 |
+| medium | +32.9042% | +86.9888% | 0 | 1 |
+| long | +78.3661% | +58.3310% | 0 | 1 |
+
+因此 `all_folds_relative_oracle_pass=1`，二维 correspondence → fixed essential solver 的上界成立。
+与此同时，short/medium 的 absolute center direction 仍下降，故
+`all_folds_absolute_trajectory_pass=0`。这不是继续调 center fusion 的许可：单目 edge 没有尺度，
+当前阶段应停止 absolute center 优化，只允许 Stage A 判断 SAM local descriptor 能否逼近 oracle
+relative correspondence。即使 Stage A 通过，也只能声明相对 rotation/direction 约束有帮助。
 
 已实现文件：
 
@@ -347,3 +365,36 @@ pose error 决定是否接受结果。
 命令开头的 smoke 同时覆盖动态 birth、NaN-aware 亚像素 z-buffer、完美对应的 essential pose、
 少于 8 点的 exact fallback，以及一个完整的合成逐帧 runner/CSV-schema 路径；服务器不需要
 `pytest` 即可先执行这些检查。
+
+### 12.3 Stage A0/A1 实现（待运行）
+
+Stage A 使用独立目录，不覆盖 dense Stage O 初版或 O-R1 结果：
+
+```text
+streaming_couping/commands_v90_stage_a_correspondence.txt
+streaming_couping/configs/v90_local_token_matcher.yaml
+streaming_couping/src/v90_explicit_matcher.py
+streaming_couping/scripts/run_v90_local_token_matcher.py
+streaming_couping/scripts/smoke_v90_local_token_matcher.py
+streaming_couping/tests/test_v90_explicit_matcher.py
+
+outputs/streaming_couping_v90_epipolar_token_stage_a/
+├── v90_stage_a_summary.csv
+├── v90_stage_a_frames.csv
+├── v90_stage_a_training.csv
+├── v90_stage_a_pairs.csv
+├── v90_stage_a_decision.md
+├── v90_stage_a_metadata.json
+└── checkpoints/
+```
+
+一键命令的固定顺序是：tensor/gradient smoke → cache audit/rebuild → A0 三 fold → A0 hard gate →
+A1。A0 未全折通过时 runner 返回成功状态并保留完整 A0 CSV，但不会创建 matcher checkpoint。
+A1 只训练参数匹配的 Q/K linear projector 和一个 dustbin logit；SAM/StreamVGGT/pose solver 都冻结，
+没有 pose loss。SAM 与 StreamVGGT descriptor 的原始通道数差异通过无参数的 deterministic channel
+pool/pad 统一，因此 trainable Q/K 参数量严格相同。
+
+所有 A1 控制固定同一 current/history/slot/UV/valid support：wrong-ID、shuffle-time 和 channel
+permutation 只替换 descriptor 内容，不替换候选 UV 或有效点数。输出同时记录
+`parameter_matched_qk`、`control_support_exact` 与 `matcher_frozen_exact`，避免再次把 coverage 或
+训练中 pose 适配误认为 SAM token 的作用。

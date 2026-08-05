@@ -54,7 +54,7 @@ geometry-only 分支通常仍使用 SAM mask 和 slot 来规定实例区域，�
 | V7.5 | SAM mask/ID + 显式 ICP/ray solver，无 token、无 pose head | full/bbox/random/stale/wrong-ID、frozen/online history | 局部 fold 有收益，但 region/history 无 all-fold pass | E2（region/ID） |
 | V8 matcher-first | 显式 GT correspondence 监督、冻结 matcher、evidence-only pose | geometry/SAM/combined、trained-off、no-match、dual Value、三个 fold | matcher/pose 均无 all-fold SAM causal pass | 未通过 E3 |
 | V8 O1–O2.7 | 无训练；GT pseudo-match + 显式 Kabsch/几何因子分解 | support、depth、K、scale/affine、Sim3、SAM-instance region | solver 与 GT geometry 可行；predicted depth/K 是当前显式 pose 的瓶颈 | E3 诊断结论，不是 SAM-token 结论 |
-| V9（Stage O/O-R1） | visible-surface 2D correspondence → fixed epipolar solver；后续才接 true SAM local token | calibrated K、raw SAM3.1 动态 slot、最近两次因果历史、short/medium/long、exact fallback | 初始 solver all-fold fail；O-R1 双初始化/有界融合已实现待运行；不读取 predicted depth/pointmap，不训练 matcher/pose head | E0 |
+| V9（O-R1/A0/A1） | visible-surface 2D correspondence → fixed epipolar solver；A0 固定 local32 query；A1 显式 SAM correspondence | calibrated K、动态 slot、最近两次因果历史、三 fold、SAM/patch/uniform/trained-off 与四种扰动 | O-R1 relative edge 全折通过；A0/A1 代码已实现待运行；absolute trajectory 未通过且不再作为 token 主命题 | E3 solver 上界；SAM token A1 为 E0 |
 
 ## 4. 分版本结果
 
@@ -391,7 +391,7 @@ offset 或刚性/相似变换选择，而是局部 depth shape/跨帧一致性�
 | full/bbox/random/stale region control | V7.5 | 已完成 |
 | GT depth / predicted depth 与 GT K / predicted K 分解 | V8 O2.6/O2.7 | 已完成 |
 | scale/affine/Sim3 是否能修复 depth | V8 O2.6/O2.7 | 已完成；不能稳定修复 |
-| SAM token → 2D–2D correspondence → epipolar pose | V9 Stage O 初始 solver 已运行且全折失败；O-R1 修正待运行；SAM matcher 尚未实现 | 与 V4–V8 不同，不使用 depth/3D Value/direct pose head；必须先过 oracle 停止门 |
+| SAM token → 2D–2D correspondence → epipolar pose | V9 O-R1 relative oracle 全折通过；A0 local32 gate 与 A1 matcher/controls 已实现待运行 | Stage A 只验证 relative rotation/direction；禁止宣称 metric center/absolute trajectory 改善 |
 
 ## 6. 已确立、不得反向解释的结论
 
@@ -434,9 +434,10 @@ offset 或刚性/相似变换选择，而是局部 depth shape/跨帧一致性�
 - 只挑选改善帧或用 GT pose error 设计回退阈值；
 - 把同场景第二 clip 称作跨场景泛化。
 
-当前唯一已登记但未完成的新实验是
-[V9 SAM3.1 local-token 二维极几何位姿因果实验](v90_epipolar_token_causality.md)。它必须先通过
-无训练的 oracle 2D solver 上界，失败时不允许继续训练 matcher。
+当前唯一已登记但未完成结果回填的新实验是
+[V9 SAM3.1 local-token 二维极几何位姿因果实验](v90_epipolar_token_causality.md)。dense O-R1
+solver 上界已通过；新实现会先运行固定 `sam_local_uv` 的 local32 A0 gate，A0 任一 fold 失败时
+正常写出 CSV 并停止，不允许训练 A1 matcher。
 
 ## 8. 更新模板
 

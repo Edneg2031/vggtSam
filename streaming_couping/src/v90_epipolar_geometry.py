@@ -61,6 +61,56 @@ class SurfaceCorrespondences:
 
 
 @dataclass
+class LocalTokenReprojection:
+    """GT label attached to a fixed cached SAM local-token query support.
+
+    ``query_valid`` means that the current SAM token lands on a valid visible
+    surface point.  ``target_visible`` additionally means that this point is
+    visible inside the same persistent slot in the historical frame.  The
+    latter is a correspondence target; the former remains a supervised
+    dustbin query when the target is not visible.
+    """
+
+    current_frame: int
+    history_frame: int
+    slot: int
+    current_uv: torch.Tensor
+    history_target_uv: torch.Tensor
+    query_valid: torch.Tensor
+    target_visible: torch.Tensor
+    weights: torch.Tensor
+    depth_residual_metric: torch.Tensor
+
+    @property
+    def query_count(self) -> int:
+        return int(self.query_valid.sum())
+
+    @property
+    def visible_count(self) -> int:
+        return int(self.target_visible.sum())
+
+    def visible_correspondences(self) -> SurfaceCorrespondences:
+        visible = self.target_visible.bool()
+        return SurfaceCorrespondences(
+            current_frame=self.current_frame,
+            history_frame=self.history_frame,
+            slot=self.slot,
+            current_uv=self.current_uv[visible].double(),
+            history_uv=self.history_target_uv[visible].double(),
+            weights=self.weights[visible].double(),
+            depth_residual_metric=self.depth_residual_metric[visible].double(),
+            sampled_queries=self.query_count,
+            projected_in_bounds=int(
+                (
+                    self.query_valid
+                    & torch.isfinite(self.history_target_uv).all(dim=-1)
+                ).sum()
+            ),
+            visible_queries=self.visible_count,
+        )
+
+
+@dataclass
 class EpipolarEstimate:
     rotation_current_to_history: torch.Tensor
     translation_current_origin_in_history: torch.Tensor
@@ -257,6 +307,155 @@ def surface_reprojection_correspondences(
         sampled_queries=sampled_queries,
         projected_in_bounds=projected_in_bounds,
         visible_queries=visible_queries,
+    )
+
+
+def local_token_reprojection_labels(
+    *,
+    current_frame: int,
+    history_frame: int,
+    slot: int,
+    local_uv_normalized: torch.Tensor,
+    local_valid: torch.Tensor,
+    masks: torch.Tensor,
+    world_points_metric: torch.Tensor,
+    depth_metric: torch.Tensor,
+    global_world_to_camera: torch.Tensor,
+    intrinsics: torch.Tensor,
+    config: VisibilityConfig,
+) -> LocalTokenReprojection:
+    """Build continuous history-UV labels for exactly the cached SAM tokens.
+
+    Unlike :func:`surface_reprojection_correspondences`, this function never
+    resamples a dense mask.  The query support and order are exactly
+    ``sam_local_uv``/``sam_local_valid`` from the retained cache, including
+    padding.  GT geometry is used only to create labels and visibility.
+    """
+
+    _validate_surface_inputs(
+        masks=masks,
+        world_points_metric=world_points_metric,
+        depth_metric=depth_metric,
+        global_world_to_camera=global_world_to_camera,
+        intrinsics=intrinsics,
+    )
+    if local_uv_normalized.ndim != 2 or local_uv_normalized.shape[-1] != 2:
+        raise ValueError("V9 local UV must have shape [P,2].")
+    if local_valid.shape != local_uv_normalized.shape[:-1]:
+        raise ValueError("V9 local UV/valid shapes disagree.")
+    sequence, slots, height, width = masks.shape
+    current = int(current_frame)
+    history = int(history_frame)
+    slot_index = int(slot)
+    if not (0 <= history < current < sequence):
+        raise ValueError("V9 local-token correspondence must be strictly causal.")
+    if not 0 <= slot_index < slots:
+        raise ValueError("V9 local-token slot index is out of range.")
+
+    normalized = local_uv_normalized.double()
+    current_uv = torch.stack(
+        [
+            (normalized[:, 0] + 1.0) * 0.5 * max(width - 1, 1),
+            (normalized[:, 1] + 1.0) * 0.5 * max(height - 1, 1),
+        ],
+        dim=-1,
+    )
+    finite_uv = torch.isfinite(current_uv).all(dim=-1)
+    in_current_bounds = (
+        finite_uv
+        & current_uv[:, 0].ge(0.0)
+        & current_uv[:, 0].le(float(width - 1))
+        & current_uv[:, 1].ge(0.0)
+        & current_uv[:, 1].le(float(height - 1))
+    )
+    current_world = world_points_metric[current].double()
+    world_valid = (
+        torch.isfinite(current_world).all(dim=-1)
+        & torch.linalg.vector_norm(current_world, dim=-1).gt(1e-8)
+    )
+    points = torch.stack(
+        [
+            _bilinear_sample(
+                current_world[..., channel],
+                current_uv,
+                positive_only=False,
+                valid_mask=world_valid,
+            )
+            for channel in range(3)
+        ],
+        dim=-1,
+    )
+    current_depth = _bilinear_sample(depth_metric[current].double(), current_uv)
+    current_mask = _nearest_sample_mask(masks[current, slot_index], current_uv)
+    query_valid = (
+        local_valid.bool()
+        & in_current_bounds
+        & current_mask
+        & torch.isfinite(points).all(dim=-1)
+        & torch.isfinite(current_depth)
+        & current_depth.gt(1e-8)
+        & torch.linalg.vector_norm(points, dim=-1).gt(1e-8)
+    )
+
+    history_pose = homogeneous(global_world_to_camera[history]).double()
+    camera = torch.einsum("ij,nj->ni", history_pose[:3, :3], points)
+    camera = camera + history_pose[:3, 3]
+    z = camera[:, 2]
+    projected = torch.einsum("ij,nj->ni", intrinsics[history].double(), camera)
+    safe_z = torch.where(z.abs().gt(1e-12), z, torch.ones_like(z))
+    target_uv = projected[:, :2] / safe_z[:, None]
+    in_history_bounds = (
+        query_valid
+        & torch.isfinite(target_uv).all(dim=-1)
+        & torch.isfinite(z)
+        & z.gt(1e-8)
+        & target_uv[:, 0].ge(0.0)
+        & target_uv[:, 0].le(float(width - 1))
+        & target_uv[:, 1].ge(0.0)
+        & target_uv[:, 1].le(float(height - 1))
+    )
+    history_depth = _bilinear_sample(depth_metric[history].double(), target_uv)
+    history_mask = _nearest_sample_mask(masks[history, slot_index], target_uv)
+    tolerance = torch.maximum(
+        torch.full_like(z, float(config.depth_tolerance_metric)),
+        z.abs() * float(config.relative_depth_tolerance),
+    )
+    residual = (history_depth - z).abs()
+    target_visible = (
+        in_history_bounds
+        & history_mask
+        & torch.isfinite(history_depth)
+        & history_depth.gt(1e-8)
+        & residual.le(tolerance)
+    )
+    weights = torch.zeros_like(z)
+    weights[target_visible] = torch.exp(
+        -0.5
+        * (
+            residual[target_visible]
+            / tolerance[target_visible].clamp_min(1e-12)
+        ).square()
+    )
+    target_uv = torch.where(
+        query_valid[:, None],
+        target_uv,
+        torch.full_like(target_uv, torch.nan),
+    )
+    residual = torch.where(
+        query_valid,
+        residual,
+        torch.full_like(residual, torch.nan),
+    )
+    return LocalTokenReprojection(
+        current_frame=current,
+        history_frame=history,
+        slot=slot_index,
+        current_uv=current_uv,
+        history_target_uv=target_uv,
+        query_valid=query_valid,
+        target_visible=target_visible,
+        weights=weights,
+        depth_residual_metric=residual,
     )
 
 
@@ -938,13 +1137,25 @@ def _skew(vector: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _bilinear_sample(image: torch.Tensor, uv: torch.Tensor) -> torch.Tensor:
+def _bilinear_sample(
+    image: torch.Tensor,
+    uv: torch.Tensor,
+    *,
+    positive_only: bool = True,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     height, width = image.shape
     uv = uv.to(dtype=image.dtype, device=image.device)
     x = 2.0 * uv[:, 0] / max(width - 1, 1) - 1.0
     y = 2.0 * uv[:, 1] / max(height - 1, 1) - 1.0
     grid = torch.stack([x, y], dim=-1).reshape(1, 1, -1, 2)
-    valid = torch.isfinite(image) & image.gt(1e-8)
+    valid = torch.isfinite(image)
+    if positive_only:
+        valid = valid & image.gt(1e-8)
+    if valid_mask is not None:
+        if valid_mask.shape != image.shape:
+            raise ValueError("V9 bilinear valid mask/image shapes disagree.")
+        valid = valid & valid_mask.bool().to(device=image.device)
     safe_image = torch.where(valid, image, torch.zeros_like(image))
     numerator = F.grid_sample(
         safe_image.reshape(1, 1, height, width),

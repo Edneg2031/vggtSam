@@ -1,0 +1,44 @@
+# V9 Stage A: fixed local32 support, then explicit 2D correspondence.
+# This is one locked experiment, not a hyperparameter sweep.
+data_config: streaming_couping/configs/v74_temporal_data.yaml
+output_dir: outputs/streaming_couping_v90_epipolar_token_stage_a
+clip_name: 00a231a370_90_525_step15_37_68_54
+
+# Each dynamic instance reads only its two latest strictly earlier observations.
+max_history: 2
+
+visibility:
+  depth_tolerance_metric: 0.03
+  relative_depth_tolerance: 0.01
+
+# Exactly the corrected O-R1 solver settings. Pose recovery is never trained.
+solver:
+  min_correspondences: 8
+  min_design_rank_ratio: 0.0000001
+  min_cheirality_fraction: 0.50
+  refinement_iterations: 5
+  refinement_huber_delta: 0.002
+  refinement_damping: 0.000001
+  refinement_step_epsilon: 0.000001
+  max_refinement_step: 0.10
+  cheirality_max_points: 128
+
+matcher:
+  # SAM and StreamVGGT controls share these exact trainable Q/K dimensions.
+  # Channel adaptation before Q/K is deterministic and parameter-free.
+  canonical_dim: 256
+  projection_dim: 64
+  temperature: 0.07
+  target_sigma_pixels: 6.0
+  target_radius_pixels: 12.0
+  pck_threshold_pixels: 8.0
+  cycle_weight: 0.10
+
+training:
+  device: cuda:0
+  seed: 90
+  steps: 800
+  batch_pairs: 16
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  log_every: 50

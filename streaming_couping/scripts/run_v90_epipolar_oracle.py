@@ -155,6 +155,20 @@ SUMMARY_COLUMNS = (
     "active_aggregate_worse_frames",
     "fallback_exact",
     "reference_exact",
+    "raw_edge_rotation_error_deg",
+    "oracle_edge_rotation_error_deg",
+    "edge_rotation_gain_percent",
+    "raw_edge_translation_direction_error_deg",
+    "oracle_edge_translation_direction_error_deg",
+    "edge_translation_direction_gain_percent",
+    "raw_relative_aggregate_deg",
+    "oracle_relative_aggregate_deg",
+    "relative_aggregate_gain_percent",
+    "relative_aggregate_worse_frames",
+    "fold_relative_oracle_pass",
+    "all_folds_relative_oracle_pass",
+    "fold_absolute_trajectory_pass",
+    "all_folds_absolute_trajectory_pass",
     "fold_oracle_pass",
     "all_folds_oracle_pass",
 )
@@ -269,12 +283,18 @@ def run_v90_oracle(config: V90Config) -> Path:
             diagnostic_rows.extend(diagnostics)
 
     summary_rows = _summarize(frame_rows, baseline=baseline)
-    all_pass = int(
+    all_absolute_pass = int(
         len(summary_rows) == len(FOLDS)
         and all(int(row["fold_oracle_pass"]) for row in summary_rows)
     )
+    all_relative_pass = int(
+        len(summary_rows) == len(FOLDS)
+        and all(int(row["fold_relative_oracle_pass"]) for row in summary_rows)
+    )
     for row in summary_rows:
-        row["all_folds_oracle_pass"] = all_pass
+        row["all_folds_oracle_pass"] = all_absolute_pass
+        row["all_folds_absolute_trajectory_pass"] = all_absolute_pass
+        row["all_folds_relative_oracle_pass"] = all_relative_pass
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
     summary_path = config.output_dir / "v90_oracle_summary.csv"
@@ -616,12 +636,49 @@ def _summarize(
             )
             for row in group
         )
-        passed = int(
+        absolute_passed = int(
             bool(active)
             and refined_rotation < raw_rotation
             and refined_direction < raw_direction
             and refined_aggregate < raw_aggregate
             and worse == 0
+            and fallback_exact == 1
+            and reference_exact == 1
+        )
+        raw_edge_rotation = _mean(
+            float(row["raw_edge_rotation_error_deg"]) for row in group
+        )
+        oracle_edge_rotation = _mean(
+            float(row["oracle_edge_rotation_error_deg"]) for row in group
+        )
+        raw_edge_direction = _mean(
+            float(row["raw_edge_translation_direction_error_deg"])
+            for row in group
+        )
+        oracle_edge_direction = _mean(
+            float(row["oracle_edge_translation_direction_error_deg"])
+            for row in group
+        )
+        raw_relative_aggregate = raw_edge_rotation + raw_edge_direction
+        oracle_relative_aggregate = (
+            oracle_edge_rotation + oracle_edge_direction
+        )
+        relative_worse = sum(
+            int(
+                float(row["oracle_edge_rotation_error_deg"])
+                + float(row["oracle_edge_translation_direction_error_deg"])
+                > float(row["raw_edge_rotation_error_deg"])
+                + float(row["raw_edge_translation_direction_error_deg"])
+                + 1e-12
+            )
+            for row in group
+        )
+        relative_passed = int(
+            bool(active)
+            and oracle_edge_rotation < raw_edge_rotation
+            and oracle_edge_direction < raw_edge_direction
+            and oracle_relative_aggregate < raw_relative_aggregate
+            and relative_worse == 0
             and fallback_exact == 1
             and reference_exact == 1
         )
@@ -669,7 +726,29 @@ def _summarize(
                 "active_aggregate_worse_frames": worse,
                 "fallback_exact": fallback_exact,
                 "reference_exact": reference_exact,
-                "fold_oracle_pass": passed,
+                "raw_edge_rotation_error_deg": raw_edge_rotation,
+                "oracle_edge_rotation_error_deg": oracle_edge_rotation,
+                "edge_rotation_gain_percent": _gain(
+                    raw_edge_rotation, oracle_edge_rotation
+                ),
+                "raw_edge_translation_direction_error_deg": raw_edge_direction,
+                "oracle_edge_translation_direction_error_deg": oracle_edge_direction,
+                "edge_translation_direction_gain_percent": _gain(
+                    raw_edge_direction, oracle_edge_direction
+                ),
+                "raw_relative_aggregate_deg": raw_relative_aggregate,
+                "oracle_relative_aggregate_deg": oracle_relative_aggregate,
+                "relative_aggregate_gain_percent": _gain(
+                    raw_relative_aggregate, oracle_relative_aggregate
+                ),
+                "relative_aggregate_worse_frames": relative_worse,
+                "fold_relative_oracle_pass": relative_passed,
+                "all_folds_relative_oracle_pass": 0,
+                "fold_absolute_trajectory_pass": absolute_passed,
+                "all_folds_absolute_trajectory_pass": 0,
+                # Backward-compatible alias: the first two V9-O reports used
+                # this name for the stronger absolute-trajectory criterion.
+                "fold_oracle_pass": absolute_passed,
                 "all_folds_oracle_pass": 0,
             }
         )
@@ -677,34 +756,43 @@ def _summarize(
 
 
 def _decision_markdown(rows: Sequence[dict[str, object]]) -> str:
-    all_pass = int(bool(rows) and all(int(row["fold_oracle_pass"]) for row in rows))
+    relative_pass = int(
+        bool(rows)
+        and all(int(row["fold_relative_oracle_pass"]) for row in rows)
+    )
+    absolute_pass = int(
+        bool(rows)
+        and all(int(row["fold_absolute_trajectory_pass"]) for row in rows)
+    )
     lines = [
         "# V9 Stage-O-R1 2D epipolar oracle decision",
         "",
         "No model is trained. GT mesh/pose is used only for visible 2D correspondence labels and scoring.",
         "Pose recovery uses calibrated K, a fixed epipolar solver and frozen StreamVGGT L0 history.",
         "",
-        f"- all-fold visible-surface oracle pass: `{all_pass}`",
+        f"- all-fold relative epipolar oracle pass: `{relative_pass}`",
+        f"- all-fold absolute trajectory pass: `{absolute_pass}`",
         "",
-        "| fold | active | rotation gain | direction gain | worse frames | pass |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| fold | active | relative R gain | relative t-dir gain | relative worse | relative pass | absolute pass |",
+        "|---|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         lines.append(
             f"| {row['fold']} | {row['active_frames']}/{row['frames']} "
-            f"| {float(row['rotation_gain_percent']):.6g} "
-            f"| {float(row['translation_direction_gain_percent']):.6g} "
-            f"| {row['active_aggregate_worse_frames']} "
-            f"| {row['fold_oracle_pass']} |"
+            f"| {float(row['edge_rotation_gain_percent']):.6g} "
+            f"| {float(row['edge_translation_direction_gain_percent']):.6g} "
+            f"| {row['relative_aggregate_worse_frames']} "
+            f"| {row['fold_relative_oracle_pass']} "
+            f"| {row['fold_absolute_trajectory_pass']} |"
         )
     lines.extend(
         [
             "",
             "Interpretation:",
             "",
-            "- pass=0: stop V9 before training a SAM matcher; inspect 2D support/epipolar degeneracy.",
-            "- all-fold pass=1: Stage A may compare SAM local descriptors with UV and StreamVGGT appearance controls.",
-            "- Center error is secondary because a monocular essential matrix does not recover metric edge scale.",
+            "- relative pass=1: Stage A may test SAM local descriptors for relative rotation/direction only.",
+            "- absolute pass=0: no claim is allowed for metric center or absolute trajectory refinement.",
+            "- Monocular essential geometry does not recover edge scale; frozen L0 history-center errors remain downstream.",
             "",
         ]
     )
