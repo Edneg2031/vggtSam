@@ -1,0 +1,11 @@
+# V8 O2.7: fixed-camera intrinsics and SAM-instance depth diagnosis.
+o26_config: streaming_couping/configs/v80_geometry_factorization.yaml
+output_dir: outputs/streaming_couping_v80_instance_geometry
+
+# Same-frame GT depth is used only to fit an oracle affine model inside each
+# SAM3.1 mask. This is a diagnostic upper bound, not an inference method.
+instance_affine:
+  trim_quantile: 0.90
+  trim_iterations: 3
+  min_pixels: 64
+  max_pixels: 32768
