@@ -1,0 +1,92 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+STREAM_GPU0="${V90_STREAM_GPU0:-1}"
+STREAM_GPU1="${V90_STREAM_GPU1:-2}"
+SAM_GPU="${V90_SAM_GPU:-3}"
+VISIBLE_GPUS="$STREAM_GPU0,$STREAM_GPU1,$SAM_GPU"
+CONFIG=streaming_couping/configs/v90_epipolar_oracle.yaml
+DATA_CONFIG=streaming_couping/configs/v74_temporal_data.yaml
+OUTPUT="${V90_OUTPUT:-outputs/streaming_couping_v90_epipolar_token_causality}"
+CACHE=outputs/streaming_couping_v74_temporal_scaling/cache/00a231a370_90_525_step15_37_68_54.pt
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+echo "V9 Stage O: deterministic visibility/epipolar smoke"
+PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.smoke_v90_epipolar_oracle
+
+NEED_REBUILD=0
+if [[ "${V90_REBUILD_CACHE:-0}" == "1" || ! -s "$CACHE" ]]; then
+  NEED_REBUILD=1
+else
+  echo "V9 validating the existing observation cache"
+  if ! PYTHONPATH=. "$PYTHON_BIN" \
+    -m streaming_couping.scripts.audit_v7_cache \
+    --config "$DATA_CONFIG" \
+    --output-dir "$OUTPUT/cache_audit_preflight" \
+    --strict; then
+    echo "V9 existing cache is stale/incomplete; rebuilding it"
+    NEED_REBUILD=1
+  fi
+fi
+
+if (( NEED_REBUILD )); then
+  echo "V9 rebuilding the retained 30-frame observation cache"
+  echo "physical GPUs=$VISIBLE_GPUS"
+  echo "logical layout: StreamVGGT=cuda:0,cuda:1 SAM3.1=cuda:2"
+  CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" \
+  PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+    -m streaming_couping.scripts.run_instance_token_pose \
+    --config "$DATA_CONFIG" \
+    --stage cache \
+    --streamvggt-devices cuda:0,cuda:1 \
+    --sam3-device cuda:2 \
+    --geometry-device cuda:0 \
+    --training-device cuda:0 \
+    --rebuild-cache
+else
+  echo "V9 reusing cache; SAM3.1 and StreamVGGT stay unloaded"
+fi
+
+[[ -s "$CACHE" ]] || {
+  echo "V9 cache was not created: $CACHE" >&2
+  exit 1
+}
+
+echo "V9 auditing the retained dynamic-instance cache"
+PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.audit_v7_cache \
+  --config "$DATA_CONFIG" \
+  --output-dir "$OUTPUT/cache_audit" \
+  --strict
+
+echo "V9 Stage O: GT-visible 2D correspondence + fixed calibrated solver"
+PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.run_v90_epipolar_oracle \
+  --config "$CONFIG" \
+  --output-dir "$OUTPUT"
+
+SUMMARY="$OUTPUT/v90_oracle_summary.csv"
+FRAMES="$OUTPUT/v90_oracle_frames.csv"
+DIAGNOSTICS="$OUTPUT/v90_correspondence_diagnostics.csv"
+DECISION="$OUTPUT/v90_decision.md"
+METADATA="$OUTPUT/v90_metadata.json"
+for file in "$SUMMARY" "$FRAMES" "$DIAGNOSTICS" "$DECISION" "$METADATA"; do
+  [[ -s "$file" ]] || { echo "missing V9 output: $file" >&2; exit 1; }
+done
+
+echo "V9 COPY THIS SUMMARY"
+cat "$SUMMARY"
+echo "V9 COPY THIS DECISION"
+cat "$DECISION"
+echo "V9 detailed frames: $FRAMES"
+echo "V9 visibility/edge diagnostics: $DIAGNOSTICS"
+echo "V9 provenance: $METADATA"

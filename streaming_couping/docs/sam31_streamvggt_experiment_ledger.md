@@ -43,8 +43,8 @@ geometry-only 分支通常仍使用 SAM mask 和 slot 来规定实例区域，�
 
 | 版本 | SAM 表示/作用 | 已完成的关键验证 | 实际结论 | 等级 |
 |---|---|---|---|---|
-| V4 | pooled appearance、mask/ID、几何/patch 分支 | train/held-out/第二 clip、module-off | 整体 pipeline 有提升；token、mask、geometry、ray solver 未隔离 | E2（整体系统） |
-| V5 | V4 前端 + adaptive pointmap + ray-centre solver | held-out/第二 clip、raw/fixed/adaptive、module-off | 最终 pose/pointmap 有提升；无法归因给 SAM token | E2（整体系统） |
+| V4 | pooled appearance/geometry instance token → mask-local DPT patch residual → depth/pointmap | train/held-out/第二 clip、depth/pointmap/pose 联合监督、module-off | 已经验证过 SAM/实例信息参与 learned depth-shape/pointmap 修正；token、mask、geometry、pose 与 ray solver 未隔离 | E2（整体系统） |
+| V5 | V4 learned DPT depth/pointmap 前端 + adaptive pointmap + ray-centre solver | held-out/第二 clip、raw/fixed/adaptive、module-off | 最终 pose/pointmap 有提升；无法归因给 SAM token | E2（整体系统） |
 | V6 | pooled SAM appearance + persistent geometry | overfit、held-out、validation、第二 clip、appearance/geometry/shuffle 控制 | instance/fusion 有部分 held-out 改善，但直接 SE(3) head 和混合输入未排除捷径 | E2 |
 | V7 | pooled token/单 token attention/identity-Key/geometry-Value/local geometry | temporal、validation、第二 clip、long30、输入扰动 | 重型 SAM/geometry 结构未稳定超过 camera L0 | E1/E2 |
 | V7.1 | frozen L0 + global instance residual | camera capacity、gate、appearance、geometry、future/cross | 所有 `causal_instance_pass=0` | 未通过 E3 |
@@ -54,6 +54,7 @@ geometry-only 分支通常仍使用 SAM mask 和 slot 来规定实例区域，�
 | V7.5 | SAM mask/ID + 显式 ICP/ray solver，无 token、无 pose head | full/bbox/random/stale/wrong-ID、frozen/online history | 局部 fold 有收益，但 region/history 无 all-fold pass | E2（region/ID） |
 | V8 matcher-first | 显式 GT correspondence 监督、冻结 matcher、evidence-only pose | geometry/SAM/combined、trained-off、no-match、dual Value、三个 fold | matcher/pose 均无 all-fold SAM causal pass | 未通过 E3 |
 | V8 O1–O2.7 | 无训练；GT pseudo-match + 显式 Kabsch/几何因子分解 | support、depth、K、scale/affine、Sim3、SAM-instance region | solver 与 GT geometry 可行；predicted depth/K 是当前显式 pose 的瓶颈 | E3 诊断结论，不是 SAM-token 结论 |
+| V9（Stage O） | visible-surface 2D correspondence → fixed epipolar solver；后续才接 true SAM local token | calibrated K、raw SAM3.1 动态 slot、最近两次因果历史、short/medium/long、exact fallback | Stage O 已实现未运行；不读取 predicted depth/pointmap，不训练 matcher 或 pose head | E0 |
 
 ## 4. 分版本结果
 
@@ -65,11 +66,18 @@ geometry-only 分支通常仍使用 SAM mask 和 slot 来规定实例区域，�
 - 训练帧 `90,105,119,130,140`，同 clip held-out `210,240`；
 - 第二 clip `492–589`；
 - `aligned` 与 `module_off`；
-- SAM `detector_fpn2` pooled appearance、mask/ID、MATCH geometry/ray support、局部 patch 更新。
+- SAM `detector_fpn2` pooled appearance、mask/ID、MATCH geometry/ray support、局部 DPT patch 更新；
+- pooled appearance/geometry 的 current、memory、difference 被编码为 persistent instance token；
+- instance token cross-attend 到 mask 内 StreamVGGT DPT patch token，随后由冻结的 depth head 和
+  point head 解码 refined depth/world pointmap；
+- 训练损失已经包含 scale-invariant depth、reference-fixed depth、aligned pointmap 和 pose/rigid
+  项，因此广义的“用 SAM/实例信息学习 depth shape/pointmap 修正”不是未做实验。
 
 结果边界：V4 因配置序列上 pose 表现较强而被保留，但正式控制只有整个 module 开/关。
-`module_off` 只能证明模块整体改变了结果，不能区分 pooled appearance、SAM mask、persistent ID、
-StreamVGGT geometry、learned DPT residual 或 ray solver 的贡献。
+`module_off` 只能证明模块整体改变了 depth/pointmap/pose，不能区分 pooled appearance、SAM mask、
+persistent ID、StreamVGGT geometry、learned DPT residual、直接 camera 更新或 ray solver 的贡献。
+它使用 pooled instance appearance，不是 V7.2 起的逐点 SAM local token；同时 depth、pointmap 和
+pose 联合训练，所以也没有证明 depth 改善是 SAM descriptor 而非 geometry/mask 或其它 loss 导致。
 
 因此不得写成“V4 证明 SAM token 改善 pose”。
 
@@ -87,10 +95,11 @@ outputs/streaming_couping_v4_coverage_first/evaluation/ray_pose_compact_summary.
 
 - 与 V4 相同的固定实例、训练/held-out/第二 clip；
 - learned pose、raw pointmap、learned pointmap、固定 blend 与 adaptive support；
+- 沿用 V4 的 instance-token → mask-local DPT patch → learned depth/pointmap 修正；
 - V5 angular-Huber ray-centre solver；
 - `module_off` bit-exact 检查。
 
-结果边界：最终改进同时包含 learned adapter、pointmap 选择、support gate 和解析 solver。
+结果边界：最终改进同时包含 learned DPT adapter、pointmap 选择、support gate 和解析 solver。
 它证明“含 SAM 的完整 pipeline 可改善配置序列”，没有 token-only、geometry-only、wrong-ID 或
 shuffle-time 的公平 held-out 因果比较。
 
@@ -358,6 +367,8 @@ offset 或刚性/相似变换选择，而是局部 depth shape/跨帧一致性�
 
 | 常见提议 | 已完成版本 | 当前结论 |
 |---|---|---|
+| 用 SAM/实例信息学习纠正 depth shape/pointmap | V4、V5 | 已完成；整体 pipeline 为 E2，但 pooled SAM token、mask、geometry、pose head 和 solver 未隔离 |
+| mask-local DPT patch residual + depth/pointmap 联合监督 | V4、V5 | 已完成；不得表述为全新物理中间量方案 |
 | 同一序列能否过拟合 | V6、V7、V7.3 long、V7.4、V8 | 能；直接 pose head 下没有因果意义 |
 | camera-only / instance-only / fusion | V6、V7、V7.1 | 已完成；实例分支有 E2 提升但未归因 token |
 | appearance-only / geometry-only | V6、V7、V7.1、V7.2、V7.3、V7.4 | 已完成；geometry 通常更稳定 |
@@ -380,28 +391,33 @@ offset 或刚性/相似变换选择，而是局部 depth shape/跨帧一致性�
 | full/bbox/random/stale region control | V7.5 | 已完成 |
 | GT depth / predicted depth 与 GT K / predicted K 分解 | V8 O2.6/O2.7 | 已完成 |
 | scale/affine/Sim3 是否能修复 depth | V8 O2.6/O2.7 | 已完成；不能稳定修复 |
+| SAM token → 2D–2D correspondence → epipolar pose | V9 Stage O oracle/solver 已实现未运行；SAM matcher 尚未实现 | 与 V4–V8 不同，不使用 depth/3D Value/direct pose head；必须先过 oracle 停止门 |
 
 ## 6. 已确立、不得反向解释的结论
 
 1. V5/V6 的提升是真实的整体 pipeline 结果，但不能倒推为 SAM local token 的贡献。
-2. 训练 loss 接近零不构成 SAM token 证据；uniform、geometry、SAM 和 wrong-input 分支都曾过拟合。
-3. SAM local token 不是“尚未实现”：V7.2 起已经真实提取并进入模型。
-4. 中途实例不是“尚未实现”：V7.4 起已经支持动态 birth 和因果 memory。
-5. V7.3/V7.4 已经做过 SAM affinity → geometry Value；不得再以相同信息流新建版本。
-6. V7.4/V8 的 all-fold SAM causal pass 均为 0；不能只选择 long 或单帧正结果声称成功。
-7. V7.5 只支持关于 mask/ID 的结论，不能被引用为 descriptor/token 证据。
-8. O1 + GT-depth/GT-K 已证明 solver 与反投影可工作；当前显式 pose 的主要瓶颈是 predicted
+2. V4/V5 已经做过 learned mask-local DPT depth/pointmap 修正；不得再把“让 SAM 帮助纠正
+   depth shape”本身描述为新方向。尚未完成的是对 pooled/local SAM descriptor、mask 和 geometry
+   的严格因果隔离。
+3. 训练 loss 接近零不构成 SAM token 证据；uniform、geometry、SAM 和 wrong-input 分支都曾过拟合。
+4. SAM local token 不是“尚未实现”：V7.2 起已经真实提取并进入模型。
+5. 中途实例不是“尚未实现”：V7.4 起已经支持动态 birth 和因果 memory。
+6. V7.3/V7.4 已经做过 SAM affinity → geometry Value；不得再以相同信息流新建版本。
+7. V7.4/V8 的 all-fold SAM causal pass 均为 0；不能只选择 long 或单帧正结果声称成功。
+8. V7.5 只支持关于 mask/ID 的结论，不能被引用为 descriptor/token 证据。
+9. O1 + GT-depth/GT-K 已证明 solver 与反投影可工作；当前显式 pose 的主要瓶颈是 predicted
    depth shape、predicted K 以及稀疏/陈旧实例历史，而不是再加一个更大的 fusion MLP。
-9. O2.7 表明 SAM instance region 比全图 depth affine 更有上界价值，但仍没有 all-fold pass。
-10. 当前所有 evaluation clip 属于同一 scene；跨场景泛化尚未验证。
+10. O2.7 表明 SAM instance region 比全图 depth affine 更有上界价值，但仍没有 all-fold pass。
+11. 当前所有 evaluation clip 属于同一 scene；跨场景泛化尚未验证。
 
 ## 7. 后续实验准入条件
 
 新实验只有满足至少一项，才算没有重复：
 
 - 去掉直接 pose residual，预测一个可单独用 GT 评估的物理中间量；
-- 使用此前从未监督过的目标，例如因果、部署可用的局部 depth correction，并让固定 solver
-  消费它；
+- 如果重新研究 depth correction，必须明确标为对 V4/V5 旧假设的因果重验，而不是新方向；
+  只有同时改为可独立评分的点级物理输出、去掉 pose head、使用 true SAM local-token 与
+  parameter-matched geometry/mask-only 控制，并由固定 solver 消费时才准入；
 - 在不读取 GT 的推理条件下，先建立 predicted geometry 的 all-fold 上界；
 - 使用真正不同 scene 的数据验证，而不是同 scene 第二 clip；
 - 改变 upstream 可训练边界，例如只微调明确的 StreamVGGT depth/K 子模块，并设置 raw、
@@ -410,11 +426,17 @@ offset 或刚性/相似变换选择，而是局部 depth shape/跨帧一致性�
 以下提议默认拒绝，除非能指出与旧实验的严格差异：
 
 - 再做一个更大的 `camera + SAM + geometry → SE(3)` MLP/Transformer；
+- 再做一个 V4/V5 式 instance token → DPT patch residual，却不增加 SAM-token/geometry/mask
+  因果控制；
 - 再扫一次 token 数、attention heads 或 hidden dimension；
 - 再做一遍 SAM-off/wrong-ID/shuffle-time，但不改变物理输出路径；
 - 只在训练序列把 pose loss 降到零；
 - 只挑选改善帧或用 GT pose error 设计回退阈值；
 - 把同场景第二 clip 称作跨场景泛化。
+
+当前唯一已登记但未完成的新实验是
+[V9 SAM3.1 local-token 二维极几何位姿因果实验](v90_epipolar_token_causality.md)。它必须先通过
+无训练的 oracle 2D solver 上界，失败时不允许继续训练 matcher。
 
 ## 8. 更新模板
 
