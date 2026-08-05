@@ -77,17 +77,20 @@ PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
 
 PRIMARY="$OUTPUT/v80_o26_decision.csv"
 SUMMARY="$OUTPUT/v80_o26_geometry_factorization.csv"
+MEDIUM="$OUTPUT/v80_o26_medium_diagnosis.csv"
 FRAMES="$OUTPUT/v80_o26_frame_diagnostics.csv"
 CALIBRATION="$OUTPUT/v80_o26_depth_intrinsics_diagnostics.csv"
 DECISION="$OUTPUT/v80_o26_decision.md"
 [[ -s "$PRIMARY" ]] || { echo "missing primary CSV: $PRIMARY" >&2; exit 1; }
 [[ -s "$SUMMARY" ]] || { echo "missing fold summary: $SUMMARY" >&2; exit 1; }
+[[ -s "$MEDIUM" ]] || { echo "missing medium diagnosis: $MEDIUM" >&2; exit 1; }
 [[ -s "$FRAMES" ]] || { echo "missing frame CSV: $FRAMES" >&2; exit 1; }
 [[ -s "$CALIBRATION" ]] || { echo "missing calibration CSV: $CALIBRATION" >&2; exit 1; }
 [[ -s "$DECISION" ]] || { echo "missing decision: $DECISION" >&2; exit 1; }
 
 echo "V8 O2.6 compact decision CSV validated: $PRIMARY"
 echo "V8 O2.6 full fold summary: $SUMMARY"
+echo "V8 O2.6 medium four-frame diagnosis: $MEDIUM"
 echo "V8 O2.6 frame diagnostics: $FRAMES"
 echo "V8 O2.6 depth/intrinsics diagnostics: $CALIBRATION"
 echo "V8 O2.6 decision: $DECISION"

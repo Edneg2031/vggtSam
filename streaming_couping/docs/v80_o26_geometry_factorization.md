@@ -53,8 +53,13 @@ zsh streaming_couping/commands_v80_geometry_factorization.txt
 
 ```bash
 cat outputs/streaming_couping_v80_geometry_factorization/v80_o26_decision.csv
+cat outputs/streaming_couping_v80_geometry_factorization/v80_o26_medium_diagnosis.csv
 cat outputs/streaming_couping_v80_geometry_factorization/v80_o26_decision.md
 ```
+
+`v80_o26_medium_diagnosis.csv` 会由一键命令直接打印到终端，固定包含 medium
+的 420/435/450/465 四帧以及 GT-depth/predicted-K、predicted-depth/GT-K、
+当前 O2、affine-depth/GT-K 四个关键分支，无需在服务器上另写筛选命令。
 
 如果需要完整的每个 fold、solver 指标，再复制：
 

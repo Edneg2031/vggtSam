@@ -366,14 +366,22 @@ def run_o26_factorization(config: O26Config) -> Path:
                         )
                     )
     summary = _summarize(frame_rows, config=config)
+    compact = _compact_decision(summary)
+    medium_diagnosis = _medium_diagnosis(
+        frame_rows,
+        compact=compact,
+        calibration_rows=calibration_rows,
+    )
     config.output_dir.mkdir(parents=True, exist_ok=True)
     summary_path = config.output_dir / "v80_o26_geometry_factorization.csv"
     compact_path = config.output_dir / "v80_o26_decision.csv"
+    medium_path = config.output_dir / "v80_o26_medium_diagnosis.csv"
     frame_path = config.output_dir / "v80_o26_frame_diagnostics.csv"
     calibration_path = config.output_dir / "v80_o26_depth_intrinsics_diagnostics.csv"
     decision_path = config.output_dir / "v80_o26_decision.md"
     _write_csv(summary_path, summary)
-    _write_csv(compact_path, _compact_decision(summary))
+    _write_csv(compact_path, compact)
+    _write_csv(medium_path, medium_diagnosis)
     _write_csv(frame_path, frame_rows)
     _write_csv(calibration_path, calibration_rows)
     decision_path.write_text(_decision_markdown(summary), encoding="utf8")
@@ -389,6 +397,7 @@ def run_o26_factorization(config: O26Config) -> Path:
         "outputs": {
             "summary": str(summary_path),
             "compact_decision": str(compact_path),
+            "medium_diagnosis": str(medium_path),
             "frames": str(frame_path),
             "calibration": str(calibration_path),
             "decision": str(decision_path),
@@ -400,6 +409,8 @@ def run_o26_factorization(config: O26Config) -> Path:
     )
     print("V8 O2.6 COMPACT GEOMETRY DECISION (COPY THIS CSV)")
     print(compact_path.read_text(encoding="utf8").rstrip())
+    print("V8 O2.6 MEDIUM FOUR-FRAME DIAGNOSIS (COPY THIS CSV)")
+    print(medium_path.read_text(encoding="utf8").rstrip())
     print(f"V8 O2.6 full fold summary: {summary_path}")
     print(f"V8 O2.6 frame diagnostics: {frame_path}")
     print(f"V8 O2.6 depth/intrinsics diagnostics: {calibration_path}")
@@ -590,6 +601,11 @@ def _frame_row(
         effective >= config.gates.min_effective_correspondences
         and unique_current >= config.gates.min_unique_current_correspondences
     )
+    reasons = list(candidate.reasons)
+    if effective < config.gates.min_effective_correspondences:
+        reasons.append("effective_correspondences_below_limit")
+    if unique_current < config.gates.min_unique_current_correspondences:
+        reasons.append("unique_current_points_below_limit")
     reliable = candidate.bounded_accept and support_pass
     raw_metrics = _pose_metrics(
         baseline[sequence_index],
@@ -642,6 +658,9 @@ def _frame_row(
             str(int(EXPECTED_FRAMES[index]))
             for index in torch.unique(history_frames).tolist()
         ),
+        "instance_slots": " ".join(
+            str(int(slot)) for slot in torch.unique(current_slots).tolist()
+        ),
         "participating_instances": int(torch.unique(current_slots).numel()),
         "correspondences": int(current.shape[0]),
         "effective_correspondences": effective,
@@ -663,7 +682,7 @@ def _frame_row(
         "fallback_exact": int(
             reliable or torch.equal(refined, baseline[sequence_index])
         ),
-        "reason": "accepted" if reliable else ";".join(candidate.reasons),
+        "reason": "accepted" if reliable else ";".join(reasons),
         "raw_rotation_error_deg": raw_metrics[0],
         "raw_center_error_native": raw_metrics[1],
         "raw_pose_loss": raw_metrics[2],
@@ -961,6 +980,92 @@ def _compact_decision(
             all(int(by_fold[fold]["fold_robust_pass"]) for fold in fold_names)
         )
         output.append(result)
+    return output
+
+
+def _medium_diagnosis(
+    frame_rows: Sequence[dict[str, object]],
+    *,
+    compact: Sequence[dict[str, object]],
+    calibration_rows: Sequence[dict[str, object]],
+) -> list[dict[str, object]]:
+    branches = {
+        "o26_gt_depth_pred_intrinsics",
+        "o26_pred_depth_gt_intrinsics",
+        "o26_pred_depth_pred_intrinsics",
+        "o26_affine_calibrated_depth_gt_intrinsics",
+    }
+    selected_solver = {
+        str(row["branch"]): str(row["selected_solver"])
+        for row in compact
+        if row["transform_family"] == "SE3" and row["branch"] in branches
+    }
+    calibration = {
+        (str(row["calibration"]), int(row["sequence_index"])): row
+        for row in calibration_rows
+    }
+    output = []
+    for row in frame_rows:
+        branch = str(row["branch"])
+        if (
+            row["fold"] != "medium"
+            or branch not in branches
+            or row["solver"] != selected_solver.get(branch)
+        ):
+            continue
+        sequence_index = int(row["sequence_index"])
+        scale_fit = calibration[("scale", sequence_index)]
+        affine_fit = calibration[("affine", sequence_index)]
+        raw_loss = float(row["raw_pose_loss"])
+        reliable_loss = float(row["reliable_pose_loss"])
+        output.append(
+            {
+                "fold": row["fold"],
+                "frame_index": row["frame_index"],
+                "branch": branch,
+                "depth_source": row["depth_source"],
+                "intrinsics_source": row["intrinsics_source"],
+                "depth_calibration": row["depth_calibration"],
+                "selected_solver": row["solver"],
+                "history_frame_indices": row["history_frame_indices"],
+                "instance_slots": row["instance_slots"],
+                "participating_instances": row["participating_instances"],
+                "correspondences": row["correspondences"],
+                "effective_correspondences": row["effective_correspondences"],
+                "unique_current_correspondences": row["unique_current_correspondences"],
+                "fit_scale": row["fit_scale"],
+                "fit_rmse_metric": row["fit_rmse_metric"],
+                "fit_p90_metric": row["fit_p90_metric"],
+                "reliable_accept": row["reliable_accept"],
+                "reason": row["reason"],
+                "raw_rotation_error_deg": row["raw_rotation_error_deg"],
+                "raw_center_error_native": row["raw_center_error_native"],
+                "raw_pose_loss": raw_loss,
+                "proposed_rotation_error_deg": row["proposed_rotation_error_deg"],
+                "proposed_center_error_native": row["proposed_center_error_native"],
+                "proposed_pose_loss": row["proposed_pose_loss"],
+                "reliable_pose_loss": reliable_loss,
+                "frame_gain_percent": _gain(raw_loss, reliable_loss),
+                "pose_improved": row["pose_improved"],
+                "pose_worse": row["pose_worse"],
+                "pred_fx_relative_error": row["pred_fx_relative_error"],
+                "pred_fy_relative_error": row["pred_fy_relative_error"],
+                "pred_cx_error_pixels": row["pred_cx_error_pixels"],
+                "pred_cy_error_pixels": row["pred_cy_error_pixels"],
+                "global_scale_depth_a": scale_fit["depth_scale"],
+                "global_scale_depth_rmse_metric": scale_fit["after_rmse_metric"],
+                "global_affine_depth_a": affine_fit["depth_scale"],
+                "global_affine_depth_b_native": affine_fit["depth_offset_native"],
+                "global_affine_depth_rmse_metric": affine_fit["after_rmse_metric"],
+                "global_affine_depth_p90_metric": affine_fit["after_p90_metric"],
+            }
+        )
+    expected = len(branches) * len(FOLDS[1].test_frames)
+    if len(output) != expected:
+        raise RuntimeError(
+            "O2.6 medium diagnosis schema selection failed: "
+            f"expected={expected}, got={len(output)}."
+        )
     return output
 
 
