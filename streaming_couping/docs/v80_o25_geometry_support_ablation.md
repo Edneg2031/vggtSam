@@ -10,7 +10,10 @@ O1/O2 已确认 30/30 帧坐标审计通过，但暴露了两个问题：medium 
 zsh streaming_couping/commands_v80_geometry_support_ablation.txt
 ```
 
-它只读取已有 V7.4 长序列 cache，在 CPU 上运行小规模 Kabsch，不加载两个 backbone。
+已有 V7.4 长序列 cache 时，它只在 CPU 上运行小规模 Kabsch，不加载两个 backbone。cache 被删除
+或 strict audit 不通过时，命令会用三张卡只重建这一份 30 帧 observation cache，然后自动继续；
+不会运行 V7.4/V8 pose 训练。物理卡可通过 `V80_O25_STREAM_GPU0`、
+`V80_O25_STREAM_GPU1`、`V80_O25_SAM_GPU` 覆盖。
 
 ## Support sweep
 
