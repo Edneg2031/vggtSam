@@ -383,6 +383,8 @@ outputs/streaming_couping_v90_epipolar_token_stage_a/
 ├── v90_stage_a_frames.csv
 ├── v90_stage_a_training.csv
 ├── v90_stage_a_pairs.csv
+├── v90_stage_a_edges.csv
+├── v90_stage_a_problem_edges.csv
 ├── v90_stage_a_decision.md
 ├── v90_stage_a_metadata.json
 └── checkpoints/
@@ -398,3 +400,7 @@ pool/pad 统一，因此 trainable Q/K 参数量严格相同。
 permutation 只替换 descriptor 内容，不替换候选 UV 或有效点数。输出同时记录
 `parameter_matched_qk`、`control_support_exact` 与 `matcher_frozen_exact`，避免再次把 coverage 或
 训练中 pose 适配误认为 SAM token 的作用。
+
+若 A0 出现恶化帧，`v90_stage_a_edges.csv` 会记录每条 current-history edge 的 UV bbox/convex-hull
+覆盖率、二维协方差比、design condition、双初始化 residual、cheirality 及 relative pose error；
+`v90_stage_a_problem_edges.csv` 只保留恶化帧所属 edge，并由一键命令直接打印，便于复制诊断。

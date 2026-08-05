@@ -71,9 +71,11 @@ SUMMARY="$OUTPUT/v90_stage_a_summary.csv"
 FRAMES="$OUTPUT/v90_stage_a_frames.csv"
 TRAINING="$OUTPUT/v90_stage_a_training.csv"
 PAIRS="$OUTPUT/v90_stage_a_pairs.csv"
+EDGES="$OUTPUT/v90_stage_a_edges.csv"
+PROBLEM_EDGES="$OUTPUT/v90_stage_a_problem_edges.csv"
 DECISION="$OUTPUT/v90_stage_a_decision.md"
 METADATA="$OUTPUT/v90_stage_a_metadata.json"
-for file in "$SUMMARY" "$FRAMES" "$TRAINING" "$PAIRS" "$DECISION" "$METADATA"; do
+for file in "$SUMMARY" "$FRAMES" "$TRAINING" "$PAIRS" "$EDGES" "$PROBLEM_EDGES" "$DECISION" "$METADATA"; do
   [[ -s "$file" ]] || { echo "missing V9 Stage A output: $file" >&2; exit 1; }
 done
 
@@ -81,7 +83,10 @@ echo "V9 STAGE A COPY THIS SUMMARY"
 cat "$SUMMARY"
 echo "V9 STAGE A COPY THIS DECISION"
 cat "$DECISION"
+echo "V9 STAGE A COPY THESE PROBLEM-FRAME EDGES"
+cat "$PROBLEM_EDGES"
 echo "V9 Stage A detailed frames: $FRAMES"
 echo "V9 Stage A training health: $TRAINING"
 echo "V9 Stage A local32 pair/support diagnostics: $PAIRS"
+echo "V9 Stage A all edge diagnostics: $EDGES"
 echo "V9 Stage A provenance: $METADATA"

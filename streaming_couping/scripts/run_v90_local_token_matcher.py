@@ -168,6 +168,48 @@ PAIR_COLUMNS = (
     "mean_nearest_key_distance_pixels",
 )
 
+EDGE_COLUMNS = (
+    "stage",
+    "fold",
+    "architecture",
+    "variant",
+    "sequence_index",
+    "frame_index",
+    "history_sequence_index",
+    "history_frame_index",
+    "participating_slots",
+    "slot_correspondence_counts",
+    "correspondences",
+    "effective_correspondences",
+    "current_uv_bbox_coverage_fraction",
+    "history_uv_bbox_coverage_fraction",
+    "current_uv_hull_coverage_fraction",
+    "history_uv_hull_coverage_fraction",
+    "current_uv_covariance_ratio",
+    "history_uv_covariance_ratio",
+    "design_rank_ratio",
+    "design_condition",
+    "sampson_rmse",
+    "eight_point_sampson_rmse",
+    "l0_local_sampson_rmse",
+    "inlier_ratio",
+    "cheirality_fraction",
+    "refinement_iterations",
+    "initialization",
+    "edge_success",
+    "edge_reason",
+    "raw_edge_rotation_error_deg",
+    "refined_edge_rotation_error_deg",
+    "rotation_improvement_deg",
+    "raw_edge_translation_direction_error_deg",
+    "refined_edge_translation_direction_error_deg",
+    "translation_direction_improvement_deg",
+    "raw_relative_aggregate_deg",
+    "refined_relative_aggregate_deg",
+    "relative_aggregate_improvement_deg",
+    "relative_aggregate_worse",
+)
+
 
 @dataclass(frozen=True)
 class TrainingConfig:
@@ -273,9 +315,10 @@ def run_stage_a(
     pair_rows = _pair_diagnostic_rows(records_by_fold, data=data)
     summary_rows: list[dict[str, object]] = []
     frame_rows: list[dict[str, object]] = []
+    edge_rows: list[dict[str, object]] = []
     train_rows: list[dict[str, object]] = []
     for fold in FOLDS:
-        rows, frames = _evaluate_a0(
+        rows, frames, edges = _evaluate_a0(
             fold_name=fold.name,
             test_frames=fold.test_frames,
             records=records_by_fold[fold.name]["test"],
@@ -284,6 +327,7 @@ def run_stage_a(
         )
         summary_rows.append(rows)
         frame_rows.extend(frames)
+        edge_rows.extend(edges)
     all_a0_pass = int(
         len(summary_rows) == len(FOLDS)
         and all(int(row["fold_a0_pass"]) for row in summary_rows)
@@ -300,6 +344,7 @@ def run_stage_a(
             frame_rows=frame_rows,
             train_rows=train_rows,
             pair_rows=pair_rows,
+            edge_rows=edge_rows,
             cache_file=cache_file,
             stopped_after_a0=not bool(all_a0_pass),
         )
@@ -339,7 +384,7 @@ def run_stage_a(
             )
             state = trained.get((fold.name, architecture))
             for variant in variants:
-                row, frames = _evaluate_matcher(
+                row, frames, edges = _evaluate_matcher(
                     fold_name=fold.name,
                     train_frames=fold.train_frames,
                     test_frames=fold.test_frames,
@@ -352,6 +397,7 @@ def run_stage_a(
                 )
                 summary_rows.append(row)
                 frame_rows.extend(frames)
+                edge_rows.extend(edges)
     _annotate_a1_decisions(summary_rows)
     return _write_outputs(
         config,
@@ -359,6 +405,7 @@ def run_stage_a(
         frame_rows=frame_rows,
         train_rows=train_rows,
         pair_rows=pair_rows,
+        edge_rows=edge_rows,
         cache_file=cache_file,
         stopped_after_a0=False,
     )
@@ -550,11 +597,15 @@ def _evaluate_a0(
     records: Sequence[PairRecord],
     data: StageAData,
     config: StageAConfig,
-) -> tuple[dict[str, object], list[dict[str, object]]]:
+) -> tuple[
+    dict[str, object],
+    list[dict[str, object]],
+    list[dict[str, object]],
+]:
     predictions = {
         id(record): record.labels.visible_correspondences() for record in records
     }
-    frame_rows = _pose_frame_rows(
+    frame_rows, edge_rows = _pose_frame_rows(
         stage="A0",
         fold_name=fold_name,
         architecture="local32_same_support_oracle",
@@ -590,7 +641,7 @@ def _evaluate_a0(
         and int(summary["relative_aggregate_worse_frames"]) == 0
     )
     summary["fold_a0_pass"] = passed
-    return summary, frame_rows
+    return summary, frame_rows, edge_rows
 
 
 def _train_matcher(
@@ -825,7 +876,11 @@ def _evaluate_matcher(
     data: StageAData,
     config: StageAConfig,
     state: TrainState | None,
-) -> tuple[dict[str, object], list[dict[str, object]]]:
+) -> tuple[
+    dict[str, object],
+    list[dict[str, object]],
+    list[dict[str, object]],
+]:
     if architecture == "mask_uv_uniform":
         if state is not None:
             raise ValueError("V9 uniform control must not have a trained state.")
@@ -898,7 +953,7 @@ def _evaluate_matcher(
             stats[id(record)] = _match_statistics(
                 record, probability=probability, accepted=accepted, config=config
             )
-    frame_rows = _pose_frame_rows(
+    frame_rows, edge_rows = _pose_frame_rows(
         stage="A1",
         fold_name=fold_name,
         architecture=architecture,
@@ -940,7 +995,7 @@ def _evaluate_matcher(
             for record in records
         ),
     )
-    return summary, frame_rows
+    return summary, frame_rows, edge_rows
 
 
 def _evaluation_inputs(
@@ -1056,11 +1111,12 @@ def _pose_frame_rows(
     match_stats: dict[int, dict[str, float]] | None,
     data: StageAData,
     config: StageAConfig,
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     by_current: dict[int, list[PairRecord]] = {}
     for record in records:
         by_current.setdefault(record.current, []).append(record)
     rows = []
+    edge_rows = []
     diagonal = math.hypot(*data.image_size)
     for frame_value in test_frames:
         current = data.frames.index(int(frame_value))
@@ -1104,6 +1160,27 @@ def _pose_frame_rows(
                     target_relative,
                 )
                 sampson_rows.append(float(estimate.sampson_rmse))
+            edge_rows.append(
+                _edge_diagnostic_row(
+                    stage=stage,
+                    fold_name=fold_name,
+                    architecture=architecture,
+                    variant=variant,
+                    current=current,
+                    history=history,
+                    edge_records=edge_records,
+                    pairs=pairs,
+                    current_uv=current_uv,
+                    history_uv=history_uv,
+                    weights=weights,
+                    estimate=estimate,
+                    raw_rotation=raw_r,
+                    refined_rotation=refined_r,
+                    raw_direction=raw_t,
+                    refined_direction=refined_t,
+                    data=data,
+                )
+            )
             raw_rotation_rows.append(raw_r)
             refined_rotation_rows.append(refined_r)
             raw_direction_rows.append(raw_t)
@@ -1203,7 +1280,148 @@ def _pose_frame_rows(
                 ),
             }
         )
-    return rows
+    return rows, edge_rows
+
+
+def _edge_diagnostic_row(
+    *,
+    stage: str,
+    fold_name: str,
+    architecture: str,
+    variant: str,
+    current: int,
+    history: int,
+    edge_records: Sequence[PairRecord],
+    pairs: Sequence[SurfaceCorrespondences],
+    current_uv: torch.Tensor,
+    history_uv: torch.Tensor,
+    weights: torch.Tensor,
+    estimate,
+    raw_rotation: float,
+    refined_rotation: float,
+    raw_direction: float,
+    refined_direction: float,
+    data: StageAData,
+) -> dict[str, object]:
+    del weights
+    slot_counts = [
+        (record.slot, pair.count)
+        for record, pair in zip(edge_records, pairs)
+        if pair.count > 0
+    ]
+    raw_aggregate = float(raw_rotation) + float(raw_direction)
+    refined_aggregate = float(refined_rotation) + float(refined_direction)
+    return {
+        "stage": stage,
+        "fold": fold_name,
+        "architecture": architecture,
+        "variant": variant,
+        "sequence_index": current,
+        "frame_index": data.frames[current],
+        "history_sequence_index": history,
+        "history_frame_index": data.frames[history],
+        "participating_slots": " ".join(str(slot) for slot, _ in slot_counts),
+        "slot_correspondence_counts": " ".join(
+            f"{slot}:{count}" for slot, count in slot_counts
+        ),
+        "correspondences": int(current_uv.shape[0]),
+        "effective_correspondences": float(estimate.effective_correspondences),
+        "current_uv_bbox_coverage_fraction": _uv_bbox_coverage(
+            current_uv, image_size=data.image_size
+        ),
+        "history_uv_bbox_coverage_fraction": _uv_bbox_coverage(
+            history_uv, image_size=data.image_size
+        ),
+        "current_uv_hull_coverage_fraction": _uv_hull_coverage(
+            current_uv, image_size=data.image_size
+        ),
+        "history_uv_hull_coverage_fraction": _uv_hull_coverage(
+            history_uv, image_size=data.image_size
+        ),
+        "current_uv_covariance_ratio": _uv_covariance_ratio(current_uv),
+        "history_uv_covariance_ratio": _uv_covariance_ratio(history_uv),
+        "design_rank_ratio": float(estimate.design_rank_ratio),
+        "design_condition": float(estimate.design_condition),
+        "sampson_rmse": float(estimate.sampson_rmse),
+        "eight_point_sampson_rmse": float(estimate.eight_point_sampson_rmse),
+        "l0_local_sampson_rmse": float(estimate.l0_local_sampson_rmse),
+        "inlier_ratio": float(estimate.inlier_ratio),
+        "cheirality_fraction": float(estimate.cheirality_fraction),
+        "refinement_iterations": int(estimate.refinement_iterations),
+        "initialization": str(estimate.initialization),
+        "edge_success": int(estimate.success),
+        "edge_reason": str(estimate.reason),
+        "raw_edge_rotation_error_deg": raw_rotation,
+        "refined_edge_rotation_error_deg": refined_rotation,
+        "rotation_improvement_deg": raw_rotation - refined_rotation,
+        "raw_edge_translation_direction_error_deg": raw_direction,
+        "refined_edge_translation_direction_error_deg": refined_direction,
+        "translation_direction_improvement_deg": raw_direction - refined_direction,
+        "raw_relative_aggregate_deg": raw_aggregate,
+        "refined_relative_aggregate_deg": refined_aggregate,
+        "relative_aggregate_improvement_deg": raw_aggregate - refined_aggregate,
+        "relative_aggregate_worse": int(
+            refined_aggregate > raw_aggregate + 1e-12
+        ),
+    }
+
+
+def _uv_bbox_coverage(
+    uv: torch.Tensor, *, image_size: tuple[int, int]
+) -> float:
+    finite = uv[torch.isfinite(uv).all(dim=-1)].double()
+    if int(finite.shape[0]) < 2:
+        return 0.0
+    height, width = (int(value) for value in image_size)
+    extent = finite.max(dim=0).values - finite.min(dim=0).values
+    denominator = float(max(width - 1, 1) * max(height - 1, 1))
+    return float((extent[0] * extent[1]).clamp_min(0.0)) / denominator
+
+
+def _uv_hull_coverage(
+    uv: torch.Tensor, *, image_size: tuple[int, int]
+) -> float:
+    finite = uv[torch.isfinite(uv).all(dim=-1)].double().cpu().tolist()
+    points = sorted({(float(row[0]), float(row[1])) for row in finite})
+    if len(points) < 3:
+        return 0.0
+
+    def cross(origin, first, second) -> float:
+        return (first[0] - origin[0]) * (second[1] - origin[1]) - (
+            first[1] - origin[1]
+        ) * (second[0] - origin[0])
+
+    lower = []
+    for point in points:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0.0:
+            lower.pop()
+        lower.append(point)
+    upper = []
+    for point in reversed(points):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0.0:
+            upper.pop()
+        upper.append(point)
+    hull = lower[:-1] + upper[:-1]
+    area = 0.5 * abs(
+        sum(
+            first[0] * second[1] - second[0] * first[1]
+            for first, second in zip(hull, hull[1:] + hull[:1])
+        )
+    )
+    height, width = (int(value) for value in image_size)
+    return area / float(max(width - 1, 1) * max(height - 1, 1))
+
+
+def _uv_covariance_ratio(uv: torch.Tensor) -> float:
+    finite = uv[torch.isfinite(uv).all(dim=-1)].double()
+    if int(finite.shape[0]) < 3:
+        return 0.0
+    centered = finite - finite.mean(dim=0, keepdim=True)
+    covariance = centered.transpose(0, 1) @ centered
+    covariance = covariance / max(int(finite.shape[0]) - 1, 1)
+    eigenvalues = torch.linalg.eigvalsh(covariance).clamp_min(0.0)
+    maximum = float(eigenvalues[-1])
+    return 0.0 if maximum <= 1e-12 else float(eigenvalues[0]) / maximum
 
 
 def _summary_row(
@@ -1401,6 +1619,7 @@ def _write_outputs(
     frame_rows: Sequence[dict[str, object]],
     train_rows: Sequence[dict[str, object]],
     pair_rows: Sequence[dict[str, object]],
+    edge_rows: Sequence[dict[str, object]],
     cache_file: Path,
     stopped_after_a0: bool,
 ) -> Path:
@@ -1408,10 +1627,42 @@ def _write_outputs(
     frames = config.output_dir / "v90_stage_a_frames.csv"
     training = config.output_dir / "v90_stage_a_training.csv"
     pairs = config.output_dir / "v90_stage_a_pairs.csv"
+    edges = config.output_dir / "v90_stage_a_edges.csv"
+    problem_edges = config.output_dir / "v90_stage_a_problem_edges.csv"
     _write_csv(summary, summary_rows, SUMMARY_COLUMNS)
     _write_csv(frames, frame_rows, FRAME_COLUMNS)
     _write_csv(training, train_rows, TRAIN_COLUMNS, allow_empty=True)
     _write_csv(pairs, pair_rows, PAIR_COLUMNS)
+    _write_csv(edges, edge_rows, EDGE_COLUMNS)
+    problem_frame_keys = {
+        (
+            row["stage"],
+            row["fold"],
+            row["architecture"],
+            row["variant"],
+            row["frame_index"],
+        )
+        for row in frame_rows
+        if int(row["relative_aggregate_worse"])
+    }
+    selected_problem_edges = [
+        row
+        for row in edge_rows
+        if (
+            row["stage"],
+            row["fold"],
+            row["architecture"],
+            row["variant"],
+            row["frame_index"],
+        )
+        in problem_frame_keys
+    ]
+    _write_csv(
+        problem_edges,
+        selected_problem_edges,
+        EDGE_COLUMNS,
+        allow_empty=True,
+    )
     (config.output_dir / "v90_stage_a_decision.md").write_text(
         _decision_markdown(summary_rows, stopped_after_a0=stopped_after_a0),
         encoding="utf8",
@@ -1440,6 +1691,8 @@ def _write_outputs(
             "frames": str(frames),
             "training": str(training),
             "pairs": str(pairs),
+            "edges": str(edges),
+            "problem_edges": str(problem_edges),
         },
     }
     (config.output_dir / "v90_stage_a_metadata.json").write_text(
