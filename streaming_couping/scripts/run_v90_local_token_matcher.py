@@ -1322,7 +1322,24 @@ def _pose_frame_rows(
             else 0.0
         )
         epe_sum = 0.0
-        if match_stats is not None:
+        metrics_precomputed = bool(
+            match_stats is not None
+            and current_records
+            and all(
+                bool(match_stats[id(record)].get("metrics_precomputed", 0.0))
+                for record in current_records
+            )
+        )
+        if metrics_precomputed:
+            pck_correct = sum(
+                float(match_stats[id(record)]["pck_correct"])
+                for record in current_records
+            )
+            epe_sum = sum(
+                float(match_stats[id(record)]["epe_sum_pixels"])
+                for record in current_records
+            )
+        elif match_stats is not None:
             for record in current_records:
                 predicted = predictions[id(record)]
                 # Recover per-query predictions again only for metrics; this
