@@ -1,7 +1,7 @@
 # V9：SAM3.1 local-token 二维极几何位姿因果实验
 
-> 状态：`Stage O-R1 relative oracle 已全折通过；Stage A0 all-edge 已完成并失败；A0-H best-condition/A1 已实现待运行；absolute trajectory 不作为 token 主命题`
-> 日期：2026-08-05  
+> 状态：`Stage O-R1 relative oracle 与 A0-H best-condition 已全折通过；Stage A0 all-edge 和 A1 SAM matcher 已完成但未通过；absolute trajectory 不作为 token 主命题`
+> 日期：2026-08-06
 > 核心目标：验证 SAM3.1 local descriptor 是否能通过真实 2D–2D 对应改善 StreamVGGT 的
 > 相机 rotation 与 translation direction，而不使用 predicted depth、pointmap Kabsch 或
 > learned pose residual。
@@ -366,7 +366,7 @@ pose error 决定是否接受结果。
 少于 8 点的 exact fallback，以及一个完整的合成逐帧 runner/CSV-schema 路径；服务器不需要
 `pytest` 即可先执行这些检查。
 
-### 12.3 Stage A0/A1 实现（待运行）
+### 12.3 Stage A0/A1 实现（已运行）
 
 Stage A 使用独立目录，不覆盖 dense Stage O 初版或 O-R1 结果：
 
@@ -438,3 +438,39 @@ CSV 新增 `edge_selection_policy`、`pose_edges_used`、选中 history index/fr
 trained-off 与全部扰动分支固定使用同一个 `best_design_condition_single` 算法；只有该 A0-H 在
 short/medium/long 全折通过才允许训练 A1。这个修改不增加 token 数、不改变 history 候选、不扫描
 阈值，也不声称 metric center 或 absolute trajectory 改善。
+
+### 12.5 A0-H/A1 最终结果（2026-08-06）
+
+`best_design_condition_single` A0-H 已在 short、medium、long 三个严格时间 fold 全部通过：
+
+| fold | active | raw aggregate | refined aggregate | gain | worse frames |
+|---|---:|---:|---:|---:|---:|
+| short | 4/4 | 13.737° | 1.279° | 90.69% | 0 |
+| medium | 4/4 | 13.801° | 1.707° | 87.63% | 0 |
+| long | 4/4 | 25.748° | 6.877° | 73.29% | 0 |
+
+这证明：在实例内 current local32 query 已知正确的连续 history UV，且只选择 design condition
+最好的因果 history edge 时，固定 O-R1 solver 可以稳定改善 relative rotation 和 translation
+direction。A0-H 不读取 SAM descriptor，history 对应也不是从实际离散 32-key 中选择，因此它是
+solver/query-support 上界，不是 SAM-token 证据。
+
+A0-H gate 通过后，A1 按预注册协议实际训练了 800 steps。正常 SAM 分支结果如下：
+
+| fold | train loss | held-out PCK@8px | EPE | raw aggregate | refined aggregate | worse frames |
+|---|---:|---:|---:|---:|---:|---:|
+| short | 5.153 → 0.429 | 2.59% | 142.37 px | 17.886° | 128.781° | 4/4 |
+| medium | 4.452 → 0.548 | 0% | 284.45 px | 19.761° | 111.955° | 4/4 |
+| long | 4.098 → 0.595 | 0.80% | 321.93 px | 25.988° | 154.722° | 4/4 |
+
+训练 objective 下降 85%–92%，但 held-out matching 与 pose 同时失败。正常 SAM 没有稳定超过
+StreamVGGT patch、uniform、trained-off、wrong-ID、shuffle-time 或 channel-permutation 控制；其中
+channel permutation 在三 fold 的 EPE 都低于正常 SAM。故当前结果支持以下边界：
+
+- 正确实例内二维 correspondence 能改善 relative pose：已证实；
+- 当前 `detector_fpn2 + farthest-UV local32 + Linear Q/K` 能产生这种未来对应：未通过，在当前
+  协议下被证伪；
+- 仅凭训练 loss 下降判断 SAM token 学成：被证伪；
+- metric center、absolute trajectory、跨 scene 泛化：本实验未回答。
+
+后续若继续，只先做 `A0-Q` 离散 history-key oracle 和 train/test matcher audit；不再重复扩大 pose
+head、fusion MLP、token 数或 solver sweep。

@@ -1,6 +1,6 @@
 # SAM3.1 × StreamVGGT 实验验证账本
 
-> 最后更新：2026-08-05  
+> 最后更新：2026-08-06
 > 用途：这是后续方案设计前必须检查的单一历史账本。它记录“已经实现什么、实际跑过什么、
 > 结果是否通过、最多能支持什么结论”，避免把旧实验换一个版本号后重复执行。
 
@@ -28,7 +28,7 @@
 | `E2 相关` | held-out 指标有改善，但没有排除容量、mask、gate、geometry 或直接 pose-head 捷径 |
 | `E3 因果` | held-out 超过公平控制，正确输入优于 SAM-off/wrong-ID/shuffle，并通过预先锁定的判据 |
 
-截至 2026-08-05，尚无实验达到“**SAM3.1 local descriptor/token 对 StreamVGGT pose 的 E3 因果证明**”。
+截至 2026-08-06，尚无实验达到“**SAM3.1 local descriptor/token 对 StreamVGGT pose 的 E3 因果证明**”。
 
 必须同时区分以下三个命题：
 
@@ -54,7 +54,7 @@ geometry-only 分支通常仍使用 SAM mask 和 slot 来规定实例区域，�
 | V7.5 | SAM mask/ID + 显式 ICP/ray solver，无 token、无 pose head | full/bbox/random/stale/wrong-ID、frozen/online history | 局部 fold 有收益，但 region/history 无 all-fold pass | E2（region/ID） |
 | V8 matcher-first | 显式 GT correspondence 监督、冻结 matcher、evidence-only pose | geometry/SAM/combined、trained-off、no-match、dual Value、三个 fold | matcher/pose 均无 all-fold SAM causal pass | 未通过 E3 |
 | V8 O1–O2.7 | 无训练；GT pseudo-match + 显式 Kabsch/几何因子分解 | support、depth、K、scale/affine、Sim3、SAM-instance region | solver 与 GT geometry 可行；predicted depth/K 是当前显式 pose 的瓶颈 | E3 诊断结论，不是 SAM-token 结论 |
-| V9（O-R1/A0-H/A1） | visible-surface 2D correspondence → fixed epipolar solver；A0 固定 local32 query；A0-H 用 design condition 选单 history edge；A1 显式 SAM correspondence | calibrated K、动态 slot、最近两次因果历史、三 fold、SAM/patch/uniform/trained-off 与四种扰动 | O-R1 relative edge 全折通过；原 all-edge A0 仅 short 通过，450/495 被坏 history edge 拉差；A0-H/A1 已实现待运行 | E3 solver 上界；原 A0 未通过；SAM token A1 为 E0 |
+| V9（O-R1/A0-H/A1） | visible-surface 2D correspondence → fixed epipolar solver；A0 固定 local32 query；A0-H 用 design condition 选单 history edge；A1 显式 SAM correspondence | calibrated K、动态 slot、最近两次因果历史、三 fold、SAM/patch/uniform/trained-off 与四种扰动 | O-R1 与 A0-H 全折通过；A1 train loss 下降 85%–92%，但未来 PCK 仅 0%–2.59%，12/12 pose frame 恶化，all-fold causal pass=0 | E3 solver/support 上界；当前 SAM token matcher 未通过 E3 |
 
 ## 4. 分版本结果
 
@@ -391,7 +391,7 @@ offset 或刚性/相似变换选择，而是局部 depth shape/跨帧一致性�
 | full/bbox/random/stale region control | V7.5 | 已完成 |
 | GT depth / predicted depth 与 GT K / predicted K 分解 | V8 O2.6/O2.7 | 已完成 |
 | scale/affine/Sim3 是否能修复 depth | V8 O2.6/O2.7 | 已完成；不能稳定修复 |
-| SAM token → 2D–2D correspondence → epipolar pose | V9 O-R1 relative oracle 全折通过；原 A0 all-edge 仅 short 通过；A0-H best-condition gate 与 A1 matcher/controls 已实现待运行 | Stage A 只验证 relative rotation/direction；禁止宣称 metric center/absolute trajectory 改善 |
+| SAM token → 2D–2D correspondence → epipolar pose | V9 O-R1 与 A0-H 全折通过；A1 已运行且 all-fold causal pass=0 | 正确连续 2D 对应的 solver/support 上界成立；当前 `detector_fpn2 + local32 + Linear Q/K` 未学出未来对应；只验证 relative rotation/direction |
 
 ## 6. 已确立、不得反向解释的结论
 
@@ -411,8 +411,13 @@ offset 或刚性/相似变换选择，而是局部 depth shape/跨帧一致性�
 11. 当前所有 evaluation clip 属于同一 scene；跨场景泛化尚未验证。
 12. V9 原 local32 A0 的 correspondence 上界并非整体失效：450/495 同时存在好坏 history edge；
     correspondence 数、Sampson residual、cheirality 不能稳定区分，design condition 是当前唯一明确且
-    不依赖 GT error 的选择信号。原 all-edge 失败结果必须保留，后续只允许一次预注册的
-    `best_design_condition_single` A0-H gate，不得转为阈值 sweep。
+    不依赖 GT error 的选择信号。原 all-edge 失败结果必须保留；预注册的
+    `best_design_condition_single` A0-H 已在三 fold 通过，不得将其改写成阈值 sweep。
+13. A0-H 的成功只证明 local32 current query、正确连续 history UV 与固定 solver 构成可行上界；
+    它不读取 SAM descriptor，也没有把对应限制在实际 32 个 history key 上，不能称作 SAM token 成功。
+14. V9 A1 已经实际训练。尽管训练 objective 明显下降，held-out PCK 只有 0%–2.59%，所有 12 个
+    future pose frame 都恶化，且正常 SAM 没有稳定超过 patch、trained-off 和输入扰动。因此当前
+    `detector_fpn2 + farthest-UV local32 + Linear Q/K` 路线未通过因果验证。
 
 ## 7. 后续实验准入条件
 
@@ -438,11 +443,13 @@ offset 或刚性/相似变换选择，而是局部 depth shape/跨帧一致性�
 - 只挑选改善帧或用 GT pose error 设计回退阈值；
 - 把同场景第二 clip 称作跨场景泛化。
 
-当前唯一已登记但未完成结果回填的新实验是
-[V9 SAM3.1 local-token 二维极几何位姿因果实验](v90_epipolar_token_causality.md)。dense O-R1
-solver 上界已通过；原 `all_edges_mean` local32 A0 已失败并作为对照保留。新实现同时运行不读 GT
-error、不设阈值的 `best_design_condition_single` A0-H；只有 A0-H 三 fold 全部通过才训练 A1，
-否则正常写出两套 A0 CSV 并停止。
+V9 O-R1、原 `all_edges_mean` A0、`best_design_condition_single` A0-H 和 A1 已全部完成并回填到
+[V9 SAM3.1 local-token 二维极几何位姿因果实验](v90_epipolar_token_causality.md)。下一步不再新增
+pose head 或 solver sweep，只补两个尚未被旧实验回答的 matching 诊断：
+
+1. `A0-Q`：把 GT history 对应限制到实际缓存的 32 个离散 key，判断 token sampling/量化上界；
+2. train/test matcher audit：同一 checkpoint 报告 raw cosine、train/held-out PCK/EPE、top-1 与
+   soft expectation、dustbin/visible CE、entropy 和 real-key mass，区分 objective shortcut 与时间过拟合。
 
 ## 8. 更新模板
 
