@@ -54,7 +54,7 @@ geometry-only 分支通常仍使用 SAM mask 和 slot 来规定实例区域，�
 | V7.5 | SAM mask/ID + 显式 ICP/ray solver，无 token、无 pose head | full/bbox/random/stale/wrong-ID、frozen/online history | 局部 fold 有收益，但 region/history 无 all-fold pass | E2（region/ID） |
 | V8 matcher-first | 显式 GT correspondence 监督、冻结 matcher、evidence-only pose | geometry/SAM/combined、trained-off、no-match、dual Value、三个 fold | matcher/pose 均无 all-fold SAM causal pass | 未通过 E3 |
 | V8 O1–O2.7 | 无训练；GT pseudo-match + 显式 Kabsch/几何因子分解 | support、depth、K、scale/affine、Sim3、SAM-instance region | solver 与 GT geometry 可行；predicted depth/K 是当前显式 pose 的瓶颈 | E3 诊断结论，不是 SAM-token 结论 |
-| V9（O-R1/A0/A1） | visible-surface 2D correspondence → fixed epipolar solver；A0 固定 local32 query；A1 显式 SAM correspondence | calibrated K、动态 slot、最近两次因果历史、三 fold、SAM/patch/uniform/trained-off 与四种扰动 | O-R1 relative edge 全折通过；A0/A1 代码已实现待运行；absolute trajectory 未通过且不再作为 token 主命题 | E3 solver 上界；SAM token A1 为 E0 |
+| V9（O-R1/A0-H/A1） | visible-surface 2D correspondence → fixed epipolar solver；A0 固定 local32 query；A0-H 用 design condition 选单 history edge；A1 显式 SAM correspondence | calibrated K、动态 slot、最近两次因果历史、三 fold、SAM/patch/uniform/trained-off 与四种扰动 | O-R1 relative edge 全折通过；原 all-edge A0 仅 short 通过，450/495 被坏 history edge 拉差；A0-H/A1 已实现待运行 | E3 solver 上界；原 A0 未通过；SAM token A1 为 E0 |
 
 ## 4. 分版本结果
 
@@ -391,7 +391,7 @@ offset 或刚性/相似变换选择，而是局部 depth shape/跨帧一致性�
 | full/bbox/random/stale region control | V7.5 | 已完成 |
 | GT depth / predicted depth 与 GT K / predicted K 分解 | V8 O2.6/O2.7 | 已完成 |
 | scale/affine/Sim3 是否能修复 depth | V8 O2.6/O2.7 | 已完成；不能稳定修复 |
-| SAM token → 2D–2D correspondence → epipolar pose | V9 O-R1 relative oracle 全折通过；A0 local32 gate 与 A1 matcher/controls 已实现待运行 | Stage A 只验证 relative rotation/direction；禁止宣称 metric center/absolute trajectory 改善 |
+| SAM token → 2D–2D correspondence → epipolar pose | V9 O-R1 relative oracle 全折通过；原 A0 all-edge 仅 short 通过；A0-H best-condition gate 与 A1 matcher/controls 已实现待运行 | Stage A 只验证 relative rotation/direction；禁止宣称 metric center/absolute trajectory 改善 |
 
 ## 6. 已确立、不得反向解释的结论
 
@@ -409,6 +409,10 @@ offset 或刚性/相似变换选择，而是局部 depth shape/跨帧一致性�
    depth shape、predicted K 以及稀疏/陈旧实例历史，而不是再加一个更大的 fusion MLP。
 10. O2.7 表明 SAM instance region 比全图 depth affine 更有上界价值，但仍没有 all-fold pass。
 11. 当前所有 evaluation clip 属于同一 scene；跨场景泛化尚未验证。
+12. V9 原 local32 A0 的 correspondence 上界并非整体失效：450/495 同时存在好坏 history edge；
+    correspondence 数、Sampson residual、cheirality 不能稳定区分，design condition 是当前唯一明确且
+    不依赖 GT error 的选择信号。原 all-edge 失败结果必须保留，后续只允许一次预注册的
+    `best_design_condition_single` A0-H gate，不得转为阈值 sweep。
 
 ## 7. 后续实验准入条件
 
@@ -436,8 +440,9 @@ offset 或刚性/相似变换选择，而是局部 depth shape/跨帧一致性�
 
 当前唯一已登记但未完成结果回填的新实验是
 [V9 SAM3.1 local-token 二维极几何位姿因果实验](v90_epipolar_token_causality.md)。dense O-R1
-solver 上界已通过；新实现会先运行固定 `sam_local_uv` 的 local32 A0 gate，A0 任一 fold 失败时
-正常写出 CSV 并停止，不允许训练 A1 matcher。
+solver 上界已通过；原 `all_edges_mean` local32 A0 已失败并作为对照保留。新实现同时运行不读 GT
+error、不设阈值的 `best_design_condition_single` A0-H；只有 A0-H 三 fold 全部通过才训练 A1，
+否则正常写出两套 A0 CSV 并停止。
 
 ## 8. 更新模板
 

@@ -1,6 +1,6 @@
 # V9：SAM3.1 local-token 二维极几何位姿因果实验
 
-> 状态：`Stage O-R1 relative oracle 已全折通过；Stage A0/A1 已实现待运行；absolute trajectory 不作为 token 主命题`
+> 状态：`Stage O-R1 relative oracle 已全折通过；Stage A0 all-edge 已完成并失败；A0-H best-condition/A1 已实现待运行；absolute trajectory 不作为 token 主命题`
 > 日期：2026-08-05  
 > 核心目标：验证 SAM3.1 local descriptor 是否能通过真实 2D–2D 对应改善 StreamVGGT 的
 > 相机 rotation 与 translation direction，而不使用 predicted depth、pointmap Kabsch 或
@@ -390,8 +390,10 @@ outputs/streaming_couping_v90_epipolar_token_stage_a/
 └── checkpoints/
 ```
 
-一键命令的固定顺序是：tensor/gradient smoke → cache audit/rebuild → A0 三 fold → A0 hard gate →
-A1。A0 未全折通过时 runner 返回成功状态并保留完整 A0 CSV，但不会创建 matcher checkpoint。
+一键命令的固定顺序是：tensor/gradient smoke → cache audit/rebuild → 两种 A0 三 fold →
+`best_design_condition_single` A0 hard gate → A1。原 `all_edges_mean` A0 始终保留为失败对照，
+但不再和新候选混在一起决定 hard gate。新 A0 未全折通过时 runner 返回成功状态并保留两套完整
+A0 CSV，但不会创建 matcher checkpoint。
 A1 只训练参数匹配的 Q/K linear projector 和一个 dustbin logit；SAM/StreamVGGT/pose solver 都冻结，
 没有 pose loss。SAM 与 StreamVGGT descriptor 的原始通道数差异通过无参数的 deterministic channel
 pool/pad 统一，因此 trainable Q/K 参数量严格相同。
@@ -404,3 +406,35 @@ permutation 只替换 descriptor 内容，不替换候选 UV 或有效点数。�
 若 A0 出现恶化帧，`v90_stage_a_edges.csv` 会记录每条 current-history edge 的 UV bbox/convex-hull
 覆盖率、二维协方差比、design condition、双初始化 residual、cheirality 及 relative pose error；
 `v90_stage_a_problem_edges.csv` 只保留恶化帧所属 edge，并由一键命令直接打印，便于复制诊断。
+
+### 12.4 A0 history-edge 诊断与 A0-H（保留原失败结果）
+
+首轮 `local32_same_support_oracle / all_edges_mean` 已运行。short 通过，但 medium 的 frame 450 与
+long 的 frame 495 被坏 history edge 拉差，所以全折 gate 为 0。该结果保留，不能覆盖或改写：
+
+| current | history | design condition | relative aggregate | 结论 |
+|---:|---:|---:|---:|---|
+| 450 | 345 | 416 | 9.29 → 1.02 | 好 edge |
+| 450 | 435 | 1722 | 22.29 → 57.42 | 坏 edge |
+| 495 | 405 | 32.7 | 16.14 → 0.54 | 好 edge |
+| 495 | 465 | 3454 | 22.07 → 103.17 | 坏 edge |
+| 495 | 480 | 3067 | 13.46 → 40.51 | 坏 edge |
+
+对应数量、Sampson RMSE 与 cheirality 在这些 edge 上都不能稳定区分好坏；唯一明确且不读取 GT
+pose error 的观测量是 normalized eight-point design matrix 的 condition/rank。由此新增一个、且只
+新增一个 A0-H 候选：
+
+```text
+best_design_condition_single:
+  1. 仍生成原来全部严格因果 history edge；
+  2. 只在数学求解成功的 edge 中选择 design_condition 最小的一条；
+  3. condition 相同时依次选择 design_rank_ratio 更大、history index 更小者；
+  4. 没有成功 edge 时保持 inactive/L0 fallback；
+  5. 不读取 GT pose error，不设置 residual/count/effect 阈值。
+```
+
+CSV 新增 `edge_selection_policy`、`pose_edges_used`、选中 history index/frame 和每条 edge 的
+`selected_by_policy`，因此服务器结果可直接确认选择路径。A1 的 SAM、StreamVGGT patch、uniform、
+trained-off 与全部扰动分支固定使用同一个 `best_design_condition_single` 算法；只有该 A0-H 在
+short/medium/long 全折通过才允许训练 A1。这个修改不增加 token 数、不改变 history 候选、不扫描
+阈值，也不声称 metric center 或 absolute trajectory 改善。

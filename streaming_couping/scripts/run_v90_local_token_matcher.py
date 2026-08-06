@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Run V9 Stage A0/A1 local-token epipolar causality experiments.
+"""Run V9 Stage A0/A0-H/A1 local-token epipolar causality experiments.
 
 A0 keeps exactly the cached 32 SAM local-token query locations and supplies
-their continuous GT-visible historical UV.  A1 then trains only a small Q/K
-correspondence projector.  StreamVGGT, SAM3.1 and the O-R1 epipolar solver are
-frozen; no pose loss is back-propagated.
+their continuous GT-visible historical UV.  The original all-edge mean stays
+as a control; A0-H selects one solved edge by design-matrix observability.
+A1 then trains only a small Q/K correspondence projector and uses the same
+edge policy.  StreamVGGT, SAM3.1 and the O-R1 epipolar solver are frozen; no
+pose loss is back-propagated.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from streaming_couping.src.v80_pose_geometry import (
 )
 from streaming_couping.src.v90_epipolar_geometry import (
     EpipolarConfig,
+    EpipolarEstimate,
     LocalTokenReprojection,
     SurfaceCorrespondences,
     VisibilityConfig,
@@ -61,11 +64,19 @@ from streaming_couping.src.v90_explicit_matcher import (
 )
 
 
+A0_EDGE_SELECTION_POLICIES = (
+    "all_edges_mean",
+    "best_design_condition_single",
+)
+A1_EDGE_SELECTION_POLICY = "best_design_condition_single"
+
+
 SUMMARY_COLUMNS = (
     "stage",
     "fold",
     "architecture",
     "variant",
+    "edge_selection_policy",
     "descriptor_source",
     "train_frames",
     "test_frames",
@@ -116,10 +127,14 @@ FRAME_COLUMNS = (
     "fold",
     "architecture",
     "variant",
+    "edge_selection_policy",
     "sequence_index",
     "frame_index",
     "history_edges",
     "solved_edges",
+    "pose_edges_used",
+    "selected_history_sequence_indices",
+    "selected_history_frame_indices",
     "active",
     "supervised_queries",
     "visible_queries",
@@ -173,6 +188,7 @@ EDGE_COLUMNS = (
     "fold",
     "architecture",
     "variant",
+    "edge_selection_policy",
     "sequence_index",
     "frame_index",
     "history_sequence_index",
@@ -198,6 +214,7 @@ EDGE_COLUMNS = (
     "initialization",
     "edge_success",
     "edge_reason",
+    "selected_by_policy",
     "raw_edge_rotation_error_deg",
     "refined_edge_rotation_error_deg",
     "rotation_improvement_deg",
@@ -273,6 +290,21 @@ class TrainState:
     final_loss: float
 
 
+@dataclass
+class EdgeOutcome:
+    history: int
+    records: Sequence[PairRecord]
+    pairs: Sequence[SurfaceCorrespondences]
+    current_uv: torch.Tensor
+    history_uv: torch.Tensor
+    weights: torch.Tensor
+    estimate: EpipolarEstimate
+    raw_rotation: float
+    refined_rotation: float
+    raw_direction: float
+    refined_direction: float
+
+
 def main() -> None:
     args = _parse_args()
     config = load_stage_a_config(args.config)
@@ -317,23 +349,36 @@ def run_stage_a(
     frame_rows: list[dict[str, object]] = []
     edge_rows: list[dict[str, object]] = []
     train_rows: list[dict[str, object]] = []
-    for fold in FOLDS:
-        rows, frames, edges = _evaluate_a0(
-            fold_name=fold.name,
-            test_frames=fold.test_frames,
-            records=records_by_fold[fold.name]["test"],
-            data=data,
-            config=config,
+    for edge_selection_policy in A0_EDGE_SELECTION_POLICIES:
+        for fold in FOLDS:
+            row, frames, edges = _evaluate_a0(
+                fold_name=fold.name,
+                test_frames=fold.test_frames,
+                records=records_by_fold[fold.name]["test"],
+                data=data,
+                config=config,
+                edge_selection_policy=edge_selection_policy,
+            )
+            summary_rows.append(row)
+            frame_rows.extend(frames)
+            edge_rows.extend(edges)
+    policy_passes = {}
+    for policy in A0_EDGE_SELECTION_POLICIES:
+        policy_rows = [
+            row
+            for row in summary_rows
+            if row["stage"] == "A0"
+            and row["edge_selection_policy"] == policy
+        ]
+        policy_passes[policy] = int(
+            len(policy_rows) == len(FOLDS)
+            and all(int(row["fold_a0_pass"]) for row in policy_rows)
         )
-        summary_rows.append(rows)
-        frame_rows.extend(frames)
-        edge_rows.extend(edges)
-    all_a0_pass = int(
-        len(summary_rows) == len(FOLDS)
-        and all(int(row["fold_a0_pass"]) for row in summary_rows)
-    )
+    all_a0_pass = policy_passes[A1_EDGE_SELECTION_POLICY]
     for row in summary_rows:
-        row["all_folds_a0_pass"] = all_a0_pass
+        row["all_folds_a0_pass"] = policy_passes[
+            str(row["edge_selection_policy"])
+        ]
 
     # A0 is a hard support gate.  A failed gate is a valid completed run, not
     # a shell error and not permission to train a matcher on inadequate data.
@@ -346,13 +391,19 @@ def run_stage_a(
             pair_rows=pair_rows,
             edge_rows=edge_rows,
             cache_file=cache_file,
-            stopped_after_a0=not bool(all_a0_pass),
+            stopped_after_a0=stage == "a0" or not bool(all_a0_pass),
         )
         if not all_a0_pass:
-            print("V9 A0 did not pass all folds; A1 was intentionally not trained.")
+            print(
+                "V9 best-condition A0 did not pass all folds; "
+                "A1 was intentionally not trained."
+            )
         return result
     if stage == "a1" and not all_a0_pass:
-        raise RuntimeError("V9 A1 is locked because local32 A0 did not pass all folds.")
+        raise RuntimeError(
+            "V9 A1 is locked because best-condition local32 A0 did not pass "
+            "all folds."
+        )
 
     trained: dict[tuple[str, str], TrainState] = {}
     for fold in FOLDS:
@@ -597,19 +648,29 @@ def _evaluate_a0(
     records: Sequence[PairRecord],
     data: StageAData,
     config: StageAConfig,
+    edge_selection_policy: str,
 ) -> tuple[
     dict[str, object],
     list[dict[str, object]],
     list[dict[str, object]],
 ]:
+    if edge_selection_policy not in A0_EDGE_SELECTION_POLICIES:
+        raise ValueError(
+            f"Unknown V9 A0 edge selection policy={edge_selection_policy!r}."
+        )
+    if edge_selection_policy == "all_edges_mean":
+        architecture = "local32_same_support_oracle"
+    else:
+        architecture = "local32_best_condition_oracle"
     predictions = {
         id(record): record.labels.visible_correspondences() for record in records
     }
     frame_rows, edge_rows = _pose_frame_rows(
         stage="A0",
         fold_name=fold_name,
-        architecture="local32_same_support_oracle",
-        variant="continuous_gt_uv",
+        architecture=architecture,
+        variant=edge_selection_policy,
+        edge_selection_policy=edge_selection_policy,
         test_frames=test_frames,
         records=records,
         predictions=predictions,
@@ -620,8 +681,9 @@ def _evaluate_a0(
     summary = _summary_row(
         stage="A0",
         fold_name=fold_name,
-        architecture="local32_same_support_oracle",
-        variant="continuous_gt_uv",
+        architecture=architecture,
+        variant=edge_selection_policy,
+        edge_selection_policy=edge_selection_policy,
         descriptor_source="none_gt_label_only",
         train_frames=(),
         test_frames=test_frames,
@@ -958,6 +1020,7 @@ def _evaluate_matcher(
         fold_name=fold_name,
         architecture=architecture,
         variant=variant,
+        edge_selection_policy=A1_EDGE_SELECTION_POLICY,
         test_frames=test_frames,
         records=records,
         predictions=predictions,
@@ -976,6 +1039,7 @@ def _evaluate_matcher(
         fold_name=fold_name,
         architecture=architecture,
         variant=variant,
+        edge_selection_policy=A1_EDGE_SELECTION_POLICY,
         descriptor_source=descriptor,
         train_frames=train_frames,
         test_frames=test_frames,
@@ -1105,6 +1169,7 @@ def _pose_frame_rows(
     fold_name: str,
     architecture: str,
     variant: str,
+    edge_selection_policy: str,
     test_frames: Sequence[int],
     records: Sequence[PairRecord],
     predictions: dict[int, SurfaceCorrespondences],
@@ -1112,6 +1177,10 @@ def _pose_frame_rows(
     data: StageAData,
     config: StageAConfig,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    if edge_selection_policy not in A0_EDGE_SELECTION_POLICIES:
+        raise ValueError(
+            f"Unknown V9 edge selection policy={edge_selection_policy!r}."
+        )
     by_current: dict[int, list[PairRecord]] = {}
     for record in records:
         by_current.setdefault(record.current, []).append(record)
@@ -1124,12 +1193,7 @@ def _pose_frame_rows(
         by_history: dict[int, list[PairRecord]] = {}
         for record in current_records:
             by_history.setdefault(record.history, []).append(record)
-        raw_rotation_rows = []
-        refined_rotation_rows = []
-        raw_direction_rows = []
-        refined_direction_rows = []
-        sampson_rows = []
-        solved = 0
+        outcomes: list[EdgeOutcome] = []
         for history, edge_records in sorted(by_history.items()):
             pairs = [predictions[id(record)] for record in edge_records]
             current_uv, history_uv, weights = concatenate_correspondences(pairs)
@@ -1150,7 +1214,6 @@ def _pose_frame_rows(
             )
             refined_r, refined_t = raw_r, raw_t
             if estimate.success:
-                solved += 1
                 candidate = torch.eye(4, dtype=torch.float64)
                 candidate[:3, :3] = estimate.rotation_current_to_history
                 refined_r = float(rotation_error_degrees(candidate, target_relative))
@@ -1159,16 +1222,10 @@ def _pose_frame_rows(
                     estimate.translation_current_origin_in_history,
                     target_relative,
                 )
-                sampson_rows.append(float(estimate.sampson_rmse))
-            edge_rows.append(
-                _edge_diagnostic_row(
-                    stage=stage,
-                    fold_name=fold_name,
-                    architecture=architecture,
-                    variant=variant,
-                    current=current,
+            outcomes.append(
+                EdgeOutcome(
                     history=history,
-                    edge_records=edge_records,
+                    records=edge_records,
                     pairs=pairs,
                     current_uv=current_uv,
                     history_uv=history_uv,
@@ -1178,13 +1235,66 @@ def _pose_frame_rows(
                     refined_rotation=refined_r,
                     raw_direction=raw_t,
                     refined_direction=refined_t,
+                )
+            )
+
+        selected_indices = _select_edge_outcome_indices(
+            outcomes, policy=edge_selection_policy
+        )
+        selected_index_set = set(selected_indices)
+        selected_outcomes = [outcomes[index] for index in selected_indices]
+        solved = sum(int(outcome.estimate.success) for outcome in outcomes)
+        for index, outcome in enumerate(outcomes):
+            edge_rows.append(
+                _edge_diagnostic_row(
+                    stage=stage,
+                    fold_name=fold_name,
+                    architecture=architecture,
+                    variant=variant,
+                    edge_selection_policy=edge_selection_policy,
+                    selected_by_policy=int(index in selected_index_set),
+                    current=current,
+                    history=outcome.history,
+                    edge_records=outcome.records,
+                    pairs=outcome.pairs,
+                    current_uv=outcome.current_uv,
+                    history_uv=outcome.history_uv,
+                    weights=outcome.weights,
+                    estimate=outcome.estimate,
+                    raw_rotation=outcome.raw_rotation,
+                    refined_rotation=outcome.refined_rotation,
+                    raw_direction=outcome.raw_direction,
+                    refined_direction=outcome.refined_direction,
                     data=data,
                 )
             )
-            raw_rotation_rows.append(raw_r)
-            refined_rotation_rows.append(refined_r)
-            raw_direction_rows.append(raw_t)
-            refined_direction_rows.append(refined_t)
+
+        # all_edges_mean exactly retains the original A0 reporting behavior:
+        # every failed edge contributes its unchanged L0 fallback.  The new
+        # policy evaluates only the one successful edge chosen without GT
+        # error.  With no successful edge it remains inactive and reports the
+        # same raw/refined fallback over the available causal edges.
+        if edge_selection_policy == "all_edges_mean":
+            pose_outcomes = outcomes
+        elif selected_outcomes:
+            pose_outcomes = selected_outcomes
+        else:
+            pose_outcomes = outcomes
+        raw_rotation_rows = [outcome.raw_rotation for outcome in pose_outcomes]
+        raw_direction_rows = [outcome.raw_direction for outcome in pose_outcomes]
+        if selected_outcomes:
+            refined_rotation_rows = [
+                outcome.refined_rotation for outcome in pose_outcomes
+            ]
+            refined_direction_rows = [
+                outcome.refined_direction for outcome in pose_outcomes
+            ]
+        else:
+            refined_rotation_rows = list(raw_rotation_rows)
+            refined_direction_rows = list(raw_direction_rows)
+        sampson_rows = [
+            float(outcome.estimate.sampson_rmse) for outcome in selected_outcomes
+        ]
 
         aggregate_stats = {
             name: sum(float(item[name]) for item in (
@@ -1260,11 +1370,19 @@ def _pose_frame_rows(
                 "fold": fold_name,
                 "architecture": architecture,
                 "variant": variant,
+                "edge_selection_policy": edge_selection_policy,
                 "sequence_index": current,
                 "frame_index": int(frame_value),
                 "history_edges": len(by_history),
                 "solved_edges": solved,
-                "active": int(solved > 0),
+                "pose_edges_used": len(selected_outcomes),
+                "selected_history_sequence_indices": " ".join(
+                    str(outcome.history) for outcome in selected_outcomes
+                ),
+                "selected_history_frame_indices": " ".join(
+                    str(data.frames[outcome.history]) for outcome in selected_outcomes
+                ),
+                "active": int(bool(selected_outcomes)),
                 **aggregate_stats,
                 "pck_correct": pck_correct,
                 "epe_sum_pixels": epe_sum,
@@ -1283,12 +1401,42 @@ def _pose_frame_rows(
     return rows, edge_rows
 
 
+def _select_edge_outcome_indices(
+    outcomes: Sequence[EdgeOutcome], *, policy: str
+) -> list[int]:
+    """Select causal solved edges using solver observability only, never GT error."""
+
+    successful = [
+        index for index, outcome in enumerate(outcomes) if outcome.estimate.success
+    ]
+    if policy == "all_edges_mean":
+        return successful
+    if policy != "best_design_condition_single":
+        raise ValueError(f"Unknown V9 edge selection policy={policy!r}.")
+    if not successful:
+        return []
+
+    def selection_key(index: int) -> tuple[float, float, int]:
+        outcome = outcomes[index]
+        condition = float(outcome.estimate.design_condition)
+        rank_ratio = float(outcome.estimate.design_rank_ratio)
+        return (
+            condition if math.isfinite(condition) else float("inf"),
+            -rank_ratio if math.isfinite(rank_ratio) else float("inf"),
+            int(outcome.history),
+        )
+
+    return [min(successful, key=selection_key)]
+
+
 def _edge_diagnostic_row(
     *,
     stage: str,
     fold_name: str,
     architecture: str,
     variant: str,
+    edge_selection_policy: str,
+    selected_by_policy: int,
     current: int,
     history: int,
     edge_records: Sequence[PairRecord],
@@ -1316,6 +1464,7 @@ def _edge_diagnostic_row(
         "fold": fold_name,
         "architecture": architecture,
         "variant": variant,
+        "edge_selection_policy": edge_selection_policy,
         "sequence_index": current,
         "frame_index": data.frames[current],
         "history_sequence_index": history,
@@ -1351,6 +1500,7 @@ def _edge_diagnostic_row(
         "initialization": str(estimate.initialization),
         "edge_success": int(estimate.success),
         "edge_reason": str(estimate.reason),
+        "selected_by_policy": int(selected_by_policy),
         "raw_edge_rotation_error_deg": raw_rotation,
         "refined_edge_rotation_error_deg": refined_rotation,
         "rotation_improvement_deg": raw_rotation - refined_rotation,
@@ -1430,6 +1580,7 @@ def _summary_row(
     fold_name: str,
     architecture: str,
     variant: str,
+    edge_selection_policy: str,
     descriptor_source: str,
     train_frames: Sequence[int],
     test_frames: Sequence[int],
@@ -1461,6 +1612,7 @@ def _summary_row(
         "fold": fold_name,
         "architecture": architecture,
         "variant": variant,
+        "edge_selection_policy": edge_selection_policy,
         "descriptor_source": descriptor_source,
         "train_frames": " ".join(str(value) for value in train_frames),
         "test_frames": " ".join(str(value) for value in test_frames),
@@ -1528,19 +1680,26 @@ def _summary_row(
 
 
 def _annotate_a1_decisions(rows: list[dict[str, object]]) -> None:
+    gate_rows = [
+        row
+        for row in rows
+        if row["stage"] == "A0"
+        and row["architecture"] == "local32_best_condition_oracle"
+        and row["variant"] == A1_EDGE_SELECTION_POLICY
+        and row["edge_selection_policy"] == A1_EDGE_SELECTION_POLICY
+    ]
     a0_pass = int(
-        all(
-            int(row["fold_a0_pass"])
-            for row in rows
-            if row["stage"] == "A0"
-        )
+        len(gate_rows) == len(FOLDS)
+        and all(int(row["fold_a0_pass"]) for row in gate_rows)
     )
     fold_passes = []
     for fold in FOLDS:
         group = {
             (str(row["architecture"]), str(row["variant"])): row
             for row in rows
-            if row["stage"] == "A1" and row["fold"] == fold.name
+            if row["stage"] == "A1"
+            and row["fold"] == fold.name
+            and row["edge_selection_policy"] == A1_EDGE_SELECTION_POLICY
         }
         required = {
             ("sam_match", "normal"),
@@ -1608,7 +1767,8 @@ def _annotate_a1_decisions(rows: list[dict[str, object]]) -> None:
         fold_passes.append(passed)
     all_pass = int(len(fold_passes) == len(FOLDS) and all(fold_passes))
     for row in rows:
-        row["all_folds_a0_pass"] = a0_pass
+        if row["stage"] == "A1":
+            row["all_folds_a0_pass"] = a0_pass
         row["all_folds_sam_causal_pass"] = all_pass
 
 
@@ -1640,6 +1800,7 @@ def _write_outputs(
             row["fold"],
             row["architecture"],
             row["variant"],
+            row["edge_selection_policy"],
             row["frame_index"],
         )
         for row in frame_rows
@@ -1653,6 +1814,7 @@ def _write_outputs(
             row["fold"],
             row["architecture"],
             row["variant"],
+            row["edge_selection_policy"],
             row["frame_index"],
         )
         in problem_frame_keys
@@ -1676,6 +1838,10 @@ def _write_outputs(
             "mtime_ns": cache_file.stat().st_mtime_ns,
         },
         "a0_hard_stop": bool(stopped_after_a0),
+        "a0_edge_selection_policies": list(A0_EDGE_SELECTION_POLICIES),
+        "a1_edge_selection_policy": A1_EDGE_SELECTION_POLICY,
+        "edge_selection_reads_gt_pose_error": False,
+        "edge_selection_uses_effect_threshold": False,
         "trained_pose_model": False,
         "pose_loss_used": False,
         "forbidden_inputs_confirmed_absent": [
@@ -1754,8 +1920,28 @@ def _pair_diagnostic_rows(
 def _decision_markdown(
     rows: Sequence[dict[str, object]], *, stopped_after_a0: bool
 ) -> str:
-    a0_rows = [row for row in rows if row["stage"] == "A0"]
-    all_a0 = int(bool(a0_rows) and all(int(row["fold_a0_pass"]) for row in a0_rows))
+    all_edge_rows = [
+        row
+        for row in rows
+        if row["stage"] == "A0"
+        and row["edge_selection_policy"] == "all_edges_mean"
+    ]
+    best_condition_rows = [
+        row
+        for row in rows
+        if row["stage"] == "A0"
+        and row["architecture"] == "local32_best_condition_oracle"
+        and row["variant"] == A1_EDGE_SELECTION_POLICY
+        and row["edge_selection_policy"] == A1_EDGE_SELECTION_POLICY
+    ]
+    all_edges_a0 = int(
+        len(all_edge_rows) == len(FOLDS)
+        and all(int(row["fold_a0_pass"]) for row in all_edge_rows)
+    )
+    best_condition_a0 = int(
+        len(best_condition_rows) == len(FOLDS)
+        and all(int(row["fold_a0_pass"]) for row in best_condition_rows)
+    )
     a1_rows = [
         row
         for row in rows
@@ -1772,12 +1958,13 @@ def _decision_markdown(
         "No pose model is trained. SAM3.1 and StreamVGGT are frozen.",
         "All pose metrics are relative edge rotation/translation direction from the fixed O-R1 solver.",
         "",
-        f"- local32 same-support A0 all-fold pass: `{all_a0}`",
+        f"- local32 all-edges A0 all-fold pass: `{all_edges_a0}`",
+        f"- local32 best-condition A0 all-fold gate pass: `{best_condition_a0}`",
         f"- explicit SAM matcher all-fold causal pass: `{all_sam}`",
         f"- stopped before matcher training: `{int(stopped_after_a0)}`",
         "",
-        "| stage | fold | architecture | variant | active | PCK | EPE px | R gain | t-dir gain | worse | pass |",
-        "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| stage | fold | architecture | variant | edge policy | active | PCK | EPE px | R gain | t-dir gain | worse | pass |",
+        "|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         pass_value = (
@@ -1787,6 +1974,7 @@ def _decision_markdown(
         )
         lines.append(
             f"| {row['stage']} | {row['fold']} | {row['architecture']} | {row['variant']} "
+            f"| {row['edge_selection_policy']} "
             f"| {row['active_frames']}/{row['frames']} | {float(row['pck_accuracy']):.6g} "
             f"| {float(row['mean_epe_pixels']):.6g} "
             f"| {float(row['edge_rotation_gain_percent']):.6g} "
@@ -1798,9 +1986,11 @@ def _decision_markdown(
             "",
             "Interpretation:",
             "",
-            "- A0=0: fixed 32-token support is insufficient; A1 is intentionally not trained.",
-            "- A0=1, SAM pass=0: solver/support is viable but cached SAM descriptors do not establish causal pose benefit.",
+            "- The retained all-edges A0 row is the original failed control and does not gate A1.",
+            "- Best-condition A0=0: deterministic single-edge observability is still insufficient; A1 is intentionally not trained.",
+            "- Best-condition A0=1, SAM pass=0: solver/support is viable but cached SAM descriptors do not establish causal pose benefit.",
             "- SAM pass=1: SAM local descriptors beat patch/uniform/trained-off and all perturbations on every temporal fold.",
+            "- Edge selection uses only design condition, rank ratio and causal history index; it never reads GT pose error or an effect threshold.",
             "- No result here supports metric center or absolute trajectory claims.",
             "",
         ]

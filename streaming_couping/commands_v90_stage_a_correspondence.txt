@@ -20,7 +20,7 @@ export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-echo "V9 Stage A smoke: local32 labels, dustbin, Q/K gradients and fallback"
+echo "V9 Stage A smoke: local32 labels, Q/K gradients, edge selection and fallback"
 PYTHONPATH=. "$PYTHON_BIN" \
   -m streaming_couping.scripts.smoke_v90_local_token_matcher
 
@@ -58,8 +58,9 @@ fi
 
 [[ -s "$CACHE" ]] || { echo "missing V9 Stage A cache: $CACHE" >&2; exit 1; }
 
-echo "V9 Stage A0 -> hard gate -> A1 explicit matcher"
-echo "A0 uses fixed local32 UV; A1 trains Q/K only on physical GPU=$MATCH_GPU"
+echo "V9 Stage A0 all-edges control + best-condition hard gate -> A1 explicit matcher"
+echo "A0 keeps fixed local32 UV; A1 uses the same best-condition edge policy"
+echo "A1 trains Q/K only on physical GPU=$MATCH_GPU"
 CUDA_VISIBLE_DEVICES="$MATCH_GPU" \
 PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
   -m streaming_couping.scripts.run_v90_local_token_matcher \

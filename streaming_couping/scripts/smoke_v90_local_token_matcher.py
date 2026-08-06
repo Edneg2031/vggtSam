@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
 from streaming_couping.scripts.run_v90_local_token_matcher import (
     FRAME_COLUMNS,
     SUMMARY_COLUMNS,
+    _select_edge_outcome_indices,
     _summary_row,
 )
 from streaming_couping.src.v90_epipolar_geometry import (
@@ -32,6 +35,7 @@ def main() -> None:
     _smoke_local32_reprojection()
     _smoke_matcher_gradient_and_loss()
     _smoke_dustbin_and_conversion()
+    _smoke_edge_selection()
     _smoke_output_schemas()
     print("V9 local-token matcher smoke passed")
 
@@ -182,16 +186,95 @@ def _smoke_dustbin_and_conversion() -> None:
     _require(rows[0].shape[-1] == 2 and rows[2].ndim == 1, "solver UV conversion")
 
 
+def _smoke_edge_selection() -> None:
+    outcomes = [
+        SimpleNamespace(
+            history=23,
+            estimate=SimpleNamespace(
+                success=True, design_condition=1722.0, design_rank_ratio=0.00058
+            ),
+        ),
+        SimpleNamespace(
+            history=17,
+            estimate=SimpleNamespace(
+                success=True, design_condition=416.0, design_rank_ratio=0.00240
+            ),
+        ),
+        SimpleNamespace(
+            history=21,
+            estimate=SimpleNamespace(
+                success=False, design_condition=1.0, design_rank_ratio=1.0
+            ),
+        ),
+    ]
+    _require(
+        _select_edge_outcome_indices(outcomes, policy="all_edges_mean") == [0, 1],
+        "all-edges policy retains all successful causal edges",
+    )
+    _require(
+        _select_edge_outcome_indices(
+            outcomes, policy="best_design_condition_single"
+        )
+        == [1],
+        "best-condition policy ignores failed edges and selects minimum condition",
+    )
+    tied = [
+        SimpleNamespace(
+            history=9,
+            estimate=SimpleNamespace(
+                success=True, design_condition=20.0, design_rank_ratio=0.1
+            ),
+        ),
+        SimpleNamespace(
+            history=7,
+            estimate=SimpleNamespace(
+                success=True, design_condition=20.0, design_rank_ratio=0.2
+            ),
+        ),
+        SimpleNamespace(
+            history=5,
+            estimate=SimpleNamespace(
+                success=True, design_condition=20.0, design_rank_ratio=0.2
+            ),
+        ),
+    ]
+    _require(
+        _select_edge_outcome_indices(
+            tied, policy="best_design_condition_single"
+        )
+        == [2],
+        "best-condition tie-break is rank ratio then causal history index",
+    )
+    failed = [
+        SimpleNamespace(
+            history=0,
+            estimate=SimpleNamespace(
+                success=False, design_condition=1.0, design_rank_ratio=1.0
+            ),
+        )
+    ]
+    _require(
+        not _select_edge_outcome_indices(
+            failed, policy="best_design_condition_single"
+        ),
+        "best-condition policy has exact inactive fallback with no solved edge",
+    )
+
+
 def _smoke_output_schemas() -> None:
     frame = {
         "stage": "A0",
         "fold": "smoke",
         "architecture": "local32_same_support_oracle",
-        "variant": "continuous_gt_uv",
+        "variant": "all_edges_mean",
+        "edge_selection_policy": "all_edges_mean",
         "sequence_index": 2,
         "frame_index": 120,
         "history_edges": 1,
         "solved_edges": 1,
+        "pose_edges_used": 1,
+        "selected_history_sequence_indices": "1",
+        "selected_history_frame_indices": "105",
         "active": 1,
         "supervised_queries": 32,
         "visible_queries": 24,
@@ -215,7 +298,8 @@ def _smoke_output_schemas() -> None:
         stage="A0",
         fold_name="smoke",
         architecture="local32_same_support_oracle",
-        variant="continuous_gt_uv",
+        variant="all_edges_mean",
+        edge_selection_policy="all_edges_mean",
         descriptor_source="none_gt_label_only",
         train_frames=(),
         test_frames=(120,),
