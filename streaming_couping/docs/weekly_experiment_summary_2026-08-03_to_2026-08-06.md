@@ -16,13 +16,15 @@
    分配永久 slot，并从第二次因果观测开始提供历史信息。
 2. **直接 pose residual 的过拟合不构成 SAM-token 证据。** uniform、geometry、SAM、错误输入
    等分支都能把长序列训练 loss 压到接近零。
-3. **SAM mask/identity 在局部 fold 有价值，但没有稳定的 all-fold 位姿收益。** V7.5 的显式
-   region/history solver 在 short/frozen 成功，但 medium/long 和 online memory 不稳定。
+3. **SAM mask/identity 在局部 fold 有价值，但没有稳定的 all-fold 位姿收益。** mask 选择
+   StreamVGGT points、ID 建立 object history 后，显式 ICP/ray solver 只在 short/frozen 成功，
+   medium/long 和 online memory 不稳定。
 4. **三维显式路线的主要瓶颈已定位为 StreamVGGT predicted depth/K。** GT camera geometry 和
    GT-depth+GT-K 能稳定工作；predicted depth 即使配 GT K 也失败，predicted K 也会独立伤害
    位姿。全局 scale、affine 和 Sim(3) 均不能稳定修复。
-5. **正确的实例内二维 correspondence 可以显著修正相对位姿。** V9 A0-H 在 short、medium、
-   long 三折全部通过，rotation 与 translation direction 同时改善，且没有恶化帧。
+5. **正确的实例内二维 correspondence 可以显著修正相对位姿。** 正确 pairs 进入固定极几何
+   solver 后，short、medium、long 三折全部通过，rotation 与 translation direction 同时改善，且
+   没有恶化帧。
 6. **当前 SAM3.1 `detector_fpn2` local token 没有学出未来帧点级 correspondence。** V9 A1
    虽然训练 loss 下降约 85%–92%，但 held-out PCK 只有 0%–2.59%，所有 12 个测试帧的 pose
    都恶化；正常 SAM 也没有稳定超过 patch、uniform、trained-off 或输入扰动。
@@ -140,22 +142,52 @@ V7.5 由于验证的是 object-map history，而不是 matcher 训练，使用�
 V9 的主要结论不涉及 metric translation scale。essential matrix 只能恢复 translation direction；
 absolute center/trajectory 只作次要诊断，不参与 SAM-token 主命题。
 
-## 3. V7.4：动态实例与严格时间因果
+## 3. SAM local descriptor 作为匹配权重，再由 adapter 输出 SE(3)
 
-### 3.1 目的
+> 对应代码阶段：V7.3/V7.4。版本号只用于定位结果，下面按真实信息流说明。
 
-V7.3 已证明各种 transport branch 都能拟合长训练序列。V7.4 不再问容量，而是问：在动态实例、
-严格未来帧和 parameter-matched control 下，SAM descriptor 是否提供超出 geometry 的可归因收益。
+### 3.1 SAM 用了什么，如何参与 StreamVGGT
 
-### 3.2 分支
+这条路线使用的不是一个抽象的“fusion 分支”，而是下面这条具体路径：
 
-- `uniform_transport`；
-- `geometry_transport`；
-- `sam_transport`；
-- `sam_geometry_transport`；
-- `sam_geometry_train_sam_off`：结构和参数量与主候选一致，但训练时禁用 SAM validity/logits。
+```text
+SAM3.1 tracking mask + persistent ID
+  → 确定当前帧与历史帧属于同一实例的区域
+  → 在 mask 内取 detector_fpn2 local descriptors，并采样为 local32
+  → 将 SAM descriptor 插值到 StreamVGGT 的实例几何采样点
+  → SAM current/history descriptor 经 Linear Q/K 产生相似度 logits
+  → softmax 得到当前点到历史点的 transport probability
+  → 用该 probability 搬运历史 StreamVGGT geometry Value
+  → [当前 geometry、搬运后 geometry、差、乘积] 池化成实例 evidence
+  → 与 frozen camera-L0 hidden 一起输入 learned SE(3) adapter
+  → adapter 输出 rotation/translation residual，左乘到 StreamVGGT L0 pose
+```
 
-主候选还运行 `sam_off`、`uniform_sam`、`wrong_sam_identity`、`shuffle_sam_time`。
+这里必须区分三种信息：
+
+| 信息 | 来源 | 在流程中的作用 | 是否直接作为 Value |
+|---|---|---|---:|
+| mask/track ID | SAM3.1 video tracker | 限定实例区域、关联历史实例、控制 memory | 否 |
+| local descriptor | `detector_fpn2` local32 | 产生 current-history matching 权重 | 默认否 |
+| local geometry | frozen StreamVGGT | 被 matching 权重搬运，形成 pose evidence | 是 |
+
+因此默认实现里，SAM token 只决定“从哪一个历史几何点取信息”，真正被搬运的是 StreamVGGT
+geometry。最终 pose 仍由可训练 adapter 输出，所以即使 pose loss 降到零，也可能只是 adapter 根据
+camera hidden、geometry 或固定帧规律拟合出来，并不能自动证明 SAM token 有效。
+
+### 3.2 对照如何切断不同信息
+
+| 代码名 | 实际含义 | 用来排除什么解释 |
+|---|---|---|
+| `uniform_transport` | 不看 SAM/geometry 相似度，平均搬运有效历史 geometry | 仅靠实例 support 和 adapter 是否已能拟合 |
+| `geometry_transport` | 只用 StreamVGGT geometry Q/K 计算权重 | 收益是否来自 geometry，而不是 SAM descriptor |
+| `sam_transport` | 只用 SAM local descriptor Q/K 算权重，但仍搬运 geometry | SAM descriptor 是否提供正确匹配 |
+| `sam_geometry_transport` | SAM logits 与 geometry logits 相加后搬运 geometry | 两种 affinity 联合是否更稳定 |
+| `trained-SAM-off` | 参数量和 adapter 相同，但训练时关闭 SAM | 增益是否只是额外参数/adapter 容量 |
+| wrong-ID / shuffle-time | 保持形状和 support，破坏正确身份或时间 | 输出是否因果依赖正确 SAM 内容 |
+
+这一阶段不再只问“能不能拟合”，而是问：在严格未来帧中，正确 SAM descriptor 是否同时超过
+geometry-only、trained-SAM-off，并且在 wrong-ID/shuffle-time 后稳定变差。
 
 ### 3.3 结果
 
@@ -169,25 +201,28 @@ long fold 虽然超过两个控制，但 `sam_off / wrong-ID / shuffle-time` 的
 `-0.88% / -0.88% / -0.67%`，即破坏正确 SAM 输入反而略好。三个 fold 和 all-fold SAM causal
 pass 均为 0。
 
-### 3.4 本阶段证据
+### 3.4 归因结论
 
 **证实：**
 
 - 动态 birth、永久 slot、严格因果 memory 和无成熟实例 exact L0 fallback 已实现；
-- SAM/geometry transport 具有训练容量；
-- 同一序列训练帧 loss 可被压低。
+- transport + SE(3) adapter 具有训练容量；
+- 同一序列训练帧 loss 可被压低，但这是 **adapter capacity** 证据。
 
 **证伪或未通过：**
 
 - 未证实 SAM descriptor 在未来帧提供超出 geometry 的稳定收益；
 - 输入破坏没有形成稳定伤害，因此不能把 pose gain 归因于正确 SAM 内容；
-- “训练到零”不能作为 SAM token 学到物理 correspondence 的证据。
+- “训练到零”只能说明 adapter 会拟合，不能作为 SAM token 学到物理 correspondence 的证据。
 
-## 4. V7.5：SAM region/identity 的显式约束
+## 4. SAM mask/ID 选择 StreamVGGT 点云，再显式求相机中心
+
+> 对应代码阶段：V7.5。这里完全不用 SAM appearance/local token，也没有 learned pose adapter。
 
 ### 4.1 目的与方法
 
-V7.5 完全不读取 SAM local descriptor，也不训练 pose head。它只测试 mask region 与 persistent ID：
+SAM 在这里提供两样东西：mask 决定从 StreamVGGT pointmap 中取哪些点，persistent ID 决定这些点
+写入哪一个历史 object map。位姿修正由固定几何算法完成：
 
 ```text
 SAM mask 内 frozen StreamVGGT points
@@ -227,17 +262,35 @@ rotation 始终保留 raw StreamVGGT。
 **证伪或未通过：** 正确 SAM region 和 persistent history 没有在所有 fold、两种 memory mode 下
 稳定改善相机中心。V7.5 也不能被引用为 SAM descriptor/token 证据。
 
-## 5. V8 matcher-first：拆掉 direct pose shortcut
+## 5. 显式监督 matching，再让 evidence-only adapter 输出 pose
+
+> 对应代码阶段：V8 matcher-first。目标是阻断 camera hidden 直接记忆 pose 的捷径。
 
 ### 5.1 目的
 
-V7 的问题是 matcher 和 pose head 被同一个末端 pose loss 驱动，head 可以绕过 correspondence。
-V8 将其拆成：
+上一条 learned route 的问题是 matcher 和 pose head 被同一个末端 pose loss 驱动，adapter 可以绕过
+correspondence。这里将其拆成：
 
 1. Stage A：用 GT-world pseudo-match 单独监督 `p_ij`；
 2. 冻结 matcher；
 3. Stage B：evidence-only pose，不读取 camera hidden；
 4. geometry、trained-SAM-off、no-match-supervision、dual Value 等控制共享相同 support。
+
+完整信息流为：
+
+```text
+SAM local descriptor + StreamVGGT local geometry
+  → 预测 current-history correspondence probability p_ij
+  → GT-world pseudo-match 单独监督 p_ij
+  → 冻结 matcher
+  → p_ij 同时搬运 history geometry；dual-Value 时也搬运 history SAM descriptor
+  → current/transported/difference/product 组成 evidence
+  → evidence-only adapter 输出 SE(3) residual
+```
+
+与第 3 节相比，adapter 不再读取 camera hidden；但它仍是可训练 pose 输出模块，所以只有 matcher
+本身的 held-out matching 指标、SAM 输入破坏和 parameter-matched controls 同时通过，才能归因给
+SAM token。
 
 ### 5.2 结果
 
@@ -263,12 +316,24 @@ V8 将其拆成：
 **证伪或未通过：** 双 Value、显式 matcher supervision 和 evidence-only pose 仍没有形成 all-fold
 SAM causal pass；short 的提升甚至不需要 match supervision，因此不能归因于 learned SAM match。
 
-## 6. V8 O1–O2.7：三维显式几何因子分解
+## 6. SAM mask 限定三维实例区域，再用固定 Kabsch 求 pose
 
-这一组实验不训练网络，固定 GT-world pseudo-correspondence，逐层替换 geometry、depth、K 和
-history pose，判断三维路线到底在哪里失效。
+> 对应代码阶段：V8 O1–O2.7。这里不使用 SAM descriptor，也不训练 adapter。
 
-### 6.1 O1/O2.5：support 与 solver 上界
+SAM mask 在这里仅用于限定实例区域；persistent ID 关联当前与历史实例。实例内三维点来自
+StreamVGGT predicted depth/pointmap，再由固定 Kabsch/Umeyama 求相对变换。实验固定 GT-world
+pseudo-correspondence，逐层替换 geometry、depth、K 和 history pose，判断三维路线到底在哪里失效：
+
+```text
+SAM mask + persistent ID
+  → 当前/历史帧实例区域
+  → 从 StreamVGGT depth/K 反投影三维点
+  → 固定 GT pseudo-correspondence（只做上界诊断）
+  → weighted/trimmed Kabsch
+  → relative pose correction
+```
+
+### 6.1 正确 GT 三维几何下验证 support 与 solver（O1/O2.5）
 
 support sweep 包括：
 
@@ -290,7 +355,7 @@ support sweep 包括：
 
 **证伪：** 当前 StreamVGGT predicted camera geometry 不是只要增加 correspondence 数就能修复。
 
-### 6.2 O2.6：depth、intrinsics、calibration、Sim(3)
+### 6.2 逐项替换 predicted depth 与 predicted K（O2.6）
 
 固定 `K=64 / history=2 / mutual / 0.10m`，分解结果：
 
@@ -311,7 +376,7 @@ predicted depth 都会独立损害位姿。
 **证伪：** predicted depth 的主要问题不是单一全局 scale/offset，也不能仅靠 Sim(3) 替代 SE(3)
 解决；局部 depth shape 与跨帧一致性是更深层瓶颈。
 
-### 6.3 O2.7：固定 K 与 SAM-instance depth affine
+### 6.3 固定/平滑 K，并在 SAM mask 内拟合 depth affine（O2.7）
 
 比较：
 
@@ -337,15 +402,18 @@ predicted depth 都会独立损害位姿。
 **证伪或未通过：** 固定/平滑 predicted K 或实例内 affine depth 仍不足以稳定修正全部未来帧；
 该结果仍不能归因于 SAM descriptor。
 
-## 7. V9：二维 correspondence → 固定极几何
+## 7. SAM local descriptor 预测二维对应，再由固定极几何修正相对 pose
+
+> 对应代码阶段：V9 Stage O/O-R1/A0/A0-H/A1。这里不训练 pose adapter。
 
 ### 7.1 为什么转向二维路线
 
-V8 已经证明 predicted depth/K 是三维显式求解的瓶颈。V9 不再使用 predicted depth、pointmap
-Kabsch 或 learned SE(3) head，而是验证：
+上一节已经证明 predicted depth/K 是三维显式求解的瓶颈。这条路线不再使用 predicted depth、
+pointmap Kabsch 或 learned SE(3) head，而是验证：
 
 ```text
-instance-local 2D correspondence
+SAM mask/ID 限定同一实例
+  → SAM current/history local descriptor 预测 2D correspondence
   → calibrated essential/epipolar solver
   → relative rotation + translation direction
 ```
@@ -353,7 +421,7 @@ instance-local 2D correspondence
 主实验使用 ScanNet++ calibrated K。它是传感器标定，在本场景中合理，但对于无标定互联网图片
 仍属于 oracle deployment 条件。
 
-### 7.2 Stage O 初版：dense visible-surface oracle
+### 7.2 用密集 GT 可见表面对应验证二维 solver（Stage O）
 
 GT mesh/depth/pose 只用于构造同一可见 surface point 的 2D label。初版 solver 结果：
 
@@ -366,7 +434,7 @@ GT mesh/depth/pose 只用于构造同一可见 surface point 的 2D label。初�
 所有 frame 均有大量 visible correspondence，因此失败不是 coverage，而是 eight-point
 initialization 与无限 history-center fusion 的求解问题。
 
-### 7.3 O-R1：固定 solver 修正
+### 7.3 修正初始化与相对位姿评分，不改变对应（O-R1）
 
 O-R1 只修求解器，不改数据和 correspondence：
 
@@ -388,7 +456,7 @@ O-R1 只修求解器，不改数据和 correspondence：
 
 **仍未证实：** absolute center/trajectory；单目 essential edge 没有新的 metric scale。
 
-### 7.4 A0 all-edges：local32 current query oracle
+### 7.4 固定 current local32 位置，给出连续 GT history 对应（A0 all-edges）
 
 A0 不训练 matcher。它保留缓存的 32 个 current local query 位置，用 GT depth/pose 将每个可见
 query 连续重投影到 history image，再进入固定 O-R1 solver。
@@ -411,7 +479,7 @@ query 连续重投影到 history image，再进入固定 O-R1 solver。
 correspondence 数、Sampson RMSE 与 cheirality 不能稳定区分好坏 edge；design condition/rank 是
 唯一明显且不读取 GT error 的 observability 信号。
 
-### 7.5 A0-H：best-condition single history
+### 7.5 用可观测性选择一条 history edge（A0-H）
 
 A0-H 不是新模型，而是一个预注册的、无效果阈值的 history 选择：
 
@@ -439,7 +507,7 @@ A0-H 不是新模型，而是一个预注册的、无效果阈值的 history 选
 - edge 选择能跨场景泛化。A0-H 规则是在当前数据的 per-edge 诊断后提出，并在同一场景 fold 上
   验证，因此它是 solver/support gate，不是独立的跨数据集结论。
 
-### 7.6 A1：显式 SAM local matcher
+### 7.6 用 SAM local descriptor 学习实际二维匹配（A1）
 
 A1 固定 SAM3.1、StreamVGGT 和 O-R1 solver，只训练一个小型 matcher：
 
@@ -493,46 +561,76 @@ A1 固定 SAM3.1、StreamVGGT 和 O-R1 solver，只训练一个小型 matcher：
 - 正常 SAM 内容没有稳定优于 generic patch、uniform 或 parameter-matched control；
 - 因果扰动没有稳定伤害，因此没有 SAM-token → correspondence → pose 的 E3 证据。
 
-## 8. 本周已经证实的内容
+## 8. 已证实有效的环节
 
-以下结论在当前 scene/protocol 下有直接实验支持：
+这里的“有效”指某个具体组件或物理中间量获得了直接证据，不等于整个 SAM-token pose 方法已经
+成功。尤其要把 adapter capacity 与 SAM information value 分开。
 
-1. **动态实例不需要固定物体参考帧。** 中途 birth、永久 slot、因果 memory 和第二次观测生效均已
-   真实运行。
-2. **learned pose head/transport 具有过拟合容量。** 这只能证明容量，不能证明 SAM 因果贡献。
-3. **SAM mask/ID 是有信息的区域约束。** V7.5 局部 fold 和 O2.7 instance-affine 上界均支持这一
-   点，但强度不足以形成稳定 all-fold pose 方法。
-4. **GT 3D geometry + 正确坐标 + Kabsch 能工作。** 因此三维显式路线的失败不能再笼统归因于
-   solver 实现错误。
-5. **predicted depth 和 predicted K 都是独立瓶颈。** GT depth + GT K 通过；交叉替换任一预测量
-   都会失败。
-6. **predicted depth 误差不是单一 scale/offset。** scale、affine 与 Sim(3) 均没有全折通过。
-7. **正确 instance-local 2D correspondence 能改善相对位姿。** O-R1 和 A0-H 均在三折形成明确
-   上界。
-8. **history edge 的可观测性很重要。** 在正确 correspondence 下，design condition 能避开
-   450/495 的退化/错误 history edge。
+| 已证实有效的东西 | SAM 提供了什么 | 如何参与 StreamVGGT/pose | 直接证据 | 不能扩大成什么结论 |
+|---|---|---|---|---|
+| 动态多实例管理 | prompt-conditioned mask、persistent track ID | 新实例分配永久 slot；当前帧结束后写 memory；第二次观测才可参与 | slot 2 在 frame 150 中途出生；因果 memory 与 exact fallback 正常 | 不代表 descriptor 有位姿价值 |
+| learned adapter 的拟合能力 | 可以有 SAM/geometry 输入，也可以关闭或破坏 SAM | evidence/camera hidden → MLP/SE(3) head → L0 pose residual | uniform、geometry、SAM、wrong-input 都能把训练 loss 压到接近零 | **有效的是 adapter 容量，不是 SAM token** |
+| SAM mask/ID 的区域信息 | 二值 mask 与跨帧 ID，不含 appearance token | mask 选择 StreamVGGT points；ID 建立历史 object map | 局部 fold 优于 full/bbox/random/stale；instance-region affine 上界优于 global affine | 还不是稳定 all-fold pose 方法，也不是 token 证据 |
+| 显式三维 solver 上界 | SAM 只限定实例区域；correspondence/geometry 使用 GT oracle | GT 3D geometry → Kabsch/Umeyama → relative pose | GT camera geometry、GT-depth+GT-K 全折可工作 | 不代表 predicted StreamVGGT geometry 足够 |
+| 正确实例内二维 correspondence | mask/ID 规定同一实例；对应本身由 GT oracle 给出 | 正确 2D pairs → fixed essential solver → rotation + translation direction | O-R1 与 A0-H 三折均通过；A0-H aggregate gain 为 90.69%/87.63%/73.29%，无恶化帧 | 不代表 SAM descriptor 能产生这些 pairs |
+| history edge 可观测性选择 | 不使用新的 SAM 特征 | 在多个因果 history 中选择 design condition 最好的一条 | 避开 frame 450/495 的退化 edge，A0-H 全折通过 | 尚未证明跨 scene 泛化 |
 
-## 9. 本周已经证伪或严格未通过的内容
+### 8.1 最关键的正面结论
 
-“证伪”均限定于本周固定的数据、模型输入和实验协议，不代表对所有 SAM/StreamVGGT 方案的
-普遍数学否定。
+当前真正被证实的是：
 
-1. **训练 loss 接近零足以证明 SAM token 有用：证伪。** uniform、geometry、错误输入都能过拟合。
-2. **V7.4 SAM+geometry 的未来帧收益来自正确 SAM descriptor：未通过。** controls 和扰动不支持
-   因果归因。
-3. **正确 SAM mask/ID history 能稳定改善所有未来 fold：未通过。** V7.5 all-fold region/history
-   pass 全为 0。
-4. **双 Value 或更丰富 fusion evidence 自动解决问题：未通过。** V8.1 dual Value 不稳定。
-5. **只要显式监督 matcher 就能消除 pose shortcut：结构上成立，但性能命题未通过。** no-match
-   control 可优于 supervised 分支。
-6. **当前 predicted depth/K 可以直接支撑实例 Kabsch pose：证伪。** 即使对应为 GT oracle 也失败。
-7. **固定 predicted K、全局 affine、实例 affine 或 Sim(3) 能稳定修复 predicted geometry：证伪。
-   **所有对应分支均无 all-fold pass。
-8. **所有 history edge 求均值会更稳定：证伪。** 450/495 的坏 edge 会压倒好 edge。
-9. **当前 detector FPN local token 能通过 Linear Q/K 学出未来点对应：证伪。** held-out PCK
-   0%–2.59%，所有 active pose frame 恶化。
-10. **当前 A1 的 pose 变化对正确 SAM 内容存在稳定因果依赖：证伪。** channel permutation、
-    wrong-ID、shuffle-time 没有形成预期的全折伤害。
+```text
+如果已经有正确的实例内二维跨帧对应
+  → 不需要 learned pose adapter
+  → 固定极几何求解器就能改善 StreamVGGT L0 的相对 rotation 和 translation direction
+```
+
+这证明“实例 correspondence 可以帮助 StreamVGGT pose”这条物理路径成立，但正确对应目前来自
+GT oracle，而不是当前 SAM local descriptor。
+
+### 8.2 adapter 过拟合应如何表述
+
+正确表述：
+
+> transport/evidence + SE(3) adapter 有足够容量拟合这一个序列的 pose residual。
+
+错误表述：
+
+> 因为带 SAM 输入的 adapter 把 loss 降到零，所以 SAM token 能修正位姿。
+
+后者不成立，因为 uniform transport、geometry-only、SAM-off 甚至错误 SAM 输入也能拟合。只要
+存在可训练 pose head，它就可能使用 camera hidden、geometry、frame regularity 或参数容量直接记忆
+训练 pose。只有正确 SAM 在 held-out 上超过参数匹配控制，并且 wrong-ID/shuffle-time 明显伤害
+结果，才能把收益归因给 SAM token；当前没有出现这种证据。
+
+## 9. 已证伪或当前实现无效的路径
+
+“证伪/无效”均限定于本周的场景、输入特征、模型和严格时间协议，不是否定所有可能的 SAM 架构。
+
+| 当前无效的主张或路径 | 实际尝试的计算路径 | 为什么判定无效 |
+|---|---|---|
+| 训练 pose loss 接近零即可证明 SAM token 有用 | SAM/geometry evidence → learned SE(3) adapter | uniform、geometry-only、SAM-off 和错误输入同样能过拟合；只能证明 adapter capacity |
+| SAM descriptor affinity 能稳定帮助未来 pose | SAM local Q/K → transport history geometry → adapter | 三个时间 fold 的 causal pass 都为 0；破坏 SAM 后没有稳定下降 |
+| 把 SAM descriptor 也作为 Value 就能解决问题 | 同一 probability 同时搬运 geometry 与 SAM Value → evidence-only adapter | short/medium 明显下降，long 仍差于 L0；无 all-fold pass |
+| 显式 matching supervision 自动带来 SAM 因果收益 | GT pseudo-match 监督 matcher → 冻结 → evidence-only pose | no-match-supervision 可更好；SAM perturbation 没有稳定伤害结果 |
+| SAM mask/ID object map 能稳定修正所有相机中心 | mask 内 StreamVGGT points → ICP/history map → ray-centre solver | 只在 short/frozen 局部通过，medium/long 与 online memory 不稳定 |
+| predicted StreamVGGT 3D geometry 足以做实例 Kabsch | SAM instance region → predicted depth/K → GT correspondence → Kabsch | 即使 correspondence 为 GT oracle 也失败；predicted depth 和 predicted K 都是独立瓶颈 |
+| 用简单 calibration 可修复 predicted geometry | fixed/median K、global/instance affine depth、scale 或 Sim(3) | 所有方案都没有 all-fold pass；depth 问题不是单一 scale/offset |
+| 将所有历史 edge 平均会更稳 | 每个 history edge 求 pose，再聚合 | frame 450/495 的坏 edge 会压倒好 edge |
+| 当前 SAM local token 能产生未来 2D 对应 | `detector_fpn2 local32 → Linear Q/K → 2D pairs → fixed epipolar solver` | train loss 下降 85%–92%，但 held-out PCK 仅 0%–2.59%，12/12 pose frame 恶化 |
+| pose 输出因果依赖正确 SAM descriptor | normal 与 wrong-ID/shuffle-time/channel-permutation 对照 | 扰动没有稳定造成 matching/pose damage；channel permutation 的三折 EPE 反而都低于 normal |
+
+### 9.1 对 SAM 各类信息的最终分类
+
+| SAM 信息 | 当前状态 | 准确结论 |
+|---|---|---|
+| text prompts | 工程有效 | 目前只配置 `bed/wardrobe`，用于发现候选实例，不直接修正 pose |
+| tracking mask | 局部有效/E2 | 能定义比全图更有意义的实例区域，但尚无稳定 all-fold pose 收益 |
+| persistent ID | 工程有效、位姿收益不稳定 | 能建立因果 object history；正确 ID 还没有稳定改善所有 fold |
+| pooled/global appearance token | 未形成因果证据 | 与 camera/geometry 一起进入 adapter 时无法隔离其贡献 |
+| `detector_fpn2` local32 descriptor | 当前协议下无效 | 当前 Linear Q/K 没有学出 held-out 2D correspondence |
+| 正确 instance-local correspondence | 有效，但来自 oracle | 能显著修正 relative pose；这是后续 descriptor 必须达到的目标中间量 |
+| SAM3.1 tracker/memory temporal feature | 未测试 | 不能用 detector-FPN 的失败代替对 temporal memory feature 的结论 |
 
 ## 10. 仍未回答的问题
 
@@ -594,6 +692,7 @@ current local32 query
 
 ```text
 动态 SAM mask/identity          已实现
+learned SE(3) adapter 拟合容量  已证实，但与 SAM token 贡献无关
 正确实例区域具有几何信息        已证实
 GT 3D/2D 显式 solver 上界       已证实
 predicted 3D depth/K 路线        当前失败，瓶颈已定位
