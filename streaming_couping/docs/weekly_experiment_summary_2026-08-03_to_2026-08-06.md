@@ -179,3 +179,5 @@ shuffle-time、channel permutation 稳定破坏 matching 和 pose，才能形成
 
 若离散 support 足够而 detector-FPN 仍失败，下一步才值得测试真正不同的 SAM3.1 video-memory
 temporal feature；不应继续扩大 adapter、fusion MLP 或 attention heads。
+
+一键命令：`zsh streaming_couping/commands_v91_token_evidence_audit.txt`。

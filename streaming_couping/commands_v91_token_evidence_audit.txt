@@ -1,0 +1,129 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+STREAM_GPU0="${V91_STREAM_GPU0:-1}"
+STREAM_GPU1="${V91_STREAM_GPU1:-2}"
+SAM_GPU="${V91_SAM_GPU:-3}"
+MATCH_GPU="${V91_MATCH_GPU:-1}"
+VISIBLE_GPUS="$STREAM_GPU0,$STREAM_GPU1,$SAM_GPU"
+DATA_CONFIG=streaming_couping/configs/v74_temporal_data.yaml
+STAGE_A_CONFIG=streaming_couping/configs/v90_local_token_matcher.yaml
+AUDIT_CONFIG=streaming_couping/configs/v91_token_evidence_audit.yaml
+STAGE_A_OUTPUT="${V90_STAGE_A_OUTPUT:-outputs/streaming_couping_v90_epipolar_token_stage_a}"
+OUTPUT="${V91_OUTPUT:-outputs/streaming_couping_v91_token_evidence_audit}"
+CACHE=outputs/streaming_couping_v74_temporal_scaling/cache/00a231a370_90_525_step15_37_68_54.pt
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+echo "V9.1 smoke: discrete-key oracle, raw cosine and Top-1/soft audit"
+PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.smoke_v91_token_evidence
+
+NEED_REBUILD=0
+if [[ "${V91_REBUILD_CACHE:-0}" == "1" || ! -s "$CACHE" ]]; then
+  NEED_REBUILD=1
+else
+  echo "V9.1 validating the retained dynamic-instance observation cache"
+  if ! PYTHONPATH=. "$PYTHON_BIN" \
+    -m streaming_couping.scripts.audit_v7_cache \
+    --config "$DATA_CONFIG" \
+    --output-dir "$OUTPUT/cache_audit_preflight" \
+    --strict; then
+    NEED_REBUILD=1
+  fi
+fi
+
+if (( NEED_REBUILD )); then
+  echo "V9.1 rebuilding the frozen 30-frame cache"
+  CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" \
+  PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+    -m streaming_couping.scripts.run_instance_token_pose \
+    --config "$DATA_CONFIG" \
+    --stage cache \
+    --streamvggt-devices cuda:0,cuda:1 \
+    --sam3-device cuda:2 \
+    --geometry-device cuda:0 \
+    --training-device cuda:0 \
+    --rebuild-cache
+fi
+[[ -s "$CACHE" ]] || { echo "missing V9.1 cache: $CACHE" >&2; exit 1; }
+
+CHECKPOINTS_OK=1
+if (( NEED_REBUILD )) || [[ "${V91_REFRESH_STAGE_A:-0}" == "1" ]]; then
+  CHECKPOINTS_OK=0
+fi
+for fold in short medium long; do
+  for architecture in sam_match stream_patch_match sam_train_off; do
+    checkpoint="$STAGE_A_OUTPUT/checkpoints/${fold}_${architecture}.pt"
+    if [[ ! -s "$checkpoint" ]]; then
+      CHECKPOINTS_OK=0
+    fi
+  done
+done
+
+if (( CHECKPOINTS_OK )); then
+  echo "V9.1 validating Stage-A checkpoint provenance"
+  if ! PYTHONPATH=. "$PYTHON_BIN" \
+    -m streaming_couping.scripts.run_v91_token_evidence_audit \
+    --config "$AUDIT_CONFIG" \
+    --stage-a-output-dir "$STAGE_A_OUTPUT" \
+    --checkpoint-preflight; then
+    CHECKPOINTS_OK=0
+  fi
+fi
+
+if (( ! CHECKPOINTS_OK )); then
+  echo "V9.1 Stage-A checkpoints are missing, stale or explicitly refreshed"
+  STAGE_A_ARGS=(
+    --config "$STAGE_A_CONFIG"
+    --output-dir "$STAGE_A_OUTPUT"
+    --stage all
+  )
+  if [[ "${V91_REFRESH_STAGE_A:-0}" == "1" ]]; then
+    STAGE_A_ARGS+=(--no-resume)
+  fi
+  CUDA_VISIBLE_DEVICES="$MATCH_GPU" \
+  PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+    -m streaming_couping.scripts.run_v90_local_token_matcher \
+    "${STAGE_A_ARGS[@]}"
+  PYTHONPATH=. "$PYTHON_BIN" \
+    -m streaming_couping.scripts.run_v91_token_evidence_audit \
+    --config "$AUDIT_CONFIG" \
+    --stage-a-output-dir "$STAGE_A_OUTPUT" \
+    --checkpoint-preflight
+else
+  echo "V9.1 reuses completed Stage-A checkpoints; no model is trained"
+fi
+
+echo "V9.1 A0-Q discrete support + train/future matcher audit"
+PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.run_v91_token_evidence_audit \
+  --config "$AUDIT_CONFIG" \
+  --stage-a-output-dir "$STAGE_A_OUTPUT" \
+  --output-dir "$OUTPUT"
+
+SUMMARY="$OUTPUT/v91_token_evidence_summary.csv"
+PAIRS="$OUTPUT/v91_token_evidence_pairs.csv"
+FRAMES="$OUTPUT/v91_token_evidence_frames.csv"
+EDGES="$OUTPUT/v91_token_evidence_edges.csv"
+DECISION="$OUTPUT/v91_token_evidence_decision.md"
+METADATA="$OUTPUT/v91_token_evidence_metadata.json"
+for file in "$SUMMARY" "$PAIRS" "$FRAMES" "$EDGES" "$DECISION" "$METADATA"; do
+  [[ -s "$file" ]] || { echo "missing V9.1 output: $file" >&2; exit 1; }
+done
+
+echo "V9.1 COPY THIS DECISION"
+cat "$DECISION"
+echo "V9.1 COPY THIS SUMMARY CSV"
+cat "$SUMMARY"
+echo "V9.1 pair diagnostics: $PAIRS"
+echo "V9.1 frame diagnostics: $FRAMES"
+echo "V9.1 edge diagnostics: $EDGES"
+echo "V9.1 provenance: $METADATA"

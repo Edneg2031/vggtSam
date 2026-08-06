@@ -104,7 +104,9 @@ def hard_discrete_oracle_probability(target: SoftMatchTarget) -> torch.Tensor:
     probability = torch.zeros_like(target.probability)
     classes = target.probability.argmax(dim=-1)
     probability.scatter_(1, classes[:, None], 1.0)
-    invalid = ~target.supervised.bool()
+    invalid = ~target.supervised.to(
+        device=probability.device, dtype=torch.bool
+    )
     if bool(invalid.any()):
         probability[invalid] = 0.0
         probability[invalid, -1] = 1.0
@@ -138,7 +140,9 @@ def raw_cosine_probability(
     query = F.normalize(query, dim=-1, eps=1e-6)
     key = F.normalize(key, dim=-1, eps=1e-6)
     logits = (query @ key.transpose(0, 1)) / float(temperature)
-    pair_valid = query_valid.bool()[:, None] & key_valid.bool()[None, :]
+    query_valid_device = query_valid.to(device=logits.device, dtype=torch.bool)
+    key_valid_device = key_valid.to(device=logits.device, dtype=torch.bool)
+    pair_valid = query_valid_device[:, None] & key_valid_device[None, :]
     logits = logits.masked_fill(~pair_valid, -1e4)
     dustbin = torch.full(
         (query.shape[0], 1),
@@ -147,7 +151,7 @@ def raw_cosine_probability(
         device=logits.device,
     )
     logits = torch.cat([logits, dustbin], dim=-1)
-    invalid = ~query_valid.bool()
+    invalid = ~query_valid_device
     if bool(invalid.any()):
         invalid_logits = torch.full_like(logits, -1e4)
         invalid_logits[..., -1] = 0.0
@@ -172,8 +176,11 @@ def decode_token_probability(
         raise ValueError("V9.1 probability must be [Q,R+1].")
     if probability.shape != (query_valid.shape[0], key_valid.shape[0] + 1):
         raise ValueError("V9.1 probability/support shapes disagree.")
-    key_uv = normalized_uv_to_pixels(history_uv_normalized, image_size)
-    real = probability[:, :-1].double() * key_valid.double()[None, :]
+    device = probability.device
+    query_valid_device = query_valid.to(device=device, dtype=torch.bool)
+    key_valid_device = key_valid.to(device=device, dtype=torch.bool)
+    key_uv = normalized_uv_to_pixels(history_uv_normalized, image_size).to(device)
+    real = probability[:, :-1].double() * key_valid_device.double()[None, :]
     real_mass = real.sum(dim=-1)
     normalized = real / real_mass[:, None].clamp_min(1e-12)
     concentration = normalized.max(dim=-1).values
@@ -186,8 +193,8 @@ def decode_token_probability(
         weights = real.gather(1, key_index[:, None])[:, 0]
     predicted_class = probability.argmax(dim=-1)
     accepted = (
-        query_valid.bool()
-        & key_valid.bool().any()
+        query_valid_device
+        & key_valid_device.any()
         & predicted_class.ne(probability.shape[-1] - 1)
         & real_mass.gt(1e-12)
         & torch.isfinite(predicted_uv).all(dim=-1)
@@ -223,21 +230,26 @@ def audit_token_probability(
     threshold = float(pck_threshold_pixels)
     if not math.isfinite(threshold) or threshold <= 0.0:
         raise ValueError("V9.1 PCK threshold must be positive.")
-    supervised = target.supervised.bool()
-    visible = labels.target_visible.bool() & supervised
-    supported = target.visible_with_key_support.bool() & visible
+    device = probability.device
+    supervised = target.supervised.to(device=device, dtype=torch.bool)
+    visible = labels.target_visible.to(device=device, dtype=torch.bool) & supervised
+    supported = (
+        target.visible_with_key_support.to(device=device, dtype=torch.bool) & visible
+    )
     diagonal = math.hypot(*image_size)
-    finite = prediction.accepted & torch.isfinite(prediction.predicted_uv).all(dim=-1)
+    prediction_accepted = prediction.accepted.to(device=device, dtype=torch.bool)
+    prediction_uv = prediction.predicted_uv.to(device)
+    finite = prediction_accepted & torch.isfinite(prediction_uv).all(dim=-1)
     error = torch.full(
         supervised.shape,
         float(diagonal),
         dtype=torch.float64,
-        device=probability.device,
+        device=device,
     )
-    valid_error = finite & torch.isfinite(labels.history_target_uv).all(dim=-1)
+    history_target_uv = labels.history_target_uv.to(device)
+    valid_error = finite & torch.isfinite(history_target_uv).all(dim=-1)
     error[valid_error] = torch.linalg.vector_norm(
-        prediction.predicted_uv[valid_error]
-        - labels.history_target_uv.to(prediction.predicted_uv.device)[valid_error],
+        prediction_uv[valid_error] - history_target_uv[valid_error],
         dim=-1,
     )
     pck = error.le(threshold) & finite
@@ -245,36 +257,33 @@ def audit_token_probability(
         target.probability.to(probability.device, probability.dtype)
         * probability.clamp_min(1e-8).log()
     ).sum(dim=-1)
-    target_class = target.probability.argmax(dim=-1).to(probability.device)
+    target_class = target.probability.argmax(dim=-1).to(device)
     predicted_class = probability.argmax(dim=-1)
     dustbin_index = probability.shape[-1] - 1
-    dustbin = supervised.to(probability.device) & target_class.eq(dustbin_index)
+    dustbin = supervised & target_class.eq(dustbin_index)
     class_count = max(int(probability.shape[-1]), 2)
     entropy = -(
         probability.clamp_min(1e-12) * probability.clamp_min(1e-12).log()
     ).sum(dim=-1) / math.log(class_count)
-    visible_device = visible.to(probability.device)
-    supported_device = supported.to(probability.device)
-    supervised_device = supervised.to(probability.device)
     return TokenAuditMetrics(
         supervised_queries=int(supervised.sum()),
         visible_queries=int(visible.sum()),
         visible_supported_queries=int(supported.sum()),
-        accepted_correspondences=int(prediction.accepted.sum()),
-        visible_pck_correct=int((pck & visible_device).sum()),
-        visible_epe_sum_pixels=float(error[visible_device].sum()),
-        supported_pck_correct=int((pck & supported_device).sum()),
-        supported_epe_sum_pixels=float(error[supported_device].sum()),
+        accepted_correspondences=int(prediction_accepted.sum()),
+        visible_pck_correct=int((pck & visible).sum()),
+        visible_epe_sum_pixels=float(error[visible].sum()),
+        supported_pck_correct=int((pck & supported).sum()),
+        supported_epe_sum_pixels=float(error[supported].sum()),
         dustbin_queries=int(dustbin.sum()),
         dustbin_correct=int((dustbin & predicted_class.eq(dustbin_index)).sum()),
-        visible_ce_sum=float(per_query_ce[supported_device].sum()),
+        visible_ce_sum=float(per_query_ce[supported].sum()),
         visible_ce_queries=int(supported.sum()),
         dustbin_ce_sum=float(per_query_ce[dustbin].sum()),
-        entropy_sum=float(entropy[supervised_device].sum()),
+        entropy_sum=float(entropy[supervised].sum()),
         real_key_mass_sum=float(
-            prediction.real_key_mass.to(probability.device)[supervised_device].sum()
+            prediction.real_key_mass.to(device)[supervised].sum()
         ),
         max_probability_sum=float(
-            probability.max(dim=-1).values[supervised_device].sum()
+            probability.max(dim=-1).values[supervised].sum()
         ),
     )
