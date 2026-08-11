@@ -46,11 +46,21 @@ summary = json.loads(Path("outputs/streaming_couping_v0/baseline_summary.json").
 assert summary["baseline_version"] == "v0"
 assert summary["implementation_revision"] == "v71_pose_conditioned_l0_v74_geometry_r3"
 assert summary["selected_pose_branch"] == "v71_pose_conditioned_camera_l0"
-assert summary["baseline_acceptance_pass"] == 1
-assert summary["selected_gain_vs_raw_percent"] > 0
 assert summary["camera_training"]["no_op_check"] == "passed"
 assert summary["geometry_training"]["no_op_check"] == "passed"
 gain = summary["selected_gain_vs_raw_percent"]
-print(f"V0 accepted gain={gain:.6g}%")
+decision = summary["baseline_acceptance_pass"]
+print(f"V0 all-fold decision={decision} mean-center aggregate gain={gain:.6g}%")
 '
-echo "V0 baseline completed"
+
+echo "V0 parameter-matched pose input controls"
+CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" PYTHONUNBUFFERED=1 PYTHONPATH=. \
+  "$PYTHON_BIN" -m streaming_couping.scripts.validate_v0_pose_controls \
+  --config "$CONFIG" \
+  --device cuda:0
+
+[[ -s outputs/streaming_couping_v0/validation/v0_pose_control_decision.json ]] || {
+  echo "missing v0_pose_control_decision.json" >&2
+  exit 1
+}
+echo "V0 baseline audit completed"

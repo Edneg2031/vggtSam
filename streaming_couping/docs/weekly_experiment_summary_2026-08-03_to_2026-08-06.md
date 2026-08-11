@@ -235,8 +235,31 @@ recent concrete observation memory
   geometry transport 不再静默覆盖最终结果，只作为 `geometry_candidate` 输出。
 - runner 验证 prefix causality、late birth、birth-frame inactivity、moving-object exclusion 和 inactive
   exact fallback；默认用 105–255 训练 camera，270–345 训练 geometry candidate，360–525 只评估。
-- runner 新增硬验收：非零梯度、非零参数更新、训练 loss 至少下降 1%，并且 selected L0 的
-  future evaluation loss 必须严格优于 raw。任一条件失败就不写合格 summary。
+- runner 拒绝零梯度、零参数更新和训练 loss 不下降；评估主指标固定为 mean camera-center error，
+  pose loss 只作为 secondary。12 个未来帧固定分成 short/medium/long 三折，并同时报告每折均值和
+  worse-frame 数量。只有每折 center 均改善且没有任何 center 坏帧才可验收。
+- 同参数量控制固定为 `camera hidden + raw pose`、`raw-pose-only`、`camera-token-only` 和
+  `time-only`。这用来判断收益是否真的来自 StreamVGGT camera hidden 的增量，而不是 raw pose
+  轨迹输入或单场景 frame/time 拟合。
+
+### V0 r3 逐帧复审结论
+
+服务器旧 summary 的 `baseline_acceptance_pass=1` 只读 12 帧 aggregate pose loss，不能作为正式
+验收。按同一份 `frame_diagnostics.csv` 重新计算 center 主指标：
+
+| fold | frames | raw center | selected center | center gain | worse frames | robust pass |
+|---|---|---:|---:|---:|---:|---:|
+| short | 360–405 | 0.130182 | 0.0904655 | 30.5087% | 1 | 0 |
+| medium | 420–465 | 0.0973828 | 0.122970 | -26.2753% | 3 | 0 |
+| long | 480–525 | 0.234801 | 0.128532 | 45.2593% | 0 | 1 |
+
+因此当前 V0 r3 的正式结论是 **all-fold fail**。12 帧 aggregate center 的确改善，但它被 short/long
+折主导，掩盖了 medium fold 的明显下降；这只能记作同场景 aggregate E2 diagnostic，不能称为稳定
+pose baseline。
+
+geometry candidate 也不能升级为 selected：它相对 selected 在 short 改善约 11.50%，medium 没有
+active correction，long 下降约 1.49%；frame 525 的 center 和 rotation 都进一步变差。当前证据不支持
+继续调 geometry transport 阈值。
 
 运行入口：
 
@@ -247,21 +270,24 @@ zsh streaming_couping/commands_v0_baseline.txt
 输出目录固定为 `outputs/streaming_couping_v0/`，但复用已有 V7.4 dynamic cache，避免重复保存冻结
 backbone tensor。结果包含 `baseline_summary.json`、
 `frame_diagnostics.csv`、`dynamic_instance_diagnostics.csv` 和 `poses.pt`。summary/checkpoint 签名都记录
-`baseline_version=v0` 和实现修订；旧 no-op checkpoint 会自动失效。只有服务器重新运行后出现
-`baseline_acceptance_pass=1`，这个 V0 才算正式验收。旧 V4–V9.8 结论只保留在本账本。
+`baseline_version=v0` 和实现修订；旧 no-op checkpoint 会自动失效。控制验证另外输出
+`validation/v0_pose_control_validation.csv` 和 `validation/v0_pose_control_decision.json`。
+科学上的 fail 不会再让命令中断或丢失输出。旧 V4–V9.8 结论只保留在本账本。
 
 这个 baseline 符合“第一帧不需要出现所有物体，未来物体可加入”，但仍有三个限制：
 
 1. SAM3.1 是 open-vocabulary prompt detector，不是 class-agnostic all-object proposal；目前只配置
    `bed`、`wardrobe`，会发现这两个概念的多个实例，但不会自动覆盖任意类别。
-2. selected pose 的收益来自 V7.1 camera L0；dynamic SAM 与 geometry candidate 是否进一步帮助 pose
-   必须看单独控制，不能从 V0 selected 指标推出。
+2. selected candidate 的 aggregate 收益来自 V7.1-style learned head，但三折 gate 已失败；dynamic
+   SAM 与 geometry candidate 是否帮助 pose 更不能从 aggregate 指标推出。
 3. 当前 runner 是按时间顺序的 causal replay；SAM3.1 session 仍由 cache builder 对整段有序帧创建和
    关闭，尚未封装成常驻服务式的 `step(frame)` API。
 
 ## 9. DualMap 启发下值得保留的下一条理论路线
 
-若 baseline 清理后继续研究，方向不应是更大的 SAM pose adapter，而应是：
+V0 三折失败后，不应继续扩大或调参当前 direct learned SE(3) head。下一版代码应保留 V0 的动态
+实例前端和 geometry-assisted mask，但把 raw StreamVGGT pose 恢复为未验收阶段的 selected 输出，
+把新 pose 方法始终作为单独 candidate。候选路线是：
 
 ```text
 global abstract registry
@@ -273,7 +299,9 @@ local concrete factor window
   + UV / geometry / timestamp / uncertainty
 
 pose update
-  = explicit robust optimizer around StreamVGGT L0
+  = calibrated-K epipolar factors
+  + StreamVGGT relative-pose/translation-scale prior
+  + explicit causal sliding-window optimizer
 ```
 
 SAM 的可验证贡献改为：
@@ -282,6 +310,17 @@ SAM 的可验证贡献改为：
 - 用 persistent ID 选择长期静态 anchor 的 history；
 - 用 stability/split 状态阻止错误 observation 污染 memory；
 - 在全图支撑中做 instance/background 分层，而不是只在实例内部求 essential matrix。
+
+实现顺序固定为：
+
+1. 定义 `CausalCorrespondenceBackend`，接入真正为视频匹配/跟踪预训练的冻结 correspondence source；
+   不再重复 V9.7/V9.8 已失败的 SAM detector/memory descriptor matcher。
+2. 同一批 correspondence 上运行 full-image、SAM dynamic-excluded、SAM instance/background-stratified、
+   random/bbox mask 四个 equal-count 分支。
+3. solver 只优化宽基线可观测的 rotation/translation direction；metric translation scale 由 frozen
+   StreamVGGT relative pose prior 锚定，避免重新进入 V8 已失败的 predicted-depth Kabsch 路线。
+4. 固定权重后先过当前长序列三折，再跑同场景第二 clip；在此之前不覆盖 raw pose，也不设计基于
+   GT 指标的回退阈值。
 
 该路线的必要控制是 equal-count full-image、random/bbox mask、wrong-ID、shuffle-time、SAM-off。
 只有 SAM-stratified 分支在相同 correspondence 和 solver 下稳定超过这些控制，才能声明

@@ -454,19 +454,40 @@ def _write_outputs(
         translation_weight=run.optimizer.translation_weight,
         evaluation_indices=evaluation_indices,
     )
-    selected_gain = _gain_percent(raw_metrics["loss"], l0_metrics["loss"])
+    selected_gain = _gain_percent(
+        raw_metrics["center_error_native"], l0_metrics["center_error_native"]
+    )
+    selected_pose_loss_gain = _gain_percent(
+        raw_metrics["loss"], l0_metrics["loss"]
+    )
     geometry_gain_vs_raw = _gain_percent(
-        raw_metrics["loss"], geometry_candidate_metrics["loss"]
+        raw_metrics["center_error_native"],
+        geometry_candidate_metrics["center_error_native"],
     )
     geometry_gain_vs_l0 = _gain_percent(
+        l0_metrics["center_error_native"],
+        geometry_candidate_metrics["center_error_native"],
+    )
+    geometry_pose_loss_gain_vs_raw = _gain_percent(
+        raw_metrics["loss"], geometry_candidate_metrics["loss"]
+    )
+    geometry_pose_loss_gain_vs_l0 = _gain_percent(
         l0_metrics["loss"], geometry_candidate_metrics["loss"]
     )
-    if selected_gain <= float(run.optimizer.min_evaluation_gain_percent):
-        raise RuntimeError(
-            "V0 acceptance failed: pose-conditioned V7.1 L0 does not improve raw "
-            f"evaluation loss (gain={selected_gain:.6g}%, required>"
-            f"{float(run.optimizer.min_evaluation_gain_percent):.6g}%)."
-        )
+    fold_results = _temporal_fold_results(
+        raw_pose=raw_pose,
+        selected_pose=l0_pose,
+        geometry_pose=refined["world_to_camera"],
+        target_pose=target_pose,
+        frame_indices=frames,
+        reference_index=reference,
+        evaluation_indices=evaluation_indices,
+        translation_weight=run.optimizer.translation_weight,
+        minimum_gain_percent=run.optimizer.min_evaluation_gain_percent,
+    )
+    baseline_acceptance = int(
+        all(int(row["selected_fold_pass"]) for row in fold_results)
+    )
     dynamic = {
         int(row["sequence_index"]): row
         for row in payload.get("dynamic_instance_diagnostics", ())
@@ -534,7 +555,7 @@ def _write_outputs(
         if str(row.get("selected_variant", "")) == "sam31_online_geometry_compete"
     ]
     summary = {
-        "schema": 2,
+        "schema": 3,
         "baseline_version": run.version,
         "implementation_revision": V0_IMPLEMENTATION_REVISION,
         "method": "v0_v71_pose_conditioned_l0_dynamic_instance_baseline",
@@ -565,9 +586,23 @@ def _write_outputs(
         "selected_pose_metrics": l0_metrics,
         "geometry_candidate_metrics": geometry_candidate_metrics,
         "selected_gain_vs_raw_percent": selected_gain,
+        "selected_pose_loss_gain_vs_raw_percent_secondary": (
+            selected_pose_loss_gain
+        ),
         "geometry_candidate_gain_vs_raw_percent": geometry_gain_vs_raw,
         "geometry_candidate_gain_vs_l0_percent": geometry_gain_vs_l0,
-        "baseline_acceptance_pass": 1,
+        "geometry_candidate_pose_loss_gain_vs_raw_percent_secondary": (
+            geometry_pose_loss_gain_vs_raw
+        ),
+        "geometry_candidate_pose_loss_gain_vs_l0_percent_secondary": (
+            geometry_pose_loss_gain_vs_l0
+        ),
+        "temporal_fold_results": fold_results,
+        "baseline_acceptance_rule": (
+            "mean_center_gain_positive_and_zero_center_worse_frames_"
+            "on_each_4_frame_fold"
+        ),
+        "baseline_acceptance_pass": baseline_acceptance,
         "camera_training": base_training,
         "geometry_training": refiner_training,
         "camera_input_audit": camera_input_audit,
@@ -598,7 +633,18 @@ def _write_outputs(
         run.output_dir / "poses.pt",
     )
     print("V0 DYNAMIC INSTANCE GEOMETRY BASELINE SUMMARY")
-    print(result.read_text(encoding="utf8").rstrip())
+    print(
+        f"  aggregate center gain={selected_gain:.6g}% "
+        f"(diagnostic only)"
+    )
+    for row in fold_results:
+        print(
+            f"  {row['fold']}: center_gain="
+            f"{float(row['selected_center_gain_vs_raw_percent']):.6g}% "
+            f"worse={row['selected_center_worse_frames']} "
+            f"pass={row['selected_fold_pass']}"
+        )
+    print(f"  all-fold acceptance={baseline_acceptance} output={result}")
     return result
 
 
@@ -637,6 +683,96 @@ def _gain_percent(reference: float, candidate: float) -> float:
     return 100.0 * (float(reference) - float(candidate)) / max(
         abs(float(reference)), 1e-12
     )
+
+
+def _temporal_fold_results(
+    *,
+    raw_pose: torch.Tensor,
+    selected_pose: torch.Tensor,
+    geometry_pose: torch.Tensor,
+    target_pose: torch.Tensor,
+    frame_indices: tuple[int, ...],
+    reference_index: int,
+    evaluation_indices: list[int],
+    translation_weight: float,
+    minimum_gain_percent: float,
+) -> list[dict[str, object]]:
+    if len(evaluation_indices) != 12:
+        raise ValueError("V0 requires exactly twelve future evaluation frames.")
+    output = []
+    for fold_index, fold in enumerate(("short", "medium", "long")):
+        indices = evaluation_indices[4 * fold_index : 4 * (fold_index + 1)]
+        raw = pose_metrics(
+            raw_pose,
+            target_pose,
+            reference_index=reference_index,
+            translation_weight=translation_weight,
+            evaluation_indices=indices,
+        )
+        selected = pose_metrics(
+            selected_pose,
+            target_pose,
+            reference_index=reference_index,
+            translation_weight=translation_weight,
+            evaluation_indices=indices,
+        )
+        geometry = pose_metrics(
+            geometry_pose,
+            target_pose,
+            reference_index=reference_index,
+            translation_weight=translation_weight,
+            evaluation_indices=indices,
+        )
+        raw_errors = _center_errors(raw_pose, target_pose, indices)
+        selected_errors = _center_errors(selected_pose, target_pose, indices)
+        geometry_errors = _center_errors(geometry_pose, target_pose, indices)
+        selected_gain = _gain_percent(
+            raw["center_error_native"], selected["center_error_native"]
+        )
+        geometry_gain = _gain_percent(
+            selected["center_error_native"], geometry["center_error_native"]
+        )
+        selected_worse = int(selected_errors.gt(raw_errors).sum().cpu())
+        geometry_worse = int(
+            geometry_errors.gt(selected_errors).sum().cpu()
+        )
+        output.append(
+            {
+                "fold": fold,
+                "sequence_indices": tuple(indices),
+                "frame_indices": tuple(frame_indices[index] for index in indices),
+                "raw_metrics": raw,
+                "selected_metrics": selected,
+                "geometry_candidate_metrics": geometry,
+                "selected_center_gain_vs_raw_percent": selected_gain,
+                "selected_pose_loss_gain_vs_raw_percent_secondary": (
+                    _gain_percent(raw["loss"], selected["loss"])
+                ),
+                "selected_center_worse_frames": selected_worse,
+                "selected_fold_pass": int(
+                    selected_gain > float(minimum_gain_percent)
+                    and selected_worse == 0
+                ),
+                "geometry_center_gain_vs_selected_percent": geometry_gain,
+                "geometry_center_worse_frames_vs_selected": geometry_worse,
+                "geometry_fold_pass": int(
+                    geometry_gain > float(minimum_gain_percent)
+                    and geometry_worse == 0
+                ),
+            }
+        )
+    return output
+
+
+def _center_errors(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    indices: list[int],
+) -> torch.Tensor:
+    index = torch.tensor(indices, dtype=torch.long, device=predicted.device)
+    predicted_center = camera_centers(predicted.index_select(1, index))
+    target_center = camera_centers(target.index_select(1, index))
+    return torch.linalg.vector_norm(predicted_center - target_center, dim=-1)
 
 
 def _camera_input_audit(

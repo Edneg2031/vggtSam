@@ -16,6 +16,14 @@ from torch import nn
 from torch.nn import functional as F
 
 
+V0_CAMERA_INPUT_MODES = (
+    "camera_pose",
+    "pose_only",
+    "camera_only",
+    "time_only",
+)
+
+
 @dataclass(frozen=True)
 class BaselineModelConfig:
     hidden_dim: int = 256
@@ -71,9 +79,13 @@ class CameraPoseBaseline(nn.Module):
         *,
         camera_dim: int,
         config: BaselineModelConfig,
+        input_mode: str = "camera_pose",
     ) -> None:
         super().__init__()
+        if input_mode not in V0_CAMERA_INPUT_MODES:
+            raise ValueError(f"Unknown V0 camera input mode: {input_mode!r}.")
         self.config = config
+        self.input_mode = input_mode
         hidden = int(config.hidden_dim)
         self.camera_projector = _mlp(int(camera_dim) + 12, hidden)
         self.feature_merger = _mlp(4 * hidden, hidden)
@@ -99,11 +111,26 @@ class CameraPoseBaseline(nn.Module):
         relative_pose = relative_pose_to_reference(
             baseline_world_to_camera.float(), reference_index=reference_index
         )
+        camera_input = camera_hidden.float()
+        pose_input = relative_pose.reshape(*camera_hidden.shape[:2], 12)
+        if self.input_mode == "pose_only":
+            camera_input = torch.zeros_like(camera_input)
+        elif self.input_mode == "camera_only":
+            pose_input = torch.zeros_like(pose_input)
+        elif self.input_mode == "time_only":
+            camera_input = torch.zeros_like(camera_input)
+            pose_input = torch.zeros_like(pose_input)
+            position = torch.arange(
+                camera_hidden.shape[1],
+                dtype=pose_input.dtype,
+                device=pose_input.device,
+            )
+            pose_input[..., 0] = position[None]
         camera = self.camera_projector(
             torch.cat(
                 [
-                    camera_hidden.float(),
-                    relative_pose.reshape(*camera_hidden.shape[:2], 12),
+                    camera_input,
+                    pose_input,
                 ],
                 dim=-1,
             )

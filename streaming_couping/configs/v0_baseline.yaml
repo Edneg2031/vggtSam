@@ -82,7 +82,8 @@ baseline:
     translation_weight: 10.0
     log_every: 200
     seed: 0
-    # A V0 run is rejected instead of written as a baseline if training is a
-    # no-op or the pose-conditioned L0 fails to improve future evaluation loss.
+    # Training is rejected if it is a no-op. Evaluation always writes an audit;
+    # acceptance requires positive mean center gain and zero worse frames in
+    # every locked four-frame future fold.
     min_train_loss_drop_percent: 1.0
     min_evaluation_gain_percent: 0.0

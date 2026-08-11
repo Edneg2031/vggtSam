@@ -69,6 +69,16 @@ def main() -> None:
     assert training["best_step"] > 0
     assert training["loss_drop_percent"] >= 0.1
     assert training["parameter_update_norm"] > 0.0
+    control_parameters = {
+        mode: sum(
+            parameter.numel()
+            for parameter in CameraPoseBaseline(
+                camera_dim=8, config=config, input_mode=mode
+            ).parameters()
+        )
+        for mode in ("camera_pose", "pose_only", "camera_only", "time_only")
+    }
+    assert len(set(control_parameters.values())) == 1
     base = CameraPoseBaseline(camera_dim=8, config=config)
     model = DynamicInstanceGeometryRefiner(
         base_model=base,
