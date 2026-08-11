@@ -167,17 +167,25 @@ shuffle-time、channel permutation 稳定破坏 matching 和 pose，才能形成
 4. 二维 essential solver 改善了 metric center 或 absolute trajectory；
 5. detector-FPN 失败代表所有 SAM3.1 temporal feature 都无效。
 
-## 8. 下一步最小验证
+## 8. V9.1 新证据与下一步
 
-只补两个 correspondence 层实验，不再增加 pose adapter：
+V9.1 已完成，不再重复：
 
-1. **A0-Q 离散 key oracle**：GT 对应只能从实际 32 个 history token 中选择，判断 local32 空间
-   support 是否足够；
-2. **train/test matcher audit**：同一 checkpoint 比较 raw cosine、训练后 Q/K、train/future
-   PCK/EPE、dustbin loss、entropy 和 real-key mass，判断是 loss shortcut、时间过拟合还是
-   `detector_fpn2` 本身缺少点级时序信息。
+| fold | actual local32 key coverage | 离散 GT PCK | trained SAM Q/K future PCK | pose 结果 |
+|---|---:|---:|---:|---|
+| short | 80.31% | 54.92% | 6.74% | 恶化 |
+| medium | 44.44% | 25.93% | 0% | 恶化 |
+| long | 47.79% | 27.71% | 1.20% | 恶化 |
 
-若离散 support 足够而 detector-FPN 仍失败，下一步才值得测试真正不同的 SAM3.1 video-memory
-temporal feature；不应继续扩大 adapter、fusion MLP 或 attention heads。
+这证伪了“连续 GT local32 上界通过，所以实际 local32 history key 也足够”。实际离散 key 的覆盖、
+PCK 和 pose 都未通过；训练 Q/K 的未来表现又明显低于离散上界，说明 **support 稀疏**和
+**descriptor/QK 时间外推失败**是两个不同问题。
 
-一键命令：`zsh streaming_couping/commands_v91_token_evidence_audit.txt`。
+下一步固定 current query32、动态多实例和 O-R1 solver，只做 V9.2 support 因子分解：
+
+- history key 使用同一个 farthest-UV 256-token cache 的 32/64/128/256 嵌套前缀；
+- 比较 nearest、mutual、greedy-unique，区分稀疏覆盖与重复 key 碰撞；
+- 不训练 matcher，不增加 prompt，不增加 pose adapter；
+- 只有离散 GT 上界三折通过后，才测试新的 SAM3.1 temporal memory feature。
+
+一键命令：`zsh streaming_couping/commands_v92_support_factorization.txt`。
