@@ -167,7 +167,7 @@ shuffle-time、channel permutation 稳定破坏 matching 和 pose，才能形成
 4. 二维 essential solver 改善了 metric center 或 absolute trajectory；
 5. detector-FPN 失败代表所有 SAM3.1 temporal feature 都无效。
 
-## 8. V9.1 新证据与下一步
+## 8. V9.1–V9.2 新证据与下一步
 
 V9.1 已完成，不再重复：
 
@@ -181,11 +181,22 @@ V9.1 已完成，不再重复：
 PCK 和 pose 都未通过；训练 Q/K 的未来表现又明显低于离散上界，说明 **support 稀疏**和
 **descriptor/QK 时间外推失败**是两个不同问题。
 
-下一步固定 current query32、动态多实例和 O-R1 solver，只做 V9.2 support 因子分解：
+V9.2 进一步固定 current query32，使用同一个 farthest-UV cache 的 32/64/128/256 history key
+嵌套前缀，并比较 nearest、mutual、greedy-unique：
 
-- history key 使用同一个 farthest-UV 256-token cache 的 32/64/128/256 嵌套前缀；
-- 比较 nearest、mutual、greedy-unique，区分稀疏覆盖与重复 key 碰撞；
-- 不训练 matcher，不增加 prompt，不增加 pose adapter；
-- 只有离散 GT 上界三折通过后，才测试新的 SAM3.1 temporal memory feature。
+| history keys | mean coverage@12 | mean nearest PCK@8 | all-fold pose pass |
+|---:|---:|---:|---:|
+| 32 | 57.52% | 36.19% | 0 |
+| 64 | 77.78% | 55.90% | 0 |
+| 128 | 95.13% | 74.98% | 0 |
+| 256 | 99.45% | 91.68% | 0 |
 
-一键命令：`zsh streaming_couping/commands_v92_support_factorization.txt`。
+mutual/greedy-unique 消除输出重复 key 后仍全部失败。这证伪了“history token 太少”以及“重复
+key 碰撞”是最终位姿瓶颈。PCK 提高而 pose 继续恶化，说明 PCK@8 对 localized-instance
+essential solver 过宽；当前 3–5px 离散量化误差或空间条件仍可能破坏 pose。
+
+下一步 V9.3 在每个测试帧冻结同一条 history edge，比较 continuous GT、hard-nearest-256、
+GT soft-convex 2/4/8-key 上界、GT EPE≤1/2/4/8px 过滤上界和 0.5–6px 噪声曲线。该实验仍不
+训练 matcher 或 pose model，用来区分硬量化、误差尾部和 O-R1 噪声敏感性。
+
+一键命令：`zsh streaming_couping/commands_v93_quantization_tolerance.txt`。
