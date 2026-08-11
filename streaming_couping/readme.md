@@ -8,10 +8,9 @@
 历史代码和 CSV 输出继续保留，但旧版本 Markdown、runbook 和重复实验说明已经删除。后续设计实验
 时，以总结中的“下一步最小验证”为准，不再重复扩大 pose adapter 或重跑已证伪的 fusion 分支。
 
-V9.2 已证实增加到 256 个 history key 和消除重复 key 都不能恢复 pose。下一步冻结完全相同的
-history edge，诊断硬量化、soft-coordinate 表达上界和 O-R1 噪声容忍度；不训练新 matcher 或
-pose adapter：
+V9.3 已证实 continuous GT 在固定边上有效，但 soft-K8 和 0.5px 噪声仍不能稳定通过。下一步是
+实例 essential 路线的最终鲁棒 solver gate；不训练 matcher 或 pose adapter：
 
 ```bash
-zsh streaming_couping/commands_v93_quantization_tolerance.txt
+zsh streaming_couping/commands_v94_solver_feasibility.txt
 ```

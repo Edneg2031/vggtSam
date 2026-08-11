@@ -1,0 +1,10 @@
+# V9.4: final solver-feasibility gate before any new SAM matcher work.
+v93_config: streaming_couping/configs/v93_quantization_tolerance.yaml
+output_dir: outputs/streaming_couping_v94_solver_feasibility
+
+robust_solver:
+  iterations: 128
+  threshold_pixels: 1.5
+  sample_size: 8
+  spatial_candidate_pool: 32
+  seed: 94

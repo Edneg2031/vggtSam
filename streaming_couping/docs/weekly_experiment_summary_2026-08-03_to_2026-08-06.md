@@ -167,7 +167,7 @@ shuffle-time、channel permutation 稳定破坏 matching 和 pose，才能形成
 4. 二维 essential solver 改善了 metric center 或 absolute trajectory；
 5. detector-FPN 失败代表所有 SAM3.1 temporal feature 都无效。
 
-## 8. V9.1–V9.2 新证据与下一步
+## 8. V9.1–V9.3 新证据与下一步
 
 V9.1 已完成，不再重复：
 
@@ -195,8 +195,22 @@ mutual/greedy-unique 消除输出重复 key 后仍全部失败。这证伪了“
 key 碰撞”是最终位姿瓶颈。PCK 提高而 pose 继续恶化，说明 PCK@8 对 localized-instance
 essential solver 过宽；当前 3–5px 离散量化误差或空间条件仍可能破坏 pose。
 
-下一步 V9.3 在每个测试帧冻结同一条 history edge，比较 continuous GT、hard-nearest-256、
-GT soft-convex 2/4/8-key 上界、GT EPE≤1/2/4/8px 过滤上界和 0.5–6px 噪声曲线。该实验仍不
-训练 matcher 或 pose model，用来区分硬量化、误差尾部和 O-R1 噪声敏感性。
+V9.3 在每个测试帧冻结相同 history edge 后得到：
 
-一键命令：`zsh streaming_couping/commands_v93_quantization_tolerance.txt`。
+| correspondence | selected EPE | mean R gain | mean t-dir gain | 恶化行 | all-fold pass |
+|---|---:|---:|---:|---:|---:|
+| continuous GT | 0px | 77.20% | 85.52% | 0 | 1 |
+| hard nearest-256 | 4.07px | -222.92% | -35.36% | 7 | 0 |
+| GT soft-convex K8 | 0.65px | 23.13% | 58.81% | 3 | 0 |
+| continuous + 0.5px noise | 0.63px | -82.32% | 10.18% | 7 | 0 |
+
+continuous 正对照三折通过，排除了此前收益只是分支选择不同导致的假象。soft-K8 虽然平均改善，
+仍有逐帧恶化；0.5px 噪声已经无法三折通过。EPE≤1/2px 的 hard-match 子集只保留 6%/17%，
+不足以稳定求解。这说明 localized-instance O-R1 对亚像素误差非常敏感，继续训练 matcher 前必须
+先证明存在能承受该误差的鲁棒 solver。
+
+下一步 V9.4 是该路线的最终 solver feasibility gate：固定 V9.3 evidence/history edge，比较原
+O-R1、确定性 RANSAC、RANSAC inlier-refine 和空间均衡 RANSAC。若所有 solver 都不能让
+soft-K8 与 0.5px noise 三折零恶化通过，就停止实例 essential 路线，不再调 SAM descriptor。
+
+一键命令：`zsh streaming_couping/commands_v94_solver_feasibility.txt`。

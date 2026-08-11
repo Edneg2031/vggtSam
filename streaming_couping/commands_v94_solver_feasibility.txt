@@ -1,0 +1,55 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+CONFIG=streaming_couping/configs/v94_solver_feasibility.yaml
+DATA_CONFIG=streaming_couping/configs/v92_support_data.yaml
+OUTPUT="${V94_OUTPUT:-outputs/streaming_couping_v94_solver_feasibility}"
+CACHE=outputs/streaming_couping_v92_support_factorization/cache/00a231a370_90_525_step15_37_68_54.pt
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+
+echo "V9.4 smoke: deterministic RANSAC, spatial sampling, schemas"
+PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.smoke_v94_solver_feasibility
+
+if [[ ! -s "$CACHE" ]]; then
+  echo "V9.4 requires the completed V9.2 256-token cache: $CACHE" >&2
+  echo "Run: zsh streaming_couping/commands_v92_support_factorization.txt" >&2
+  exit 1
+fi
+
+echo "V9.4 validating the retained dynamic-instance cache"
+PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.audit_v7_cache \
+  --config "$DATA_CONFIG" \
+  --output-dir "$OUTPUT/cache_audit" \
+  --require-local \
+  --strict
+
+echo "V9.4 CPU-only final solver-feasibility gate"
+echo "Evidence=continuous,soft-K8,noise-0.5px,noise-1px; no model is trained"
+CUDA_VISIBLE_DEVICES="" PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.run_v94_solver_feasibility \
+  --config "$CONFIG" \
+  --output-dir "$OUTPUT"
+
+SUMMARY="$OUTPUT/v94_solver_summary.csv"
+FRAMES="$OUTPUT/v94_solver_frames.csv"
+DECISION="$OUTPUT/v94_solver_decision.md"
+METADATA="$OUTPUT/v94_solver_metadata.json"
+for file in "$SUMMARY" "$FRAMES" "$DECISION" "$METADATA"; do
+  [[ -s "$file" ]] || { echo "missing V9.4 output: $file" >&2; exit 1; }
+done
+
+echo "V9.4 COPY THIS DECISION"
+cat "$DECISION"
+echo "V9.4 COPY THIS COMPACT SUMMARY CSV (48 rows)"
+cat "$SUMMARY"
+echo "V9.4 detailed solver/frame rows: $FRAMES"
+echo "V9.4 provenance: $METADATA"
