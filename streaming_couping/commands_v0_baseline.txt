@@ -1,0 +1,41 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+STREAM_GPU0="${BASELINE_STREAM_GPU0:-1}"
+STREAM_GPU1="${BASELINE_STREAM_GPU1:-2}"
+SAM_GPU="${BASELINE_SAM_GPU:-3}"
+VISIBLE_GPUS="$STREAM_GPU0,$STREAM_GPU1,$SAM_GPU"
+CONFIG=streaming_couping/configs/v0_baseline.yaml
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+echo "V0 smoke: late birth, maturity, static gate and exact fallback"
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_dynamic_instance_baseline
+
+ARGS=()
+[[ "${BASELINE_FRESH:-0}" == "1" ]] && ARGS+=(--rebuild-cache --no-resume)
+
+echo "V0 physical GPUs=$VISIBLE_GPUS"
+echo "logical layout: StreamVGGT=cuda:0,cuda:1 SAM3.1=cuda:2 fit=cuda:0"
+CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" PYTHONUNBUFFERED=1 PYTHONPATH=. \
+  "$PYTHON_BIN" -m streaming_couping.scripts.run_dynamic_instance_baseline \
+  --config "$CONFIG" \
+  --stage all \
+  --streamvggt-devices cuda:0,cuda:1 \
+  --sam3-device cuda:2 \
+  --geometry-device cuda:0 \
+  --training-device cuda:0 \
+  "${ARGS[@]}"
+
+[[ -s outputs/streaming_couping_v0/baseline_summary.json ]] || {
+  echo "missing baseline_summary.json" >&2
+  exit 1
+}
+echo "V0 baseline completed"

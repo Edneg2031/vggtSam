@@ -39,9 +39,10 @@ from ..recovery import output_mask_to_stream
 from ..streamvggt_geometry_prompt import build_streamvggt_geometry_prompts
 from ..tracking_recovery import run_natural_recovery_tracking
 from ..types import TrackingSequence
-from ..v6_geometry_segmentation import (
+from ..geometry_segmentation import (
     V6_DEPLOYED_VARIANT,
     V6GeometrySegmentationConfig,
+    causal_prompts_after_birth,
     segment_instance_with_geometry_prompts,
 )
 from .config import ClipConfig, LearnedPoseConfig
@@ -55,6 +56,8 @@ from .observations import (
 
 
 CACHE_VERSION = 3
+ONLINE_RAW_VARIANT = "sam31_online_forward"
+ONLINE_GEOMETRY_VARIANT = "sam31_online_geometry_compete"
 
 
 def build_feature_caches(config: LearnedPoseConfig) -> list[Path]:
@@ -150,11 +153,35 @@ def build_feature_caches(config: LearnedPoseConfig) -> list[Path]:
             "only SAM appearance cache fields will be augmented"
         )
 
-    # The image model and video predictor are both large. Never keep both on
-    # the SAM device while extracting pooled appearance descriptors.
+    # The retained geometry-only baseline needs the causal video masks but no
+    # SAM appearance descriptor.  Avoid loading the second SAM image model in
+    # that mode and make the omission explicit in cache provenance.
     sam_video_holder.clear()
     gc.collect()
     _empty_cuda_cache()
+    if not config.features.cache_sam_appearance:
+        if config.features.cache_sam_local_tokens:
+            raise ValueError(
+                "SAM local tokens require features.cache_sam_appearance=true."
+            )
+        for _, path in pending:
+            payload = load_feature_cache(path, require_complete=False)
+            for field in (
+                "appearance",
+                "appearance_dim",
+                "sam_local_features",
+                "sam_local_uv",
+                "sam_local_valid",
+            ):
+                payload.pop(field, None)
+            payload["sam_appearance_source"] = "disabled_geometry_only_baseline"
+            payload["cache_sam_appearance"] = False
+            payload["complete"] = True
+            torch.save(payload, path)
+        return paths
+
+    # The image model and video predictor are both large. Never keep both on
+    # the SAM device while extracting pooled appearance descriptors.
     sam_image_model = load_sam3_image_model(
         repo_path=recovery.sam3_repo,
         checkpoint_path=recovery.sam3_checkpoint,
@@ -194,6 +221,7 @@ def build_feature_caches(config: LearnedPoseConfig) -> list[Path]:
         )
         payload["appearance"] = appearance.float()
         payload["appearance_dim"] = int(appearance.shape[-1])
+        payload["cache_sam_appearance"] = True
         if config.features.cache_sam_local_tokens:
             local, local_uv, local_valid = sample_sam_instance_tokens(
                 spatial,
@@ -366,6 +394,28 @@ def _build_geometry_cache(
                 sam_video_holder=sam_video_holder,
             )
         )
+        if config.features.sam_segmentation_variant == ONLINE_GEOMETRY_VARIANT:
+            recovered, correction_rows = (
+                _run_sam31_online_geometry_correction(
+                    recovery,
+                    config,
+                    clip,
+                    shared=shared,
+                    raw_tracking=recovered,
+                    tracking_rows=segmentation_diagnostics,
+                    geometry=geometry_sequence,
+                    world_to_camera=baseline_w2c[0].detach().float().cpu(),
+                    intrinsics=baseline_intrinsics[0].detach().float().cpu(),
+                    sam_video_holder=sam_video_holder,
+                )
+            )
+            segmentation_diagnostics.extend(correction_rows)
+        elif config.features.sam_segmentation_variant != ONLINE_RAW_VARIANT:
+            raise ValueError(
+                "sam31_online supports segmentation variants "
+                f"{ONLINE_RAW_VARIANT!r} and {ONLINE_GEOMETRY_VARIANT!r}; "
+                f"got {config.features.sam_segmentation_variant!r}."
+            )
     elif config.features.sam_segmentation_variant != "legacy_recovery":
         if clip.instance_source != "configured_gt_reference":
             raise ValueError(
@@ -1124,6 +1174,115 @@ def _load_or_run_sam31_online_tracking(
         tracking_rows=rows,
     )
     return recovered, rows
+
+
+def _run_sam31_online_geometry_correction(
+    recovery,
+    config: LearnedPoseConfig,
+    clip: ClipConfig,
+    *,
+    shared,
+    raw_tracking: Mapping[int, TrackingSequence],
+    tracking_rows: list[dict[str, object]],
+    geometry,
+    world_to_camera: torch.Tensor,
+    intrinsics: torch.Tensor,
+    sam_video_holder: dict[str, SAM3Wrapper],
+) -> tuple[dict[int, TrackingSequence], list[dict[str, object]]]:
+    """Apply the validated geometry compete policy after each causal birth.
+
+    The raw multiplex session remains the owner of persistent IDs.  Geometry
+    correction changes only the masks consumed by downstream observations; it
+    never rewrites earlier frames and currently does not feed a prompted mask
+    back into the live multiplex memory.
+    """
+
+    sam3: SAM3Wrapper | None = None
+    corrected: dict[int, TrackingSequence] = {}
+    diagnostics: list[dict[str, object]] = []
+    segmentation_config = V6GeometrySegmentationConfig()
+    prompt_by_instance = {
+        int(row.get("instance_id", -1)): str(row.get("instance_prompt", ""))
+        for row in tracking_rows
+    }
+    for instance_id in clip.instance_ids:
+        instance_id = int(instance_id)
+        raw = raw_tracking[instance_id]
+        visible = raw.masks.flatten(1).any(dim=1)
+        positions = torch.nonzero(visible, as_tuple=False).flatten()
+        if not positions.numel():
+            corrected[instance_id] = raw
+            continue
+        birth = int(positions[0])
+        prompt = prompt_by_instance.get(instance_id, "") or clip.instance_prompt
+        sequence = SimpleNamespace(
+            scene_id=clip.scene_id,
+            frame_indices=list(clip.frame_indices),
+            image_paths=list(shared.image_paths),
+            label=str(prompt),
+            reference_frame_idx=birth,
+        )
+        reference_mask = raw.masks[birth].detach().cpu().bool()
+        prompt_batch = build_streamvggt_geometry_prompts(
+            recovery=recovery,
+            sequence=sequence,
+            reference_mask=reference_mask,
+            world_points=geometry.world_points,
+            confidence=geometry.confidence,
+            world_to_camera=world_to_camera,
+            intrinsics=intrinsics,
+            source_sizes=geometry.source_sizes,
+            processed_size=geometry.processed_size,
+            point_confidence_threshold=(
+                config.features.geometry_prompt_point_confidence_threshold
+            ),
+        )
+        # Birth is the first admissible reference.  Suppress every earlier
+        # prompt even if the frozen pointmap happens to project there.
+        causal_prompts = causal_prompts_after_birth(
+            prompt_batch.prompts,
+            birth_index=birth,
+        )
+        if sam3 is None:
+            sam3 = _sam_video_model(recovery, sam_video_holder)
+        result = segment_instance_with_geometry_prompts(
+            sequence=sequence,
+            reference_mask=reference_mask,
+            raw_tracking=raw,
+            geometry_prompts=causal_prompts,
+            output_size=recovery.output_size,
+            sam3=sam3,
+            config=segmentation_config,
+        )
+        masks = result["masks"][V6_DEPLOYED_VARIANT].bool()
+        scores = result["scores"][V6_DEPLOYED_VARIANT].float()
+        if bool(masks[:birth].any()):
+            raise RuntimeError(
+                "Geometry correction created a mask before SAM track birth."
+            )
+        corrected[instance_id] = TrackingSequence(
+            masks=masks,
+            scores=scores,
+            selected_obj_id=raw.selected_obj_id,
+        )
+        for segmentation_row, backend_row in zip(
+            result["diagnostics"], prompt_batch.diagnostics
+        ):
+            frame = int(segmentation_row["sequence_index"])
+            diagnostics.append(
+                {
+                    "clip": clip.name,
+                    "instance_id": instance_id,
+                    "instance_prompt": str(prompt),
+                    "selected_variant": ONLINE_GEOMETRY_VARIANT,
+                    "birth_sequence_index": birth,
+                    "causal_prompt_allowed": int(frame > birth),
+                    "memory_writeback": 0,
+                    **backend_row,
+                    **segmentation_row,
+                }
+            )
+    return corrected, diagnostics
 
 
 def _online_tracks_duplicate_at_birth(

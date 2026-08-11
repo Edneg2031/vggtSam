@@ -11,7 +11,7 @@ from .aggregation.mine_revisit_segments import mine_revisit_candidate
 from .aggregation.point_map_fusion import sample_masked_observation
 from .config import ExperimentConfig
 from .recovery import output_mask_to_stream
-from .v6_geometry_segmentation import GeometrySegmentationPrompt
+from .geometry_segmentation import GeometrySegmentationPrompt
 
 
 @dataclass(frozen=True)

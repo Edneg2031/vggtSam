@@ -1,9 +1,0 @@
-# V9.3 reuses the completed V9.2 256-token cache and trains no model.
-support_config: streaming_couping/configs/v92_support_factorization.yaml
-output_dir: outputs/streaming_couping_v93_quantization_tolerance
-
-soft_neighbors: [2, 4, 8]
-filter_thresholds_pixels: [1.0, 2.0, 4.0, 8.0]
-noise_sigmas_pixels: [0.5, 1.0, 2.0, 4.0, 6.0]
-noise_replicates: 5
-noise_seed: 93

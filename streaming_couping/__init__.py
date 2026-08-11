@@ -1,2 +1,1 @@
-"""Explicit SAM3 and StreamVGGT coupling experiments."""
-
+"""Retained causal SAM3.1 and StreamVGGT coupling baseline."""

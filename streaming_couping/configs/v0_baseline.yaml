@@ -1,0 +1,82 @@
+# V0: retained SAM3.1 + StreamVGGT baseline.  SAM appearance descriptors are
+# intentionally disabled; SAM contributes dynamic masks/IDs and StreamVGGT
+# contributes camera and local geometry.
+recovery_config: streaming_couping/configs/recovery_dynamic_instance.yaml
+output_dir: outputs/streaming_couping_v0/data_stage
+
+dataset:
+  manifest: data/processed/scannetpp_pinhole_2d/manifest.json
+  clips:
+    - name: 00a231a370_90_525_step15_37_68_54
+      scene_id: 00a231a370
+      frame_indices: [90, 105, 120, 135, 150, 165, 180, 195, 210, 225, 240, 255, 270, 285, 300, 315, 330, 345, 360, 375, 390, 405, 420, 435, 450, 465, 480, 495, 510, 525]
+      # Permanent capacity slots. A slot is assigned causally at first sight
+      # and is never reused, so objects may first appear after frame 90.
+      instance_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+      instance_source: sam31_online
+      # SAM3.1 detects all instances of each configured open-vocabulary noun.
+      # Add scene-relevant static concepts here; this is not class-agnostic.
+      instance_prompts: [bed, wardrobe]
+      reference_sequence_index: 0
+      split: baseline
+
+runtime:
+  streamvggt_devices: [cuda:0, cuda:1]
+  streamvggt_amp_dtype: bfloat16
+  geometry_device: cuda:0
+  sam3_device: cuda:2
+
+features:
+  cache_dir: outputs/streaming_couping_v0/cache
+  rebuild: false
+  cache_sam_appearance: false
+  sam_source: disabled_geometry_only_baseline
+  sam_segmentation_variant: sam31_online_geometry_compete
+  sam_resolution: 1008
+  sam_grid: [72, 72]
+  sam_batch_size: 0
+  cache_sam_local_tokens: false
+  geometry_prompt_point_confidence_threshold: 0.30
+  point_confidence_threshold: 0.30
+  min_instance_points: 128
+  sampled_instance_points: 128
+
+fusion:
+  min_track_confidence: 0.50
+  min_geometry_confidence: 0.20
+  min_static_score: 0.20
+  strict_identity_gate: true
+  identity_hard_mismatch_min_points: 512
+  identity_hard_mismatch_max_fitness: 0.02
+  dpt_layer_indices: [4, 11, 17, 23]
+
+training:
+  device: cuda:0
+
+baseline:
+  version: v0
+  output_dir: outputs/streaming_couping_v0
+  clip_name: 00a231a370_90_525_step15_37_68_54
+  training_device: cuda:0
+  local_point_count: 32
+  frames:
+    camera_base: [105, 120, 135, 150, 165, 180, 195, 210, 225, 240, 255]
+    geometry_refiner: [270, 285, 300, 315, 330, 345]
+    evaluation: [360, 375, 390, 405, 420, 435, 450, 465, 480, 495, 510, 525]
+  model:
+    hidden_dim: 256
+    min_track_confidence: 0.50
+    min_geometry_confidence: 0.20
+    min_static_score: 0.20
+    max_rotation_degrees: 15.0
+    max_translation_native: 0.50
+    affinity_temperature: 0.10
+  optimization:
+    base_steps: 1200
+    refiner_steps: 3000
+    learning_rate: 0.001
+    weight_decay: 0.0
+    grad_clip_norm: 5.0
+    translation_weight: 10.0
+    log_every: 200
+    seed: 0

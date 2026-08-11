@@ -1,24 +1,34 @@
-"""Learned persistent-instance guidance for StreamVGGT camera pose."""
+"""Causal dynamic-instance guidance for StreamVGGT camera pose."""
 
 from typing import TYPE_CHECKING
 
 from .config import LearnedPoseConfig, load_learned_pose_config
 
 if TYPE_CHECKING:
-    from .model import InstancePoseAdapter
+    from .dynamic_instance_baseline import (
+        BaselineModelConfig,
+        CameraPoseBaseline,
+        DynamicInstanceGeometryRefiner,
+    )
 
 __all__ = [
-    "InstancePoseAdapter",
+    "BaselineModelConfig",
+    "CameraPoseBaseline",
+    "DynamicInstanceGeometryRefiner",
     "LearnedPoseConfig",
     "load_learned_pose_config",
 ]
 
 
 def __getattr__(name: str):
-    """Keep configuration inspection independent of the PyTorch runtime."""
+    """Keep YAML/config inspection independent of the PyTorch runtime."""
 
-    if name == "InstancePoseAdapter":
-        from .model import InstancePoseAdapter
+    if name in {
+        "BaselineModelConfig",
+        "CameraPoseBaseline",
+        "DynamicInstanceGeometryRefiner",
+    }:
+        from . import dynamic_instance_baseline
 
-        return InstancePoseAdapter
+        return getattr(dynamic_instance_baseline, name)
     raise AttributeError(name)

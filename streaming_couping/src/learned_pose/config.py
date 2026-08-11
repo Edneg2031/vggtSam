@@ -33,6 +33,9 @@ class ClipConfig:
 class FeatureConfig:
     cache_dir: Path
     rebuild: bool = False
+    # The retained geometry baseline needs SAM video masks but deliberately
+    # does not consume a second SAM image-backbone appearance pass.
+    cache_sam_appearance: bool = True
     sam_source: str = "detector_fpn2"
     sam_segmentation_variant: str = "legacy_recovery"
     sam_resolution: int = 1008
@@ -200,6 +203,9 @@ def load_learned_pose_config(path: str | Path) -> LearnedPoseConfig:
         features=FeatureConfig(
             cache_dir=_path(features.get("cache_dir"), source.parent),
             rebuild=bool(features.get("rebuild", False)),
+            cache_sam_appearance=bool(
+                features.get("cache_sam_appearance", True)
+            ),
             sam_source=str(features.get("sam_source", "detector_fpn2")),
             sam_segmentation_variant=str(
                 features.get(
@@ -399,6 +405,14 @@ def _parse_clip(value: dict[str, Any], base: Path) -> ClipConfig:
 
 
 def _validate(config: LearnedPoseConfig) -> None:
+    if (
+        config.features.cache_sam_local_tokens
+        and not config.features.cache_sam_appearance
+    ):
+        raise ValueError(
+            "features.cache_sam_local_tokens requires "
+            "features.cache_sam_appearance=true."
+        )
     if config.streamvggt_devices:
         if len(config.streamvggt_devices) < 2:
             raise ValueError(
@@ -441,6 +455,7 @@ def _validate(config: LearnedPoseConfig) -> None:
         "legacy_recovery",
         "v6_sam31_adaptive_positive_compete_010",
         "sam31_online_forward",
+        "sam31_online_geometry_compete",
     }
     if (
         config.features.sam_segmentation_variant
@@ -449,7 +464,7 @@ def _validate(config: LearnedPoseConfig) -> None:
         raise ValueError(
             "features.sam_segmentation_variant must be legacy_recovery, "
             "v6_sam31_adaptive_positive_compete_010, or "
-            "sam31_online_forward."
+            "a sam31_online variant."
         )
     if not (
         0.0
@@ -610,19 +625,25 @@ def _validate(config: LearnedPoseConfig) -> None:
         if (
             clip.instance_source == "sam31_online"
             and config.features.sam_segmentation_variant
-            != "sam31_online_forward"
+            not in {
+                "sam31_online_forward",
+                "sam31_online_geometry_compete",
+            }
         ):
             raise ValueError(
                 f"Clip {clip.name!r} sam31_online requires "
-                "features.sam_segmentation_variant=sam31_online_forward."
+                "a forward-only sam31_online segmentation variant."
             )
         if (
             config.features.sam_segmentation_variant
-            == "sam31_online_forward"
+            in {
+                "sam31_online_forward",
+                "sam31_online_geometry_compete",
+            }
             and clip.instance_source != "sam31_online"
         ):
             raise ValueError(
-                "sam31_online_forward requires instance_source=sam31_online "
+                "sam31_online segmentation requires instance_source=sam31_online "
                 f"for clip {clip.name!r}."
             )
         if clip.reference_sequence_index != 0:

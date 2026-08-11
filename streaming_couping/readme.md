@@ -1,16 +1,17 @@
 # streaming_couping
 
-本目录保留 SAM3.1 × StreamVGGT 的实验代码、配置和复现命令。研究设置、有效证据、失败方法和
-结论边界统一记录在：
+本目录只保留 `V0` SAM3.1 × StreamVGGT 动态实例几何 baseline。V4–V9.8 的实验设置、有效证据、
+失败方法和结论边界统一记录在：
 
 [本周实验总结](docs/weekly_experiment_summary_2026-08-03_to_2026-08-06.md)
 
-历史代码和 CSV 输出继续保留，但旧版本 Markdown、runbook 和重复实验说明已经删除。后续设计实验
-时，以总结中的“下一步最小验证”为准，不再重复扩大 pose adapter 或重跑已证伪的 fusion 分支。
-
-V9.3 已证实 continuous GT 在固定边上有效，但 soft-K8 和 0.5px 噪声仍不能稳定通过。下一步是
-实例 essential 路线的最终鲁棒 solver gate；不训练 matcher 或 pose adapter：
+运行：
 
 ```bash
-zsh streaming_couping/commands_v94_solver_feasibility.txt
+zsh streaming_couping/commands_v0_baseline.txt
 ```
+
+该入口支持多 prompt、多实例、未来帧 birth、永久 slot、几何辅助 mask、静态实例几何 pose residual
+和无有效实例时的 exact camera-baseline fallback。它不缓存 SAM appearance token，也不声称 SAM token
+能改善 pose。旧版本 runner、配置、命令和专用测试已删除；模型、数据、`externals/`、`outputs/`
+均不在本次清理范围。
