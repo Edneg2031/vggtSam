@@ -195,12 +195,14 @@ loss 下降 85%–95% 仍没有形成训练内高精度 correspondence；因此 
 6. predicted depth/K 的三维路线不是简单 scale、offset、affine 或 Sim3 问题。
 7. dense detector-FPN 和真正 temporal-memory feature 都未学出未来 correspondence。
 8. 当前结果不能支持 metric center、absolute trajectory 或跨场景 SAM 因果结论。
-9. 第一版清理后的 V0 是 no-op：camera train loss `0.344872→0.344872`，geometry train loss
-   `0.428219→0.428219`，评估 rotation/center 完全不变。它是实现回归，已废弃，不能作为 baseline 证据。
+9. 清理后的 V0 r1/r2 都是 no-op：真实 cache 上 camera train loss
+   `0.344872→0.344872`，r2 的 1200 step 全部梯度严格为 0；但随机输入 smoke 能正常下降。
+   这把问题定位为真实 `camera_hidden` 下的零初始化 stationary point。r1/r2 已废弃，不能作为
+   baseline 证据。
 
 ## 8. V0 baseline（恢复 V7.1 后重新验收）
 
-名称仍为 `V0`，实现修订为 `restored_v71_l0_v74_geometry_r2`：
+名称仍为 `V0`，当前实现修订为 `v71_pose_conditioned_l0_v74_geometry_r3`：
 
 ```text
 RGB stream
@@ -213,7 +215,7 @@ RGB stream
      → corrected mask/ID/quality observation
           ↓
 recent concrete observation memory
-     ├─ restored V7.1 camera L0 → V0 selected pose
+     ├─ V7.1-style camera hidden + raw relative L0 pose → V0 selected pose
      └─ V7.4-style geometry-only transport → 单独计分的 candidate
           （无 mature/static/geometry-valid slot 时 exact L0）
 ```
@@ -228,11 +230,12 @@ recent concrete observation memory
   moving/unknown/低质量实例被排除。
 - 几何纠 mask 使用 frozen StreamVGGT raw pose/pointmap，不读 refined 同帧 pose，避免同帧循环依赖；
   correction 进入下游 observation，但暂不回写 SAM3.1 multiplex 内部 memory。
-- V0 的最终 pose 固定选择恢复的 V7.1 camera L0；geometry transport 不再静默覆盖最终结果，只作为
-  `geometry_candidate` 输出。二者都不能把改善归因于 SAM token。
+- V0 的最终 pose 选择 V7.1-style L0。为避开 r2 在真实 cache 上的零梯度 stationary point，L0
+  同时读取 raw StreamVGGT 相对参考帧 pose；该输入部署时可得，不读 GT、SAM token 或未来帧。
+  geometry transport 不再静默覆盖最终结果，只作为 `geometry_candidate` 输出。
 - runner 验证 prefix causality、late birth、birth-frame inactivity、moving-object exclusion 和 inactive
   exact fallback；默认用 105–255 训练 camera，270–345 训练 geometry candidate，360–525 只评估。
-- runner 新增硬验收：非零梯度、非零参数更新、训练 loss 至少下降 1%，并且 selected V7.1 L0 的
+- runner 新增硬验收：非零梯度、非零参数更新、训练 loss 至少下降 1%，并且 selected L0 的
   future evaluation loss 必须严格优于 raw。任一条件失败就不写合格 summary。
 
 运行入口：

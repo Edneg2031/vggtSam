@@ -283,6 +283,7 @@ def train_pose_model(
         for name, value in model.state_dict().items()
     }
     maximum_gradient_norm = 0.0
+    first_gradient_norm = 0.0
     model.train()
     for step in range(1, int(steps) + 1):
         optimizer.zero_grad(set_to_none=True)
@@ -308,6 +309,12 @@ def train_pose_model(
         maximum_gradient_norm = max(
             maximum_gradient_norm, float(norm.detach().cpu())
         )
+        if step == 1:
+            first_gradient_norm = float(norm.detach().cpu())
+            if first_gradient_norm <= 0.0:
+                raise RuntimeError(
+                    "V0 training is a no-op at step 1: every gradient is zero."
+                )
         optimizer.step()
         if step % int(config.log_every) == 0 or step == int(steps):
             model.eval()
@@ -364,6 +371,7 @@ def train_pose_model(
         "best_step": best_step,
         "loss_drop_percent": loss_drop_percent,
         "maximum_gradient_norm": maximum_gradient_norm,
+        "first_gradient_norm": first_gradient_norm,
         "parameter_update_norm": parameter_update_norm,
         "no_op_check": "passed",
     }

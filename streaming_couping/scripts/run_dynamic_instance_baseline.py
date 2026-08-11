@@ -39,10 +39,11 @@ from streaming_couping.src.learned_pose.config import (
 from streaming_couping.src.learned_pose.dynamic_instance_baseline import (
     CameraPoseBaseline,
     DynamicInstanceGeometryRefiner,
+    relative_pose_to_reference,
 )
 
 
-V0_IMPLEMENTATION_REVISION = "restored_v71_l0_v74_geometry_r2"
+V0_IMPLEMENTATION_REVISION = "v71_pose_conditioned_l0_v74_geometry_r3"
 
 
 FRAME_COLUMNS = (
@@ -145,6 +146,14 @@ def run_baseline(
     reference = int(payload["reference_sequence_index"])
     if reference != 0:
         raise ValueError("The retained baseline currently requires reference index 0.")
+    camera_input_audit = _camera_input_audit(
+        batch["camera_hidden"], raw_pose, reference_index=reference
+    )
+    print(
+        "V0 camera input audit "
+        f"hidden_temporal_std={camera_input_audit['camera_hidden_temporal_std']:.8g} "
+        f"raw_relative_pose_std={camera_input_audit['raw_relative_pose_temporal_std']:.8g}"
+    )
     all_requested = (
         run.base_train_frames
         + run.geometry_train_frames
@@ -253,6 +262,7 @@ def run_baseline(
         evaluation_indices=[positions[frame] for frame in run.evaluation_frames],
         base_training=base_training,
         refiner_training=refiner_training,
+        camera_input_audit=camera_input_audit,
     )
     return result
 
@@ -420,6 +430,7 @@ def _write_outputs(
     evaluation_indices,
     base_training,
     refiner_training,
+    camera_input_audit,
 ) -> Path:
     frames = tuple(int(value) for value in payload["frame_indices"])
     raw_metrics = pose_metrics(
@@ -452,7 +463,7 @@ def _write_outputs(
     )
     if selected_gain <= float(run.optimizer.min_evaluation_gain_percent):
         raise RuntimeError(
-            "V0 acceptance failed: restored V7.1 L0 does not improve raw "
+            "V0 acceptance failed: pose-conditioned V7.1 L0 does not improve raw "
             f"evaluation loss (gain={selected_gain:.6g}%, required>"
             f"{float(run.optimizer.min_evaluation_gain_percent):.6g}%)."
         )
@@ -526,7 +537,7 @@ def _write_outputs(
         "schema": 2,
         "baseline_version": run.version,
         "implementation_revision": V0_IMPLEMENTATION_REVISION,
-        "method": "v0_restored_v71_l0_dynamic_instance_baseline",
+        "method": "v0_v71_pose_conditioned_l0_dynamic_instance_baseline",
         "claim_level": "empirical_baseline_not_sam_token_causality",
         "config": str(run.source_path),
         "cache": str(cache_path_value),
@@ -535,9 +546,9 @@ def _write_outputs(
         "frames": frames,
         "evaluation_frames": tuple(frames[index] for index in evaluation_indices),
         "sam_role": "prompted_dynamic_discovery_mask_persistent_id",
-        "pose_role": "restored_v71_camera_l0",
+        "pose_role": "v71_camera_plus_raw_relative_pose_l0",
         "geometry_pose_role": "v74_geometry_only_transport_candidate",
-        "selected_pose_branch": "restored_v71_camera_l0",
+        "selected_pose_branch": "v71_pose_conditioned_camera_l0",
         "segmentation_variant": payload.get("sam_segmentation_variant"),
         "geometry_corrections_applied": sum(
             int(row.get("correction_applied", 0)) for row in correction_rows
@@ -559,6 +570,7 @@ def _write_outputs(
         "baseline_acceptance_pass": 1,
         "camera_training": base_training,
         "geometry_training": refiner_training,
+        "camera_input_audit": camera_input_audit,
         "model": asdict(run.model),
         "optimizer": asdict(run.optimizer),
     }
@@ -606,7 +618,7 @@ def _signature(*, run, payload, cache_path_value: Path) -> str:
     identity = {
         "schema": 2,
         "implementation_revision": V0_IMPLEMENTATION_REVISION,
-        "purpose": "v0_restored_v71_l0_dynamic_instance_baseline",
+        "purpose": "v0_v71_pose_conditioned_l0_dynamic_instance_baseline",
         "config": asdict(run),
         "cache": str(cache_path_value),
         "clip": payload.get("clip_name"),
@@ -625,6 +637,29 @@ def _gain_percent(reference: float, candidate: float) -> float:
     return 100.0 * (float(reference) - float(candidate)) / max(
         abs(float(reference)), 1e-12
     )
+
+
+def _camera_input_audit(
+    camera_hidden: torch.Tensor,
+    raw_pose: torch.Tensor,
+    *,
+    reference_index: int,
+) -> dict[str, float]:
+    relative = relative_pose_to_reference(
+        raw_pose.float(), reference_index=reference_index
+    ).reshape(*raw_pose.shape[:2], 12)
+    hidden_centered = camera_hidden.float() - camera_hidden.float().mean(
+        dim=1, keepdim=True
+    )
+    relative_centered = relative - relative.mean(dim=1, keepdim=True)
+    return {
+        "camera_hidden_temporal_std": float(
+            hidden_centered.square().mean().sqrt().detach().cpu()
+        ),
+        "raw_relative_pose_temporal_std": float(
+            relative_centered.square().mean().sqrt().detach().cpu()
+        ),
+    }
 
 
 def _validate_payload(payload: dict, *, clip: ClipConfig, run: BaselineRunConfig) -> None:

@@ -1,4 +1,4 @@
-# V0: restored V7.1 camera L0 plus the retained dynamic SAM3.1 frontend.
+# V0: V7.1-style pose-conditioned camera L0 plus dynamic SAM3.1 frontend.
 # SAM appearance descriptors are disabled; V7.4-style geometry transport is
 # evaluated as a separate candidate and does not overwrite the selected L0.
 recovery_config: streaming_couping/configs/recovery_dynamic_instance.yaml
@@ -83,6 +83,6 @@ baseline:
     log_every: 200
     seed: 0
     # A V0 run is rejected instead of written as a baseline if training is a
-    # no-op or the restored V7.1 L0 fails to improve future evaluation loss.
+    # no-op or the pose-conditioned L0 fails to improve future evaluation loss.
     min_train_loss_drop_percent: 1.0
     min_evaluation_gain_percent: 0.0

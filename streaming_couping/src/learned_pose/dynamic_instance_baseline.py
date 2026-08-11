@@ -2,8 +2,9 @@
 
 SAM3.1 contributes masks, persistent identities and slot lifecycle.  The pose
 branch deliberately does not consume SAM appearance tokens.  The accepted V0
-pose is the restored V7.1 camera L0; the V7.4-style geometry-only transport is
-retained as a separately scored candidate and never silently replaces L0.
+pose is a V7.1-style camera L0 conditioned on the raw relative StreamVGGT pose;
+the V7.4-style geometry-only transport is retained as a separately scored
+candidate and never silently replaces L0.
 """
 
 from __future__ import annotations
@@ -56,7 +57,14 @@ def eligible_pose_instances(
 
 
 class CameraPoseBaseline(nn.Module):
-    """The original V7.1 L0 bounded correction around StreamVGGT camera output."""
+    """V7.1-style L0 with a deployable raw-relative-pose conditioning path.
+
+    The original V7.1 head used only ``camera_hidden``.  On the retained
+    dynamic cache its zero-initialized output is an exact stationary point
+    (all parameter gradients are zero).  The raw StreamVGGT pose is already
+    available at inference time and provides a gauge-relative per-frame signal
+    without reading SAM, GT, or future frames.
+    """
 
     def __init__(
         self,
@@ -67,7 +75,7 @@ class CameraPoseBaseline(nn.Module):
         super().__init__()
         self.config = config
         hidden = int(config.hidden_dim)
-        self.camera_projector = _mlp(int(camera_dim), hidden)
+        self.camera_projector = _mlp(int(camera_dim) + 12, hidden)
         self.feature_merger = _mlp(4 * hidden, hidden)
         self.se3_head = nn.Sequential(
             nn.Linear(hidden, hidden),
@@ -88,7 +96,18 @@ class CameraPoseBaseline(nn.Module):
             raise ValueError("camera_hidden must be [B,S,C].")
         if baseline_world_to_camera.shape != (*camera_hidden.shape[:2], 3, 4):
             raise ValueError("baseline pose must be [B,S,3,4].")
-        camera = self.camera_projector(camera_hidden.float())
+        relative_pose = relative_pose_to_reference(
+            baseline_world_to_camera.float(), reference_index=reference_index
+        )
+        camera = self.camera_projector(
+            torch.cat(
+                [
+                    camera_hidden.float(),
+                    relative_pose.reshape(*camera_hidden.shape[:2], 12),
+                ],
+                dim=-1,
+            )
+        )
         evidence = torch.zeros_like(camera)
         fused = self.feature_merger(
             torch.cat(
@@ -339,6 +358,25 @@ def homogeneous_pose(world_to_camera: torch.Tensor) -> torch.Tensor:
     ).expand(*world_to_camera.shape[:-2], 4, 4).clone()
     output[..., :3, :4] = world_to_camera
     return output
+
+
+def relative_pose_to_reference(
+    world_to_camera: torch.Tensor, *, reference_index: int
+) -> torch.Tensor:
+    """Return current-from-reference transforms using only frozen raw poses."""
+
+    pose = homogeneous_pose(world_to_camera)
+    reference = pose[:, int(reference_index)]
+    rotation = reference[..., :3, :3]
+    translation = reference[..., :3, 3]
+    inverse = torch.eye(
+        4, dtype=pose.dtype, device=pose.device
+    ).expand(reference.shape).clone()
+    inverse[..., :3, :3] = rotation.transpose(-1, -2)
+    inverse[..., :3, 3] = -(
+        rotation.transpose(-1, -2) @ translation[..., None]
+    ).squeeze(-1)
+    return (pose @ inverse[:, None])[..., :3, :4]
 
 
 def se3_exp(twist: torch.Tensor) -> torch.Tensor:

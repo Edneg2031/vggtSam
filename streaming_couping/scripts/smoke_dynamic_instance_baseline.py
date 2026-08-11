@@ -42,8 +42,12 @@ def main() -> None:
     assert bool(torch.isfinite(zero_twist.grad).all())
     assert float(zero_twist.grad.abs().sum()) > 0.0
     train_base = CameraPoseBaseline(camera_dim=8, config=config)
-    train_batch = {"camera_hidden": torch.randn(1, 5, 8)}
+    # Reproduce the real-cache failure mode: camera_hidden alone carries no
+    # temporal distinction. Raw relative pose must still make L0 trainable.
+    shared_hidden = torch.randn(1, 1, 8)
+    train_batch = {"camera_hidden": shared_hidden.expand(1, 5, 8).clone()}
     train_baseline = _identity_poses(sequence=5)
+    train_baseline[0, 1:, 1, 3] = torch.tensor([0.10, 0.20, 0.30, 0.40])
     train_target = train_baseline.clone()
     train_target[0, 1:, 0, 3] = torch.tensor([0.03, -0.05, 0.08, -0.10])
     training = train_pose_model(

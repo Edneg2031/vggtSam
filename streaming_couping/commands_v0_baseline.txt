@@ -16,7 +16,7 @@ export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-echo "V0 smoke: restored V7.1 gradients/training, late birth and exact fallback"
+echo "V0 smoke: pose-conditioned L0 gradients, late birth and exact fallback"
 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_dynamic_instance_baseline
 
 ARGS=()
@@ -44,8 +44,8 @@ import json
 from pathlib import Path
 summary = json.loads(Path("outputs/streaming_couping_v0/baseline_summary.json").read_text())
 assert summary["baseline_version"] == "v0"
-assert summary["implementation_revision"] == "restored_v71_l0_v74_geometry_r2"
-assert summary["selected_pose_branch"] == "restored_v71_camera_l0"
+assert summary["implementation_revision"] == "v71_pose_conditioned_l0_v74_geometry_r3"
+assert summary["selected_pose_branch"] == "v71_pose_conditioned_camera_l0"
 assert summary["baseline_acceptance_pass"] == 1
 assert summary["selected_gain_vs_raw_percent"] > 0
 assert summary["camera_training"]["no_op_check"] == "passed"
