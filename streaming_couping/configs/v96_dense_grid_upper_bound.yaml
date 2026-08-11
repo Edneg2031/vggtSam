@@ -1,0 +1,20 @@
+# V9.6: actual 72x72 coordinate support before any dense descriptor cache.
+v95_config: streaming_couping/configs/v95_spatial_support_scope.yaml
+output_dir: outputs/streaming_couping_v96_dense_grid_upper_bound
+
+grid_size: [72, 72]
+
+support_scopes:
+  - full_grid
+  - sam_mask_balanced
+  - bbox_balanced
+  - random_shifted_mask_balanced
+
+decoders:
+  - continuous_gt
+  - hard_nearest
+  - soft_bilinear_k4
+
+complement_fraction: 0.5
+random_mask_seed: 96
+pck_threshold_pixels: 1.0

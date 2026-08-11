@@ -227,7 +227,7 @@ detector-FPN descriptor、token 数、Q/K、soft decoder 或 RANSAC 参数。
 这不代表所有 SAM3.1 feature 无效；它只证伪了当前局部实例 correspondence 可以通过固定
 essential solver 稳定修正 pose。
 
-## 9. V9.5：不同于已有实验的空间支撑上界
+## 9. V9.5：空间支撑上界
 
 V9.5 不再优化 localized-instance solver，而是直接检验 V9.4 失败是否由实例区域过于局部造成：
 
@@ -238,8 +238,37 @@ V9.5 不再优化 localized-instance solver，而是直接检验 V9.4 失败是�
 - 在 support 选定后分别加入 0、0.5、1.0px 噪声，噪声分支运行 5 个固定 seed replicate；
 - GT joint-view 选点是诊断上界，任何通过都不能直接归因给 SAM descriptor。
 
-唯一继续条件：full-image 或 instance/background balanced 在 0.5px 下三折全部 active、R 与
-t-direction 均改善且零恶化。若两者都失败，则停止整个 fixed-essential 路线；若 hybrid 通过，才
-值得设计“全局匹配 + SAM mask/ID 分层”的真实因果实验。
+V9.5 结果三折全部配平到平均 26.25 条 correspondence：
 
-一键命令：`zsh streaming_couping/commands_v95_spatial_support_scope.txt`。
+| support | noise | current hull | mean R gain | mean t-dir gain | 恶化 | pass |
+|---|---:|---:|---:|---:|---:|---:|
+| instance-local32 | 0px | 0.130 | 77.20% | 85.52% | 0 | 1 |
+| instance-local32 | 0.5px | 0.130 | -52.61% | -6.59% | 10 | 0 |
+| full-image | 0.5px | 0.576 | 83.76% | 89.68% | 0 | 1 |
+| full-image | 1.0px | 0.576 | 74.63% | 80.89% | 0 | 1 |
+| instance/background balanced | 0.5px | 0.566 | 81.93% | 87.96% | 0 | 1 |
+| instance/background balanced | 1.0px | 0.566 | 73.26% | 81.54% | 0 | 1 |
+
+这把 V9.4 的失败定位为**局部实例区域空间条件不足**，而不是 O-R1 本身无法容忍 0.5–1px
+误差。等量全图或实例/背景混合支撑都能稳定承受 1px，说明 fixed-essential 路线只能转为
+“全局匹配 + SAM 分层”，不能继续使用 localized-instance-only correspondence。
+
+它仍未证明 SAM 有用：full-image 略好于 balanced，且所有 correspondence 都来自 GT 上界。
+
+## 10. V9.6：实际 72×72 网格坐标 gate
+
+V9.6 在训练 dense matcher 之前验证真实离散坐标是否具有可行上界：
+
+- current query 必须来自实际 SAM `detector_fpn2` 的 72×72 align-corners 网格；
+- support 选择只读取 current UV 和 current mask，不读取 history GT UV 或 GT pose error；
+- history 比较 continuous GT、单个实际 grid key hard-nearest、四个相邻实际 key 的
+  soft-bilinear-K4；
+- 空间策略比较 full-grid、SAM-mask balanced、bbox balanced、等面积随机移位 mask balanced；
+- 每条边仍配平到 V9.5 instance-local32 的相同数量，固定同一组 12 条 history edge 和 O-R1；
+- PCK 收紧到 1px；不缓存或评价 dense descriptor，也不训练任何模型。
+
+只有 full-grid continuous、full-grid soft-K4 和 SAM-balanced soft-K4 均三折零恶化通过，才允许
+扩展 cache 并训练 dense descriptor。bbox/random/full 控制若同样通过，只说明 SAM mask 在坐标
+上界阶段并非独有贡献，不能写成 SAM 因果收益。
+
+一键命令：`zsh streaming_couping/commands_v96_dense_grid_upper_bound.txt`。
