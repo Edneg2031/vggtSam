@@ -1,6 +1,6 @@
 # SAM3.1 × StreamVGGT 实验结论
 
-> 时间：2026-08-03 至 2026-08-06
+> 时间：2026-08-03 至 2026-08-11
 >
 > 目标：验证 SAM3.1 的 mask、persistent identity 和 local token 是否能帮助 StreamVGGT 修正相机位姿。
 
@@ -167,7 +167,7 @@ shuffle-time、channel permutation 稳定破坏 matching 和 pose，才能形成
 4. 二维 essential solver 改善了 metric center 或 absolute trajectory；
 5. detector-FPN 失败代表所有 SAM3.1 temporal feature 都无效。
 
-## 8. V9.1–V9.3 新证据与下一步
+## 8. V9.1–V9.4 新证据与终止结论
 
 V9.1 已完成，不再重复：
 
@@ -209,8 +209,37 @@ continuous 正对照三折通过，排除了此前收益只是分支选择不同
 不足以稳定求解。这说明 localized-instance O-R1 对亚像素误差非常敏感，继续训练 matcher 前必须
 先证明存在能承受该误差的鲁棒 solver。
 
-下一步 V9.4 是该路线的最终 solver feasibility gate：固定 V9.3 evidence/history edge，比较原
-O-R1、确定性 RANSAC、RANSAC inlier-refine 和空间均衡 RANSAC。若所有 solver 都不能让
-soft-K8 与 0.5px noise 三折零恶化通过，就停止实例 essential 路线，不再调 SAM descriptor。
+V9.4 固定 V9.3 的 evidence/history edge，比较 O-R1、确定性 RANSAC minimal、RANSAC
+inlier-refine 和空间均衡 RANSAC：
 
-一键命令：`zsh streaming_couping/commands_v94_solver_feasibility.txt`。
+| evidence | 最好现象 | all-fold pass |
+|---|---|---:|
+| continuous GT | O-R1 与 deterministic RANSAC minimal 三折通过、零恶化 | 1 |
+| GT soft-convex K8 | spatial RANSAC 只剩 1 个恶化行，但存在 inactive 且 medium 不稳 | 0 |
+| continuous + 0.5px noise | spatial RANSAC 平均 R/t-dir 改善，但有 6 个恶化行 | 0 |
+| continuous + 1.0px noise | 所有 solver 均不稳定 | 0 |
+
+continuous 正对照通过说明协议、固定边和 solver 实现有效；soft-K8 与 0.5px noise 在所有 robust
+solver 下失败，满足预设终止条件。因此正式停止
+`localized SAM-instance correspondence → essential matrix → pose` 路线，不再调整该路线的
+detector-FPN descriptor、token 数、Q/K、soft decoder 或 RANSAC 参数。
+
+这不代表所有 SAM3.1 feature 无效；它只证伪了当前局部实例 correspondence 可以通过固定
+essential solver 稳定修正 pose。
+
+## 9. V9.5：不同于已有实验的空间支撑上界
+
+V9.5 不再优化 localized-instance solver，而是直接检验 V9.4 失败是否由实例区域过于局部造成：
+
+- 固定 V9.3/V9.4 的同一组 12 条 history edge；
+- 固定 O-R1 solver，不训练 matcher 或 pose model；
+- 比较 `instance-local32`、`full-image`、`instance + background 50/50`；
+- 每条边严格配平到相同 correspondence 数，排除“点更多”的混杂因素；
+- 在 support 选定后分别加入 0、0.5、1.0px 噪声，噪声分支运行 5 个固定 seed replicate；
+- GT joint-view 选点是诊断上界，任何通过都不能直接归因给 SAM descriptor。
+
+唯一继续条件：full-image 或 instance/background balanced 在 0.5px 下三折全部 active、R 与
+t-direction 均改善且零恶化。若两者都失败，则停止整个 fixed-essential 路线；若 hybrid 通过，才
+值得设计“全局匹配 + SAM mask/ID 分层”的真实因果实验。
+
+一键命令：`zsh streaming_couping/commands_v95_spatial_support_scope.txt`。
