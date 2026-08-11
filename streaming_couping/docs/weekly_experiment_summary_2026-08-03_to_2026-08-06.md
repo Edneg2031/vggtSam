@@ -280,7 +280,7 @@ V9.6 的主 gate 只回答真实 72×72 网格能否表达可求解的连续坐�
 EPE 2.34px）。因此已证实真实网格需要子网格解码，并已允许进入 dense descriptor 实验。
 SAM-balanced soft-K4 本身零恶化，但 long fold 无法严格配平，不能据此声明 SAM mask 独有贡献。
 
-## 11. V9.7：下一步唯一实验
+## 11. V9.7：dense detector-FPN 已证伪
 
 V9.7 不再重复 local32、token 数、RANSAC、depth/K 或 mask-support 上界：
 
@@ -296,8 +296,52 @@ V9.7 不再重复 local32、token 数、RANSAC、depth/K 或 mask-support 上界
 solver 再用这些对应修正 StreamVGGT L0 的相对旋转和位移方向。** 它不把 SAM token 注入
 StreamVGGT backbone，也没有可直接背 pose 的 adapter。
 
-只有正常 SAM 在三个未来 fold 的 PCK@1、EPE、rotation 和 translation direction 同时优于所有
-参数匹配控制，而且三种 SAM 扰乱稳定破坏收益，才可写“SAM token 对 StreamVGGT relative pose
-有因果帮助”。训练 loss 降低但 gate=0 仍属于证伪结果。
+实际结果：
+
+| fold | train loss | future PCK@1 | future EPE | pose 结果 |
+|---|---:|---:|---:|---|
+| short | 10.29 → 0.38 | 0 | 110.69px | 4/4 恶化 |
+| medium | 9.97 → 1.15 | 0 | 98.00px | 3/4 恶化，1 帧 inactive 回退 |
+| long | 10.03 → 2.00 | 1.65% | 105.22px | 4/4 恶化 |
+
+train-off loss 不下降，说明正常 matcher 的梯度和 descriptor 输入确实生效；但未来 correspondence
+几乎为零，StreamVGGT dense control 的 EPE 也始终低于 SAM。因此证伪的是：
+
+> 逐帧 `detector_fpn2` dense descriptor 虽可拟合训练前缀，但不能在当前同场景时间外推协议中
+> 预测未来 correspondence，也不能帮助 StreamVGGT relative pose。
+
+V9.6 的 full-grid soft-K4 上界已经通过，所以该失败不能再归因于 72×72 坐标量化、局部实例
+support 或 O-R1 的 1px 容差。它不代表 SAM3.1 video memory feature 无效。
 
 一键命令：`zsh streaming_couping/commands_v97_dense_descriptor_causality.txt`。
+
+## 12. V9.8：只验证真正的 SAM3.1 temporal memory
+
+V9.8 是 V9.7 后唯一新增假设，不再调整 detector-FPN、depth/K、token 数或 solver：
+
+- 在 SAM3.1 multiplex tracker 的 `_prepare_memory_conditioned_features` 返回处捕获特征；这是当前帧
+  propagation feature 已读取过去 `maskmem_features` 和 `obj_ptr` 后的真实 history-read map；
+- memory-off 是**同一次调用**进入 memory encoder 前的 raw propagation map，不用另一模型近似；
+- `bed`、`wardrobe` 各自运行 forward-only session，再对可用 prompt map 等权合并；中途新实例可由
+  tracker 动态 birth，并从后续帧的 memory read 开始参与；
+- multiplex 输出按 bucket joint feature 处理，不错误地当成 per-object tensor 做 `demux`；
+- query/key、5184 history keys、V9.3 fixed edges、O-R1 和训练 label 与 V9.7 完全相同；
+- matcher seed、初始化、batch 顺序和优化器也锁定为 V9.7 的设置，不重训已经完成的 detector-FPN；
+  完全相同的 V9.7 zero-input checkpoint 也直接复用，不重复训练；
+- 正式控制：same-call memory-off、V9.7 detector-FPN、StreamVGGT、train-off；扰乱为 memory-off-at-eval、
+  channel permutation 和 causal time shuffle；
+- 先从 V9.7 checkpoint 输出 train/future PCK/EPE 审计，再训练 V9.8 correspondence matcher；不训练
+  pose model，也不使用 pose loss。
+
+只有 temporal feature 在三个未来 fold 都同时满足以下条件，才能写“SAM3.1 memory 帮助
+StreamVGGT relative pose”：
+
+1. PCK@1 更高、EPE 更低，超过全部正式控制；
+2. memory-off/time-shuffle/channel-permute 都破坏 correspondence；
+3. 固定 O-R1 的 rotation 与 translation-direction 都优于 L0，且没有恶化帧；
+4. pose 也优于全部控制，三折同时通过。
+
+训练 loss 下降、训练 PCK 高或单折 pose 变好都不算成功。该实验仍只允许同场景时间外推的
+relative pose 结论。
+
+一键命令：`zsh streaming_couping/commands_v98_temporal_memory_causality.txt`。

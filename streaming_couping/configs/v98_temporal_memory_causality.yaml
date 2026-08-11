@@ -1,0 +1,31 @@
+# V9.8: genuine SAM3.1 video-memory read, after detector_fpn2 V9.7 failed.
+v97_config: streaming_couping/configs/v97_dense_descriptor_causality.yaml
+data_config: streaming_couping/configs/v92_support_data.yaml
+output_dir: outputs/streaming_couping_v98_temporal_memory_causality
+temporal_cache_path: outputs/streaming_couping_v98_temporal_memory_causality/cache/00a231a370_90_525_step15_temporal.pt
+v97_dense_cache_path: outputs/streaming_couping_v97_dense_descriptor_causality/cache/00a231a370_90_525_step15_dense.pt
+v97_output_dir: outputs/streaming_couping_v97_dense_descriptor_causality
+clip_name: 00a231a370_90_525_step15_37_68_54
+
+grid_size: [72, 72]
+cache_device: cuda:0
+
+# Exactly parameter-matched to V9.7. Pose is never an input or a loss.
+matcher:
+  canonical_dim: 256
+  projection_dim: 64
+  offset_hidden_dim: 128
+  temperature: 0.07
+  offset_weight: 1.0
+  pck_threshold_pixels: 1.0
+
+training:
+  device: cuda:0
+  # Reuse V9.7's seed so detector-FPN/Stream and V9.8 controls have the exact
+  # same matcher initialization and cyclic batch order without retraining V9.7.
+  seed: 97
+  steps: 600
+  batch_pairs: 4
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  log_every: 50
