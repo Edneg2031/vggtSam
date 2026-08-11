@@ -178,24 +178,16 @@ def build_equal_count_grid_supports(
             complement,
             current_farthest_indices(complement, desired_complement, image_size),
         )
-        if (
-            selected_region.count != desired_region
-            or selected_complement.count != desired_complement
-        ):
-            raise ValueError(
-                "V9.6 cannot construct the locked 50/50 control for "
-                f"scope={scope}: region={selected_region.count}/{desired_region}, "
-                f"complement={selected_complement.count}/{desired_complement}."
-            )
+        # Some coarse controls can cover the entire mutually visible image on
+        # one edge (for example, a union bbox), leaving no valid complement.
+        # Keep the available rows and let equal_count_exact/fold_pass mark that
+        # control infeasible.  A missing negative control must not abort the
+        # full-grid and SAM-balanced coordinate gates, nor count as a SAM win.
         combined = concatenate_surface_rows(
             [selected_region, selected_complement],
             current_frame=full.current_frame,
             history_frame=full.history_frame,
         )
-        if combined.count != target:
-            raise ValueError(
-                f"V9.6 scope={scope} rows={combined.count}, required={target}."
-            )
         output[scope] = GridSupport(
             scope,
             combined,

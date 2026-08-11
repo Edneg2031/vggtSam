@@ -98,3 +98,26 @@ def test_equal_count_scopes_and_current_only_selection() -> None:
         current_farthest_indices(full, 20, (80, 100)),
         current_farthest_indices(changed_history, 20, (80, 100)),
     )
+
+
+def test_unavailable_balanced_control_is_reported_without_aborting() -> None:
+    full_uv = torch.tensor(
+        [[5.0 + 10 * x, 5.0 + 10 * y] for y in range(4) for x in range(5)]
+    )
+    full = _surface(full_uv)
+    scarce_region = _surface(full_uv[:5])
+    empty_complement = _surface(full_uv[:0])
+    feasible = (_surface(full_uv[:10]), _surface(full_uv[10:]))
+    supports = build_equal_count_grid_supports(
+        full=full,
+        regions={
+            "sam_mask_balanced": feasible,
+            "bbox_balanced": (scarce_region, empty_complement),
+            "random_shifted_mask_balanced": feasible,
+        },
+        target_count=10,
+        image_size=(50, 60),
+    )
+    assert supports["bbox_balanced"].count == 5
+    assert supports["full_grid"].count == 10
+    assert supports["sam_mask_balanced"].count == 10

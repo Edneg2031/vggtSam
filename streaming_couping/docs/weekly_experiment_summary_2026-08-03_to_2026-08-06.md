@@ -271,4 +271,7 @@ V9.6 在训练 dense matcher 之前验证真实离散坐标是否具有可行上
 扩展 cache 并训练 dense descriptor。bbox/random/full 控制若同样通过，只说明 SAM mask 在坐标
 上界阶段并非独有贡献，不能写成 SAM 因果收益。
 
+若 bbox 或随机 mask 在某条边无法提供足够的 region/complement 点，runner 会保留可用点、标记
+`equal-count feasible=0` 和 `pass=0`，但继续执行主 gate；不可构造的负控制不会被算成 SAM 胜出。
+
 一键命令：`zsh streaming_couping/commands_v96_dense_grid_upper_bound.txt`。

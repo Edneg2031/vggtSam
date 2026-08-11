@@ -543,6 +543,12 @@ def _decision_markdown(rows: Sequence[dict[str, object]]) -> str:
                 {
                     "scope": scope,
                     "decoder": decoder,
+                    "count": _finite_mean(
+                        float(row["mean_correspondences"]) for row in values
+                    ),
+                    "equal": int(
+                        all(int(row["equal_count_exact"]) for row in values)
+                    ),
                     "pck": _finite_mean(float(row["pck_accuracy"]) for row in values),
                     "epe": _finite_mean(float(row["mean_epe_pixels"]) for row in values),
                     "max_epe": _finite_max(float(row["max_epe_pixels"]) for row in values),
@@ -570,8 +576,21 @@ def _decision_markdown(rows: Sequence[dict[str, object]]) -> str:
     soft_random = _group_pass(
         groups, "random_shifted_mask_balanced", "soft_bilinear_k4"
     )
+    sam_feasible = _group_equal(groups, "sam_mask_balanced", "soft_bilinear_k4")
+    bbox_feasible = _group_equal(groups, "bbox_balanced", "soft_bilinear_k4")
+    random_feasible = _group_equal(
+        groups, "random_shifted_mask_balanced", "soft_bilinear_k4"
+    )
     gate = int(positive and soft_full and soft_sam)
-    sam_unique = int(soft_sam and not soft_full and not soft_bbox and not soft_random)
+    sam_unique = int(
+        sam_feasible
+        and soft_sam
+        and not soft_full
+        and bbox_feasible
+        and not soft_bbox
+        and random_feasible
+        and not soft_random
+    )
     lines = [
         "# V9.6 actual dense-grid coordinate decision",
         "",
@@ -585,15 +604,19 @@ def _decision_markdown(rows: Sequence[dict[str, object]]) -> str:
         f"- SAM-mask balanced soft-bilinear-K4 pass: `{soft_sam}`",
         f"- bbox balanced soft-bilinear-K4 pass: `{soft_bbox}`",
         f"- random-shifted-mask balanced soft-bilinear-K4 pass: `{soft_random}`",
+        f"- SAM-mask balanced equal-count feasible: `{sam_feasible}`",
+        f"- bbox balanced equal-count feasible: `{bbox_feasible}`",
+        f"- random-shifted-mask balanced equal-count feasible: `{random_feasible}`",
         f"- SAM mask uniquely required by this oracle: `{sam_unique}`",
         f"- dense-descriptor stage allowed: `{gate}`",
         "",
-        "| support | decoder | PCK@1 | EPE px | max EPE | current hull | mean R gain | mean t-dir gain | worse | pass |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| support | decoder | rows/edge | equal count | PCK@1 | EPE px | max EPE | current hull | mean R gain | mean t-dir gain | worse | pass |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in groups:
         lines.append(
-            f"| {row['scope']} | {row['decoder']} | {row['pck']:.6g} "
+            f"| {row['scope']} | {row['decoder']} | {row['count']:.6g} "
+            f"| {row['equal']} | {row['pck']:.6g} "
             f"| {row['epe']:.6g} | {row['max_epe']:.6g} | {row['hull']:.6g} "
             f"| {row['r_gain']:.6g} | {row['t_gain']:.6g} "
             f"| {row['worse']} | {row['pass']} |"
@@ -607,6 +630,7 @@ def _decision_markdown(rows: Sequence[dict[str, object]]) -> str:
             "- hard=1: Top-1 grid coordinates are already solver-feasible.",
             "- hard=0 and soft-K4=1: a learned sub-grid expectation decoder is required.",
             "- dense-descriptor-stage=1: coordinate/support expressivity is sufficient to justify caching and testing dense features.",
+            "- A bbox/random row with equal-count=0 is an unavailable control, not evidence that SAM won.",
             "- bbox/random/full controls passing means SAM mask is not uniquely useful at the oracle-coordinate stage.",
             "- No result here is evidence that a SAM descriptor predicts correspondence or improves pose.",
             "",
@@ -624,6 +648,17 @@ def _group_pass(groups, scope: str, decoder: str) -> int:
     if len(values) != 1:
         raise ValueError(f"V9.6 lacks group scope={scope} decoder={decoder}.")
     return int(values[0]["pass"])
+
+
+def _group_equal(groups, scope: str, decoder: str) -> int:
+    values = [
+        row
+        for row in groups
+        if row["scope"] == scope and row["decoder"] == decoder
+    ]
+    if len(values) != 1:
+        raise ValueError(f"V9.6 lacks group scope={scope} decoder={decoder}.")
+    return int(values[0]["equal"])
 
 
 def load_dense_grid_config(path: str | Path) -> DenseGridConfig:
