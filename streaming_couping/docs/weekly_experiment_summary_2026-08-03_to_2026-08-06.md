@@ -195,10 +195,12 @@ loss 下降 85%–95% 仍没有形成训练内高精度 correspondence；因此 
 6. predicted depth/K 的三维路线不是简单 scale、offset、affine 或 Sim3 问题。
 7. dense detector-FPN 和真正 temporal-memory feature 都未学出未来 correspondence。
 8. 当前结果不能支持 metric center、absolute trajectory 或跨场景 SAM 因果结论。
+9. 第一版清理后的 V0 是 no-op：camera train loss `0.344872→0.344872`，geometry train loss
+   `0.428219→0.428219`，评估 rotation/center 完全不变。它是实现回归，已废弃，不能作为 baseline 证据。
 
-## 8. 现已冻结的 V0 baseline
+## 8. V0 baseline（恢复 V7.1 后重新验收）
 
-当前代码基线正式记为 `V0: dynamic_instance_geometry_baseline`：
+名称仍为 `V0`，实现修订为 `restored_v71_l0_v74_geometry_r2`：
 
 ```text
 RGB stream
@@ -211,10 +213,9 @@ RGB stream
      → corrected mask/ID/quality observation
           ↓
 recent concrete observation memory
-          ↓
-camera baseline + geometry-only transport residual
-          ↓
-refined pose；无 mature/static/geometry-valid slot 时 exact camera-baseline fallback
+     ├─ restored V7.1 camera L0 → V0 selected pose
+     └─ V7.4-style geometry-only transport → 单独计分的 candidate
+          （无 mature/static/geometry-valid slot 时 exact L0）
 ```
 
 实现边界：
@@ -227,10 +228,12 @@ refined pose；无 mature/static/geometry-valid slot 时 exact camera-baseline f
   moving/unknown/低质量实例被排除。
 - 几何纠 mask 使用 frozen StreamVGGT raw pose/pointmap，不读 refined 同帧 pose，避免同帧循环依赖；
   correction 进入下游 observation，但暂不回写 SAM3.1 multiplex 内部 memory。
-- pose 仍有 learned bounded residual head，因此只能称为同场景经验 baseline，不能称为显式 solver
-  的理论保证，也不能把改善归因于 SAM token。
+- V0 的最终 pose 固定选择恢复的 V7.1 camera L0；geometry transport 不再静默覆盖最终结果，只作为
+  `geometry_candidate` 输出。二者都不能把改善归因于 SAM token。
 - runner 验证 prefix causality、late birth、birth-frame inactivity、moving-object exclusion 和 inactive
-  exact fallback；默认用 105–255 训练 camera，270–345 训练 geometry residual，360–525 只评估。
+  exact fallback；默认用 105–255 训练 camera，270–345 训练 geometry candidate，360–525 只评估。
+- runner 新增硬验收：非零梯度、非零参数更新、训练 loss 至少下降 1%，并且 selected V7.1 L0 的
+  future evaluation loss 必须严格优于 raw。任一条件失败就不写合格 summary。
 
 运行入口：
 
@@ -238,17 +241,18 @@ refined pose；无 mature/static/geometry-valid slot 时 exact camera-baseline f
 zsh streaming_couping/commands_v0_baseline.txt
 ```
 
-输出目录固定为 `outputs/streaming_couping_v0/`，包含 `baseline_summary.json`、
+输出目录固定为 `outputs/streaming_couping_v0/`，但复用已有 V7.4 dynamic cache，避免重复保存冻结
+backbone tensor。结果包含 `baseline_summary.json`、
 `frame_diagnostics.csv`、`dynamic_instance_diagnostics.csv` 和 `poses.pt`。summary/checkpoint 签名都记录
-`baseline_version=v0`；以后 V1 不得覆盖或冒充 V0。旧 V4–V9.8 runner/config/command/test 已删除，
-历史结论只保留在本账本。
+`baseline_version=v0` 和实现修订；旧 no-op checkpoint 会自动失效。只有服务器重新运行后出现
+`baseline_acceptance_pass=1`，这个 V0 才算正式验收。旧 V4–V9.8 结论只保留在本账本。
 
 这个 baseline 符合“第一帧不需要出现所有物体，未来物体可加入”，但仍有三个限制：
 
 1. SAM3.1 是 open-vocabulary prompt detector，不是 class-agnostic all-object proposal；目前只配置
    `bed`、`wardrobe`，会发现这两个概念的多个实例，但不会自动覆盖任意类别。
-2. `geometry_transport` 仍含 learned residual head，其效果只能称为经验 E2/capacity baseline，
-   不能归因于 SAM token。
+2. selected pose 的收益来自 V7.1 camera L0；dynamic SAM 与 geometry candidate 是否进一步帮助 pose
+   必须看单独控制，不能从 V0 selected 指标推出。
 3. 当前 runner 是按时间顺序的 causal replay；SAM3.1 session 仍由 cache builder 对整段有序帧创建和
    关闭，尚未封装成常驻服务式的 `step(frame)` API。
 

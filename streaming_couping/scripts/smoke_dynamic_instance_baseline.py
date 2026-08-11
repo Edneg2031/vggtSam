@@ -11,6 +11,11 @@ from streaming_couping.src.learned_pose.dynamic_instance_baseline import (
     BaselineModelConfig,
     CameraPoseBaseline,
     DynamicInstanceGeometryRefiner,
+    se3_exp,
+)
+from streaming_couping.src.learned_pose.baseline_runtime import (
+    OptimizerConfig,
+    train_pose_model,
 )
 from streaming_couping.src.geometry_segmentation import (
     GeometrySegmentationPrompt,
@@ -28,6 +33,38 @@ def main() -> None:
         min_geometry_confidence=0.2,
         min_static_score=0.2,
     )
+    # The successful V7.1 path starts at an exact identity update. Verify that
+    # the exponential map remains differentiable there and that an actual
+    # camera L0 fit cannot silently become a no-op.
+    zero_twist = torch.zeros(1, 6, requires_grad=True)
+    se3_exp(zero_twist).sum().backward()
+    assert zero_twist.grad is not None
+    assert bool(torch.isfinite(zero_twist.grad).all())
+    assert float(zero_twist.grad.abs().sum()) > 0.0
+    train_base = CameraPoseBaseline(camera_dim=8, config=config)
+    train_batch = {"camera_hidden": torch.randn(1, 5, 8)}
+    train_baseline = _identity_poses(sequence=5)
+    train_target = train_baseline.clone()
+    train_target[0, 1:, 0, 3] = torch.tensor([0.03, -0.05, 0.08, -0.10])
+    training = train_pose_model(
+        train_base,
+        batch=train_batch,
+        baseline=train_baseline,
+        target=train_target,
+        reference_index=0,
+        training_indices=[1, 2, 3, 4],
+        steps=80,
+        config=OptimizerConfig(
+            base_steps=80,
+            refiner_steps=80,
+            learning_rate=1e-3,
+            log_every=20,
+            min_train_loss_drop_percent=0.1,
+        ),
+    )
+    assert training["best_step"] > 0
+    assert training["loss_drop_percent"] >= 0.1
+    assert training["parameter_update_norm"] > 0.0
     base = CameraPoseBaseline(camera_dim=8, config=config)
     model = DynamicInstanceGeometryRefiner(
         base_model=base,

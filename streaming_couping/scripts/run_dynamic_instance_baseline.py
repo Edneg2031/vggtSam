@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build, fit and evaluate the retained dynamic-instance geometry baseline."""
+"""Build and audit V0: restored V7.1 L0 plus dynamic-instance candidates."""
 
 from __future__ import annotations
 
@@ -42,6 +42,9 @@ from streaming_couping.src.learned_pose.dynamic_instance_baseline import (
 )
 
 
+V0_IMPLEMENTATION_REVISION = "restored_v71_l0_v74_geometry_r2"
+
+
 FRAME_COLUMNS = (
     "sequence_index",
     "frame_index",
@@ -49,14 +52,16 @@ FRAME_COLUMNS = (
     "observed_instances",
     "eligible_instances",
     "mature_instances",
-    "pose_active",
-    "exact_l0_fallback",
+    "geometry_candidate_active",
+    "geometry_candidate_exact_l0_fallback",
     "raw_rotation_error_deg",
     "l0_rotation_error_deg",
-    "refined_rotation_error_deg",
+    "geometry_candidate_rotation_error_deg",
+    "selected_rotation_error_deg",
     "raw_center_error_native",
     "l0_center_error_native",
-    "refined_center_error_native",
+    "geometry_candidate_center_error_native",
+    "selected_center_error_native",
 )
 
 
@@ -150,6 +155,7 @@ def run_baseline(
         raise ValueError(f"Baseline cache lacks requested frames={sorted(missing)}.")
 
     run.output_dir.mkdir(parents=True, exist_ok=True)
+    _clear_stale_result_artifacts(run.output_dir)
     signature = _signature(run=run, payload=payload, cache_path_value=path)
     seed_everything(run.optimizer.seed)
     base = CameraPoseBaseline(
@@ -353,6 +359,20 @@ def _save_checkpoint(path: Path, signature: str, model, training: dict) -> None:
     temporary.replace(path)
 
 
+def _clear_stale_result_artifacts(output_dir: Path) -> None:
+    """A failed rerun must not leave an older summary looking accepted."""
+
+    for name in (
+        "baseline_summary.json",
+        "frame_diagnostics.csv",
+        "dynamic_instance_diagnostics.csv",
+        "poses.pt",
+    ):
+        path = output_dir / name
+        if path.is_file():
+            path.unlink()
+
+
 def _assert_causal_prefix_equivalence(
     model,
     *,
@@ -402,6 +422,40 @@ def _write_outputs(
     refiner_training,
 ) -> Path:
     frames = tuple(int(value) for value in payload["frame_indices"])
+    raw_metrics = pose_metrics(
+        raw_pose,
+        target_pose,
+        reference_index=reference,
+        translation_weight=run.optimizer.translation_weight,
+        evaluation_indices=evaluation_indices,
+    )
+    l0_metrics = pose_metrics(
+        l0_pose,
+        target_pose,
+        reference_index=reference,
+        translation_weight=run.optimizer.translation_weight,
+        evaluation_indices=evaluation_indices,
+    )
+    geometry_candidate_metrics = pose_metrics(
+        refined["world_to_camera"],
+        target_pose,
+        reference_index=reference,
+        translation_weight=run.optimizer.translation_weight,
+        evaluation_indices=evaluation_indices,
+    )
+    selected_gain = _gain_percent(raw_metrics["loss"], l0_metrics["loss"])
+    geometry_gain_vs_raw = _gain_percent(
+        raw_metrics["loss"], geometry_candidate_metrics["loss"]
+    )
+    geometry_gain_vs_l0 = _gain_percent(
+        l0_metrics["loss"], geometry_candidate_metrics["loss"]
+    )
+    if selected_gain <= float(run.optimizer.min_evaluation_gain_percent):
+        raise RuntimeError(
+            "V0 acceptance failed: restored V7.1 L0 does not improve raw "
+            f"evaluation loss (gain={selected_gain:.6g}%, required>"
+            f"{float(run.optimizer.min_evaluation_gain_percent):.6g}%)."
+        )
     dynamic = {
         int(row["sequence_index"]): row
         for row in payload.get("dynamic_instance_diagnostics", ())
@@ -410,9 +464,10 @@ def _write_outputs(
     for index, frame in enumerate(frames):
         raw_rotation, raw_center = _frame_errors(raw_pose, target_pose, index)
         l0_rotation, l0_center = _frame_errors(l0_pose, target_pose, index)
-        refined_rotation, refined_center = _frame_errors(
+        geometry_rotation, geometry_center = _frame_errors(
             refined["world_to_camera"], target_pose, index
         )
+        selected_rotation, selected_center = l0_rotation, l0_center
         active = bool(refined["active_frames"][0, index].cpu())
         fallback = torch.equal(
             refined["world_to_camera"][:, index], l0_pose[:, index]
@@ -430,14 +485,18 @@ def _write_outputs(
                 "mature_instances": int(
                     refined["usable_instance_mask"][0, index].sum().cpu()
                 ),
-                "pose_active": int(active),
-                "exact_l0_fallback": int((not active) and fallback),
+                "geometry_candidate_active": int(active),
+                "geometry_candidate_exact_l0_fallback": int(
+                    (not active) and fallback
+                ),
                 "raw_rotation_error_deg": raw_rotation,
                 "l0_rotation_error_deg": l0_rotation,
-                "refined_rotation_error_deg": refined_rotation,
+                "geometry_candidate_rotation_error_deg": geometry_rotation,
+                "selected_rotation_error_deg": selected_rotation,
                 "raw_center_error_native": raw_center,
                 "l0_center_error_native": l0_center,
-                "refined_center_error_native": refined_center,
+                "geometry_candidate_center_error_native": geometry_center,
+                "selected_center_error_native": selected_center,
             }
         )
     frame_path = run.output_dir / "frame_diagnostics.csv"
@@ -447,27 +506,6 @@ def _write_outputs(
     if dynamic_rows:
         _write_csv(dynamic_path, dynamic_rows, tuple(dynamic_rows[0]))
 
-    raw_metrics = pose_metrics(
-        raw_pose,
-        target_pose,
-        reference_index=reference,
-        translation_weight=run.optimizer.translation_weight,
-        evaluation_indices=evaluation_indices,
-    )
-    l0_metrics = pose_metrics(
-        l0_pose,
-        target_pose,
-        reference_index=reference,
-        translation_weight=run.optimizer.translation_weight,
-        evaluation_indices=evaluation_indices,
-    )
-    refined_metrics = pose_metrics(
-        refined["world_to_camera"],
-        target_pose,
-        reference_index=reference,
-        translation_weight=run.optimizer.translation_weight,
-        evaluation_indices=evaluation_indices,
-    )
     births = tuple(int(value) for value in payload.get("sam_birth_indices", ()))
     late_births = tuple(value for value in births if value > reference)
     evaluated_active = sum(
@@ -485,9 +523,10 @@ def _write_outputs(
         if str(row.get("selected_variant", "")) == "sam31_online_geometry_compete"
     ]
     summary = {
-        "schema": 1,
+        "schema": 2,
         "baseline_version": run.version,
-        "method": "v0_dynamic_instance_geometry_baseline",
+        "implementation_revision": V0_IMPLEMENTATION_REVISION,
+        "method": "v0_restored_v71_l0_dynamic_instance_baseline",
         "claim_level": "empirical_baseline_not_sam_token_causality",
         "config": str(run.source_path),
         "cache": str(cache_path_value),
@@ -496,7 +535,9 @@ def _write_outputs(
         "frames": frames,
         "evaluation_frames": tuple(frames[index] for index in evaluation_indices),
         "sam_role": "prompted_dynamic_discovery_mask_persistent_id",
-        "pose_role": "streamvggt_geometry_transport_without_sam_appearance_tokens",
+        "pose_role": "restored_v71_camera_l0",
+        "geometry_pose_role": "v74_geometry_only_transport_candidate",
+        "selected_pose_branch": "restored_v71_camera_l0",
         "segmentation_variant": payload.get("sam_segmentation_variant"),
         "geometry_corrections_applied": sum(
             int(row.get("correction_applied", 0)) for row in correction_rows
@@ -505,12 +546,17 @@ def _write_outputs(
         "sam_appearance_cached": bool(payload.get("cache_sam_appearance", True)),
         "late_birth_count": len(late_births),
         "late_birth_sequence_indices": late_births,
-        "evaluation_active_frames": evaluated_active,
-        "evaluation_inactive_exact_l0": int(inactive_exact),
+        "geometry_candidate_active_frames": evaluated_active,
+        "geometry_candidate_inactive_exact_l0": int(inactive_exact),
         "causal_prefix_check": "passed_atol_2e-6",
         "raw_metrics": raw_metrics,
         "camera_baseline_metrics": l0_metrics,
-        "geometry_refined_metrics": refined_metrics,
+        "selected_pose_metrics": l0_metrics,
+        "geometry_candidate_metrics": geometry_candidate_metrics,
+        "selected_gain_vs_raw_percent": selected_gain,
+        "geometry_candidate_gain_vs_raw_percent": geometry_gain_vs_raw,
+        "geometry_candidate_gain_vs_l0_percent": geometry_gain_vs_l0,
+        "baseline_acceptance_pass": 1,
         "camera_training": base_training,
         "geometry_training": refiner_training,
         "model": asdict(run.model),
@@ -526,8 +572,15 @@ def _write_outputs(
             "frame_indices": frames,
             "raw_world_to_camera": raw_pose.detach().cpu(),
             "camera_baseline_world_to_camera": l0_pose.detach().cpu(),
-            "refined_world_to_camera": refined["world_to_camera"].detach().cpu(),
-            "active_frames": refined["active_frames"].detach().cpu(),
+            "selected_world_to_camera": l0_pose.detach().cpu(),
+            # Compatibility field: V0's accepted refined pose is V7.1 L0.
+            "refined_world_to_camera": l0_pose.detach().cpu(),
+            "geometry_candidate_world_to_camera": refined[
+                "world_to_camera"
+            ].detach().cpu(),
+            "geometry_candidate_active_frames": refined[
+                "active_frames"
+            ].detach().cpu(),
             "usable_instance_mask": refined["usable_instance_mask"].detach().cpu(),
         },
         run.output_dir / "poses.pt",
@@ -551,8 +604,9 @@ def _frame_errors(predicted, target, index: int) -> tuple[float, float]:
 
 def _signature(*, run, payload, cache_path_value: Path) -> str:
     identity = {
-        "schema": 1,
-        "purpose": "v0_dynamic_instance_geometry_baseline",
+        "schema": 2,
+        "implementation_revision": V0_IMPLEMENTATION_REVISION,
+        "purpose": "v0_restored_v71_l0_dynamic_instance_baseline",
         "config": asdict(run),
         "cache": str(cache_path_value),
         "clip": payload.get("clip_name"),
@@ -565,6 +619,12 @@ def _signature(*, run, payload, cache_path_value: Path) -> str:
     return hashlib.sha256(
         json.dumps(identity, sort_keys=True, default=str).encode("utf8")
     ).hexdigest()
+
+
+def _gain_percent(reference: float, candidate: float) -> float:
+    return 100.0 * (float(reference) - float(candidate)) / max(
+        abs(float(reference)), 1e-12
+    )
 
 
 def _validate_payload(payload: dict, *, clip: ClipConfig, run: BaselineRunConfig) -> None:

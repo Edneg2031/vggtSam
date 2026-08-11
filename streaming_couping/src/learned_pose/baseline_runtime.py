@@ -28,6 +28,8 @@ class OptimizerConfig:
     translation_weight: float = 10.0
     log_every: int = 200
     seed: int = 0
+    min_train_loss_drop_percent: float = 1.0
+    min_evaluation_gain_percent: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -81,6 +83,12 @@ def load_baseline_run_config(path: str | Path) -> BaselineRunConfig:
             translation_weight=float(optimization.get("translation_weight", 10.0)),
             log_every=int(optimization.get("log_every", 200)),
             seed=int(optimization.get("seed", 0)),
+            min_train_loss_drop_percent=float(
+                optimization.get("min_train_loss_drop_percent", 1.0)
+            ),
+            min_evaluation_gain_percent=float(
+                optimization.get("min_evaluation_gain_percent", 0.0)
+            ),
         ),
     )
     _validate_config(config)
@@ -237,7 +245,7 @@ def train_pose_model(
     training_indices: list[int],
     steps: int,
     config: OptimizerConfig,
-) -> dict[str, float | int]:
+) -> dict[str, float | int | str]:
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not parameters:
         raise ValueError("Pose model has no trainable parameters.")
@@ -246,6 +254,11 @@ def train_pose_model(
         lr=float(config.learning_rate),
         weight_decay=float(config.weight_decay),
     )
+    initial_parameters = {
+        name: value.detach().cpu().clone()
+        for name, value in model.named_parameters()
+        if value.requires_grad
+    }
     model.eval()
     with torch.no_grad():
         initial = forward_model(
@@ -263,9 +276,13 @@ def train_pose_model(
                 evaluation_indices=training_indices,
             ).cpu()
         )
-    best_loss = float("inf")
+    best_loss = initial_loss
     best_step = 0
-    best_state = None
+    best_state = {
+        name: value.detach().cpu().clone()
+        for name, value in model.state_dict().items()
+    }
+    maximum_gradient_norm = 0.0
     model.train()
     for step in range(1, int(steps) + 1):
         optimizer.zero_grad(set_to_none=True)
@@ -288,6 +305,9 @@ def train_pose_model(
         norm = torch.nn.utils.clip_grad_norm_(parameters, config.grad_clip_norm)
         if not bool(torch.isfinite(norm)):
             raise RuntimeError(f"Non-finite baseline gradient at step {step}.")
+        maximum_gradient_norm = max(
+            maximum_gradient_norm, float(norm.detach().cpu())
+        )
         optimizer.step()
         if step % int(config.log_every) == 0 or step == int(steps):
             model.eval()
@@ -316,14 +336,36 @@ def train_pose_model(
                     for name, value in model.state_dict().items()
                 }
             model.train()
-    if best_state is None:
-        raise RuntimeError("Baseline training produced no checkpoint candidate.")
     model.load_state_dict(best_state)
     model.eval()
+    parameter_update_norm = 0.0
+    for name, value in model.named_parameters():
+        if name not in initial_parameters:
+            continue
+        difference = value.detach().cpu() - initial_parameters[name]
+        parameter_update_norm += float(difference.square().sum())
+    parameter_update_norm = parameter_update_norm**0.5
+    loss_drop_percent = 100.0 * (initial_loss - best_loss) / max(
+        abs(initial_loss), 1e-12
+    )
+    if maximum_gradient_norm <= 0.0:
+        raise RuntimeError("V0 training is a no-op: every gradient norm is zero.")
+    if parameter_update_norm <= 1e-10:
+        raise RuntimeError("V0 training is a no-op: parameters did not change.")
+    if loss_drop_percent < float(config.min_train_loss_drop_percent):
+        raise RuntimeError(
+            "V0 training loss did not pass the no-op gate: "
+            f"drop={loss_drop_percent:.6g}% required>="
+            f"{float(config.min_train_loss_drop_percent):.6g}%."
+        )
     return {
         "initial_loss": initial_loss,
         "best_loss": best_loss,
         "best_step": best_step,
+        "loss_drop_percent": loss_drop_percent,
+        "maximum_gradient_norm": maximum_gradient_norm,
+        "parameter_update_norm": parameter_update_norm,
+        "no_op_check": "passed",
     }
 
 
@@ -468,3 +510,7 @@ def _validate_config(config: BaselineRunConfig) -> None:
         raise ValueError("Baseline training steps must be positive.")
     if config.optimizer.log_every < 1:
         raise ValueError("baseline.optimization.log_every must be positive.")
+    if config.optimizer.min_train_loss_drop_percent <= 0:
+        raise ValueError(
+            "baseline.optimization.min_train_loss_drop_percent must be positive."
+        )

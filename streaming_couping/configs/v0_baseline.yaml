@@ -1,6 +1,6 @@
-# V0: retained SAM3.1 + StreamVGGT baseline.  SAM appearance descriptors are
-# intentionally disabled; SAM contributes dynamic masks/IDs and StreamVGGT
-# contributes camera and local geometry.
+# V0: restored V7.1 camera L0 plus the retained dynamic SAM3.1 frontend.
+# SAM appearance descriptors are disabled; V7.4-style geometry transport is
+# evaluated as a separate candidate and does not overwrite the selected L0.
 recovery_config: streaming_couping/configs/recovery_dynamic_instance.yaml
 output_dir: outputs/streaming_couping_v0/data_stage
 
@@ -27,7 +27,9 @@ runtime:
   sam3_device: cuda:2
 
 features:
-  cache_dir: outputs/streaming_couping_v0/cache
+  # Reuse the retained dynamic-instance cache; do not duplicate the frozen
+  # SAM3.1/StreamVGGT tensors under the much smaller V0 result directory.
+  cache_dir: outputs/streaming_couping_v74_temporal_scaling/cache
   rebuild: false
   cache_sam_appearance: false
   sam_source: disabled_geometry_only_baseline
@@ -80,3 +82,7 @@ baseline:
     translation_weight: 10.0
     log_every: 200
     seed: 0
+    # A V0 run is rejected instead of written as a baseline if training is a
+    # no-op or the restored V7.1 L0 fails to improve future evaluation loss.
+    min_train_loss_drop_percent: 1.0
+    min_evaluation_gain_percent: 0.0

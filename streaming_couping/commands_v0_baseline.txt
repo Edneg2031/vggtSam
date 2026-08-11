@@ -16,11 +16,12 @@ export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-echo "V0 smoke: late birth, maturity, static gate and exact fallback"
+echo "V0 smoke: restored V7.1 gradients/training, late birth and exact fallback"
 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_dynamic_instance_baseline
 
 ARGS=()
-[[ "${BASELINE_FRESH:-0}" == "1" ]] && ARGS+=(--rebuild-cache --no-resume)
+[[ "${BASELINE_FRESH:-0}" == "1" ]] && ARGS+=(--no-resume)
+[[ "${BASELINE_REBUILD_CACHE:-0}" == "1" ]] && ARGS+=(--rebuild-cache)
 
 echo "V0 physical GPUs=$VISIBLE_GPUS"
 echo "logical layout: StreamVGGT=cuda:0,cuda:1 SAM3.1=cuda:2 fit=cuda:0"
@@ -38,4 +39,18 @@ CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" PYTHONUNBUFFERED=1 PYTHONPATH=. \
   echo "missing baseline_summary.json" >&2
   exit 1
 }
+PYTHONPATH=. "$PYTHON_BIN" -c '
+import json
+from pathlib import Path
+summary = json.loads(Path("outputs/streaming_couping_v0/baseline_summary.json").read_text())
+assert summary["baseline_version"] == "v0"
+assert summary["implementation_revision"] == "restored_v71_l0_v74_geometry_r2"
+assert summary["selected_pose_branch"] == "restored_v71_camera_l0"
+assert summary["baseline_acceptance_pass"] == 1
+assert summary["selected_gain_vs_raw_percent"] > 0
+assert summary["camera_training"]["no_op_check"] == "passed"
+assert summary["geometry_training"]["no_op_check"] == "passed"
+gain = summary["selected_gain_vs_raw_percent"]
+print(f"V0 accepted gain={gain:.6g}%")
+'
 echo "V0 baseline completed"

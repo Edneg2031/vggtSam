@@ -1,9 +1,9 @@
-"""Causal dynamic-instance geometry baseline.
+"""Causal dynamic-instance V0 pose candidates.
 
 SAM3.1 contributes masks, persistent identities and slot lifecycle.  The pose
-branch deliberately does not consume SAM appearance tokens: it transports only
-StreamVGGT geometry from the latest reliable observation of each static slot.
-This keeps the retained baseline aligned with the V4--V9.8 evidence ledger.
+branch deliberately does not consume SAM appearance tokens.  The accepted V0
+pose is the restored V7.1 camera L0; the V7.4-style geometry-only transport is
+retained as a separately scored candidate and never silently replaces L0.
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ def eligible_pose_instances(
 
 
 class CameraPoseBaseline(nn.Module):
-    """Small bounded correction around frozen StreamVGGT camera output."""
+    """The original V7.1 L0 bounded correction around StreamVGGT camera output."""
 
     def __init__(
         self,
@@ -194,7 +194,7 @@ class CausalGeometryTransport(nn.Module):
 
 
 class DynamicInstanceGeometryRefiner(nn.Module):
-    """Frozen camera baseline plus a geometry-only instance pose residual."""
+    """V7.4-style geometry-only transport residual over frozen V7.1 L0."""
 
     def __init__(
         self,
@@ -342,20 +342,23 @@ def homogeneous_pose(world_to_camera: torch.Tensor) -> torch.Tensor:
 
 
 def se3_exp(twist: torch.Tensor) -> torch.Tensor:
+    """Original V6/V7 exponential map for twists stored as ``[omega,rho]``.
+
+    In particular, the SO(3) coefficient uses ``torch.sinc`` at the origin.
+    That is the numerically stable implementation used by the successful
+    V7.1/V7.4 runs and avoids changing the zero-initialized training path.
+    """
+
     if twist.shape[-1] != 6:
         raise ValueError("SE(3) twist must end in six values.")
     omega = twist[..., :3]
     rho = twist[..., 3:]
+    rotation = so3_exp(omega)
     angle = torch.linalg.vector_norm(omega, dim=-1, keepdim=True)
     skew = _skew(omega)
     angle2 = angle.square()
     identity = torch.eye(3, dtype=twist.dtype, device=twist.device).expand(
         *twist.shape[:-1], 3, 3
-    )
-    a = torch.where(
-        angle < 1e-4,
-        1.0 - angle2 / 6.0 + angle2.square() / 120.0,
-        torch.sin(angle) / angle.clamp_min(1e-12),
     )
     b = torch.where(
         angle < 1e-4,
@@ -367,7 +370,6 @@ def se3_exp(twist: torch.Tensor) -> torch.Tensor:
         1.0 / 6.0 - angle2 / 120.0 + angle2.square() / 5040.0,
         (angle - torch.sin(angle)) / (angle2 * angle).clamp_min(1e-12),
     )
-    rotation = identity + a[..., None] * skew + b[..., None] * (skew @ skew)
     jacobian = identity + b[..., None] * skew + c[..., None] * (skew @ skew)
     translation = (jacobian @ rho[..., None]).squeeze(-1)
     output = torch.eye(4, dtype=twist.dtype, device=twist.device).expand(
@@ -376,6 +378,30 @@ def se3_exp(twist: torch.Tensor) -> torch.Tensor:
     output[..., :3, :3] = rotation
     output[..., :3, 3] = translation
     return output
+
+
+def so3_exp(omega: torch.Tensor) -> torch.Tensor:
+    """Stable Rodrigues map copied from the successful V6/V7 implementation."""
+
+    if omega.shape[-1] != 3:
+        raise ValueError("SO(3) vector must end in three values.")
+    angle = torch.linalg.vector_norm(omega, dim=-1, keepdim=True)
+    angle2 = angle.square()
+    skew = _skew(omega)
+    identity = torch.eye(3, dtype=omega.dtype, device=omega.device).expand(
+        *omega.shape[:-1], 3, 3
+    )
+    coefficient_a = torch.sinc(angle / torch.pi)
+    coefficient_b = torch.where(
+        angle < 1e-4,
+        0.5 - angle2 / 24.0 + angle2.square() / 720.0,
+        (1.0 - torch.cos(angle)) / angle2.clamp_min(1e-12),
+    )
+    return (
+        identity
+        + coefficient_a[..., None] * skew
+        + coefficient_b[..., None] * (skew @ skew)
+    )
 
 
 def _skew(vector: torch.Tensor) -> torch.Tensor:
