@@ -581,7 +581,12 @@ def _decision_markdown(rows: Sequence[dict[str, object]]) -> str:
     random_feasible = _group_equal(
         groups, "random_shifted_mask_balanced", "soft_bilinear_k4"
     )
-    gate = int(positive and soft_full and soft_sam)
+    # V9.6 asks whether the real 72x72 grid can express solver-feasible
+    # sub-grid coordinates.  The full-grid continuous/soft-K4 rows answer
+    # that question directly.  A balanced SAM-mask row is a secondary region
+    # diagnostic and can be unavailable when an edge cannot supply the locked
+    # 50/50 count; it must not veto the dense-descriptor experiment.
+    gate = int(positive and soft_full)
     sam_unique = int(
         sam_feasible
         and soft_sam

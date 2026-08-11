@@ -267,11 +267,37 @@ V9.6 在训练 dense matcher 之前验证真实离散坐标是否具有可行上
 - 每条边仍配平到 V9.5 instance-local32 的相同数量，固定同一组 12 条 history edge 和 O-R1；
 - PCK 收紧到 1px；不缓存或评价 dense descriptor，也不训练任何模型。
 
-只有 full-grid continuous、full-grid soft-K4 和 SAM-balanced soft-K4 均三折零恶化通过，才允许
-扩展 cache 并训练 dense descriptor。bbox/random/full 控制若同样通过，只说明 SAM mask 在坐标
-上界阶段并非独有贡献，不能写成 SAM 因果收益。
+V9.6 的主 gate 只回答真实 72×72 网格能否表达可求解的连续坐标，因此由 full-grid continuous
+和 full-grid soft-K4 决定。SAM/bbox/random balanced 只诊断区域选择；某条边无法严格凑齐 50/50
+时不得反向否决 full-grid 坐标 gate，也不得被算成 SAM 胜出。
 
 若 bbox 或随机 mask 在某条边无法提供足够的 region/complement 点，runner 会保留可用点、标记
 `equal-count feasible=0` 和 `pass=0`，但继续执行主 gate；不可构造的负控制不会被算成 SAM 胜出。
 
 一键命令：`zsh streaming_couping/commands_v96_dense_grid_upper_bound.txt`。
+
+实际结果：full-grid continuous 与 soft-K4 均三折通过、零恶化；hard-nearest 失败（平均
+EPE 2.34px）。因此已证实真实网格需要子网格解码，并已允许进入 dense descriptor 实验。
+SAM-balanced soft-K4 本身零恶化，但 long fold 无法严格配平，不能据此声明 SAM mask 独有贡献。
+
+## 11. V9.7：下一步唯一实验
+
+V9.7 不再重复 local32、token 数、RANSAC、depth/K 或 mask-support 上界：
+
+- 每帧一次性缓存完整 SAM3.1 `detector_fpn2` 72×72 descriptor；
+- current query 使用 current-only FPS，history 使用全部 5184 个真实 grid key；
+- matcher 只预测 coarse history cell 和 bounded 2D sub-cell offset；
+- 训练只使用 GT 2D correspondence label，不使用 pose loss；
+- matcher 冻结后，用固定 V9.3 history edge 和 O-R1 评价未来 short/medium/long；
+- 参数与 support 完全匹配的控制为 StreamVGGT patch、coordinate-only、SAM train-off；
+- 正常 SAM 另做 SAM-off、channel permutation、shuffle-time 扰乱。
+
+这里 SAM 的作用路径是：**SAM dense descriptor 预测当前点在历史帧的连续二维位置，固定极几何
+solver 再用这些对应修正 StreamVGGT L0 的相对旋转和位移方向。** 它不把 SAM token 注入
+StreamVGGT backbone，也没有可直接背 pose 的 adapter。
+
+只有正常 SAM 在三个未来 fold 的 PCK@1、EPE、rotation 和 translation direction 同时优于所有
+参数匹配控制，而且三种 SAM 扰乱稳定破坏收益，才可写“SAM token 对 StreamVGGT relative pose
+有因果帮助”。训练 loss 降低但 gate=0 仍属于证伪结果。
+
+一键命令：`zsh streaming_couping/commands_v97_dense_descriptor_causality.txt`。

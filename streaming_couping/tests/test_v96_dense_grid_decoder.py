@@ -11,6 +11,12 @@ from streaming_couping.src.v96_dense_grid_decoder import (
     dense_grid_normalized,
     random_shifted_mask_stream,
 )
+from streaming_couping.scripts.run_v96_dense_grid_upper_bound import (
+    SUMMARY_COLUMNS,
+    _annotate_passes,
+    _decision_markdown,
+)
+from streaming_couping.src.v74_temporal_protocol import FOLDS
 
 
 def _surface(uv: torch.Tensor) -> SurfaceCorrespondences:
@@ -121,3 +127,41 @@ def test_unavailable_balanced_control_is_reported_without_aborting() -> None:
     assert supports["bbox_balanced"].count == 5
     assert supports["full_grid"].count == 10
     assert supports["sam_mask_balanced"].count == 10
+
+
+def test_dense_stage_gate_depends_on_full_grid_not_balanced_feasibility() -> None:
+    rows = []
+    for scope in (
+        "full_grid",
+        "sam_mask_balanced",
+        "bbox_balanced",
+        "random_shifted_mask_balanced",
+    ):
+        for decoder in ("continuous_gt", "hard_nearest", "soft_bilinear_k4"):
+            for fold in FOLDS:
+                row = dict.fromkeys(SUMMARY_COLUMNS, 0)
+                full_positive = scope == "full_grid" and decoder in {
+                    "continuous_gt",
+                    "soft_bilinear_k4",
+                }
+                row.update(
+                    {
+                        "fold": fold.name,
+                        "support_scope": scope,
+                        "decoder": decoder,
+                        "frames": 4,
+                        "active_frames": 4,
+                        "equal_count_exact": int(full_positive),
+                        "raw_rotation_error_deg": 2.0,
+                        "refined_rotation_error_deg": 1.0 if full_positive else 3.0,
+                        "raw_translation_direction_error_deg": 2.0,
+                        "refined_translation_direction_error_deg": (
+                            1.0 if full_positive else 3.0
+                        ),
+                    }
+                )
+                rows.append(row)
+    _annotate_passes(rows)
+    decision = _decision_markdown(rows)
+    assert "SAM-mask balanced equal-count feasible: `0`" in decision
+    assert "dense-descriptor stage allowed: `1`" in decision

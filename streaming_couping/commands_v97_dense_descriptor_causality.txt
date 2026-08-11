@@ -1,0 +1,77 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+GPU="${V97_GPU:-3}"
+CONFIG=streaming_couping/configs/v97_dense_descriptor_causality.yaml
+DATA_CONFIG=streaming_couping/configs/v92_support_data.yaml
+OUTPUT="${V97_OUTPUT:-outputs/streaming_couping_v97_dense_descriptor_causality}"
+SOURCE_CACHE=outputs/streaming_couping_v92_support_factorization/cache/00a231a370_90_525_step15_37_68_54.pt
+DENSE_CACHE="$OUTPUT/cache/00a231a370_90_525_step15_dense.pt"
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+[[ -s "$SOURCE_CACHE" ]] || {
+  echo "V9.7 requires the retained V9.2 observation cache: $SOURCE_CACHE" >&2
+  echo "Run commands_v92_support_factorization.txt only if that cache was deleted." >&2
+  exit 1
+}
+
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+echo "V9.7 smoke: dense matcher, sub-cell decoder, gradients and decision schema"
+PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.smoke_v97_dense_descriptor_causality
+
+echo "V9.7 inherits the completed V9.6 full-grid continuous+soft-K4 gate"
+echo "V9.6 is not rerun and SAM-balanced feasibility does not veto this stage"
+
+echo "V9.7 validating the retained dynamic-instance/geometry cache"
+PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.audit_v7_cache \
+  --config "$DATA_CONFIG" \
+  --output-dir "$OUTPUT/cache_audit" \
+  --require-local \
+  --strict
+
+echo "V9.7 dense cache: one SAM3.1 detector_fpn2 72x72 map per frame"
+echo "physical GPU=$GPU; logical cache device=cuda:0"
+REBUILD_ARGS=()
+if [[ "${V97_REBUILD_DENSE:-0}" == "1" ]]; then
+  REBUILD_ARGS=(--rebuild)
+fi
+CUDA_VISIBLE_DEVICES="$GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.build_v97_dense_descriptor_cache \
+  --config "$CONFIG" \
+  --device cuda:0 \
+  --dense-cache-path "$DENSE_CACHE" \
+  "${REBUILD_ARGS[@]}"
+
+[[ -s "$DENSE_CACHE" ]] || { echo "missing V9.7 dense cache: $DENSE_CACHE" >&2; exit 1; }
+
+echo "V9.7 correspondence-only training and future-fold pose evaluation"
+echo "No pose model is trained; controls=StreamVGGT,coordinate,train-off,off/permutation/time-shuffle"
+CUDA_VISIBLE_DEVICES="$GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.run_v97_dense_descriptor_causality \
+  --config "$CONFIG" \
+  --output-dir "$OUTPUT" \
+  --dense-cache-path "$DENSE_CACHE"
+
+SUMMARY="$OUTPUT/v97_dense_descriptor_summary.csv"
+FRAMES="$OUTPUT/v97_dense_descriptor_frames.csv"
+TRAINING="$OUTPUT/v97_dense_descriptor_training.csv"
+DECISION="$OUTPUT/v97_dense_descriptor_decision.md"
+METADATA="$OUTPUT/v97_dense_descriptor_metadata.json"
+for file in "$SUMMARY" "$FRAMES" "$TRAINING" "$DECISION" "$METADATA"; do
+  [[ -s "$file" ]] || { echo "missing V9.7 output: $file" >&2; exit 1; }
+done
+
+echo "V9.7 COPY THIS DECISION"
+cat "$DECISION"
+echo "V9.7 compact 21-row CSV: $SUMMARY"
+echo "V9.7 frame diagnostics: $FRAMES"
+echo "V9.7 training diagnostics: $TRAINING"
+echo "V9.7 provenance: $METADATA"
