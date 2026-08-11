@@ -551,7 +551,12 @@ def _current_uv_to_grid_indices(
         return torch.empty(0, dtype=torch.long)
     distance = torch.cdist(current_uv.double(), grid_uv_pixels.double())
     values, indices = distance.min(dim=-1)
-    if float(values.max()) > 1e-5:
+    # local_token_reprojection_labels receives float32 normalized grid UV and
+    # converts it back to pixel coordinates.  That round trip can accumulate
+    # roughly 1e-5 px error on the real image width.  A 1e-3 px tolerance is
+    # still thousands of times smaller than one 72x72 grid-cell spacing, so it
+    # accepts only the same actual grid key and cannot hide off-grid support.
+    if float(values.max()) > 1e-3:
         raise ValueError(
             f"V9.7 current queries are not actual grid cells; max={float(values.max())}."
         )

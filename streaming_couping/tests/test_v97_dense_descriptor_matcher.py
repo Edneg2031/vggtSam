@@ -6,6 +6,7 @@ from streaming_couping.scripts.run_v92_support_factorization import SupportData
 from streaming_couping.scripts.run_v97_dense_descriptor_causality import (
     DenseData,
     DenseRecord,
+    _current_uv_to_grid_indices,
     _training_batch,
     load_v97_config,
 )
@@ -154,3 +155,18 @@ def test_runner_batches_full_5184_key_bank_without_pose_inputs() -> None:
     assert key.shape == (1, tokens, 8)
     assert query_valid.all() and key_valid.all()
     assert target.coarse_index.shape == (1, 4)
+
+
+def test_actual_grid_mapping_tolerates_only_float_round_trip_error() -> None:
+    grid = torch.tensor(
+        [[0.0, 0.0], [5.0, 0.0], [0.0, 5.0], [5.0, 5.0]],
+        dtype=torch.float64,
+    )
+    query = grid[[3, 1]] + torch.tensor([8e-6, -8e-6])
+    assert _current_uv_to_grid_indices(query, grid).tolist() == [3, 1]
+    try:
+        _current_uv_to_grid_indices(grid[[0]] + 0.01, grid)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("V9.7 accepted a genuinely off-grid query")
