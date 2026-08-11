@@ -345,3 +345,26 @@ StreamVGGT relative pose”：
 relative pose 结论。
 
 一键命令：`zsh streaming_couping/commands_v98_temporal_memory_causality.txt`。
+
+### V9.8 实际结果
+
+| fold | memory train loss | future PCK@1 | memory EPE | raw-control EPE | pose 恶化帧 |
+|---|---:|---:|---:|---:|---:|
+| short | 9.59 → 0.46 | 0 | 120.46px | 116.85px | 2/4 |
+| medium | 9.31 → 1.37 | 0 | 117.12px | 99.63px | 3/4 |
+| long | 9.97 → 2.28 | 0 | 117.47px | 99.35px | 3/4 |
+
+正常 memory 相比向同一 matcher 输入 memory-off、channel-permute 或 time-shuffle 通常有更低 EPE，
+说明真实 history-read feature 被模型使用，并非 hook/梯度断流。但它在三个未来 fold 的 PCK@1
+全部为零，且 EPE 全部差于单独训练的 same-call raw control，也没有超过 V9.7 detector-FPN 或
+StreamVGGT control。rotation/translation-direction 三折均为负收益。
+
+因此 V9.8 证伪：**当前 SAM3.1 causal video-memory feature 不能通过该单场景 dense matcher 产生
+未来像素级 correspondence，也不能帮助 StreamVGGT relative pose。** 这只终止当前单场景
+matcher 路线，不等价于证明所有经多场景训练的 SAM/Stream fusion 都无效。
+
+V9.7 的 checkpoint 审计还显示 detector-FPN 的训练前缀 PCK@1 只有 29.4%/14.1%/9.2%，因此
+loss 大幅下降不能自动解释成“训练对应已经学会”。V9.8 已增加一个不重训的 checkpoint-only
+train/future 审计来区分训练内不足与时间过拟合：
+
+`zsh streaming_couping/commands_v98_train_future_audit.txt`

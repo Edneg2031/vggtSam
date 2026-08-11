@@ -1,0 +1,41 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+GPU="${V98_GPU:-3}"
+CONFIG=streaming_couping/configs/v98_temporal_memory_causality.yaml
+V97_OUTPUT="${V97_OUTPUT:-outputs/streaming_couping_v97_dense_descriptor_causality}"
+OUTPUT="${V98_OUTPUT:-outputs/streaming_couping_v98_temporal_memory_causality}"
+V97_DENSE="$V97_OUTPUT/cache/00a231a370_90_525_step15_dense.pt"
+TEMPORAL_CACHE="$OUTPUT/cache/00a231a370_90_525_step15_temporal.pt"
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+[[ -s "$V97_DENSE" ]] || { echo "missing V9.7 dense cache: $V97_DENSE" >&2; exit 1; }
+[[ -s "$TEMPORAL_CACHE" ]] || { echo "missing V9.8 temporal cache: $TEMPORAL_CACHE" >&2; exit 1; }
+for fold in short medium long; do
+  for architecture in sam_memory memory_off_raw; do
+    checkpoint="$OUTPUT/checkpoints/${fold}_${architecture}.pt"
+    [[ -s "$checkpoint" ]] || { echo "missing V9.8 checkpoint: $checkpoint" >&2; exit 1; }
+  done
+done
+
+export PYTHONHASHSEED=0
+
+echo "V9.8 checkpoint-only train/future correspondence audit"
+echo "No SAM3.1 inference and no training will run"
+CUDA_VISIBLE_DEVICES="$GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.audit_v98_train_future_correspondence \
+  --config "$CONFIG" \
+  --output-dir "$OUTPUT" \
+  --temporal-cache-path "$TEMPORAL_CACHE" \
+  --v97-dense-cache-path "$V97_DENSE"
+
+CSV="$OUTPUT/v98_train_future_correspondence_audit.csv"
+DECISION="$OUTPUT/v98_train_future_correspondence_audit.md"
+[[ -s "$CSV" ]] || { echo "missing V9.8 audit CSV: $CSV" >&2; exit 1; }
+[[ -s "$DECISION" ]] || { echo "missing V9.8 audit decision: $DECISION" >&2; exit 1; }
+
+echo "V9.8 COPY THIS AUDIT"
+cat "$DECISION"
