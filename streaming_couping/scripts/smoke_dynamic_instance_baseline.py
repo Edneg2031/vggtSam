@@ -7,8 +7,8 @@ import copy
 
 import torch
 
-from streaming_couping.scripts.run_dynamic_instance_baseline import (
-    _tracking_audit,
+from streaming_couping.src.learned_pose.baseline_runtime import (
+    tracking_audit,
 )
 from streaming_couping.src.geometry_segmentation import (
     GeometrySegmentationPrompt,
@@ -33,13 +33,13 @@ def main() -> None:
             _row(3, 135, discovered=2, mature=2),
         ],
     }
-    audit = _tracking_audit(payload, reference_index=0)
+    audit = tracking_audit(payload, reference_index=0)
     assert audit["tracking_audit_pass"] == 1
     assert audit["future_birth_supported"] == 1
     assert audit["late_birth_sequence_indices"] == (2,)
     broken = copy.deepcopy(payload)
     broken["dynamic_instance_diagnostics"][2]["discovered_tracks"] = 1
-    assert _tracking_audit(broken, reference_index=0)["tracking_audit_pass"] == 0
+    assert tracking_audit(broken, reference_index=0)["tracking_audit_pass"] == 0
 
     raw_pose = torch.randn(1, 4, 3, 4)
     selected_pose = raw_pose

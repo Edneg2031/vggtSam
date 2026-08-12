@@ -20,6 +20,7 @@ from streaming_couping.src.learned_pose.baseline_runtime import (
     decode_cached_poses,
     load_baseline_run_config,
     pose_metrics,
+    tracking_audit,
 )
 from streaming_couping.src.learned_pose.cache import (
     build_feature_caches,
@@ -115,9 +116,9 @@ def run_baseline(data: LearnedPoseConfig, run: BaselineRunConfig) -> Path:
         raise ValueError(f"Baseline cache lacks evaluation frames={sorted(missing)}.")
     reference = int(payload["reference_sequence_index"])
     evaluation_indices = [positions[frame] for frame in run.evaluation_frames]
-    tracking_audit = _tracking_audit(payload, reference_index=reference)
-    if not int(tracking_audit["tracking_audit_pass"]):
-        raise RuntimeError(f"V0 dynamic tracking audit failed: {tracking_audit}")
+    tracking_result = tracking_audit(payload, reference_index=reference)
+    if not int(tracking_result["tracking_audit_pass"]):
+        raise RuntimeError(f"V0 dynamic tracking audit failed: {tracking_result}")
 
     run.output_dir.mkdir(parents=True, exist_ok=True)
     _clear_stale_result_artifacts(run.output_dir)
@@ -130,7 +131,7 @@ def run_baseline(data: LearnedPoseConfig, run: BaselineRunConfig) -> Path:
         target_pose=target_pose,
         reference=reference,
         evaluation_indices=evaluation_indices,
-        tracking_audit=tracking_audit,
+        tracking_audit=tracking_result,
     )
 
 
@@ -274,99 +275,6 @@ def _write_outputs(
     )
     print(f"  output={result}")
     return result
-
-
-def _tracking_audit(
-    payload: dict,
-    *,
-    reference_index: int,
-) -> dict[str, object]:
-    frames = tuple(int(value) for value in payload.get("frame_indices", ()))
-    births = tuple(int(value) for value in payload.get("sam_birth_indices", ()))
-    geometry_births = tuple(
-        int(value) for value in payload.get("instance_birth_indices", ())
-    )
-    instance_ids = tuple(int(value) for value in payload.get("instance_ids", ()))
-    sam_track_ids = tuple(
-        int(value) for value in payload.get("sam_track_ids", ())
-    )
-    sam_track_prompts = tuple(
-        str(value) for value in payload.get("sam_track_prompts", ())
-    )
-    registry_shapes_match = (
-        len(instance_ids) == len(births)
-        and len(geometry_births) == len(births)
-        and len(sam_track_ids) == len(births)
-        and len(sam_track_prompts) == len(births)
-    )
-    rows = sorted(
-        (dict(row) for row in payload.get("dynamic_instance_diagnostics", ())),
-        key=lambda row: int(row["sequence_index"]),
-    )
-    rows_aligned = len(rows) == len(frames) and all(
-        int(row["sequence_index"]) == index
-        and int(row["frame_index"]) == frames[index]
-        for index, row in enumerate(rows)
-    )
-    expected_discovered = tuple(
-        sum(birth >= 0 and birth <= index for birth in births)
-        for index in range(len(frames))
-    )
-    reported_discovered = tuple(
-        int(row.get("discovered_tracks", -1)) for row in rows
-    )
-    discovery_exact = rows_aligned and reported_discovered == expected_discovered
-    discovery_monotonic = all(
-        left <= right
-        for left, right in zip(
-            reported_discovered,
-            reported_discovered[1:],
-        )
-    )
-    mature_is_causal = rows_aligned and all(
-        int(row.get("mature_tracks", -1))
-        <= sum(birth >= 0 and birth < index for birth in geometry_births)
-        for index, row in enumerate(rows)
-    )
-    valid_track_keys = tuple(
-        (sam_track_prompts[index], track_id)
-        for index, track_id in enumerate(sam_track_ids)
-        if track_id >= 0
-    )
-    track_keys_unique = len(valid_track_keys) == len(set(valid_track_keys))
-    discovered_track_count = sum(birth >= 0 for birth in births)
-    track_count_matches_births = len(valid_track_keys) == discovered_track_count
-    late_births = tuple(
-        birth for birth in births if birth > int(reference_index)
-    )
-    future_birth_supported = bool(late_births)
-    passed = all(
-        (
-            rows_aligned,
-            registry_shapes_match,
-            discovery_exact,
-            discovery_monotonic,
-            mature_is_causal,
-            track_keys_unique,
-            track_count_matches_births,
-            future_birth_supported,
-        )
-    )
-    return {
-        "rows_aligned": int(rows_aligned),
-        "registry_shapes_match": int(registry_shapes_match),
-        "discovery_exact_from_birth_registry": int(discovery_exact),
-        "discovery_monotonic": int(discovery_monotonic),
-        "mature_tracks_require_prior_geometry_birth": int(mature_is_causal),
-        "persistent_prompt_track_keys_unique": int(track_keys_unique),
-        "track_count_matches_birth_registry": int(track_count_matches_births),
-        "future_birth_supported": int(future_birth_supported),
-        "late_birth_count": len(late_births),
-        "late_birth_sequence_indices": late_births,
-        "discovered_track_count": discovered_track_count,
-        "permanent_slot_capacity": len(births),
-        "tracking_audit_pass": int(passed),
-    }
 
 
 def _raw_temporal_fold_results(
