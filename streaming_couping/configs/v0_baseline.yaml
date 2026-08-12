@@ -26,8 +26,7 @@ runtime:
   sam3_device: cuda:2
 
 features:
-  # Stable V0-owned path. The candidate command first links a compatible
-  # historical cache here and rebuilds only when none remains on disk.
+  # Stable V0-owned cache. Rebuild explicitly when it is absent or stale.
   cache_dir: outputs/streaming_couping_v0/cache
   rebuild: false
   cache_sam_appearance: false
@@ -58,98 +57,5 @@ baseline:
   audit_device: cuda:0
   frames:
     evaluation: [360, 375, 390, 405, 420, 435, 450, 465, 480, 495, 510, 525]
-  # Independent pose candidate. It never changes the active V0 pose until
-  # the fixed primary method passes all three future folds offline.
-  track_ba_candidate:
-    enabled: true
-    # Keep the incompatible cached-token experiment as immutable evidence.
-    output_dir: outputs/streaming_couping_v0/track_ba_keypoint_candidate
-    device: cuda:0
-    # TrackHead expects multi-frame features produced in one aggregator call.
-    # Every call sees only the latest five frames up to the current frame.
-    track_token_source: window_reaggregated
-    # Upstream StreamVGGT BA queries TrackHead at detected keypoints, not a
-    # uniform grid. Shi-Tomasi is deterministic and needs no learned model.
-    query_source: shi_tomasi
-    # Broad full-image support with only low-trust/identity-unknown SAM regions
-    # removed. This choice is locked before reading future GT metrics.
-    primary_method: sam_dynamic_excluded
-    methods:
-      - full_image
-      - sam_dynamic_excluded
-      - sam_instance_background_stratified
-      - bbox_instance_background_stratified
-      - random_instance_background_stratified
-    window_frames: 5
-    query_count: 256
-    query_grid: [64, 64]
-    track_iterations: 4
-    # These are the official TrackHead confidence gates, not GT score gates.
-    visibility_threshold: 0.05
-    track_confidence_threshold: 0.05
-    point_confidence_threshold: 0.30
-    min_correspondences: 32
-    optimizer_steps: 120
-    learning_rate: 0.03
-    robust_delta_pixels: 4.0
-    rotation_prior_weight: 0.50
-    translation_prior_weight: 0.50
-    temporal_prior_weight: 0.10
-    max_rotation_degrees: 10.0
-    max_translation_scene_fraction: 0.25
-
-  # r3 fixed landmark/history factors showed that SIFT correspondence remains
-  # the unresolved variable. This successor changes only that variable.
-  lightglue_pnp_candidate:
-    enabled: true
-    output_dir: outputs/streaming_couping_v0/lightglue_pnp_candidate
-    device: cuda:0
-    # The server command pins this inference-only dependency and stores its
-    # checksum-verified public weights on the mounted model disk.
-    lightglue_repo: externals/LightGlue
-    primary_method: sam_dynamic_excluded
-    methods: [full_image, sam_dynamic_excluded]
-    # Match StreamVGGT's official pose-eval keypoint defaults; do not tune on GT.
-    nfeatures: 2048
-    detection_threshold: 0.005
-    max_correspondences: 256
-    min_correspondences: 32
-    min_inliers: 16
-    point_confidence_threshold: 0.30
-    ransac_iterations: 1000
-    ransac_reprojection_pixels: 4.0
-    ransac_confidence: 0.999
-    max_rotation_degrees: 10.0
-    max_translation_scene_fraction: 0.25
-
-  # Independent successor after TrackHead failed its one-frame query-slot
-  # positive control. This uses explicit local-feature matches and PnP.
-  feature_pnp_candidate:
-    enabled: true
-    # r2 evidence remains immutable in feature_pnp_candidate/.
-    output_dir: outputs/streaming_couping_v0/feature_pnp_factor_candidate
-    primary_method: sam_dynamic_excluded
-    methods:
-      - full_image
-      - sam_dynamic_excluded
-      - sam_instance_background_stratified
-      - bbox_instance_background_stratified
-      - random_instance_background_stratified
-    # Fixed 2x2 diagnosis. The primary is locked before offline scoring.
-    primary_landmark_source: native_world_pointmap
-    landmark_sources: [raw_depth_unprojected, native_world_pointmap]
-    primary_history_scope: all_causal
-    history_scopes: [recent, all_causal]
-    anchor_lookback: 4
-    nfeatures: 4096
-    contrast_threshold: 0.01
-    ratio_threshold: 0.75
-    max_correspondences: 256
-    min_correspondences: 32
-    min_inliers: 16
-    point_confidence_threshold: 0.30
-    ransac_iterations: 1000
-    ransac_reprojection_pixels: 4.0
-    ransac_confidence: 0.999
-    max_rotation_degrees: 10.0
-    max_translation_scene_fraction: 0.25
+  # Pose is intentionally unmodified. A new pose idea must first pass an
+  # independent causal feasibility experiment before entering this baseline.
