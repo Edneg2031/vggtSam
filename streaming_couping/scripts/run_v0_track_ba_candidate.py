@@ -30,6 +30,7 @@ from streaming_couping.src.v0_track_ba import (
     build_track_window,
     compose_relative_candidate,
     load_frozen_track_head,
+    load_frozen_window_track_modules,
     optimize_track_window,
     region_coverage,
     scene_scale_from_cache,
@@ -37,7 +38,7 @@ from streaming_couping.src.v0_track_ba import (
 )
 
 
-REVISION = "causal_track_head_fixed_structure_ba_r2_validity_audit"
+REVISION = "causal_window_reaggregated_track_head_ba_r3"
 
 
 def main() -> None:
@@ -79,11 +80,19 @@ def main() -> None:
     evaluation_indices = [
         positions[frame] for frame in baseline.evaluation_frames
     ]
-    head = load_frozen_track_head(
-        repo_path=recovery.streamvggt_repo,
-        checkpoint_path=recovery.streamvggt_checkpoint,
-        device=candidate.device,
-    )
+    aggregator = None
+    if candidate.track_token_source == "window_reaggregated":
+        aggregator, head = load_frozen_window_track_modules(
+            repo_path=recovery.streamvggt_repo,
+            checkpoint_path=recovery.streamvggt_checkpoint,
+            device=candidate.device,
+        )
+    else:
+        head = load_frozen_track_head(
+            repo_path=recovery.streamvggt_repo,
+            checkpoint_path=recovery.streamvggt_checkpoint,
+            device=candidate.device,
+        )
     scene_scale = scene_scale_from_cache(
         payload,
         candidate.point_confidence_threshold,
@@ -96,6 +105,7 @@ def main() -> None:
             evaluation_indices=evaluation_indices,
             frames=frames,
             head=head,
+            aggregator=aggregator,
             candidate=candidate,
         )
         print(f"V0 Track-BA validity audit={output}")
@@ -113,6 +123,7 @@ def main() -> None:
         frames=frames,
         reference_index=int(payload["reference_sequence_index"]),
         head=head,
+        aggregator=aggregator,
         candidate=candidate,
         scene_scale=scene_scale,
         cache_path_value=path,
@@ -130,6 +141,7 @@ def run_candidate(
     frames: tuple[int, ...],
     reference_index: int,
     head,
+    aggregator,
     candidate,
     scene_scale: float,
     cache_path_value: Path,
@@ -137,12 +149,17 @@ def run_candidate(
     output_dir = candidate.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, object]] = []
-    method_poses: dict[str, torch.Tensor] = {}
+    method_poses: dict[str, torch.Tensor] = {
+        method: raw_pose.detach().clone().cpu()
+        for method in candidate.methods
+    }
     method_active: dict[str, set[int]] = {}
     method_feasible: dict[str, set[int]] = {}
-    for method in candidate.methods:
-        predicted = raw_pose.detach().clone().cpu()
-        for current in evaluation_indices:
+    for current in evaluation_indices:
+        # All methods share the same images/aggregator output at one current
+        # frame. Only their deterministic support/query points differ.
+        token_cache = {}
+        for method in candidate.methods:
             window = build_track_window(
                 payload=payload,
                 head=head,
@@ -151,6 +168,8 @@ def run_candidate(
                 config=candidate,
                 raw_world_to_camera=raw_pose,
                 intrinsics=intrinsics,
+                aggregator=aggregator,
+                token_cache=token_cache,
             )
             optimized_relative, diagnostics = optimize_track_window(
                 raw_world_to_camera=raw_pose,
@@ -160,7 +179,7 @@ def run_candidate(
                 config=candidate,
             )
             if int(diagnostics["optimized"]):
-                predicted[0, current] = compose_relative_candidate(
+                method_poses[method][0, current] = compose_relative_candidate(
                     raw_world_to_camera=raw_pose,
                     anchor_index=window.anchor_index,
                     candidate_relative=optimized_relative,
@@ -177,6 +196,7 @@ def run_candidate(
                     ),
                     "window_frames": len(window.sequence_indices),
                     "query_count": int(window.query_points.shape[0]),
+                    "track_token_source": candidate.track_token_source,
                     "region_coverage_fraction": region_coverage(
                         window.region_mask
                     ),
@@ -191,9 +211,10 @@ def run_candidate(
                 method_active.setdefault(method, set()).add(current)
             if window.equal_count_region_feasible:
                 method_feasible.setdefault(method, set()).add(current)
-        method_poses[method] = predicted
+        token_cache.clear()
+    for method in candidate.methods:
         print(f"V0 Track-BA completed method={method}")
-    del head
+    del head, aggregator
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -235,7 +256,12 @@ def run_candidate(
         "pose_model_trained": False,
         "sam_appearance_used": False,
         "sam_role": "dynamic_exclusion_and_spatial_stratification",
-        "correspondence_source": "frozen_streamvggt_track_head",
+        "correspondence_source": (
+            "frozen_streamvggt_window_reaggregated_track_head"
+            if candidate.track_token_source == "window_reaggregated"
+            else "frozen_streamvggt_cached_streaming_track_head"
+        ),
+        "track_token_source": candidate.track_token_source,
         "geometry_source": "raw_streamvggt_depth_unprojected_in_anchor_camera",
         "pose_initializer_and_prior": "raw_streamvggt",
         "scene_scale_native": scene_scale,
@@ -269,6 +295,7 @@ def run_validity_audit(
     evaluation_indices: list[int],
     frames: tuple[int, ...],
     head,
+    aggregator,
     candidate,
 ) -> Path:
     """Rerun only enough TrackHead calls to localize a zero-validity gate."""
@@ -276,8 +303,9 @@ def run_validity_audit(
     candidate.output_dir.mkdir(parents=True, exist_ok=True)
     methods = tuple(dict.fromkeys(("full_image", candidate.primary_method)))
     rows: list[dict[str, object]] = []
-    for method in methods:
-        for current in evaluation_indices:
+    for current in evaluation_indices:
+        token_cache = {}
+        for method in methods:
             window = build_track_window(
                 payload=payload,
                 head=head,
@@ -286,6 +314,8 @@ def run_validity_audit(
                 config=candidate,
                 raw_world_to_camera=raw_pose,
                 intrinsics=intrinsics,
+                aggregator=aggregator,
+                token_cache=token_cache,
             )
             rows.append(
                 {
@@ -299,6 +329,7 @@ def run_validity_audit(
                     ),
                     "window_frames": len(window.sequence_indices),
                     "query_count": int(window.query_points.shape[0]),
+                    "track_token_source": candidate.track_token_source,
                     "region_coverage_fraction": region_coverage(
                         window.region_mask
                     ),
@@ -308,8 +339,10 @@ def run_validity_audit(
                     **window.validity_diagnostics,
                 }
             )
+        token_cache.clear()
+    for method in methods:
         print(f"V0 Track-BA validity completed method={method}")
-    del head
+    del head, aggregator
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

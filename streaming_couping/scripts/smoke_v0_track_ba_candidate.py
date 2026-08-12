@@ -204,6 +204,7 @@ def _config() -> TrackBACandidateConfig:
         enabled=True,
         output_dir=Path("/tmp/v0_track_ba_smoke"),
         device="cpu",
+        track_token_source="cached_streaming",
         primary_method="sam_dynamic_excluded",
         methods=("full_image", "sam_dynamic_excluded"),
         window_frames=3,

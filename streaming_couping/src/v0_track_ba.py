@@ -8,6 +8,7 @@ bounded SE(3) variables regularized to the raw StreamVGGT trajectory.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 import math
 from pathlib import Path
@@ -47,6 +48,50 @@ def load_frozen_track_head(
     from streamvggt.heads.track_head import TrackHead
 
     head = TrackHead(dim_in=2048, patch_size=14)
+    state = _load_checkpoint_state(checkpoint_path)
+    selected = _component_state(state, "track_head")
+    if not selected:
+        raise ValueError("StreamVGGT checkpoint contains no track_head weights.")
+    head.load_state_dict(selected, strict=True)
+    head = head.to(device).eval()
+    for parameter in head.parameters():
+        parameter.requires_grad_(False)
+    return head
+
+
+def load_frozen_window_track_modules(
+    *,
+    repo_path: str | Path,
+    checkpoint_path: str | Path,
+    device: str,
+):
+    """Load only the aggregator and TrackHead needed by window tracking."""
+
+    maybe_add_repo_to_path(repo_path)
+    from streamvggt.heads.track_head import TrackHead
+    from streamvggt.models.aggregator import Aggregator
+
+    aggregator = Aggregator()
+    head = TrackHead(dim_in=2048, patch_size=14)
+    state = _load_checkpoint_state(checkpoint_path)
+    aggregator_state = _component_state(state, "aggregator")
+    track_state = _component_state(state, "track_head")
+    if not aggregator_state or not track_state:
+        raise ValueError(
+            "StreamVGGT checkpoint must contain aggregator and track_head."
+        )
+    aggregator.load_state_dict(aggregator_state, strict=True)
+    head.load_state_dict(track_state, strict=True)
+    del state, aggregator_state, track_state
+    aggregator = aggregator.to(device).eval()
+    head = head.to(device).eval()
+    for module in (aggregator, head):
+        for parameter in module.parameters():
+            parameter.requires_grad_(False)
+    return aggregator, head
+
+
+def _load_checkpoint_state(checkpoint_path: str | Path) -> dict:
     try:
         state = torch.load(
             checkpoint_path,
@@ -61,7 +106,11 @@ def load_frozen_track_head(
         state = state["state_dict"]
     if not isinstance(state, dict):
         raise ValueError("StreamVGGT checkpoint is not a state dictionary.")
-    prefix = "track_head."
+    return state
+
+
+def _component_state(state: dict, component: str) -> dict:
+    prefix = f"{component}."
     selected = {}
     for name, value in state.items():
         normalized = str(name)
@@ -69,13 +118,7 @@ def load_frozen_track_head(
             normalized = normalized[len("module.") :]
         if normalized.startswith(prefix):
             selected[normalized[len(prefix) :]] = value
-    if not selected:
-        raise ValueError("StreamVGGT checkpoint contains no track_head weights.")
-    head.load_state_dict(selected, strict=True)
-    head = head.to(device).eval()
-    for parameter in head.parameters():
-        parameter.requires_grad_(False)
-    return head
+    return selected
 
 
 def validate_track_cache(payload: dict) -> None:
@@ -152,6 +195,8 @@ def build_track_window(
     config: TrackBACandidateConfig,
     raw_world_to_camera: torch.Tensor,
     intrinsics: torch.Tensor,
+    aggregator=None,
+    token_cache: dict[tuple[int, ...], list[torch.Tensor | None]] | None = None,
 ) -> TrackWindow:
     """Produce one causal fixed-count factor window.
 
@@ -159,10 +204,11 @@ def build_track_window(
     neither tokens nor masks after ``current_index`` are materialized.
     """
 
-    # Every cached token is causal at its original time. Re-anchoring the
-    # TrackHead to the oldest frame of a recent consecutive window therefore
-    # reads history but never future state. It also lets an object born after
-    # frame 0 enter pose support once it is mature at a later window anchor.
+    # Re-anchor a recent consecutive window at its oldest frame. The preferred
+    # path re-runs the frozen aggregator jointly on exactly this prefix window,
+    # matching TrackHead's multi-frame feature contract without reading frames
+    # after current_index. A late-born object can therefore enter later pose
+    # support after it has a mature observation at a future window anchor.
     anchor = max(0, int(current_index) - int(config.window_frames) + 1)
     indices = list(range(anchor, int(current_index) + 1))
     device = config.device
@@ -194,13 +240,44 @@ def build_track_window(
         method=method,
         frame_index=anchor,
     )
-    token_list = cache_tokens_for_track_head(
-        payload,
-        indices=indices,
-        device=device,
-    )
     batch_images = images.unsqueeze(0).to(device=device, dtype=torch.float32)
     batch_queries = queries.unsqueeze(0).to(device=device, dtype=torch.float32)
+    cache_key = tuple(indices)
+    token_list = None if token_cache is None else token_cache.get(cache_key)
+    if token_list is not None:
+        pass
+    elif config.track_token_source == "cached_streaming":
+        if aggregator is not None:
+            raise ValueError(
+                "cached_streaming Track-BA must not receive an aggregator."
+            )
+        token_list = cache_tokens_for_track_head(
+            payload,
+            indices=indices,
+            device=device,
+        )
+    elif config.track_token_source == "window_reaggregated":
+        if aggregator is None:
+            raise ValueError(
+                "window_reaggregated Track-BA requires a frozen aggregator."
+            )
+        with _aggregator_autocast(device):
+            aggregated, patch_start_idx = aggregator(batch_images)
+        if int(patch_start_idx) != int(payload["patch_start_idx"]):
+            raise ValueError(
+                "Reaggregated/cached patch_start_idx disagree: "
+                f"{patch_start_idx}/{payload['patch_start_idx']}."
+            )
+        token_list = [None] * len(aggregated)
+        for layer_index in tuple(int(v) for v in payload["dpt_layer_indices"]):
+            token_list[layer_index] = aggregated[layer_index].float()
+        del aggregated
+    else:
+        raise ValueError(
+            f"Unknown Track-BA token source={config.track_token_source!r}."
+        )
+    if token_cache is not None and cache_key not in token_cache:
+        token_cache[cache_key] = token_list
     with _autocast_off(device):
         coordinate_iterations, visibility, confidence = head(
             token_list,
@@ -261,6 +338,12 @@ def build_track_window(
         equal_count_region_feasible=region_feasible,
         validity_diagnostics=validity_diagnostics,
     )
+
+
+def _aggregator_autocast(device: str):
+    if str(device).startswith("cuda"):
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
 
 
 def track_validity_and_diagnostics(

@@ -387,16 +387,18 @@ V0 r4 的职责判断保持不变：SAM3.1 是主要 tracking 前端；StreamVGG
 pose candidate，专门验证冻结的时序点轨迹能否修正这个偏移：
 
 ```text
-V0 r4 cache（不重跑 backbone）
+V0 r4 cache
 ├─ SAM3.1 mask / persistent ID / birth / static-quality
 │    └─ 排除身份未知区域，或做静态实例/背景等量分层
-└─ StreamVGGT 四层 causal DPT token + image
-     └─ frozen built-in TrackHead：最近连续历史，最多 5 帧、256 个全图点轨迹
-          └─ anchor raw depth + raw K/pose 反投影为冻结 3D 点
-               └─ bounded motion-only fixed-history BA（只优化当前相机）
-                    ├─ raw StreamVGGT pose 初始化
-                    ├─ raw pose/temporal prior
-                    └─ 只输出 candidate，不改写 r4 selected pose
+├─ raw StreamVGGT depth / K / pose（冻结）
+└─ 最近连续历史图像，最多 5 帧
+     └─ 同窗口重新执行 frozen StreamVGGT aggregator
+          └─ frozen built-in TrackHead：256 个宽空间点轨迹
+               └─ anchor raw depth + raw K/pose 反投影为冻结 3D 点
+                    └─ bounded motion-only fixed-history BA（只优化当前相机）
+                         ├─ raw StreamVGGT pose 初始化
+                         ├─ raw pose/temporal prior
+                         └─ 只输出 candidate，不改写 r4 selected pose
 ```
 
 这个实验与已有失败路线的区别是：
@@ -405,8 +407,8 @@ V0 r4 cache（不重跑 backbone）
 - 不训练 matcher 或 pose model，correspondence 来自 StreamVGGT 自带的视频 TrackHead；
 - 不做已经被 V9.3–V9.4 证伪的 instance-only essential matrix，而使用 V9.5 已通过上界的宽空间支撑；
 - 不做 V8 已失败的跨帧 predicted pointmap 3D–3D Kabsch；raw depth 只在 anchor 帧生成固定 3D landmark；
-- 每个 evaluation frame 只输入最近连续历史、合计最多 5 帧的 causal token；历史相机固定，
-  只优化当前相机，禁止一次读取完整未来序列；
+- 每个 evaluation frame 只重新聚合最近连续历史、合计最多 5 帧；输入不含 future，状态和算量有界；
+  历史相机固定，只优化当前相机；
 - 新物体仍可未来 birth，但 birth 本身不会改过去 pose；只有形成可信历史 observation 后，其 mask 状态
   才能参与后续选点。
 
@@ -439,11 +441,22 @@ TrackHead + BA**，因为 BA 从未启动。逐帧原因全部是
 因此当前只证实失败发生在 TrackHead 当前帧 validity gate，且与 SAM mask 无关（`full_image` 同样为
 零）；在拆清坐标、visibility 和 confidence 前，不降低阈值、不调 BA 权重。
 
-实现修订 `causal_track_head_fixed_structure_ba_r2_validity_audit` 已在同一运行入口加入轻量诊断。已有
-候选输出时，它只重跑 `full_image` 和预锁定的 `sam_dynamic_excluded` TrackHead 窗口，不运行 BA、
-不解码 GT，也不覆盖既有 candidate。它逐帧及汇总打印：finite、in-bounds、visibility pass、
-confidence pass、gate 交集、geometry 交集和坐标/分数范围，并自动区分坐标尺度/re-anchor、visibility、
-confidence 或 gate 交集失败。
+`causal_track_head_fixed_structure_ba_r2_validity_audit` 的服务器结果进一步定位了失败。两个方法合计
+`6144/6144` 条 current tracks 都是 finite，`6122/6144` 在图内，anchor geometry 也有
+`4347/6144` 条有效，因此坐标尺度、SAM mask 和 anchor depth 都不是全灭原因。但 visibility 与
+confidence 均为 `0/6144` 通过：visibility 约为 `7.4e-5–7.5e-3`，confidence 约为
+`9.8e-11–2.0e-8`。这不是把 `0.05` 小幅下调可以修复的阈值问题。
+
+该结果证伪的是当前 cache-reuse 实现：每个时刻在原始 streaming history 下独立生成的 DPT token，不能
+重新拼接成一个以晚时刻为 slot 0 的 TrackHead 多帧窗口。它尚未证伪 TrackHead correspondence 或
+motion-only BA，因为 TrackHead 的多帧输入契约还没有被正确满足。
+
+下一修订 `causal_window_reaggregated_track_head_ba_r3` 使用同一组最近 5 帧真实图像，在每个 current
+时刻只读取截至当前的帧，重新执行一次 frozen aggregator，再把这次同窗口产生的四层特征交给 frozen
+TrackHead。旧结果保留在 `track_ba_candidate/`；新结果写入 `track_ba_window_candidate/`，不会覆盖负例。
+命令采用两阶段门控：先只跑 `full_image` 和预锁定的 `sam_dynamic_excluded` validity；两者必须在 12 帧
+每帧都有至少 32 条有效 current tracks，才自动运行五组固定控制和 BA。若门控失败，命令在 BA 前停止，
+不会再次把 no-op 当成 pose 方法结果。V0 active selected pose 在两种情况下都仍是 raw StreamVGGT。
 
 服务器仍只需运行：
 
@@ -451,5 +464,6 @@ confidence 或 gate 交集失败。
 zsh streaming_couping/commands_v0_track_ba_candidate.txt
 ```
 
-需要回传该命令末尾打印的 `V0 Track-BA current-validity factor audit`；无需设置
+需要回传该命令打印的 `V0 Track-BA current-validity factor audit`；若门控通过并自动完成 BA，再同时
+回传末尾的 optimization reason audit 和 `fold_decision.csv`。无需设置
 `V0_TRACK_BA_FORCE_RERUN=1`，也无需手写额外命令。

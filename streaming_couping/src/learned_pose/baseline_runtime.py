@@ -26,6 +26,7 @@ class TrackBACandidateConfig:
     enabled: bool
     output_dir: Path
     device: str
+    track_token_source: str
     primary_method: str
     methods: tuple[str, ...]
     window_frames: int
@@ -101,6 +102,9 @@ def load_track_ba_candidate_config(
             )
         ),
         device=str(section.get("device", baseline.get("audit_device", "cuda:0"))),
+        track_token_source=str(
+            section.get("track_token_source", "window_reaggregated")
+        ).strip().lower(),
         primary_method=str(
             section.get("primary_method", "sam_dynamic_excluded")
         ).strip().lower(),
@@ -334,6 +338,14 @@ def _validate_config(config: BaselineRunConfig) -> None:
 
 
 def _validate_track_ba_config(config: TrackBACandidateConfig) -> None:
+    if config.track_token_source not in {
+        "cached_streaming",
+        "window_reaggregated",
+    }:
+        raise ValueError(
+            "Track-BA track_token_source must be cached_streaming or "
+            "window_reaggregated."
+        )
     allowed = {
         "full_image",
         "sam_dynamic_excluded",
