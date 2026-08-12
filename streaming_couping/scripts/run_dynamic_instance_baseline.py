@@ -354,11 +354,19 @@ def _signature(
 
 
 def _clear_stale_result_artifacts(output_dir: Path) -> None:
+    """Remove outputs that could be mistaken for active V0 r4 evidence."""
+
     for name in (
         "baseline_summary.json",
         "frame_diagnostics.csv",
         "dynamic_instance_diagnostics.csv",
         "poses.pt",
+        # Retired V0 r3 learned-pose checkpoints.
+        "camera_baseline.pt",
+        "geometry_pose_refiner.pt",
+        # Retired V0 r3 parameter-matched control outputs.
+        "validation/v0_pose_control_validation.csv",
+        "validation/v0_pose_control_decision.json",
     ):
         path = output_dir / name
         if path.is_file():

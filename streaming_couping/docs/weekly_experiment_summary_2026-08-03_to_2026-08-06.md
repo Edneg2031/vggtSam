@@ -308,6 +308,8 @@ selected pose = raw StreamVGGT exactly
 - 删除 `CameraPoseBaseline`、`DynamicInstanceGeometryRefiner` 及训练 runtime；
 - 删除已完成使命的 parameter-matched control runner；其结果保留在本账本；
 - 不再生成或读取 `camera_baseline.pt`、`geometry_pose_refiner.pt`；
+- 每次 r4 audit 会删除这两个旧 checkpoint 以及旧 `validation/v0_pose_control_*` 文件，防止把 r3
+  控制结果误认为 r4 输出；
 - `poses.pt` 只保存 raw 和与其完全相同的 selected pose；
 - summary 固定记录 `pose_modification_applied=false`、`pose_improvement_claim=false`；
 - tracking gate 验证 birth registry 与逐帧 discovered 数严格一致、discovery 单调、mature track 只能读取

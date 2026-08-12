@@ -39,6 +39,10 @@ CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" PYTHONUNBUFFERED=1 PYTHONPATH=. \
   echo "missing baseline_summary.json" >&2
   exit 1
 }
+[[ ! -e outputs/streaming_couping_v0/validation/v0_pose_control_validation.csv ]] || {
+  echo "retired V0 r3 validation CSV still exists" >&2
+  exit 1
+}
 PYTHONPATH=. "$PYTHON_BIN" -c '
 import json
 from pathlib import Path
