@@ -8,7 +8,7 @@ bounded SE(3) variables regularized to the raw StreamVGGT trajectory.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from pathlib import Path
 
@@ -32,6 +32,7 @@ class TrackWindow:
     confidence: torch.Tensor
     region_mask: torch.Tensor
     equal_count_region_feasible: bool
+    validity_diagnostics: dict[str, float | int] = field(default_factory=dict)
 
 
 def load_frozen_track_head(
@@ -226,23 +227,25 @@ def build_track_window(
         raw_world_to_camera[0, anchor].detach().float().cpu(),
         intrinsics[0, anchor].detach().float().cpu(),
     )
-    finite = torch.isfinite(world).all(dim=-1)
-    finite &= torch.isfinite(depth) & (depth > 1e-6)
-    finite &= torch.isfinite(point_confidence)
-    finite &= point_confidence >= float(config.point_confidence_threshold)
-    valid = (
-        (visibility >= float(config.visibility_threshold))
-        & (confidence >= float(config.track_confidence_threshold))
-        & finite[None]
-        & torch.isfinite(tracks).all(dim=-1)
-        & (tracks[..., 0] >= 0)
-        & (tracks[..., 0] <= width - 1)
-        & (tracks[..., 1] >= 0)
-        & (tracks[..., 1] <= height - 1)
+    geometry_valid = torch.isfinite(world).all(dim=-1)
+    geometry_valid &= torch.isfinite(depth) & (depth > 1e-6)
+    geometry_valid &= torch.isfinite(point_confidence)
+    geometry_valid &= point_confidence >= float(
+        config.point_confidence_threshold
+    )
+    valid, validity_diagnostics = track_validity_and_diagnostics(
+        tracks=tracks,
+        visibility=visibility,
+        confidence=confidence,
+        geometry_valid=geometry_valid,
+        width=width,
+        height=height,
+        visibility_threshold=float(config.visibility_threshold),
+        confidence_threshold=float(config.track_confidence_threshold),
     )
     # The query observation itself is exact by definition and must survive
     # confidence filtering so every 3D point keeps its anchor observation.
-    valid[0] = finite
+    valid[0] = geometry_valid
     tracks[0] = queries
     return TrackWindow(
         anchor_index=anchor,
@@ -256,7 +259,139 @@ def build_track_window(
         confidence=confidence,
         region_mask=region,
         equal_count_region_feasible=region_feasible,
+        validity_diagnostics=validity_diagnostics,
     )
+
+
+def track_validity_and_diagnostics(
+    *,
+    tracks: torch.Tensor,
+    visibility: torch.Tensor,
+    confidence: torch.Tensor,
+    geometry_valid: torch.Tensor,
+    width: int,
+    height: int,
+    visibility_threshold: float,
+    confidence_threshold: float,
+) -> tuple[torch.Tensor, dict[str, float | int]]:
+    """Apply the TrackHead gates and expose every current-frame factor.
+
+    StreamVGGT's tracker already applies sigmoid to visibility/confidence.
+    Keeping independent and cumulative counts here distinguishes a coordinate
+    scale failure from low scores or invalid anchor geometry without changing
+    any acceptance threshold.
+    """
+
+    if tracks.ndim != 3 or tracks.shape[-1] != 2:
+        raise ValueError("TrackHead tracks must be [S,N,2].")
+    if visibility.shape != tracks.shape[:2]:
+        raise ValueError("TrackHead visibility shape disagrees with tracks.")
+    if confidence.shape != tracks.shape[:2]:
+        raise ValueError("TrackHead confidence shape disagrees with tracks.")
+    if geometry_valid.shape != tracks.shape[1:2]:
+        raise ValueError("TrackHead anchor geometry must be [N].")
+
+    track_finite = torch.isfinite(tracks).all(dim=-1)
+    in_bounds = (
+        track_finite
+        & (tracks[..., 0] >= 0)
+        & (tracks[..., 0] <= int(width) - 1)
+        & (tracks[..., 1] >= 0)
+        & (tracks[..., 1] <= int(height) - 1)
+    )
+    visibility_finite = torch.isfinite(visibility)
+    confidence_finite = torch.isfinite(confidence)
+    visibility_pass = visibility_finite & (
+        visibility >= float(visibility_threshold)
+    )
+    confidence_pass = confidence_finite & (
+        confidence >= float(confidence_threshold)
+    )
+    finite_bounds_visibility = in_bounds & visibility_pass
+    track_gate_pass = finite_bounds_visibility & confidence_pass
+    valid = track_gate_pass & geometry_valid[None]
+
+    current = -1
+    query_count = int(tracks.shape[1])
+    current_tracks = tracks[current]
+    current_track_finite = track_finite[current]
+    current_visibility = visibility[current]
+    current_confidence = confidence[current]
+    diagnostics: dict[str, float | int] = {
+        "validity_image_width": int(width),
+        "validity_image_height": int(height),
+        "current_query_count": query_count,
+        "current_geometry_valid_count": int(geometry_valid.sum()),
+        "current_track_finite_count": int(current_track_finite.sum()),
+        "current_track_in_bounds_count": int(in_bounds[current].sum()),
+        "current_visibility_finite_count": int(
+            visibility_finite[current].sum()
+        ),
+        "current_visibility_pass_count": int(
+            visibility_pass[current].sum()
+        ),
+        "current_confidence_finite_count": int(
+            confidence_finite[current].sum()
+        ),
+        "current_confidence_pass_count": int(confidence_pass[current].sum()),
+        "current_finite_bounds_visibility_count": int(
+            finite_bounds_visibility[current].sum()
+        ),
+        "current_track_gate_pass_count": int(track_gate_pass[current].sum()),
+        "current_valid_after_geometry_count": int(valid[current].sum()),
+        "current_track_in_bounds_fraction": _fraction(
+            in_bounds[current], query_count
+        ),
+        "current_visibility_pass_fraction": _fraction(
+            visibility_pass[current], query_count
+        ),
+        "current_confidence_pass_fraction": _fraction(
+            confidence_pass[current], query_count
+        ),
+        "current_track_gate_pass_fraction": _fraction(
+            track_gate_pass[current], query_count
+        ),
+        **_finite_range("current_visibility", current_visibility),
+        **_finite_range("current_confidence", current_confidence),
+        **_finite_range(
+            "current_track_x",
+            current_tracks[:, 0],
+            mask=current_track_finite,
+        ),
+        **_finite_range(
+            "current_track_y",
+            current_tracks[:, 1],
+            mask=current_track_finite,
+        ),
+    }
+    return valid, diagnostics
+
+
+def _fraction(mask: torch.Tensor, denominator: int) -> float:
+    return float(mask.sum()) / max(int(denominator), 1)
+
+
+def _finite_range(
+    prefix: str,
+    values: torch.Tensor,
+    *,
+    mask: torch.Tensor | None = None,
+) -> dict[str, float]:
+    finite = torch.isfinite(values)
+    if mask is not None:
+        finite &= mask
+    selected = values[finite].float()
+    if not selected.numel():
+        return {
+            f"{prefix}_min": float("nan"),
+            f"{prefix}_mean": float("nan"),
+            f"{prefix}_max": float("nan"),
+        }
+    return {
+        f"{prefix}_min": float(selected.min()),
+        f"{prefix}_mean": float(selected.mean()),
+        f"{prefix}_max": float(selected.max()),
+    }
 
 
 def support_region(

@@ -433,5 +433,23 @@ GT 只在全部 candidate 写完后评分。主指标仍是三折 mean camera-ce
 zsh streaming_couping/commands_v0_track_ba_candidate.txt
 ```
 
-需要回传：`track_ba_candidate/candidate_summary.json` 与
-`track_ba_candidate/fold_decision.csv`。
+首次服务器运行五个方法均为 `active_frames=0/12`，candidate 与 raw 完全一致；但这**不能证伪
+TrackHead + BA**，因为 BA 从未启动。逐帧原因全部是
+`fewer_than_min_correspondences`：anchor 有 `106–227/256` 个有效点，而 current 严格为 `0/256`。
+因此当前只证实失败发生在 TrackHead 当前帧 validity gate，且与 SAM mask 无关（`full_image` 同样为
+零）；在拆清坐标、visibility 和 confidence 前，不降低阈值、不调 BA 权重。
+
+实现修订 `causal_track_head_fixed_structure_ba_r2_validity_audit` 已在同一运行入口加入轻量诊断。已有
+候选输出时，它只重跑 `full_image` 和预锁定的 `sam_dynamic_excluded` TrackHead 窗口，不运行 BA、
+不解码 GT，也不覆盖既有 candidate。它逐帧及汇总打印：finite、in-bounds、visibility pass、
+confidence pass、gate 交集、geometry 交集和坐标/分数范围，并自动区分坐标尺度/re-anchor、visibility、
+confidence 或 gate 交集失败。
+
+服务器仍只需运行：
+
+```text
+zsh streaming_couping/commands_v0_track_ba_candidate.txt
+```
+
+需要回传该命令末尾打印的 `V0 Track-BA current-validity factor audit`；无需设置
+`V0_TRACK_BA_FORCE_RERUN=1`，也无需手写额外命令。

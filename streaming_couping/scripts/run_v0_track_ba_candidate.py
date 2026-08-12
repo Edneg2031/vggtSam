@@ -37,7 +37,7 @@ from streaming_couping.src.v0_track_ba import (
 )
 
 
-REVISION = "causal_track_head_fixed_structure_ba_r1"
+REVISION = "causal_track_head_fixed_structure_ba_r2_validity_audit"
 
 
 def main() -> None:
@@ -67,10 +67,6 @@ def main() -> None:
         payload["baseline_pose_encoding"].unsqueeze(0).to(candidate.device),
         image_size_hw=tuple(int(v) for v in payload["image_size"]),
     )
-    target_pose = _decode_target_for_scoring(
-        payload=payload,
-        pose_decoder=pose_encoding_to_extri_intri,
-    )
     encoding = payload["baseline_pose_encoding"].unsqueeze(0).to(
         candidate.device
     )
@@ -91,6 +87,22 @@ def main() -> None:
     scene_scale = scene_scale_from_cache(
         payload,
         candidate.point_confidence_threshold,
+    )
+    if args.validity_audit_only:
+        output = run_validity_audit(
+            payload=payload,
+            raw_pose=raw_pose,
+            intrinsics=intrinsics,
+            evaluation_indices=evaluation_indices,
+            frames=frames,
+            head=head,
+            candidate=candidate,
+        )
+        print(f"V0 Track-BA validity audit={output}")
+        return
+    target_pose = _decode_target_for_scoring(
+        payload=payload,
+        pose_decoder=pose_encoding_to_extri_intri,
     )
     output = run_candidate(
         payload=payload,
@@ -171,6 +183,7 @@ def run_candidate(
                     "equal_count_region_feasible": int(
                         window.equal_count_region_feasible
                     ),
+                    **window.validity_diagnostics,
                     **diagnostics,
                 }
             )
@@ -204,6 +217,7 @@ def run_candidate(
         method_feasible=method_feasible,
     )
     _write_csv(output_dir / "frame_diagnostics.csv", rows)
+    _write_csv(output_dir / "validity_audit.csv", rows)
     _write_csv(output_dir / "fold_decision.csv", fold_rows)
     summary = {
         "schema": 1,
@@ -245,6 +259,63 @@ def run_candidate(
         output_dir / "candidate_poses.pt",
     )
     return result
+
+
+def run_validity_audit(
+    *,
+    payload: dict,
+    raw_pose: torch.Tensor,
+    intrinsics: torch.Tensor,
+    evaluation_indices: list[int],
+    frames: tuple[int, ...],
+    head,
+    candidate,
+) -> Path:
+    """Rerun only enough TrackHead calls to localize a zero-validity gate."""
+
+    candidate.output_dir.mkdir(parents=True, exist_ok=True)
+    methods = tuple(dict.fromkeys(("full_image", candidate.primary_method)))
+    rows: list[dict[str, object]] = []
+    for method in methods:
+        for current in evaluation_indices:
+            window = build_track_window(
+                payload=payload,
+                head=head,
+                current_index=current,
+                method=method,
+                config=candidate,
+                raw_world_to_camera=raw_pose,
+                intrinsics=intrinsics,
+            )
+            rows.append(
+                {
+                    "method": method,
+                    "sequence_index": current,
+                    "frame_index": frames[current],
+                    "anchor_sequence_index": window.anchor_index,
+                    "anchor_frame_index": frames[window.anchor_index],
+                    "window_sequence_indices": " ".join(
+                        str(value) for value in window.sequence_indices
+                    ),
+                    "window_frames": len(window.sequence_indices),
+                    "query_count": int(window.query_points.shape[0]),
+                    "region_coverage_fraction": region_coverage(
+                        window.region_mask
+                    ),
+                    "equal_count_region_feasible": int(
+                        window.equal_count_region_feasible
+                    ),
+                    **window.validity_diagnostics,
+                }
+            )
+        print(f"V0 Track-BA validity completed method={method}")
+    del head
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    output = candidate.output_dir / "validity_audit.csv"
+    _write_csv(output, rows)
+    return output
 
 
 def _decode_target_for_scoring(*, payload: dict, pose_decoder) -> torch.Tensor:
@@ -448,6 +519,14 @@ def _parse_args() -> argparse.Namespace:
         default="streaming_couping/configs/v0_baseline.yaml",
     )
     parser.add_argument("--device")
+    parser.add_argument(
+        "--validity-audit-only",
+        action="store_true",
+        help=(
+            "Run full-image and locked-primary TrackHead validity gates only; "
+            "do not optimize, decode GT, score, or replace candidate outputs."
+        ),
+    )
     return parser.parse_args()
 
 

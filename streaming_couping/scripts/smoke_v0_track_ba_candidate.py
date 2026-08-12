@@ -20,6 +20,7 @@ from streaming_couping.src.v0_track_ba import (
     sample_query_points,
     so3_exp,
     support_region,
+    track_validity_and_diagnostics,
 )
 
 
@@ -27,6 +28,7 @@ def main() -> None:
     config = _config()
     _cache_shape_smoke()
     _sampling_smoke(config)
+    _validity_smoke(config)
     _optimizer_smoke(config)
     print("V0 causal TrackHead motion-only BA smoke passed")
 
@@ -164,6 +166,37 @@ def _optimizer_smoke(config: TrackBACandidateConfig) -> None:
         rotation_matrix,
         torch.eye(3, dtype=torch.double).repeat(4, 1, 1),
     )
+
+
+def _validity_smoke(config: TrackBACandidateConfig) -> None:
+    tracks = torch.tensor(
+        [
+            [[2.0, 2.0], [4.0, 4.0], [6.0, 6.0], [8.0, 8.0]],
+            [[3.0, 3.0], [-1.0, 4.0], [float("nan"), 6.0], [20.0, 8.0]],
+        ]
+    )
+    visibility = torch.tensor(
+        [[1.0, 1.0, 1.0, 1.0], [0.9, 0.9, 0.9, 0.01]]
+    )
+    confidence = torch.tensor(
+        [[1.0, 1.0, 1.0, 1.0], [0.9, 0.01, 0.9, 0.9]]
+    )
+    valid, diagnostics = track_validity_and_diagnostics(
+        tracks=tracks,
+        visibility=visibility,
+        confidence=confidence,
+        geometry_valid=torch.tensor([True, True, True, True]),
+        width=16,
+        height=12,
+        visibility_threshold=config.visibility_threshold,
+        confidence_threshold=config.track_confidence_threshold,
+    )
+    assert int(valid[-1].sum()) == 1
+    assert diagnostics["current_track_finite_count"] == 3
+    assert diagnostics["current_track_in_bounds_count"] == 1
+    assert diagnostics["current_visibility_pass_count"] == 3
+    assert diagnostics["current_confidence_pass_count"] == 3
+    assert diagnostics["current_valid_after_geometry_count"] == 1
 
 
 def _config() -> TrackBACandidateConfig:

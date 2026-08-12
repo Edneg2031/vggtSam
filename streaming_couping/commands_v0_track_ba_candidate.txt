@@ -9,6 +9,7 @@ OUTPUT=outputs/streaming_couping_v0/track_ba_candidate
 SUMMARY="$OUTPUT/candidate_summary.json"
 FOLD_CSV="$OUTPUT/fold_decision.csv"
 FRAME_CSV="$OUTPUT/frame_diagnostics.csv"
+VALIDITY_CSV="$OUTPUT/validity_audit.csv"
 
 cd "$ROOT"
 [[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
@@ -36,6 +37,20 @@ else
   echo "Set V0_TRACK_BA_FORCE_RERUN=1 only when an intentional rerun is needed"
 fi
 
+if [[ ! -s "$VALIDITY_CSV" ]] || \
+   ! head -n 1 "$VALIDITY_CSV" | grep -q 'current_track_finite_count'; then
+  echo "V0 Track-BA lightweight current-validity audit"
+  echo "Only full_image + locked primary are run; no BA or GT scoring"
+  PYTHONPATH=. "$PYTHON_BIN" -m \
+    streaming_couping.scripts.smoke_v0_track_ba_candidate
+  CUDA_VISIBLE_DEVICES="$TRACK_GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. \
+    "$PYTHON_BIN" -m \
+    streaming_couping.scripts.run_v0_track_ba_candidate \
+    --config "$CONFIG" \
+    --device cuda:0 \
+    --validity-audit-only
+fi
+
 [[ -s "$SUMMARY" ]] || {
   echo "missing Track-BA candidate_summary.json" >&2
   exit 1
@@ -48,13 +63,20 @@ fi
   echo "missing Track-BA frame_diagnostics.csv" >&2
   exit 1
 }
+[[ -s "$VALIDITY_CSV" ]] || {
+  echo "missing Track-BA validity_audit.csv" >&2
+  exit 1
+}
 
 PYTHONPATH=. "$PYTHON_BIN" - <<'PY'
 import json
 from pathlib import Path
 path = Path("outputs/streaming_couping_v0/track_ba_candidate/candidate_summary.json")
 summary = json.loads(path.read_text())
-assert summary["implementation_revision"] == "causal_track_head_fixed_structure_ba_r1"
+assert summary["implementation_revision"] in {
+    "causal_track_head_fixed_structure_ba_r1",
+    "causal_track_head_fixed_structure_ba_r2_validity_audit",
+}
 assert summary["causal_window"] is True
 assert summary["gt_used_for_candidate_generation"] is False
 assert summary["pose_model_trained"] is False
@@ -113,3 +135,84 @@ for method, items in grouped.items():
 PY
 
 echo "Send the V0 Track-BA no-op reason audit printed above for review"
+
+echo "V0 Track-BA current-validity factor audit"
+PYTHONPATH=. "$PYTHON_BIN" - "$VALIDITY_CSV" <<'PY'
+import csv
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+path = Path(sys.argv[1])
+with path.open(encoding="utf8", newline="") as handle:
+    rows = list(csv.DictReader(handle))
+if not rows:
+    raise SystemExit(f"empty Track-BA validity audit: {path}")
+
+grouped = defaultdict(list)
+for row in rows:
+    grouped[row["method"]].append(row)
+
+for method, items in grouped.items():
+    print(f"\nmethod={method}")
+    factor_totals = {
+        name: sum(int(row[name]) for row in items)
+        for name in (
+            "current_query_count",
+            "current_geometry_valid_count",
+            "current_track_finite_count",
+            "current_track_in_bounds_count",
+            "current_visibility_pass_count",
+            "current_confidence_pass_count",
+            "current_track_gate_pass_count",
+            "current_valid_after_geometry_count",
+        )
+    }
+    query_total = factor_totals["current_query_count"]
+    if factor_totals["current_track_finite_count"] == 0:
+        diagnosis = "nonfinite_track_output"
+    elif factor_totals["current_track_in_bounds_count"] == 0:
+        diagnosis = "coordinate_scale_or_reanchoring_failure"
+    elif factor_totals["current_visibility_pass_count"] == 0:
+        diagnosis = "visibility_gate_collapse"
+    elif factor_totals["current_confidence_pass_count"] == 0:
+        diagnosis = "confidence_gate_collapse"
+    elif factor_totals["current_track_gate_pass_count"] == 0:
+        diagnosis = "gate_intersection_collapse"
+    elif factor_totals["current_valid_after_geometry_count"] == 0:
+        diagnosis = "track_geometry_intersection_collapse"
+    else:
+        diagnosis = "current_tracks_survive_recheck_ba_activation_next"
+    print(
+        "  aggregate "
+        f"finite={factor_totals['current_track_finite_count']}/{query_total} "
+        f"bounds={factor_totals['current_track_in_bounds_count']}/{query_total} "
+        f"vis={factor_totals['current_visibility_pass_count']}/{query_total} "
+        f"conf={factor_totals['current_confidence_pass_count']}/{query_total} "
+        f"track_gate={factor_totals['current_track_gate_pass_count']}/{query_total} "
+        f"geometry={factor_totals['current_geometry_valid_count']}/{query_total} "
+        f"valid={factor_totals['current_valid_after_geometry_count']}/{query_total} "
+        f"diagnosis={diagnosis}"
+    )
+    for row in items:
+        print(
+            "  "
+            f"frame={row['frame_index']} "
+            f"geometry={row['current_geometry_valid_count']}/"
+            f"{row['current_query_count']} "
+            f"finite={row['current_track_finite_count']} "
+            f"bounds={row['current_track_in_bounds_count']} "
+            f"vis={row['current_visibility_pass_count']} "
+            f"conf={row['current_confidence_pass_count']} "
+            f"track_gate={row['current_track_gate_pass_count']} "
+            f"valid={row['current_valid_after_geometry_count']} "
+            f"x={row['current_track_x_min']}..{row['current_track_x_max']} "
+            f"y={row['current_track_y_min']}..{row['current_track_y_max']} "
+            f"vis_range={row['current_visibility_min']}.."
+            f"{row['current_visibility_max']} "
+            f"conf_range={row['current_confidence_min']}.."
+            f"{row['current_confidence_max']}"
+        )
+PY
+
+echo "Send the V0 Track-BA current-validity factor audit printed above for review"
