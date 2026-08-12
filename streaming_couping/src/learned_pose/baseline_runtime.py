@@ -48,6 +48,29 @@ class TrackBACandidateConfig:
     max_translation_scene_fraction: float
 
 
+@dataclass(frozen=True)
+class FeaturePnPCandidateConfig:
+    """Frozen local-feature 2D-3D pose candidate without learned fitting."""
+
+    enabled: bool
+    output_dir: Path
+    primary_method: str
+    methods: tuple[str, ...]
+    anchor_lookback: int
+    nfeatures: int
+    contrast_threshold: float
+    ratio_threshold: float
+    max_correspondences: int
+    min_correspondences: int
+    min_inliers: int
+    point_confidence_threshold: float
+    ransac_iterations: int
+    ransac_reprojection_pixels: float
+    ransac_confidence: float
+    max_rotation_degrees: float
+    max_translation_scene_fraction: float
+
+
 def load_baseline_run_config(path: str | Path) -> BaselineRunConfig:
     source = Path(path).expanduser().resolve()
     with source.open("r", encoding="utf8") as handle:
@@ -139,6 +162,64 @@ def load_track_ba_candidate_config(
         ),
     )
     _validate_track_ba_config(config)
+    return config
+
+
+def load_feature_pnp_candidate_config(
+    path: str | Path,
+) -> FeaturePnPCandidateConfig:
+    source = Path(path).expanduser().resolve()
+    with source.open("r", encoding="utf8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    baseline = raw.get("baseline", {})
+    section = baseline.get("feature_pnp_candidate", {})
+    methods = tuple(
+        str(value).strip().lower()
+        for value in section.get(
+            "methods",
+            (
+                "full_image",
+                "sam_dynamic_excluded",
+                "sam_instance_background_stratified",
+                "bbox_instance_background_stratified",
+                "random_instance_background_stratified",
+            ),
+        )
+    )
+    config = FeaturePnPCandidateConfig(
+        enabled=bool(section.get("enabled", True)),
+        output_dir=_path(
+            section.get(
+                "output_dir",
+                Path(baseline.get("output_dir", "outputs/streaming_couping_v0"))
+                / "feature_pnp_candidate",
+            )
+        ),
+        primary_method=str(
+            section.get("primary_method", "sam_dynamic_excluded")
+        ).strip().lower(),
+        methods=methods,
+        anchor_lookback=int(section.get("anchor_lookback", 4)),
+        nfeatures=int(section.get("nfeatures", 4096)),
+        contrast_threshold=float(section.get("contrast_threshold", 0.01)),
+        ratio_threshold=float(section.get("ratio_threshold", 0.75)),
+        max_correspondences=int(section.get("max_correspondences", 256)),
+        min_correspondences=int(section.get("min_correspondences", 32)),
+        min_inliers=int(section.get("min_inliers", 16)),
+        point_confidence_threshold=float(
+            section.get("point_confidence_threshold", 0.30)
+        ),
+        ransac_iterations=int(section.get("ransac_iterations", 1000)),
+        ransac_reprojection_pixels=float(
+            section.get("ransac_reprojection_pixels", 4.0)
+        ),
+        ransac_confidence=float(section.get("ransac_confidence", 0.999)),
+        max_rotation_degrees=float(section.get("max_rotation_degrees", 10.0)),
+        max_translation_scene_fraction=float(
+            section.get("max_translation_scene_fraction", 0.25)
+        ),
+    )
+    _validate_feature_pnp_config(config)
     return config
 
 
@@ -401,3 +482,44 @@ def _validate_track_ba_config(config: TrackBACandidateConfig) -> None:
         raise ValueError(
             "Track-BA max_translation_scene_fraction must be positive."
         )
+
+
+def _validate_feature_pnp_config(config: FeaturePnPCandidateConfig) -> None:
+    allowed = {
+        "full_image",
+        "sam_dynamic_excluded",
+        "sam_instance_background_stratified",
+        "bbox_instance_background_stratified",
+        "random_instance_background_stratified",
+    }
+    if not config.methods or len(config.methods) != len(set(config.methods)):
+        raise ValueError("Feature-PnP methods must be non-empty and unique.")
+    unknown = set(config.methods) - allowed
+    if unknown:
+        raise ValueError(f"Unknown Feature-PnP methods={sorted(unknown)}.")
+    if config.primary_method not in config.methods:
+        raise ValueError("Feature-PnP primary method must appear in methods.")
+    if config.anchor_lookback < 1 or config.nfeatures < 64:
+        raise ValueError("Feature-PnP lookback/nfeatures are too small.")
+    if not 0 < config.contrast_threshold < 1:
+        raise ValueError("Feature-PnP contrast threshold must be in (0,1).")
+    if not 0 < config.ratio_threshold < 1:
+        raise ValueError("Feature-PnP ratio threshold must be in (0,1).")
+    if config.max_correspondences < config.min_correspondences:
+        raise ValueError("Feature-PnP max correspondences is below minimum.")
+    if config.min_correspondences < 8 or config.min_inliers < 6:
+        raise ValueError("Feature-PnP correspondence/inlier gates are too small.")
+    if config.min_inliers > config.min_correspondences:
+        raise ValueError(
+            "Feature-PnP min inliers cannot exceed min correspondences."
+        )
+    if not 0 <= config.point_confidence_threshold <= 1:
+        raise ValueError("Feature-PnP point confidence must be in [0,1].")
+    if config.ransac_iterations < 1 or config.ransac_reprojection_pixels <= 0:
+        raise ValueError("Feature-PnP RANSAC settings must be positive.")
+    if not 0 < config.ransac_confidence < 1:
+        raise ValueError("Feature-PnP RANSAC confidence must be in (0,1).")
+    if config.max_rotation_degrees <= 0:
+        raise ValueError("Feature-PnP rotation bound must be positive.")
+    if config.max_translation_scene_fraction <= 0:
+        raise ValueError("Feature-PnP translation bound must be positive.")

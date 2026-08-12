@@ -11,6 +11,11 @@ FOLD_CSV="$OUTPUT/fold_decision.csv"
 FRAME_CSV="$OUTPUT/frame_diagnostics.csv"
 VALIDITY_CSV="$OUTPUT/validity_audit.csv"
 TEMPORAL_CSV="$OUTPUT/temporal_validity_audit.csv"
+PNP_OUTPUT=outputs/streaming_couping_v0/feature_pnp_candidate
+PNP_SUMMARY="$PNP_OUTPUT/candidate_summary.json"
+PNP_FOLD_CSV="$PNP_OUTPUT/fold_decision.csv"
+PNP_FRAME_CSV="$PNP_OUTPUT/frame_diagnostics.csv"
+PNP_REVISION=causal_sift_mutual_depth_pnp_r2
 
 cd "$ROOT"
 [[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
@@ -51,19 +56,20 @@ PYTHONPATH=. "$PYTHON_BIN" -m \
   --csv "$VALIDITY_CSV" \
   --temporal-csv "$TEMPORAL_CSV"
 
+TRACK_BA_GATE_PASS=1
 if ! PYTHONPATH=. "$PYTHON_BIN" -m \
   streaming_couping.scripts.summarize_v0_track_ba_validity \
   --csv "$VALIDITY_CSV" \
   --require-pass >/dev/null; then
+  TRACK_BA_GATE_PASS=0
   echo "V0 Track-BA stopped before BA: reaggregated TrackHead validity failed"
   echo "The active V0 selected pose remains raw StreamVGGT"
-  echo "Send the validity factor audit printed above for review"
-  exit 0
 fi
 
-if [[ "${V0_TRACK_BA_FORCE_RERUN:-0}" == "1" ]] || \
+if [[ "$TRACK_BA_GATE_PASS" == "1" ]] && { \
+   [[ "${V0_TRACK_BA_FORCE_RERUN:-0}" == "1" ]] || \
    [[ ! -s "$SUMMARY" ]] || [[ ! -s "$FOLD_CSV" ]] || \
-   [[ ! -s "$FRAME_CSV" ]]; then
+   [[ ! -s "$FRAME_CSV" ]]; }; then
   echo "V0 Track-BA validity passed; running all fixed controls + BA"
   echo "GT is scoring-only; V0 selected pose remains raw in this experiment"
   CUDA_VISIBLE_DEVICES="$TRACK_GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. \
@@ -71,15 +77,15 @@ if [[ "${V0_TRACK_BA_FORCE_RERUN:-0}" == "1" ]] || \
     streaming_couping.scripts.run_v0_track_ba_candidate \
     --config "$CONFIG" \
     --device cuda:0
-else
+elif [[ "$TRACK_BA_GATE_PASS" == "1" ]]; then
   echo "V0 Track-BA complete outputs already exist; skipping the GPU experiment"
   echo "Set V0_TRACK_BA_FORCE_RERUN=1 only when an intentional rerun is needed"
 fi
 
+if [[ "$TRACK_BA_GATE_PASS" == "1" ]]; then
 [[ -s "$SUMMARY" ]] || { echo "missing Track-BA summary" >&2; exit 1; }
 [[ -s "$FOLD_CSV" ]] || { echo "missing Track-BA fold CSV" >&2; exit 1; }
 [[ -s "$FRAME_CSV" ]] || { echo "missing Track-BA frame CSV" >&2; exit 1; }
-
 PYTHONPATH=. "$PYTHON_BIN" - <<'PY'
 import json
 from pathlib import Path
@@ -146,3 +152,106 @@ for method, items in grouped.items():
 PY
 
 echo "Send the V0 Track-BA optimization reason audit printed above for review"
+fi
+
+PNP_OUTPUT_REVISION=""
+if [[ -s "$PNP_SUMMARY" ]]; then
+  PNP_OUTPUT_REVISION=$(PYTHONPATH=. "$PYTHON_BIN" - "$PNP_SUMMARY" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    print(json.loads(Path(sys.argv[1]).read_text()).get("implementation_revision", ""))
+except (OSError, ValueError):
+    print("")
+PY
+)
+fi
+
+if [[ "${V0_FEATURE_PNP_FORCE_RERUN:-0}" == "1" ]] || \
+   [[ "$PNP_OUTPUT_REVISION" != "$PNP_REVISION" ]] || \
+   [[ ! -s "$PNP_SUMMARY" ]] || [[ ! -s "$PNP_FOLD_CSV" ]] || \
+   [[ ! -s "$PNP_FRAME_CSV" ]]; then
+  echo "V0 Feature-PnP smoke: SIFT support, calibrated PnP and locked bounds"
+  PYTHONPATH=. "$PYTHON_BIN" -m \
+    streaming_couping.scripts.smoke_v0_feature_pnp_candidate
+  echo "V0 Feature-PnP causal SIFT matching + anchor-depth PnP controls"
+  echo "No matcher/pose model is trained; GT is scoring-only"
+  PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" -m \
+    streaming_couping.scripts.run_v0_feature_pnp_candidate \
+    --config "$CONFIG"
+else
+  echo "V0 Feature-PnP outputs already exist; skipping recomputation"
+  echo "Set V0_FEATURE_PNP_FORCE_RERUN=1 only for an intentional rerun"
+fi
+
+[[ -s "$PNP_SUMMARY" ]] || { echo "missing Feature-PnP summary" >&2; exit 1; }
+[[ -s "$PNP_FOLD_CSV" ]] || { echo "missing Feature-PnP fold CSV" >&2; exit 1; }
+[[ -s "$PNP_FRAME_CSV" ]] || { echo "missing Feature-PnP frame CSV" >&2; exit 1; }
+
+PYTHONPATH=. "$PYTHON_BIN" - "$PNP_SUMMARY" "$PNP_FOLD_CSV" "$PNP_FRAME_CSV" <<'PY'
+import csv
+import json
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+summary = json.loads(Path(sys.argv[1]).read_text())
+assert summary["implementation_revision"] == "causal_sift_mutual_depth_pnp_r2"
+assert summary["gt_used_for_candidate_generation"] is False
+assert summary["pose_model_trained"] is False
+assert summary["matcher_trained"] is False
+decision = summary["decision"]
+print(
+    "V0 Feature-PnP completed "
+    f"primary={decision['primary_method']} "
+    f"all_fold_pass={decision['primary_all_fold_pass']} "
+    "selected_pose_unchanged=1"
+)
+with Path(sys.argv[2]).open(encoding="utf8", newline="") as handle:
+    folds = list(csv.DictReader(handle))
+print("V0 Feature-PnP fold decision")
+for row in folds:
+    print(
+        f"  fold={row['fold']} method={row['method']} "
+        f"active={row['active_frames']}/4 "
+        f"equal_count={row['equal_count_feasible_frames']}/4 "
+        f"center_gain={float(row['center_gain_percent']):.6g}% "
+        f"center_worse={row['center_worse_frames']} "
+        f"rotation_gain={float(row['rotation_gain_percent']):.6g}% "
+        f"pass={row['fold_pass']}"
+    )
+with Path(sys.argv[3]).open(encoding="utf8", newline="") as handle:
+    frames = list(csv.DictReader(handle))
+grouped = defaultdict(list)
+for row in frames:
+    grouped[row["method"]].append(row)
+print("V0 Feature-PnP optimization audit")
+for method, rows in grouped.items():
+    reasons = Counter(row["reason"] for row in rows)
+    active = sum(int(row["optimized"]) for row in rows)
+    feasible = sum(int(row["equal_count_feasible"]) for row in rows)
+    print(
+        f"  method={method} active={active}/{len(rows)} "
+        f"equal_count={feasible}/{len(rows)} reasons={dict(reasons)}"
+    )
+    for row in rows:
+        print(
+            "    "
+            f"frame={row['frame_index']} "
+            f"pool={row['pooled_unique_matches']} "
+            f"locked={row['locked_equal_count']} "
+            f"selected={row['selected_correspondences']} "
+            f"available={row['method_available_matches']} "
+            f"inliers={row['inliers']} "
+            f"inlier_ratio={row['inlier_ratio']} "
+            f"positive_depth={row['inlier_positive_depth_fraction']} "
+            f"rmse={row['reprojection_rmse_pixels']} "
+            f"rotation_update_deg={row['rotation_update_degrees']} "
+            f"center_update={row['center_update_native']} "
+            f"reason={row['reason']}"
+        )
+PY
+
+echo "Send the V0 Feature-PnP fold decision and optimization audit for review"

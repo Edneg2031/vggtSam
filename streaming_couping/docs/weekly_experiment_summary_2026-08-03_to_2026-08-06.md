@@ -477,6 +477,48 @@ anchor query slot 和 slot 0–4 的 gate 数量；另用同一批 future frames
 - anchor 正常、后续 slot 快速归零：15-frame 采样间隔/运动幅度超过 tracker 时间尺度；
 - current 每帧至少 32 条有效：关键点契约成立，原命令自动继续五组 BA 和三折评分。
 
+r4 的服务器结果满足第一种终止条件：Shi–Tomasi 查询下，`window=1/2/3/5` 的 anchor/current gate
+全部为 `0/3072`；5 帧窗口的 slot 0–4 也全部为零。即使 query slot 自身坐标被 TrackHead 强制设为
+输入 UV，visibility 最大值仍低于 `0.05`，confidence 只有约 `1e-10–3e-9`。因此失败与时间跨度、
+SAM mask、网格点、cached/reaggregated token、BA 都无关。当前 checkpoint + 当前 upstream TrackHead/
+预处理组合的 score head 没有通过最基本的一帧正控制，**到此终止 TrackHead-BA 路线**；不降低到
+接近零的阈值，也不再修改窗口或选点。
+
+## 12. V0 r6 候选：SIFT mutual + raw-depth PnP
+
+下一条 pose candidate 不再依赖失败的 TrackHead score head，也不训练 matcher/pose model：
+
+```text
+current frame 与最近 4 个 history frames
+  → deterministic SIFT features
+  → bidirectional ratio-test mutual matches
+  → 每个 current feature 只保留一个最强 history match
+  → history raw StreamVGGT depth + K + pose：2D history → frozen world 3D
+  → calibrated solvePnPRansac(EPNP) + inlier LM refine
+  → 与 raw pose 比较 locked rotation / camera-center update bound
+  → independent candidate（不覆盖 active V0 raw pose）
+```
+
+SAM 仍不提供 appearance descriptor，只提供可部署的 mask/identity/status：主方法预锁定为
+`sam_dynamic_excluded`，并同时运行 full-image、SAM instance/background、bbox、random-shifted-mask。
+每帧 correspondence count 锁定为主方法可用数量（最多 256），其他方法必须同数才算 feasible；因此
+不能靠给某个控制更多匹配获得优势；凑不齐同数的控制在该帧精确回退 raw，不用较少点生成不可比的
+pose。SIFT 的亚像素 UV 会直接进入 depth sampling 与 PnP，只有 mask membership 查询才取整；分层控制
+还要求 instance 匹配两端都在区域内、background 两端都在区域外，不接收跨区域混合匹配。GT 只在五组
+candidate 全部生成后用于三折评分，主指标仍是 mean
+camera-center error；每折要求 4/4 active、4/4 equal-count feasible、center gain 为正且
+`center_worse_frames=0`。即使通过也只记 `eligible_for_future_v0_revision=1`，本次运行不自动修改 V0。
+
+同一个命令会复用已完成的 TrackHead 终止审计，不再运行 GPU TrackHead，然后自动执行 CPU
+Feature-PnP smoke、五组候选和三折评分：
+
+```text
+zsh streaming_couping/commands_v0_track_ba_candidate.txt
+```
+
+新输出独立保存在 `outputs/streaming_couping_v0/feature_pnp_candidate/`。需要回传命令末尾的
+`V0 Feature-PnP fold decision` 和 `optimization audit`。
+
 服务器仍只需运行：
 
 ```text
