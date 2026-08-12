@@ -70,33 +70,34 @@ def main() -> None:
                 for name in slot_names
             )
         )
-        for row in items:
-            print(
-                "  "
-                f"frame={row['frame_index']} "
-                f"anchor_gate={row['anchor_track_gate_pass_count']} "
-                f"anchor_valid={row['anchor_valid_after_geometry_count']} "
-                f"geometry={row['current_geometry_valid_count']}/"
-                f"{row['current_query_count']} "
-                f"finite={row['current_track_finite_count']} "
-                f"bounds={row['current_track_in_bounds_count']} "
-                f"vis={row['current_visibility_pass_count']} "
-                f"conf={row['current_confidence_pass_count']} "
-                f"track_gate={row['current_track_gate_pass_count']} "
-                f"valid={row['current_valid_after_geometry_count']} "
-                f"x={row['current_track_x_min']}.."
-                f"{row['current_track_x_max']} "
-                f"y={row['current_track_y_min']}.."
-                f"{row['current_track_y_max']} "
-                f"vis_range={row['current_visibility_min']}.."
-                f"{row['current_visibility_max']} "
-                f"conf_range={row['current_confidence_min']}.."
-                f"{row['current_confidence_max']} "
-                f"anchor_vis_range={row['anchor_visibility_min']}.."
-                f"{row['anchor_visibility_max']} "
-                f"anchor_conf_range={row['anchor_confidence_min']}.."
-                f"{row['anchor_confidence_max']}"
-            )
+        if not args.summary_only:
+            for row in items:
+                print(
+                    "  "
+                    f"frame={row['frame_index']} "
+                    f"anchor_gate={row['anchor_track_gate_pass_count']} "
+                    f"anchor_valid={row['anchor_valid_after_geometry_count']} "
+                    f"geometry={row['current_geometry_valid_count']}/"
+                    f"{row['current_query_count']} "
+                    f"finite={row['current_track_finite_count']} "
+                    f"bounds={row['current_track_in_bounds_count']} "
+                    f"vis={row['current_visibility_pass_count']} "
+                    f"conf={row['current_confidence_pass_count']} "
+                    f"track_gate={row['current_track_gate_pass_count']} "
+                    f"valid={row['current_valid_after_geometry_count']} "
+                    f"x={row['current_track_x_min']}.."
+                    f"{row['current_track_x_max']} "
+                    f"y={row['current_track_y_min']}.."
+                    f"{row['current_track_y_max']} "
+                    f"vis_range={row['current_visibility_min']}.."
+                    f"{row['current_visibility_max']} "
+                    f"conf_range={row['current_confidence_min']}.."
+                    f"{row['current_confidence_max']} "
+                    f"anchor_vis_range={row['anchor_visibility_min']}.."
+                    f"{row['anchor_visibility_max']} "
+                    f"anchor_conf_range={row['anchor_confidence_min']}.."
+                    f"{row['anchor_confidence_max']}"
+                )
 
     gate, reason = _gate(
         grouped,
@@ -217,6 +218,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-frames", type=int, default=12)
     parser.add_argument("--minimum-correspondences", type=int, default=32)
     parser.add_argument("--require-pass", action="store_true")
+    parser.add_argument("--summary-only", action="store_true")
     return parser.parse_args()
 
 

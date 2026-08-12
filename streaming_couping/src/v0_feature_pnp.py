@@ -1,14 +1,14 @@
 """Causal local-feature 2D-3D PnP factors for the V0 pose candidate.
 
-No model is trained. SIFT matches provide current 2D to historical 2D
-correspondence; frozen raw StreamVGGT depth/K/pose lifts only the historical
-observations into the baseline world gauge. SAM contributes deployable masks
-for dynamic exclusion or equal-count instance/background stratification.
+No model is trained. SIFT supplies current/history 2D correspondences. Locked
+controls compare raw-depth unprojection with the frozen StreamVGGT world-point
+head, and recent history with all causal history. SAM contributes deployable
+masks for dynamic exclusion or equal-count spatial stratification.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 
 import torch
@@ -36,6 +36,8 @@ class MatchPool:
     anchor_indices: torch.Tensor
     anchor_region: dict[str, torch.Tensor]
     current_region: dict[str, torch.Tensor]
+    landmark_world_points: dict[str, torch.Tensor] | None = None
+    landmark_anchor_reprojection_epe: dict[str, torch.Tensor] | None = None
 
 
 def extract_sift_features(
@@ -87,6 +89,7 @@ def build_match_pool(
     raw_world_to_camera: torch.Tensor,
     intrinsics: torch.Tensor,
     config: FeaturePnPCandidateConfig,
+    history_scope: str = "recent",
 ) -> MatchPool:
     current = features[int(current_index)]
     if current is None:
@@ -104,7 +107,12 @@ def build_match_pool(
         for method in config.methods
     }
     records = []
-    start = max(0, int(current_index) - int(config.anchor_lookback))
+    if history_scope == "recent":
+        start = max(0, int(current_index) - int(config.anchor_lookback))
+    elif history_scope == "all_causal":
+        start = 0
+    else:
+        raise ValueError(f"Unknown Feature-PnP history scope={history_scope!r}.")
     for anchor_index in range(start, int(current_index)):
         anchor = features[anchor_index]
         if anchor is None:
@@ -131,13 +139,21 @@ def build_match_pool(
             payload["baseline_world_confidence"][anchor_index][..., None],
             anchor_points,
         )[..., 0]
-        world = unproject_depth_samples(
+        raw_depth_world = unproject_depth_samples(
             anchor_points,
             depth,
             raw_world_to_camera[0, anchor_index].detach().float().cpu(),
             intrinsics[0, anchor_index].detach().float().cpu(),
         )
-        valid = torch.isfinite(world).all(dim=-1)
+        native_world = bilinear_sample_map(
+            payload["baseline_world_points"][anchor_index],
+            anchor_points,
+        )
+        # The 2x2 landmark-source diagnosis uses an identical match set for
+        # both sources. A row must therefore be valid under both deployable
+        # representations before either branch may consume it.
+        valid = torch.isfinite(raw_depth_world).all(dim=-1)
+        valid &= torch.isfinite(native_world).all(dim=-1)
         valid &= torch.isfinite(depth) & (depth > 1e-6)
         valid &= torch.isfinite(point_confidence)
         valid &= point_confidence >= float(config.point_confidence_threshold)
@@ -148,7 +164,8 @@ def build_match_pool(
                 anchor_index,
                 anchor_points[valid],
                 current_points[valid],
-                world[valid],
+                raw_depth_world[valid],
+                native_world[valid],
                 distances[valid],
                 current_ids[valid],
             )
@@ -159,7 +176,15 @@ def build_match_pool(
     # One current feature must vote for at most one historical 3D point.
     # Keep its strongest descriptor match, with recent anchors as tie-breaker.
     candidates = []
-    for anchor_index, anchor_uv, current_uv, world, distances, current_ids in records:
+    for (
+        anchor_index,
+        anchor_uv,
+        current_uv,
+        raw_depth_world,
+        native_world,
+        distances,
+        current_ids,
+    ) in records:
         for row in range(int(current_uv.shape[0])):
             candidates.append(
                 (
@@ -169,7 +194,8 @@ def build_match_pool(
                     int(anchor_index),
                     anchor_uv[row],
                     current_uv[row],
-                    world[row],
+                    raw_depth_world[row],
+                    native_world[row],
                 )
             )
     candidates.sort(key=lambda item: item[:3])
@@ -184,7 +210,8 @@ def build_match_pool(
     anchor_indices = torch.tensor([item[3] for item in retained], dtype=torch.long)
     anchor_points = torch.stack([item[4] for item in retained])
     current_points = torch.stack([item[5] for item in retained])
-    world_points = torch.stack([item[6] for item in retained])
+    raw_depth_world_points = torch.stack([item[6] for item in retained])
+    native_world_points = torch.stack([item[7] for item in retained])
     distances = torch.tensor([item[0] for item in retained], dtype=torch.float32)
 
     unique_anchors = sorted(set(anchor_indices.tolist()))
@@ -209,14 +236,56 @@ def build_match_pool(
         method: _points_in_mask(current_points, region)
         for method, region in current_regions.items()
     }
+    landmark_points = {
+        "raw_depth_unprojected": raw_depth_world_points,
+        "native_world_pointmap": native_world_points,
+    }
     return MatchPool(
         current_points=current_points,
-        world_points=world_points,
+        world_points=raw_depth_world_points,
         distances=distances,
         anchor_indices=anchor_indices,
         anchor_region=anchor_regions,
         current_region=current_region_flags,
+        landmark_world_points=landmark_points,
+        landmark_anchor_reprojection_epe={
+            source: _anchor_reprojection_epe(
+                points,
+                anchor_points=anchor_points,
+                anchor_indices=anchor_indices,
+                raw_world_to_camera=raw_world_to_camera,
+                intrinsics=intrinsics,
+            )
+            for source, points in landmark_points.items()
+        },
     )
+
+
+def select_landmark_source(pool: MatchPool, source: str) -> MatchPool:
+    """Select one locked 3D representation without changing 2D support."""
+
+    if pool.landmark_world_points is None:
+        if source == "raw_depth_unprojected":
+            return pool
+        raise ValueError("Match pool does not contain landmark-source controls.")
+    if source not in pool.landmark_world_points:
+        raise ValueError(f"Unknown Feature-PnP landmark source={source!r}.")
+    return replace(pool, world_points=pool.landmark_world_points[source])
+
+
+def landmark_anchor_reprojection_stats(
+    pool: MatchPool,
+    *,
+    source: str,
+    selected: torch.Tensor,
+) -> tuple[float, float]:
+    if pool.landmark_anchor_reprojection_epe is None:
+        return float("nan"), float("nan")
+    values = pool.landmark_anchor_reprojection_epe[source].index_select(0, selected)
+    values = values[torch.isfinite(values)]
+    if not values.numel():
+        return float("nan"), float("nan")
+    return float(values.mean()), float(values.max())
 
 
 def mutual_ratio_matches(left, right, *, ratio: float) -> list[tuple[int, int, float]]:
@@ -436,7 +505,48 @@ def _empty_pool(current_regions: dict[str, torch.Tensor]) -> MatchPool:
         anchor_indices=torch.empty(0, dtype=torch.long),
         anchor_region={name: torch.empty(0, dtype=torch.bool) for name in current_regions},
         current_region={name: torch.empty(0, dtype=torch.bool) for name in current_regions},
+        landmark_world_points={
+            "raw_depth_unprojected": torch.empty(0, 3),
+            "native_world_pointmap": torch.empty(0, 3),
+        },
+        landmark_anchor_reprojection_epe={
+            "raw_depth_unprojected": torch.empty(0),
+            "native_world_pointmap": torch.empty(0),
+        },
     )
+
+
+def _anchor_reprojection_epe(
+    world_points: torch.Tensor,
+    *,
+    anchor_points: torch.Tensor,
+    anchor_indices: torch.Tensor,
+    raw_world_to_camera: torch.Tensor,
+    intrinsics: torch.Tensor,
+) -> torch.Tensor:
+    poses = raw_world_to_camera[0].detach().float().cpu().index_select(
+        0, anchor_indices
+    )
+    calibration = intrinsics[0].detach().float().cpu().index_select(
+        0, anchor_indices
+    )
+    camera = torch.bmm(
+        poses[:, :3, :3],
+        world_points[..., None],
+    )[..., 0] + poses[:, :3, 3]
+    depth = camera[:, 2]
+    safe = torch.isfinite(camera).all(dim=-1) & (depth.abs() > 1e-8)
+    projected = torch.stack(
+        (
+            calibration[:, 0, 0] * camera[:, 0] / depth
+            + calibration[:, 0, 2],
+            calibration[:, 1, 1] * camera[:, 1] / depth
+            + calibration[:, 1, 2],
+        ),
+        dim=-1,
+    )
+    epe = torch.linalg.vector_norm(projected - anchor_points, dim=-1)
+    return torch.where(safe & torch.isfinite(epe), epe, torch.nan)
 
 
 def _gray_uint8(image: torch.Tensor, cv2, np):

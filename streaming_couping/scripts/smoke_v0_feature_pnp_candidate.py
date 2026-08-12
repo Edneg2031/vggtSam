@@ -12,6 +12,7 @@ import torch
 from streaming_couping.src.v0_feature_pnp import (
     MatchPool,
     mutual_ratio_matches,
+    select_landmark_source,
     select_method_correspondences,
     solve_feature_pnp,
 )
@@ -25,6 +26,8 @@ def main() -> None:
         "streaming_couping/configs/v0_baseline.yaml"
     )
     assert config.primary_method == "sam_dynamic_excluded"
+    assert config.primary_landmark_source == "native_world_pointmap"
+    assert config.primary_history_scope == "all_causal"
     _test_mutual_ratio_matching()
     _test_equal_count_selection()
     _test_pnp_and_fallbacks(config)
@@ -75,7 +78,14 @@ def _test_equal_count_selection() -> None:
             "sam_instance_background_stratified": region,
             "bbox_instance_background_stratified": scarce_region,
         },
+        landmark_world_points={
+            "raw_depth_unprojected": torch.ones(count, 3),
+            "native_world_pointmap": torch.full((count, 3), 2.0),
+        },
     )
+    native = select_landmark_source(pool, "native_world_pointmap")
+    torch.testing.assert_close(native.world_points, torch.full((count, 3), 2.0))
+    torch.testing.assert_close(native.current_points, pool.current_points)
     selected, feasible, _ = select_method_correspondences(
         pool,
         method="full_image",

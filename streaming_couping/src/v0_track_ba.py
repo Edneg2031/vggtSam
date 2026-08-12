@@ -128,6 +128,7 @@ def validate_track_cache(payload: dict) -> None:
         "stream_images",
         "patch_start_idx",
         "baseline_depth",
+        "baseline_world_points",
         "baseline_world_confidence",
         "tracking_masks_stream",
         "trusted_tracking_masks_stream",
@@ -156,6 +157,11 @@ def validate_track_cache(payload: dict) -> None:
         raise ValueError("Cached patch shape does not match TrackHead images.")
     if not torch.is_tensor(payload["baseline_depth"]):
         raise ValueError("baseline_depth must be a tensor.")
+    world_points = payload["baseline_world_points"]
+    if not torch.is_tensor(world_points) or world_points.ndim != 4:
+        raise ValueError("baseline_world_points must be [S,H,W,3].")
+    if world_points.shape[0] != images.shape[0] or world_points.shape[-1] != 3:
+        raise ValueError("Cached world-point/image sequence shapes disagree.")
     if not torch.is_tensor(payload["baseline_world_confidence"]):
         raise ValueError("baseline_world_confidence must be a tensor.")
 

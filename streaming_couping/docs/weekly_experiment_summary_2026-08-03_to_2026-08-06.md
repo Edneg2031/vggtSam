@@ -519,6 +519,28 @@ zsh streaming_couping/commands_v0_track_ba_candidate.txt
 新输出独立保存在 `outputs/streaming_couping_v0/feature_pnp_candidate/`。需要回传命令末尾的
 `V0 Feature-PnP fold decision` 和 `optimization audit`。
 
+### r6 服务器结论
+
+实现和 smoke 均通过，SIFT-PnP 在 short 折能稳定启动：`full_image` 与预锁定的
+`sam_dynamic_excluded` 都为 `active=4/4`、equal-count `4/4`，inlier ratio 约
+`0.69–0.84`、LM 后 RMSE 约 `0.97–1.65px`、正深度比例均为 `1.0`。这证实 explicit local
+feature → 2D–3D PnP 的工程链路是可运行的，不再存在 TrackHead score-head 全灭问题。
+
+但它没有改善主指标。short 折 full-image 的 rotation gain 为 `+22.95%`，center gain 为
+`-3.50%`、`3/4` 帧中心更差；`sam_dynamic_excluded` 的 rotation gain 为 `+15.29%`，center gain
+为 `-2.84%`、同样 `3/4` 帧更差。SAM exclusion 与 full-image 接近，没有独立 pose 收益。
+
+medium/long 不是 PnP solver failure，而是主方法的 causal match support 分别只有
+`30/27/13/16` 与 `21/4/13/16`，低于预锁 `32` 条，因此全部 exact-raw fallback。三种
+instance/background 分层控制在所有帧都无法凑齐主方法的相同数量，不能用于 SAM 有效性结论。
+
+因此 r6 明确证伪“最近 4 帧 raw-depth PnP 能稳定提高长序列 camera center”。其理论问题是历史
+landmark 由 `raw depth + raw camera pose` 反投影生成：camera-head 的中心偏差会被写入 3D anchor，
+PnP 可能改善 rotation，却没有独立世界地图约束来纠正同源 translation bias。下一步不降低匹配阈值，
+而做固定 2×2 因子诊断：`raw-depth-unprojected` 对 `native StreamVGGT world pointmap`，以及
+`recent-4` 对 `all causal history`。预锁主候选为 `native pointmap + all history`；GT 仍仅评分，
+结果仍不自动覆盖 V0 raw pose。
+
 服务器仍只需运行：
 
 ```text

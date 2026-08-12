@@ -56,6 +56,10 @@ class FeaturePnPCandidateConfig:
     output_dir: Path
     primary_method: str
     methods: tuple[str, ...]
+    primary_landmark_source: str
+    landmark_sources: tuple[str, ...]
+    primary_history_scope: str
+    history_scopes: tuple[str, ...]
     anchor_lookback: int
     nfeatures: int
     contrast_threshold: float
@@ -186,6 +190,20 @@ def load_feature_pnp_candidate_config(
             ),
         )
     )
+    landmark_sources = tuple(
+        str(value).strip().lower()
+        for value in section.get(
+            "landmark_sources",
+            ("raw_depth_unprojected", "native_world_pointmap"),
+        )
+    )
+    history_scopes = tuple(
+        str(value).strip().lower()
+        for value in section.get(
+            "history_scopes",
+            ("recent", "all_causal"),
+        )
+    )
     config = FeaturePnPCandidateConfig(
         enabled=bool(section.get("enabled", True)),
         output_dir=_path(
@@ -199,6 +217,14 @@ def load_feature_pnp_candidate_config(
             section.get("primary_method", "sam_dynamic_excluded")
         ).strip().lower(),
         methods=methods,
+        primary_landmark_source=str(
+            section.get("primary_landmark_source", "native_world_pointmap")
+        ).strip().lower(),
+        landmark_sources=landmark_sources,
+        primary_history_scope=str(
+            section.get("primary_history_scope", "all_causal")
+        ).strip().lower(),
+        history_scopes=history_scopes,
         anchor_lookback=int(section.get("anchor_lookback", 4)),
         nfeatures=int(section.get("nfeatures", 4096)),
         contrast_threshold=float(section.get("contrast_threshold", 0.01)),
@@ -499,6 +525,28 @@ def _validate_feature_pnp_config(config: FeaturePnPCandidateConfig) -> None:
         raise ValueError(f"Unknown Feature-PnP methods={sorted(unknown)}.")
     if config.primary_method not in config.methods:
         raise ValueError("Feature-PnP primary method must appear in methods.")
+    landmark_sources = {"raw_depth_unprojected", "native_world_pointmap"}
+    if (
+        not config.landmark_sources
+        or len(config.landmark_sources) != len(set(config.landmark_sources))
+        or set(config.landmark_sources) - landmark_sources
+    ):
+        raise ValueError("Feature-PnP landmark sources are invalid or duplicated.")
+    if config.primary_landmark_source not in config.landmark_sources:
+        raise ValueError(
+            "Feature-PnP primary landmark source must appear in sources."
+        )
+    history_scopes = {"recent", "all_causal"}
+    if (
+        not config.history_scopes
+        or len(config.history_scopes) != len(set(config.history_scopes))
+        or set(config.history_scopes) - history_scopes
+    ):
+        raise ValueError("Feature-PnP history scopes are invalid or duplicated.")
+    if config.primary_history_scope not in config.history_scopes:
+        raise ValueError(
+            "Feature-PnP primary history scope must appear in scopes."
+        )
     if config.anchor_lookback < 1 or config.nfeatures < 64:
         raise ValueError("Feature-PnP lookback/nfeatures are too small.")
     if not 0 < config.contrast_threshold < 1:

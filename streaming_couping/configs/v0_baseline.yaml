@@ -102,7 +102,8 @@ baseline:
   # positive control. This uses explicit local-feature matches and PnP.
   feature_pnp_candidate:
     enabled: true
-    output_dir: outputs/streaming_couping_v0/feature_pnp_candidate
+    # r2 evidence remains immutable in feature_pnp_candidate/.
+    output_dir: outputs/streaming_couping_v0/feature_pnp_factor_candidate
     primary_method: sam_dynamic_excluded
     methods:
       - full_image
@@ -110,6 +111,11 @@ baseline:
       - sam_instance_background_stratified
       - bbox_instance_background_stratified
       - random_instance_background_stratified
+    # Fixed 2x2 diagnosis. The primary is locked before offline scoring.
+    primary_landmark_source: native_world_pointmap
+    landmark_sources: [raw_depth_unprojected, native_world_pointmap]
+    primary_history_scope: all_causal
+    history_scopes: [recent, all_causal]
     anchor_lookback: 4
     nfeatures: 4096
     contrast_threshold: 0.01
