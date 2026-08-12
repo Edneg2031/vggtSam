@@ -379,3 +379,59 @@ SAM 的可验证贡献改为：
 该路线的必要控制是 equal-count full-image、random/bbox mask、wrong-ID、shuffle-time、SAM-off。
 只有 SAM-stratified 分支在相同 correspondence 和 solver 下稳定超过这些控制，才能声明
 “SAM system 帮助 pose”。这首先验证 mask/identity/status，而不是强行证明 appearance token。
+
+## 11. V0 r5 候选实验：因果 TrackHead + 固定结构 BA
+
+V0 r4 的职责判断保持不变：SAM3.1 是主要 tracking 前端；StreamVGGT 几何在 tracking 分支中主要用于
+低质量 mask 的候选纠正/回退。但 raw StreamVGGT pose 存在系统偏移，因此新增一个与 tracking 解耦的
+pose candidate，专门验证冻结的时序点轨迹能否修正这个偏移：
+
+```text
+V0 r4 cache（不重跑 backbone）
+├─ SAM3.1 mask / persistent ID / birth / static-quality
+│    └─ 排除身份未知区域，或做静态实例/背景等量分层
+└─ StreamVGGT 四层 causal DPT token + image
+     └─ frozen built-in TrackHead：最近连续历史，最多 5 帧、256 个全图点轨迹
+          └─ anchor raw depth + raw K/pose 反投影为冻结 3D 点
+               └─ bounded motion-only fixed-history BA（只优化当前相机）
+                    ├─ raw StreamVGGT pose 初始化
+                    ├─ raw pose/temporal prior
+                    └─ 只输出 candidate，不改写 r4 selected pose
+```
+
+这个实验与已有失败路线的区别是：
+
+- 不再用 pooled SAM token 或高容量 SE(3) head 直接回归 pose；
+- 不训练 matcher 或 pose model，correspondence 来自 StreamVGGT 自带的视频 TrackHead；
+- 不做已经被 V9.3–V9.4 证伪的 instance-only essential matrix，而使用 V9.5 已通过上界的宽空间支撑；
+- 不做 V8 已失败的跨帧 predicted pointmap 3D–3D Kabsch；raw depth 只在 anchor 帧生成固定 3D landmark；
+- 每个 evaluation frame 只输入最近连续历史、合计最多 5 帧的 causal token；历史相机固定，
+  只优化当前相机，禁止一次读取完整未来序列；
+- 新物体仍可未来 birth，但 birth 本身不会改过去 pose；只有形成可信历史 observation 后，其 mask 状态
+  才能参与后续选点。
+
+预先锁定的主方法是 `sam_dynamic_excluded`：保留全图宽支撑，只排除 SAM 已观测但不能通过静态/身份
+可信 gate 的区域。以下同数目控制同时运行，但不会按 GT 结果选择赢家：
+
+| 方法 | 作用 |
+|---|---|
+| `full_image` | 不读 SAM 的 TrackHead + BA 基线 |
+| `sam_dynamic_excluded` | 预先锁定主方法；排除低可信/可能动态区 |
+| `sam_instance_background_stratified` | 静态实例和背景各一半 |
+| `bbox_instance_background_stratified` | bbox 形状控制 |
+| `random_instance_background_stratified` | 确定性随机平移 mask 控制 |
+
+GT 只在全部 candidate 写完后评分。主指标仍是三折 mean camera-center error；每折必须为正收益且
+`center_worse_frames=0` 才通过。即使通过，本次脚本也只写
+`eligible_for_future_v0_revision=1`，不会在同一次运行中用 GT gate 覆盖 raw pose。若主方法三折通过，
+再单独修改 V0 revision 并用已锁配置复跑；若 full-image 通过而 SAM 主方法不通过，只能称 TrackHead/BA
+有效，不能称 SAM 帮助 pose；若全部失败，则停止该 candidate，不调 GT 回退阈值。
+
+运行入口：
+
+```text
+zsh streaming_couping/commands_v0_track_ba_candidate.txt
+```
+
+需要回传：`track_ba_candidate/candidate_summary.json` 与
+`track_ba_candidate/fold_decision.csv`。

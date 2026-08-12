@@ -58,3 +58,35 @@ baseline:
   audit_device: cuda:0
   frames:
     evaluation: [360, 375, 390, 405, 420, 435, 450, 465, 480, 495, 510, 525]
+  # Independent pose candidate. It never changes the active V0 pose until
+  # the fixed primary method passes all three future folds offline.
+  track_ba_candidate:
+    enabled: true
+    output_dir: outputs/streaming_couping_v0/track_ba_candidate
+    device: cuda:0
+    # Broad full-image support with only low-trust/identity-unknown SAM regions
+    # removed. This choice is locked before reading future GT metrics.
+    primary_method: sam_dynamic_excluded
+    methods:
+      - full_image
+      - sam_dynamic_excluded
+      - sam_instance_background_stratified
+      - bbox_instance_background_stratified
+      - random_instance_background_stratified
+    window_frames: 5
+    query_count: 256
+    query_grid: [64, 64]
+    track_iterations: 4
+    # These are the official TrackHead confidence gates, not GT score gates.
+    visibility_threshold: 0.05
+    track_confidence_threshold: 0.05
+    point_confidence_threshold: 0.30
+    min_correspondences: 32
+    optimizer_steps: 120
+    learning_rate: 0.03
+    robust_delta_pixels: 4.0
+    rotation_prior_weight: 0.50
+    translation_prior_weight: 0.50
+    temporal_prior_weight: 0.10
+    max_rotation_degrees: 10.0
+    max_translation_scene_fraction: 0.25

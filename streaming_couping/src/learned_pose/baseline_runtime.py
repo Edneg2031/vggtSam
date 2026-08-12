@@ -19,6 +19,33 @@ class BaselineRunConfig:
     evaluation_frames: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class TrackBACandidateConfig:
+    """Locked deployable inputs for the V0 fixed-structure pose candidate."""
+
+    enabled: bool
+    output_dir: Path
+    device: str
+    primary_method: str
+    methods: tuple[str, ...]
+    window_frames: int
+    query_count: int
+    query_grid: tuple[int, int]
+    track_iterations: int
+    visibility_threshold: float
+    track_confidence_threshold: float
+    point_confidence_threshold: float
+    min_correspondences: int
+    optimizer_steps: int
+    learning_rate: float
+    robust_delta_pixels: float
+    rotation_prior_weight: float
+    translation_prior_weight: float
+    temporal_prior_weight: float
+    max_rotation_degrees: float
+    max_translation_scene_fraction: float
+
+
 def load_baseline_run_config(path: str | Path) -> BaselineRunConfig:
     source = Path(path).expanduser().resolve()
     with source.open("r", encoding="utf8") as handle:
@@ -39,6 +66,71 @@ def load_baseline_run_config(path: str | Path) -> BaselineRunConfig:
         evaluation_frames=_int_tuple(frames.get("evaluation", ())),
     )
     _validate_config(config)
+    return config
+
+
+def load_track_ba_candidate_config(
+    path: str | Path,
+) -> TrackBACandidateConfig:
+    source = Path(path).expanduser().resolve()
+    with source.open("r", encoding="utf8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    baseline = raw.get("baseline", {})
+    section = baseline.get("track_ba_candidate", {})
+    methods = tuple(
+        str(value).strip().lower()
+        for value in section.get(
+            "methods",
+            (
+                "full_image",
+                "sam_dynamic_excluded",
+                "sam_instance_background_stratified",
+                "bbox_instance_background_stratified",
+                "random_instance_background_stratified",
+            ),
+        )
+    )
+    grid = _int_tuple(section.get("query_grid", (64, 64)))
+    config = TrackBACandidateConfig(
+        enabled=bool(section.get("enabled", True)),
+        output_dir=_path(
+            section.get(
+                "output_dir",
+                Path(baseline.get("output_dir", "outputs/streaming_couping_v0"))
+                / "track_ba_candidate",
+            )
+        ),
+        device=str(section.get("device", baseline.get("audit_device", "cuda:0"))),
+        primary_method=str(
+            section.get("primary_method", "sam_dynamic_excluded")
+        ).strip().lower(),
+        methods=methods,
+        window_frames=int(section.get("window_frames", 5)),
+        query_count=int(section.get("query_count", 256)),
+        query_grid=(int(grid[0]), int(grid[1])) if len(grid) == 2 else grid,
+        track_iterations=int(section.get("track_iterations", 4)),
+        visibility_threshold=float(section.get("visibility_threshold", 0.05)),
+        track_confidence_threshold=float(
+            section.get("track_confidence_threshold", 0.05)
+        ),
+        point_confidence_threshold=float(
+            section.get("point_confidence_threshold", 0.30)
+        ),
+        min_correspondences=int(section.get("min_correspondences", 32)),
+        optimizer_steps=int(section.get("optimizer_steps", 120)),
+        learning_rate=float(section.get("learning_rate", 0.03)),
+        robust_delta_pixels=float(section.get("robust_delta_pixels", 4.0)),
+        rotation_prior_weight=float(section.get("rotation_prior_weight", 0.50)),
+        translation_prior_weight=float(
+            section.get("translation_prior_weight", 0.50)
+        ),
+        temporal_prior_weight=float(section.get("temporal_prior_weight", 0.10)),
+        max_rotation_degrees=float(section.get("max_rotation_degrees", 10.0)),
+        max_translation_scene_fraction=float(
+            section.get("max_translation_scene_fraction", 0.25)
+        ),
+    )
+    _validate_track_ba_config(config)
     return config
 
 
@@ -239,3 +331,53 @@ def _validate_config(config: BaselineRunConfig) -> None:
         raise ValueError("V0 evaluation frames must be unique.")
     if tuple(sorted(config.evaluation_frames)) != config.evaluation_frames:
         raise ValueError("V0 evaluation frames must be strictly time ordered.")
+
+
+def _validate_track_ba_config(config: TrackBACandidateConfig) -> None:
+    allowed = {
+        "full_image",
+        "sam_dynamic_excluded",
+        "sam_instance_background_stratified",
+        "bbox_instance_background_stratified",
+        "random_instance_background_stratified",
+    }
+    if not config.methods or len(config.methods) != len(set(config.methods)):
+        raise ValueError("V0 Track-BA methods must be non-empty and unique.")
+    unknown = set(config.methods) - allowed
+    if unknown:
+        raise ValueError(f"Unknown V0 Track-BA methods={sorted(unknown)}.")
+    if config.primary_method not in config.methods:
+        raise ValueError("Track-BA primary_method must appear in methods.")
+    if config.window_frames < 2:
+        raise ValueError("Track-BA window_frames must be at least two.")
+    if config.query_count < 2 or config.query_count % 2:
+        raise ValueError("Track-BA query_count must be a positive even number.")
+    if len(config.query_grid) != 2 or min(config.query_grid) < 2:
+        raise ValueError("Track-BA query_grid must contain two values >=2.")
+    if config.query_grid[0] * config.query_grid[1] < config.query_count:
+        raise ValueError("Track-BA query_grid has fewer cells than query_count.")
+    if config.track_iterations < 1 or config.optimizer_steps < 1:
+        raise ValueError("Track/optimizer iterations must be positive.")
+    for name, value in (
+        ("visibility_threshold", config.visibility_threshold),
+        ("track_confidence_threshold", config.track_confidence_threshold),
+        ("point_confidence_threshold", config.point_confidence_threshold),
+    ):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"Track-BA {name} must be in [0,1].")
+    if config.min_correspondences < 8:
+        raise ValueError("Track-BA needs at least eight correspondences.")
+    if config.learning_rate <= 0 or config.robust_delta_pixels <= 0:
+        raise ValueError("Track-BA learning rate/robust delta must be positive.")
+    if min(
+        config.rotation_prior_weight,
+        config.translation_prior_weight,
+        config.temporal_prior_weight,
+    ) < 0:
+        raise ValueError("Track-BA prior weights cannot be negative.")
+    if config.max_rotation_degrees <= 0:
+        raise ValueError("Track-BA max_rotation_degrees must be positive.")
+    if config.max_translation_scene_fraction <= 0:
+        raise ValueError(
+            "Track-BA max_translation_scene_fraction must be positive."
+        )

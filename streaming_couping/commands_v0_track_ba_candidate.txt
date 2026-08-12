@@ -1,0 +1,58 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+TRACK_GPU="${V0_TRACK_BA_GPU:-1}"
+CONFIG=streaming_couping/configs/v0_baseline.yaml
+OUTPUT=outputs/streaming_couping_v0/track_ba_candidate
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+echo "V0 Track-BA smoke: equal-count support, bounded SE3 and gradients"
+PYTHONPATH=. "$PYTHON_BIN" -m \
+  streaming_couping.scripts.smoke_v0_track_ba_candidate
+
+echo "V0 Track-BA frozen TrackHead + causal fixed-structure optimizer"
+echo "physical GPU=$TRACK_GPU logical device=cuda:0"
+echo "GT is scoring-only; V0 selected pose remains raw in this experiment"
+CUDA_VISIBLE_DEVICES="$TRACK_GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. \
+  "$PYTHON_BIN" -m \
+  streaming_couping.scripts.run_v0_track_ba_candidate \
+  --config "$CONFIG" \
+  --device cuda:0
+
+[[ -s "$OUTPUT/candidate_summary.json" ]] || {
+  echo "missing Track-BA candidate_summary.json" >&2
+  exit 1
+}
+[[ -s "$OUTPUT/fold_decision.csv" ]] || {
+  echo "missing Track-BA fold_decision.csv" >&2
+  exit 1
+}
+
+PYTHONPATH=. "$PYTHON_BIN" -c '
+import json
+from pathlib import Path
+path = Path("outputs/streaming_couping_v0/track_ba_candidate/candidate_summary.json")
+summary = json.loads(path.read_text())
+assert summary["implementation_revision"] == "causal_track_head_fixed_structure_ba_r1"
+assert summary["causal_window"] is True
+assert summary["gt_used_for_candidate_generation"] is False
+assert summary["pose_model_trained"] is False
+assert summary["candidate_status"] == "offline_not_selected"
+decision = summary["decision"]
+print(
+    "V0 Track-BA completed "
+    f"primary={decision['primary_method']} "
+    f"all_fold_pass={decision['primary_all_fold_pass']} "
+    "selected_pose_unchanged=1"
+)
+'
+
+echo "Send candidate_summary.json and fold_decision.csv for review"
