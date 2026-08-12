@@ -102,11 +102,9 @@ fi
 [[ -s "$PNP_FRAME_CSV" ]] || { echo "missing Feature-PnP frame CSV" >&2; exit 1; }
 [[ -s "$PNP_DECISION_MD" ]] || { echo "missing Feature-PnP decision markdown" >&2; exit 1; }
 
-PYTHONPATH=. "$PYTHON_BIN" - "$PNP_SUMMARY" "$PNP_FOLD_CSV" "$PNP_FRAME_CSV" <<'PY'
-import csv
+PYTHONPATH=. "$PYTHON_BIN" - "$PNP_SUMMARY" <<'PY'
 import json
 import sys
-from collections import Counter, defaultdict
 from pathlib import Path
 
 summary = json.loads(Path(sys.argv[1]).read_text())
@@ -121,51 +119,6 @@ print(
     f"all_fold_pass={decision['primary_all_fold_pass']} "
     "selected_pose_unchanged=1"
 )
-with Path(sys.argv[2]).open(encoding="utf8", newline="") as handle:
-    folds = list(csv.DictReader(handle))
-print("V0 Feature-PnP fold decision")
-for row in folds:
-    print(
-        f"  fold={row['fold']} landmark={row['landmark_source']} "
-        f"history={row['history_scope']} support={row['support_method']} "
-        f"active={row['active_frames']}/4 "
-        f"equal_count={row['equal_count_feasible_frames']}/4 "
-        f"center_gain={float(row['center_gain_percent']):.6g}% "
-        f"center_worse={row['center_worse_frames']} "
-        f"rotation_gain={float(row['rotation_gain_percent']):.6g}% "
-        f"pass={row['fold_pass']}"
-    )
-with Path(sys.argv[3]).open(encoding="utf8", newline="") as handle:
-    frames = list(csv.DictReader(handle))
-grouped = defaultdict(list)
-for row in frames:
-    grouped[row["method"]].append(row)
-print("V0 Feature-PnP optimization audit")
-primary = summary["primary_branch_locked_before_scoring"]
-for method, rows in grouped.items():
-    reasons = Counter(row["reason"] for row in rows)
-    active = sum(int(row["optimized"]) for row in rows)
-    feasible = sum(int(row["equal_count_feasible"]) for row in rows)
-    print(
-        f"  method={method} active={active}/{len(rows)} "
-        f"equal_count={feasible}/{len(rows)} reasons={dict(reasons)}"
-    )
-    if method != primary:
-        continue
-    print("    locked-primary per-frame diagnostics")
-    for row in rows:
-        print(
-            "    "
-            f"frame={row['frame_index']} "
-            f"pool={row['pooled_unique_matches']} "
-            f"locked={row['locked_equal_count']} "
-            f"anchor_epe={row['landmark_anchor_reprojection_mean_epe_pixels']} "
-            f"inliers={row['inliers']} "
-            f"rmse={row['reprojection_rmse_pixels']} "
-            f"rotation_update_deg={row['rotation_update_degrees']} "
-            f"center_update={row['center_update_native']} "
-            f"reason={row['reason']}"
-        )
 PY
 
 echo "V0 Feature-PnP r3 retained as completed negative evidence"
@@ -189,18 +142,66 @@ fi
 mkdir -p "$LG_MODEL_ROOT/torch/hub/checkpoints"
 ALIKED_WEIGHT="$LG_MODEL_ROOT/torch/hub/checkpoints/aliked-n16.pth"
 LG_WEIGHT="$LG_MODEL_ROOT/torch/hub/checkpoints/aliked_lightglue_v0-1_arxiv.pth"
-if [[ ! -s "$ALIKED_WEIGHT" ]]; then
-  echo "Downloading public frozen ALIKED weight to mounted model storage"
-  curl -L --fail --show-error -o "$ALIKED_WEIGHT.part" \
-    https://github.com/Shiaoming/ALIKED/raw/main/models/aliked-n16.pth
-  mv "$ALIKED_WEIGHT.part" "$ALIKED_WEIGHT"
-fi
-if [[ ! -s "$LG_WEIGHT" ]]; then
-  echo "Downloading public frozen ALIKED-LightGlue weight to mounted model storage"
-  curl -L --fail --show-error -o "$LG_WEIGHT.part" \
-    https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/aliked_lightglue.pth
-  mv "$LG_WEIGHT.part" "$LG_WEIGHT"
-fi
+
+# The server is behind a TLS-inspecting proxy whose self-signed CA is not in
+# curl's trust store. Normal verification is attempted first. Only that exact
+# certificate failure falls back to the proxy route, and no bytes become an
+# active checkpoint until their independently locked SHA256 matches.
+function weight_sha256_matches() {
+  local path="$1"
+  local expected="$2"
+  [[ -s "$path" ]] || return 1
+  PYTHONPATH=. "$PYTHON_BIN" - "$path" "$expected" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+actual = hashlib.sha256(path.read_bytes()).hexdigest()
+raise SystemExit(0 if actual == sys.argv[2] else 1)
+PY
+}
+
+function fetch_checksum_locked_weight() {
+  local name="$1"
+  local target="$2"
+  local expected="$3"
+  local url="$4"
+  local partial="${target}.part"
+  if weight_sha256_matches "$target" "$expected"; then
+    echo "$name already present and checksum-valid: $target"
+    return
+  fi
+  echo "Downloading $name to mounted model storage"
+  if curl -L --fail --show-error --retry 2 -o "$partial" "$url"; then
+    :
+  else
+    local curl_status=$?
+    if [[ "$curl_status" != "60" ]]; then
+      echo "$name download failed with curl status=$curl_status" >&2
+      exit "$curl_status"
+    fi
+    echo "Verified TLS failed; retrying through the server TLS proxy"
+    curl --insecure -L --fail --show-error --retry 2 -o "$partial" "$url"
+  fi
+  if ! weight_sha256_matches "$partial" "$expected"; then
+    echo "$name download failed the locked SHA256; refusing checkpoint" >&2
+    exit 1
+  fi
+  mv "$partial" "$target"
+}
+
+fetch_checksum_locked_weight \
+  "public frozen ALIKED weight" \
+  "$ALIKED_WEIGHT" \
+  "5be8704840ed662d9d8c561bf7279c222092674e7eb05fd0feab94899e9d82f2" \
+  "https://github.com/Shiaoming/ALIKED/raw/main/models/aliked-n16.pth"
+fetch_checksum_locked_weight \
+  "public frozen ALIKED-LightGlue weight" \
+  "$LG_WEIGHT" \
+  "d975e965b105311a6143194852297dff4f02aea5cc2e10cecfed966ca0e22503" \
+  "https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/aliked_lightglue.pth"
+
 PYTHONPATH=. "$PYTHON_BIN" - "$ALIKED_WEIGHT" "$LG_WEIGHT" <<'PY'
 import hashlib
 import sys
