@@ -1,16 +1,16 @@
 #!/usr/bin/env zsh
 set -euo pipefail
 
+# Legacy filename retained so the server command does not change. TrackHead-BA
+# is intentionally not rerun: its one-frame positive control already failed.
 ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
-TRACK_GPU="${V0_TRACK_BA_GPU:-1}"
+STREAM_GPU0="${BASELINE_STREAM_GPU0:-1}"
+STREAM_GPU1="${BASELINE_STREAM_GPU1:-2}"
+SAM_GPU="${BASELINE_SAM_GPU:-3}"
+VISIBLE_GPUS="$STREAM_GPU0,$STREAM_GPU1,$SAM_GPU"
 CONFIG=streaming_couping/configs/v0_baseline.yaml
-OUTPUT=outputs/streaming_couping_v0/track_ba_keypoint_candidate
-SUMMARY="$OUTPUT/candidate_summary.json"
-FOLD_CSV="$OUTPUT/fold_decision.csv"
-FRAME_CSV="$OUTPUT/frame_diagnostics.csv"
-VALIDITY_CSV="$OUTPUT/validity_audit.csv"
-TEMPORAL_CSV="$OUTPUT/temporal_validity_audit.csv"
+CLIP=00a231a370_90_525_step15_37_68_54
 PNP_OUTPUT=outputs/streaming_couping_v0/feature_pnp_factor_candidate
 PNP_SUMMARY="$PNP_OUTPUT/candidate_summary.json"
 PNP_FOLD_CSV="$PNP_OUTPUT/fold_decision.csv"
@@ -25,135 +25,34 @@ export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-if [[ "${V0_TRACK_BA_FORCE_RERUN:-0}" == "1" ]] || \
-   [[ ! -s "$VALIDITY_CSV" ]] || [[ ! -s "$TEMPORAL_CSV" ]] || \
-   ! head -n 1 "$VALIDITY_CSV" | grep -q 'current_track_finite_count'; then
-  echo "V0 Track-BA smoke: equal-count support, bounded SE3 and gradients"
+echo "V0 TrackHead-BA skipped: retained one-frame validity control failed"
+echo "V0 preparing a stable dynamic-tracking/geometry cache"
+if PYTHONPATH=. "$PYTHON_BIN" -m \
+  streaming_couping.scripts.prepare_v0_candidate_cache \
+  --config "$CONFIG" \
+  --clip "$CLIP"; then
+  :
+else
+  PREPARE_STATUS=$?
+  if [[ "$PREPARE_STATUS" != "2" ]]; then
+    echo "V0 cache discovery failed with status=$PREPARE_STATUS" >&2
+    exit "$PREPARE_STATUS"
+  fi
+  echo "No compatible cache remains; rebuilding the V0 cache once"
+  echo "physical GPUs=$VISIBLE_GPUS"
+  echo "logical layout: StreamVGGT=cuda:0,cuda:1 SAM3.1=cuda:2"
+  CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" PYTHONUNBUFFERED=1 PYTHONPATH=. \
+    "$PYTHON_BIN" -m streaming_couping.scripts.run_dynamic_instance_baseline \
+    --config "$CONFIG" \
+    --stage cache \
+    --rebuild-cache \
+    --streamvggt-devices cuda:0,cuda:1 \
+    --sam3-device cuda:2 \
+    --geometry-device cuda:0
   PYTHONPATH=. "$PYTHON_BIN" -m \
-    streaming_couping.scripts.smoke_v0_track_ba_candidate
-
-  echo "V0 Track-BA reaggregated-window validity preflight"
-  echo "physical GPU=$TRACK_GPU logical device=cuda:0"
-  echo "Only full_image + locked primary are run; no BA or GT scoring"
-  CUDA_VISIBLE_DEVICES="$TRACK_GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. \
-    "$PYTHON_BIN" -m \
-    streaming_couping.scripts.run_v0_track_ba_candidate \
+    streaming_couping.scripts.prepare_v0_candidate_cache \
     --config "$CONFIG" \
-    --device cuda:0 \
-    --validity-audit-only
-fi
-
-[[ -s "$VALIDITY_CSV" ]] || {
-  echo "missing Track-BA validity_audit.csv" >&2
-  exit 1
-}
-[[ -s "$TEMPORAL_CSV" ]] || {
-  echo "missing Track-BA temporal_validity_audit.csv" >&2
-  exit 1
-}
-
-PYTHONPATH=. "$PYTHON_BIN" -m \
-  streaming_couping.scripts.summarize_v0_track_ba_validity \
-  --csv "$VALIDITY_CSV" \
-  --temporal-csv "$TEMPORAL_CSV" \
-  --summary-only
-
-TRACK_BA_GATE_PASS=1
-if ! PYTHONPATH=. "$PYTHON_BIN" -m \
-  streaming_couping.scripts.summarize_v0_track_ba_validity \
-  --csv "$VALIDITY_CSV" \
-  --require-pass >/dev/null; then
-  TRACK_BA_GATE_PASS=0
-  echo "V0 Track-BA stopped before BA: reaggregated TrackHead validity failed"
-  echo "The active V0 selected pose remains raw StreamVGGT"
-fi
-
-if [[ "$TRACK_BA_GATE_PASS" == "1" ]] && { \
-   [[ "${V0_TRACK_BA_FORCE_RERUN:-0}" == "1" ]] || \
-   [[ ! -s "$SUMMARY" ]] || [[ ! -s "$FOLD_CSV" ]] || \
-   [[ ! -s "$FRAME_CSV" ]]; }; then
-  echo "V0 Track-BA validity passed; running all fixed controls + BA"
-  echo "GT is scoring-only; V0 selected pose remains raw in this experiment"
-  CUDA_VISIBLE_DEVICES="$TRACK_GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. \
-    "$PYTHON_BIN" -m \
-    streaming_couping.scripts.run_v0_track_ba_candidate \
-    --config "$CONFIG" \
-    --device cuda:0
-elif [[ "$TRACK_BA_GATE_PASS" == "1" ]]; then
-  echo "V0 Track-BA complete outputs already exist; skipping the GPU experiment"
-  echo "Set V0_TRACK_BA_FORCE_RERUN=1 only when an intentional rerun is needed"
-fi
-
-if [[ "$TRACK_BA_GATE_PASS" == "1" ]]; then
-[[ -s "$SUMMARY" ]] || { echo "missing Track-BA summary" >&2; exit 1; }
-[[ -s "$FOLD_CSV" ]] || { echo "missing Track-BA fold CSV" >&2; exit 1; }
-[[ -s "$FRAME_CSV" ]] || { echo "missing Track-BA frame CSV" >&2; exit 1; }
-PYTHONPATH=. "$PYTHON_BIN" - <<'PY'
-import json
-from pathlib import Path
-path = Path("outputs/streaming_couping_v0/track_ba_keypoint_candidate/candidate_summary.json")
-summary = json.loads(path.read_text())
-assert summary["implementation_revision"] == "causal_window_keypoint_track_head_ba_r4"
-assert summary["track_token_source"] == "window_reaggregated"
-assert summary["query_source"] == "shi_tomasi"
-assert summary["causal_window"] is True
-assert summary["gt_used_for_candidate_generation"] is False
-assert summary["pose_model_trained"] is False
-assert summary["candidate_status"] == "offline_not_selected"
-decision = summary["decision"]
-print(
-    "V0 Track-BA completed "
-    f"primary={decision['primary_method']} "
-    f"all_fold_pass={decision['primary_all_fold_pass']} "
-    "selected_pose_unchanged=1"
-)
-PY
-
-echo "V0 Track-BA optimization reason audit"
-PYTHONPATH=. "$PYTHON_BIN" - "$FRAME_CSV" <<'PY'
-import csv
-import sys
-from collections import Counter, defaultdict
-from pathlib import Path
-
-path = Path(sys.argv[1])
-with path.open(encoding="utf8", newline="") as handle:
-    rows = list(csv.DictReader(handle))
-if not rows:
-    raise SystemExit(f"empty Track-BA diagnostics: {path}")
-
-grouped = defaultdict(list)
-for row in rows:
-    grouped[row["method"]].append(row)
-
-for method, items in grouped.items():
-    reasons = Counter(row.get("reason", "missing") for row in items)
-    active = sum(int(row.get("optimized", 0) or 0) for row in items)
-    feasible = sum(
-        int(row.get("equal_count_region_feasible", 0) or 0)
-        for row in items
-    )
-    print(f"\nmethod={method}")
-    print(
-        f"  active={active}/{len(items)} "
-        f"equal_count_feasible={feasible}/{len(items)} "
-        f"reasons={dict(reasons)}"
-    )
-    for row in items:
-        print(
-            "  "
-            f"frame={row['frame_index']} "
-            f"reason={row.get('reason', '')} "
-            f"anchor_corr={row.get('anchor_correspondences', '')} "
-            f"current_corr={row.get('current_correspondences', '')} "
-            f"rmse={row.get('initial_reprojection_rmse_pixels', '')}"
-            f"->{row.get('final_reprojection_rmse_pixels', '')} "
-            f"rotation_update_deg={row.get('current_rotation_update_degrees', '')} "
-            f"translation_update={row.get('current_translation_update_native', '')}"
-        )
-PY
-
-echo "Send the V0 Track-BA optimization reason audit printed above for review"
+    --clip "$CLIP"
 fi
 
 PNP_OUTPUT_REVISION=""
@@ -175,7 +74,7 @@ if [[ "${V0_FEATURE_PNP_FORCE_RERUN:-0}" == "1" ]] || \
    [[ "$PNP_OUTPUT_REVISION" != "$PNP_REVISION" ]] || \
    [[ ! -s "$PNP_SUMMARY" ]] || [[ ! -s "$PNP_FOLD_CSV" ]] || \
    [[ ! -s "$PNP_FRAME_CSV" ]] || [[ ! -s "$PNP_DECISION_MD" ]]; then
-  echo "V0 Feature-PnP smoke: SIFT support, calibrated PnP and locked bounds"
+  echo "V0 Feature-PnP smoke: matching, equal-count and locked fallback"
   PYTHONPATH=. "$PYTHON_BIN" -m \
     streaming_couping.scripts.smoke_v0_feature_pnp_candidate
   echo "V0 Feature-PnP landmark-source x causal-history factorization"
@@ -184,7 +83,7 @@ if [[ "${V0_FEATURE_PNP_FORCE_RERUN:-0}" == "1" ]] || \
     streaming_couping.scripts.run_v0_feature_pnp_candidate \
     --config "$CONFIG"
 else
-  echo "V0 Feature-PnP outputs already exist; skipping recomputation"
+  echo "V0 Feature-PnP r3 outputs already exist; skipping recomputation"
   echo "Set V0_FEATURE_PNP_FORCE_RERUN=1 only for an intentional rerun"
 fi
 
@@ -250,12 +149,8 @@ for method, rows in grouped.items():
             f"frame={row['frame_index']} "
             f"pool={row['pooled_unique_matches']} "
             f"locked={row['locked_equal_count']} "
-            f"selected={row['selected_correspondences']} "
-            f"available={row['method_available_matches']} "
             f"anchor_epe={row['landmark_anchor_reprojection_mean_epe_pixels']} "
             f"inliers={row['inliers']} "
-            f"inlier_ratio={row['inlier_ratio']} "
-            f"positive_depth={row['inlier_positive_depth_fraction']} "
             f"rmse={row['reprojection_rmse_pixels']} "
             f"rotation_update_deg={row['rotation_update_degrees']} "
             f"center_update={row['center_update_native']} "

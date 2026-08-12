@@ -519,6 +519,11 @@ zsh streaming_couping/commands_v0_track_ba_candidate.txt
 新输出独立保存在 `outputs/streaming_couping_v0/feature_pnp_candidate/`。需要回传命令末尾的
 `V0 Feature-PnP fold decision` 和 `optimization audit`。
 
+V0 cache 不再依赖可能被清理的 `streaming_couping_v74_temporal_scaling/cache` 路径，固定写到
+`outputs/streaming_couping_v0/cache/`。candidate 命令会先在 `outputs/` 中按完整 provenance 查找可兼容
+cache 并建立软链接；找不到时才自动用 V0 配置重建。已通过一帧正控制证伪的 TrackHead-BA 不再由该
+入口加载或复跑，旧证据目录仍保留。
+
 ### r6 服务器结论
 
 实现和 smoke 均通过，SIFT-PnP 在 short 折能稳定启动：`full_image` 与预锁定的

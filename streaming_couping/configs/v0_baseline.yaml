@@ -26,9 +26,9 @@ runtime:
   sam3_device: cuda:2
 
 features:
-  # Reuse the retained dynamic-instance cache; do not duplicate the frozen
-  # SAM3.1/StreamVGGT tensors under the much smaller V0 result directory.
-  cache_dir: outputs/streaming_couping_v74_temporal_scaling/cache
+  # Stable V0-owned path. The candidate command first links a compatible
+  # historical cache here and rebuilds only when none remains on disk.
+  cache_dir: outputs/streaming_couping_v0/cache
   rebuild: false
   cache_sam_appearance: false
   sam_source: disabled_geometry_only_baseline
