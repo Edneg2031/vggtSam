@@ -75,6 +75,29 @@ class FeaturePnPCandidateConfig:
     max_translation_scene_fraction: float
 
 
+@dataclass(frozen=True)
+class LightGluePnPCandidateConfig:
+    """Frozen ALIKED-LightGlue correspondence audit with locked PnP."""
+
+    enabled: bool
+    output_dir: Path
+    device: str
+    lightglue_repo: Path
+    primary_method: str
+    methods: tuple[str, ...]
+    nfeatures: int
+    detection_threshold: float
+    max_correspondences: int
+    min_correspondences: int
+    min_inliers: int
+    point_confidence_threshold: float
+    ransac_iterations: int
+    ransac_reprojection_pixels: float
+    ransac_confidence: float
+    max_rotation_degrees: float
+    max_translation_scene_fraction: float
+
+
 def load_baseline_run_config(path: str | Path) -> BaselineRunConfig:
     source = Path(path).expanduser().resolve()
     with source.open("r", encoding="utf8") as handle:
@@ -246,6 +269,60 @@ def load_feature_pnp_candidate_config(
         ),
     )
     _validate_feature_pnp_config(config)
+    return config
+
+
+def load_lightglue_pnp_candidate_config(
+    path: str | Path,
+) -> LightGluePnPCandidateConfig:
+    source = Path(path).expanduser().resolve()
+    with source.open("r", encoding="utf8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    baseline = raw.get("baseline", {})
+    section = baseline.get("lightglue_pnp_candidate", {})
+    methods = tuple(
+        str(value).strip().lower()
+        for value in section.get(
+            "methods",
+            ("full_image", "sam_dynamic_excluded"),
+        )
+    )
+    config = LightGluePnPCandidateConfig(
+        enabled=bool(section.get("enabled", True)),
+        output_dir=_path(
+            section.get(
+                "output_dir",
+                Path(baseline.get("output_dir", "outputs/streaming_couping_v0"))
+                / "lightglue_pnp_candidate",
+            )
+        ),
+        device=str(section.get("device", baseline.get("audit_device", "cuda:0"))),
+        lightglue_repo=_path(
+            section.get("lightglue_repo", "externals/LightGlue")
+        ),
+        primary_method=str(
+            section.get("primary_method", "sam_dynamic_excluded")
+        ).strip().lower(),
+        methods=methods,
+        nfeatures=int(section.get("nfeatures", 2048)),
+        detection_threshold=float(section.get("detection_threshold", 0.005)),
+        max_correspondences=int(section.get("max_correspondences", 256)),
+        min_correspondences=int(section.get("min_correspondences", 32)),
+        min_inliers=int(section.get("min_inliers", 16)),
+        point_confidence_threshold=float(
+            section.get("point_confidence_threshold", 0.30)
+        ),
+        ransac_iterations=int(section.get("ransac_iterations", 1000)),
+        ransac_reprojection_pixels=float(
+            section.get("ransac_reprojection_pixels", 4.0)
+        ),
+        ransac_confidence=float(section.get("ransac_confidence", 0.999)),
+        max_rotation_degrees=float(section.get("max_rotation_degrees", 10.0)),
+        max_translation_scene_fraction=float(
+            section.get("max_translation_scene_fraction", 0.25)
+        ),
+    )
+    _validate_lightglue_pnp_config(config)
     return config
 
 
@@ -571,3 +648,38 @@ def _validate_feature_pnp_config(config: FeaturePnPCandidateConfig) -> None:
         raise ValueError("Feature-PnP rotation bound must be positive.")
     if config.max_translation_scene_fraction <= 0:
         raise ValueError("Feature-PnP translation bound must be positive.")
+
+
+def _validate_lightglue_pnp_config(
+    config: LightGluePnPCandidateConfig,
+) -> None:
+    allowed = {"full_image", "sam_dynamic_excluded"}
+    if not config.methods or len(config.methods) != len(set(config.methods)):
+        raise ValueError("LightGlue-PnP methods must be non-empty and unique.")
+    unknown = set(config.methods) - allowed
+    if unknown:
+        raise ValueError(f"Unknown LightGlue-PnP methods={sorted(unknown)}.")
+    if config.primary_method not in config.methods:
+        raise ValueError("LightGlue-PnP primary method must appear in methods.")
+    if config.nfeatures < 64:
+        raise ValueError("LightGlue-PnP nfeatures is too small.")
+    if not 0 <= config.detection_threshold < 1:
+        raise ValueError("LightGlue-PnP detection threshold must be in [0,1).")
+    if config.max_correspondences < config.min_correspondences:
+        raise ValueError("LightGlue-PnP max correspondences is below minimum.")
+    if config.min_correspondences < 8 or config.min_inliers < 6:
+        raise ValueError("LightGlue-PnP correspondence/inlier gates are too small.")
+    if config.min_inliers > config.min_correspondences:
+        raise ValueError(
+            "LightGlue-PnP min inliers cannot exceed min correspondences."
+        )
+    if not 0 <= config.point_confidence_threshold <= 1:
+        raise ValueError("LightGlue-PnP point confidence must be in [0,1].")
+    if config.ransac_iterations < 1 or config.ransac_reprojection_pixels <= 0:
+        raise ValueError("LightGlue-PnP RANSAC settings must be positive.")
+    if not 0 < config.ransac_confidence < 1:
+        raise ValueError("LightGlue-PnP RANSAC confidence must be in (0,1).")
+    if config.max_rotation_degrees <= 0:
+        raise ValueError("LightGlue-PnP rotation bound must be positive.")
+    if config.max_translation_scene_fraction <= 0:
+        raise ValueError("LightGlue-PnP translation bound must be positive.")

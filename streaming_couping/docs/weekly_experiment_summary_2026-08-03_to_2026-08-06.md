@@ -555,3 +555,64 @@ zsh streaming_couping/commands_v0_track_ba_candidate.txt
 需要回传该命令打印的 `V0 Track-BA current-validity factor audit`；若门控通过并自动完成 BA，再同时
 回传末尾的 optimization reason audit 和 `fold_decision.csv`。无需设置
 `V0_TRACK_BA_FORCE_RERUN=1`，也无需手写额外命令。
+
+### r6 landmark/history 2×2 因子实验的服务器结论
+
+该实验固定同一批 SIFT mutual matches 与同一个 PnP solver，只比较 3D landmark 来源和因果历史范围：
+
+| landmark | history | fold | active | equal count | center gain | center worse | rotation gain | pass |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| raw depth unprojected | recent 4 | short | 4/4 | 4/4 | -2.84% | 3 | +15.29% | 0 |
+| raw depth unprojected | all causal | short | 4/4 | 4/4 | -8.02% | 3 | -1.94% | 0 |
+| raw depth unprojected | all causal | medium | 2/4 | 4/4 | -9.98% | 1 | -24.70% | 0 |
+| raw depth unprojected | all causal | long | 3/4 | 4/4 | +4.36% | 2 | -11.94% | 0 |
+| native world pointmap | recent 4 | short | 4/4 | 4/4 | +3.69% | 3 | +24.35% | 0 |
+| native world pointmap | recent 4 | medium/long | 0/4 | 0/4 | 0 | 0 | 0 | 0 |
+| native world pointmap | all causal | short | 4/4 | 4/4 | +7.70% | 2 | +8.43% | 0 |
+| native world pointmap | all causal | medium | 1/4 | 4/4 | +0.59% | 0 | -10.82% | 0 |
+| native world pointmap | all causal | long | 0/4 | 4/4 | 0 | 0 | 0 | 0 |
+
+这组结果证实：
+
+- `all_causal` 让 medium/long 的 equal-count coverage 从不可用变为 `4/4`，最近 4 帧确实是匹配支撑瓶颈；
+- short 折中 native pointmap 的 center gain 高于 raw-depth unprojection，raw pose 参与反投影会把同源
+  camera-center 偏差写进 3D landmark；
+- explicit feature → native 3D point → PnP 链路可以在部分帧修正 raw pose，不是纯 no-op。
+
+同时也证伪：
+
+- 预锁主分支 `native_world_pointmap + all_causal + sam_dynamic_excluded` 没有通过三折：short 仍有
+  `2/4` 帧 center 变差，medium 只启动 `1/4`，long `0/4`；不能覆盖 V0 raw pose；
+- 同几何的 full-image 控制 short 为 `+2.70%`、medium 为 `-0.44%`、long 不启动；SAM exclusion
+  虽在 short 数值更高，但两个分支都失败，不能声称 SAM 帮助 pose；
+- 三种 instance/background 50/50 控制始终无法形成可比较支撑，后续删除，不再据此做 SAM 因果判断。
+
+因此停止调 SIFT ratio、最小点数、PnP 阈值和历史长度。下一实验只替换 correspondence source；
+native pointmap、all-causal history、PnP、GT scoring-only 和三折通过条件全部固定。
+
+## 13. V0 r7 候选：冻结 ALIKED + LightGlue correspondence audit
+
+下一候选使用 StreamVGGT 官方 pose-evaluation 依赖中已有明确接口的冻结局部特征，而不再训练 matcher：
+
+```text
+ALIKED keypoints/descriptors
+  → frozen ALIKED-LightGlue pair matching（current ↔ every causal history frame）
+  → one current keypoint / one best history landmark
+  → frozen native StreamVGGT world pointmap
+  → calibrated PnP-RANSAC + LM
+  → independent offline candidate
+```
+
+本次只保留两个可行且可解释的支撑分支：
+
+- `sam_dynamic_excluded`：预锁主分支，只排除两帧中 SAM 判为不可信/可能动态的区域；
+- `full_image`：相同 matcher、landmark、history 和 solver 的无 SAM 控制。
+
+不再运行已经连续不可行的 SAM/bbox/random 50/50 控制。先审计每帧 pair match 数、all-causal pooled
+unique-current 数、current spatial hull、equal-count、PnP inlier ratio/RMSE；之后才读取 GT 做三折评分。
+通过条件保持为每折 `active=4/4`、`equal-count=4/4`、mean center gain > 0 且
+`center_worse_frames=0`。即使通过，也只产生 offline candidate，不在同一次运行中覆盖 V0。
+
+该实验能证实或证伪的是“更强、为稀疏局部特征预训练的 correspondence source 是否能补上 r6 的
+coverage/错误匹配瓶颈”。它不能单独证明 SAM token 有效；只有预锁 SAM exclusion 分支三折通过且
+equal-count full-image 不通过，才可把额外收益归因到 SAM mask gating。

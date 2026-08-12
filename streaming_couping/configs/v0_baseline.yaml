@@ -98,6 +98,30 @@ baseline:
     max_rotation_degrees: 10.0
     max_translation_scene_fraction: 0.25
 
+  # r3 fixed landmark/history factors showed that SIFT correspondence remains
+  # the unresolved variable. This successor changes only that variable.
+  lightglue_pnp_candidate:
+    enabled: true
+    output_dir: outputs/streaming_couping_v0/lightglue_pnp_candidate
+    device: cuda:0
+    # The server command pins this inference-only dependency and stores its
+    # checksum-verified public weights on the mounted model disk.
+    lightglue_repo: externals/LightGlue
+    primary_method: sam_dynamic_excluded
+    methods: [full_image, sam_dynamic_excluded]
+    # Match StreamVGGT's official pose-eval keypoint defaults; do not tune on GT.
+    nfeatures: 2048
+    detection_threshold: 0.005
+    max_correspondences: 256
+    min_correspondences: 32
+    min_inliers: 16
+    point_confidence_threshold: 0.30
+    ransac_iterations: 1000
+    ransac_reprojection_pixels: 4.0
+    ransac_confidence: 0.999
+    max_rotation_degrees: 10.0
+    max_translation_scene_fraction: 0.25
+
   # Independent successor after TrackHead failed its one-frame query-slot
   # positive control. This uses explicit local-feature matches and PnP.
   feature_pnp_candidate:
