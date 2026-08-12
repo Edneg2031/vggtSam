@@ -36,7 +36,7 @@ CUDA_VISIBLE_DEVICES="$TRACK_GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. \
   exit 1
 }
 
-PYTHONPATH=. "$PYTHON_BIN" -c '
+PYTHONPATH=. "$PYTHON_BIN" - <<'PY'
 import json
 from pathlib import Path
 path = Path("outputs/streaming_couping_v0/track_ba_candidate/candidate_summary.json")
@@ -53,6 +53,6 @@ print(
     f"all_fold_pass={decision['primary_all_fold_pass']} "
     "selected_pose_unchanged=1"
 )
-'
+PY
 
 echo "Send candidate_summary.json and fold_decision.csv for review"
