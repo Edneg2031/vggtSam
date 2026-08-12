@@ -6,6 +6,9 @@ PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/pyt
 TRACK_GPU="${V0_TRACK_BA_GPU:-1}"
 CONFIG=streaming_couping/configs/v0_baseline.yaml
 OUTPUT=outputs/streaming_couping_v0/track_ba_candidate
+SUMMARY="$OUTPUT/candidate_summary.json"
+FOLD_CSV="$OUTPUT/fold_decision.csv"
+FRAME_CSV="$OUTPUT/frame_diagnostics.csv"
 
 cd "$ROOT"
 [[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
@@ -14,25 +17,35 @@ export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-echo "V0 Track-BA smoke: equal-count support, bounded SE3 and gradients"
-PYTHONPATH=. "$PYTHON_BIN" -m \
-  streaming_couping.scripts.smoke_v0_track_ba_candidate
+if [[ "${V0_TRACK_BA_FORCE_RERUN:-0}" == "1" ]] || \
+   [[ ! -s "$SUMMARY" ]] || [[ ! -s "$FOLD_CSV" ]] || [[ ! -s "$FRAME_CSV" ]]; then
+  echo "V0 Track-BA smoke: equal-count support, bounded SE3 and gradients"
+  PYTHONPATH=. "$PYTHON_BIN" -m \
+    streaming_couping.scripts.smoke_v0_track_ba_candidate
 
-echo "V0 Track-BA frozen TrackHead + causal fixed-structure optimizer"
-echo "physical GPU=$TRACK_GPU logical device=cuda:0"
-echo "GT is scoring-only; V0 selected pose remains raw in this experiment"
-CUDA_VISIBLE_DEVICES="$TRACK_GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. \
-  "$PYTHON_BIN" -m \
-  streaming_couping.scripts.run_v0_track_ba_candidate \
-  --config "$CONFIG" \
-  --device cuda:0
+  echo "V0 Track-BA frozen TrackHead + causal fixed-structure optimizer"
+  echo "physical GPU=$TRACK_GPU logical device=cuda:0"
+  echo "GT is scoring-only; V0 selected pose remains raw in this experiment"
+  CUDA_VISIBLE_DEVICES="$TRACK_GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. \
+    "$PYTHON_BIN" -m \
+    streaming_couping.scripts.run_v0_track_ba_candidate \
+    --config "$CONFIG" \
+    --device cuda:0
+else
+  echo "V0 Track-BA outputs already exist; skipping the GPU experiment"
+  echo "Set V0_TRACK_BA_FORCE_RERUN=1 only when an intentional rerun is needed"
+fi
 
-[[ -s "$OUTPUT/candidate_summary.json" ]] || {
+[[ -s "$SUMMARY" ]] || {
   echo "missing Track-BA candidate_summary.json" >&2
   exit 1
 }
-[[ -s "$OUTPUT/fold_decision.csv" ]] || {
+[[ -s "$FOLD_CSV" ]] || {
   echo "missing Track-BA fold_decision.csv" >&2
+  exit 1
+}
+[[ -s "$FRAME_CSV" ]] || {
+  echo "missing Track-BA frame_diagnostics.csv" >&2
   exit 1
 }
 
@@ -55,4 +68,48 @@ print(
 )
 PY
 
-echo "Send candidate_summary.json and fold_decision.csv for review"
+echo "V0 Track-BA no-op reason audit"
+PYTHONPATH=. "$PYTHON_BIN" - "$FRAME_CSV" <<'PY'
+import csv
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+path = Path(sys.argv[1])
+with path.open(encoding="utf8", newline="") as handle:
+    rows = list(csv.DictReader(handle))
+if not rows:
+    raise SystemExit(f"empty Track-BA diagnostics: {path}")
+
+grouped = defaultdict(list)
+for row in rows:
+    grouped[row["method"]].append(row)
+
+for method, items in grouped.items():
+    reasons = Counter(row.get("reason", "missing") for row in items)
+    active = sum(int(row.get("optimized", 0) or 0) for row in items)
+    feasible = sum(
+        int(row.get("equal_count_region_feasible", 0) or 0)
+        for row in items
+    )
+    print(f"\nmethod={method}")
+    print(
+        f"  active={active}/{len(items)} "
+        f"equal_count_feasible={feasible}/{len(items)} "
+        f"reasons={dict(reasons)}"
+    )
+    for row in items:
+        print(
+            "  "
+            f"frame={row['frame_index']} "
+            f"reason={row.get('reason', '')} "
+            f"anchor_corr={row.get('anchor_correspondences', '')} "
+            f"current_corr={row.get('current_correspondences', '')} "
+            f"rmse={row.get('initial_reprojection_rmse_pixels', '')}"
+            f"->{row.get('final_reprojection_rmse_pixels', '')} "
+            f"rotation_update_deg={row.get('current_rotation_update_degrees', '')} "
+            f"translation_update={row.get('current_translation_update_native', '')}"
+        )
+PY
+
+echo "Send the V0 Track-BA no-op reason audit printed above for review"
