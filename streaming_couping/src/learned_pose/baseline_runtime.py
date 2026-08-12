@@ -27,6 +27,7 @@ class TrackBACandidateConfig:
     output_dir: Path
     device: str
     track_token_source: str
+    query_source: str
     primary_method: str
     methods: tuple[str, ...]
     window_frames: int
@@ -104,6 +105,9 @@ def load_track_ba_candidate_config(
         device=str(section.get("device", baseline.get("audit_device", "cuda:0"))),
         track_token_source=str(
             section.get("track_token_source", "window_reaggregated")
+        ).strip().lower(),
+        query_source=str(
+            section.get("query_source", "shi_tomasi")
         ).strip().lower(),
         primary_method=str(
             section.get("primary_method", "sam_dynamic_excluded")
@@ -345,6 +349,10 @@ def _validate_track_ba_config(config: TrackBACandidateConfig) -> None:
         raise ValueError(
             "Track-BA track_token_source must be cached_streaming or "
             "window_reaggregated."
+        )
+    if config.query_source not in {"uniform_grid", "shi_tomasi"}:
+        raise ValueError(
+            "Track-BA query_source must be uniform_grid or shi_tomasi."
         )
     allowed = {
         "full_image",

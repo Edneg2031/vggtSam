@@ -87,6 +87,22 @@ def _sampling_smoke(config: TrackBACandidateConfig) -> None:
     pixel_x = points[:, 0].round().long()
     pixel_y = points[:, 1].round().long()
     assert int(region[pixel_y, pixel_x].sum()) == 16
+    corner_candidates = torch.tensor(
+        [[float(x), float(y)] for y in range(2, 14, 2) for x in range(2, 22, 2)]
+    )
+    keypoints, keypoint_feasible = sample_query_points(
+        full,
+        count=32,
+        grid_shape=(12, 16),
+        method="full_image",
+        frame_index=0,
+        candidate_points=corner_candidates,
+    )
+    assert keypoints.shape == (32, 2) and keypoint_feasible
+    assert all(
+        any(torch.equal(point, candidate) for candidate in corner_candidates)
+        for point in keypoints
+    )
 
 
 def _optimizer_smoke(config: TrackBACandidateConfig) -> None:
@@ -205,6 +221,7 @@ def _config() -> TrackBACandidateConfig:
         output_dir=Path("/tmp/v0_track_ba_smoke"),
         device="cpu",
         track_token_source="cached_streaming",
+        query_source="uniform_grid",
         primary_method="sam_dynamic_excluded",
         methods=("full_image", "sam_dynamic_excluded"),
         window_frames=3,

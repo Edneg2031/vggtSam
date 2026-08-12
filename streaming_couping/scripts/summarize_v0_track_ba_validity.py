@@ -19,6 +19,8 @@ COUNT_FIELDS = (
     "current_confidence_pass_count",
     "current_track_gate_pass_count",
     "current_valid_after_geometry_count",
+    "anchor_track_gate_pass_count",
+    "anchor_valid_after_geometry_count",
 )
 
 
@@ -36,6 +38,10 @@ def main() -> None:
         print(f"\nmethod={method}")
         print(
             "  aggregate "
+            f"anchor_gate={totals['anchor_track_gate_pass_count']}/"
+            f"{query_total} "
+            f"anchor_valid={totals['anchor_valid_after_geometry_count']}/"
+            f"{query_total} "
             f"finite={totals['current_track_finite_count']}/{query_total} "
             f"bounds={totals['current_track_in_bounds_count']}/{query_total} "
             f"vis={totals['current_visibility_pass_count']}/{query_total} "
@@ -47,10 +53,29 @@ def main() -> None:
             f"{query_total} "
             f"diagnosis={_diagnosis(totals)}"
         )
+        slot_names = sorted(
+            (
+                name
+                for name in items[0]
+                if name.startswith("slot_")
+                and name.endswith("_track_gate_pass_count")
+            ),
+            key=lambda name: int(name.split("_")[1]),
+        )
+        print(
+            "  temporal_gate_counts "
+            + " ".join(
+                f"slot{name.split('_')[1]}="
+                f"{sum(int(row[name]) for row in items)}/{query_total}"
+                for name in slot_names
+            )
+        )
         for row in items:
             print(
                 "  "
                 f"frame={row['frame_index']} "
+                f"anchor_gate={row['anchor_track_gate_pass_count']} "
+                f"anchor_valid={row['anchor_valid_after_geometry_count']} "
                 f"geometry={row['current_geometry_valid_count']}/"
                 f"{row['current_query_count']} "
                 f"finite={row['current_track_finite_count']} "
@@ -66,7 +91,11 @@ def main() -> None:
                 f"vis_range={row['current_visibility_min']}.."
                 f"{row['current_visibility_max']} "
                 f"conf_range={row['current_confidence_min']}.."
-                f"{row['current_confidence_max']}"
+                f"{row['current_confidence_max']} "
+                f"anchor_vis_range={row['anchor_visibility_min']}.."
+                f"{row['anchor_visibility_max']} "
+                f"anchor_conf_range={row['anchor_confidence_min']}.."
+                f"{row['anchor_confidence_max']}"
             )
 
     gate, reason = _gate(
@@ -81,6 +110,36 @@ def main() -> None:
     )
     if args.require_pass and not gate:
         raise SystemExit(2)
+    if args.temporal_csv is not None:
+        _print_temporal_audit(_read_rows(args.temporal_csv))
+
+
+def _print_temporal_audit(rows: list[dict[str, str]]) -> None:
+    grouped: dict[int, list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        grouped[int(row["window_frames"])].append(row)
+    print("\nV0 Track-BA temporal-span validity audit")
+    for window_frames in (1, 2, 3, 5):
+        items = grouped.get(window_frames, [])
+        if not items:
+            print(f"  window={window_frames} missing")
+            continue
+        totals = _totals(items)
+        query_total = totals["current_query_count"]
+        minimum = min(
+            int(row["current_valid_after_geometry_count"])
+            for row in items
+        )
+        print(
+            f"  window={window_frames} rows={len(items)} "
+            f"anchor_gate={totals['anchor_track_gate_pass_count']}/"
+            f"{query_total} "
+            f"current_gate={totals['current_track_gate_pass_count']}/"
+            f"{query_total} "
+            f"current_valid={totals['current_valid_after_geometry_count']}/"
+            f"{query_total} min_frame_valid={minimum} "
+            f"diagnosis={_diagnosis(totals)}"
+        )
 
 
 def _read_rows(path: Path) -> list[dict[str, str]]:
@@ -96,6 +155,12 @@ def _read_rows(path: Path) -> list[dict[str, str]]:
         raise ValueError(
             "Validity audit is stale or has the wrong token source: "
             f"{sorted(sources)}."
+        )
+    query_sources = {row.get("query_source", "") for row in rows}
+    if query_sources != {"shi_tomasi"}:
+        raise ValueError(
+            "Validity audit is stale or has the wrong query source: "
+            f"{sorted(query_sources)}."
         )
     return rows
 
@@ -148,6 +213,7 @@ def _gate(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", type=Path, required=True)
+    parser.add_argument("--temporal-csv", type=Path)
     parser.add_argument("--expected-frames", type=int, default=12)
     parser.add_argument("--minimum-correspondences", type=int, default=32)
     parser.add_argument("--require-pass", action="store_true")

@@ -5,11 +5,12 @@ ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
 TRACK_GPU="${V0_TRACK_BA_GPU:-1}"
 CONFIG=streaming_couping/configs/v0_baseline.yaml
-OUTPUT=outputs/streaming_couping_v0/track_ba_window_candidate
+OUTPUT=outputs/streaming_couping_v0/track_ba_keypoint_candidate
 SUMMARY="$OUTPUT/candidate_summary.json"
 FOLD_CSV="$OUTPUT/fold_decision.csv"
 FRAME_CSV="$OUTPUT/frame_diagnostics.csv"
 VALIDITY_CSV="$OUTPUT/validity_audit.csv"
+TEMPORAL_CSV="$OUTPUT/temporal_validity_audit.csv"
 
 cd "$ROOT"
 [[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
@@ -19,7 +20,7 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 if [[ "${V0_TRACK_BA_FORCE_RERUN:-0}" == "1" ]] || \
-   [[ ! -s "$VALIDITY_CSV" ]] || \
+   [[ ! -s "$VALIDITY_CSV" ]] || [[ ! -s "$TEMPORAL_CSV" ]] || \
    ! head -n 1 "$VALIDITY_CSV" | grep -q 'current_track_finite_count'; then
   echo "V0 Track-BA smoke: equal-count support, bounded SE3 and gradients"
   PYTHONPATH=. "$PYTHON_BIN" -m \
@@ -40,10 +41,15 @@ fi
   echo "missing Track-BA validity_audit.csv" >&2
   exit 1
 }
+[[ -s "$TEMPORAL_CSV" ]] || {
+  echo "missing Track-BA temporal_validity_audit.csv" >&2
+  exit 1
+}
 
 PYTHONPATH=. "$PYTHON_BIN" -m \
   streaming_couping.scripts.summarize_v0_track_ba_validity \
-  --csv "$VALIDITY_CSV"
+  --csv "$VALIDITY_CSV" \
+  --temporal-csv "$TEMPORAL_CSV"
 
 if ! PYTHONPATH=. "$PYTHON_BIN" -m \
   streaming_couping.scripts.summarize_v0_track_ba_validity \
@@ -77,10 +83,11 @@ fi
 PYTHONPATH=. "$PYTHON_BIN" - <<'PY'
 import json
 from pathlib import Path
-path = Path("outputs/streaming_couping_v0/track_ba_window_candidate/candidate_summary.json")
+path = Path("outputs/streaming_couping_v0/track_ba_keypoint_candidate/candidate_summary.json")
 summary = json.loads(path.read_text())
-assert summary["implementation_revision"] == "causal_window_reaggregated_track_head_ba_r3"
+assert summary["implementation_revision"] == "causal_window_keypoint_track_head_ba_r4"
 assert summary["track_token_source"] == "window_reaggregated"
+assert summary["query_source"] == "shi_tomasi"
 assert summary["causal_window"] is True
 assert summary["gt_used_for_candidate_generation"] is False
 assert summary["pose_model_trained"] is False

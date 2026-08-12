@@ -7,6 +7,7 @@ import argparse
 import csv
 import gc
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -38,7 +39,7 @@ from streaming_couping.src.v0_track_ba import (
 )
 
 
-REVISION = "causal_window_reaggregated_track_head_ba_r3"
+REVISION = "causal_window_keypoint_track_head_ba_r4"
 
 
 def main() -> None:
@@ -197,6 +198,7 @@ def run_candidate(
                     "window_frames": len(window.sequence_indices),
                     "query_count": int(window.query_points.shape[0]),
                     "track_token_source": candidate.track_token_source,
+                    "query_source": candidate.query_source,
                     "region_coverage_fraction": region_coverage(
                         window.region_mask
                     ),
@@ -262,6 +264,7 @@ def run_candidate(
             else "frozen_streamvggt_cached_streaming_track_head"
         ),
         "track_token_source": candidate.track_token_source,
+        "query_source": candidate.query_source,
         "geometry_source": "raw_streamvggt_depth_unprojected_in_anchor_camera",
         "pose_initializer_and_prior": "raw_streamvggt",
         "scene_scale_native": scene_scale,
@@ -303,6 +306,7 @@ def run_validity_audit(
     candidate.output_dir.mkdir(parents=True, exist_ok=True)
     methods = tuple(dict.fromkeys(("full_image", candidate.primary_method)))
     rows: list[dict[str, object]] = []
+    temporal_rows: list[dict[str, object]] = []
     for current in evaluation_indices:
         token_cache = {}
         for method in methods:
@@ -330,6 +334,7 @@ def run_validity_audit(
                     "window_frames": len(window.sequence_indices),
                     "query_count": int(window.query_points.shape[0]),
                     "track_token_source": candidate.track_token_source,
+                    "query_source": candidate.query_source,
                     "region_coverage_fraction": region_coverage(
                         window.region_mask
                     ),
@@ -340,6 +345,38 @@ def run_validity_audit(
                 }
             )
         token_cache.clear()
+        for window_frames in (1, 2, 3):
+            temporal_config = replace(
+                candidate,
+                window_frames=int(window_frames),
+            )
+            temporal_window = build_track_window(
+                payload=payload,
+                head=head,
+                current_index=current,
+                method="full_image",
+                config=temporal_config,
+                raw_world_to_camera=raw_pose,
+                intrinsics=intrinsics,
+                aggregator=aggregator,
+                token_cache={},
+            )
+            temporal_rows.append(
+                _validity_row(
+                    method="full_image",
+                    current=current,
+                    frames=frames,
+                    window=temporal_window,
+                    candidate=temporal_config,
+                )
+            )
+        full_row = next(
+            row
+            for row in reversed(rows)
+            if row["method"] == "full_image"
+            and int(row["sequence_index"]) == int(current)
+        )
+        temporal_rows.append(dict(full_row))
     for method in methods:
         print(f"V0 Track-BA validity completed method={method}")
     del head, aggregator
@@ -348,7 +385,40 @@ def run_validity_audit(
         torch.cuda.empty_cache()
     output = candidate.output_dir / "validity_audit.csv"
     _write_csv(output, rows)
+    _write_csv(
+        candidate.output_dir / "temporal_validity_audit.csv",
+        temporal_rows,
+    )
     return output
+
+
+def _validity_row(
+    *,
+    method: str,
+    current: int,
+    frames: tuple[int, ...],
+    window,
+    candidate,
+) -> dict[str, object]:
+    return {
+        "method": method,
+        "sequence_index": current,
+        "frame_index": frames[current],
+        "anchor_sequence_index": window.anchor_index,
+        "anchor_frame_index": frames[window.anchor_index],
+        "window_sequence_indices": " ".join(
+            str(value) for value in window.sequence_indices
+        ),
+        "window_frames": len(window.sequence_indices),
+        "query_count": int(window.query_points.shape[0]),
+        "track_token_source": candidate.track_token_source,
+        "query_source": candidate.query_source,
+        "region_coverage_fraction": region_coverage(window.region_mask),
+        "equal_count_region_feasible": int(
+            window.equal_count_region_feasible
+        ),
+        **window.validity_diagnostics,
+    }
 
 
 def _decode_target_for_scoring(*, payload: dict, pose_decoder) -> torch.Tensor:
@@ -539,8 +609,11 @@ def _gain(raw: float, candidate: float) -> float:
 def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
     if not rows:
         raise ValueError(f"Refusing to write empty CSV {path}.")
+    fieldnames = tuple(
+        dict.fromkeys(name for row in rows for name in row)
+    )
     with path.open("w", encoding="utf8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=tuple(rows[0]))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 

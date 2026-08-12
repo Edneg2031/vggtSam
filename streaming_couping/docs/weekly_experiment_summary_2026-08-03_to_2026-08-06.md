@@ -458,6 +458,25 @@ TrackHead。旧结果保留在 `track_ba_candidate/`；新结果写入 `track_ba
 每帧都有至少 32 条有效 current tracks，才自动运行五组固定控制和 BA。若门控失败，命令在 BA 前停止，
 不会再次把 no-op 当成 pose 方法结果。V0 active selected pose 在两种情况下都仍是 raw StreamVGGT。
 
+r3 服务器预检仍然失败：同窗口重聚合后，两种方法的 `6144/6144` tracks 均 finite 且全部在图内，
+但 current visibility/confidence 仍为 `0/6144` 通过，confidence 仍只有约 `5e-11–9e-10`。因此
+“独立 streaming token 不能重拼窗口”并非完整根因；正确重聚合本身也没有恢复官方 confidence gate。
+
+对照 upstream StreamVGGT BA 后发现另一个未满足的输入契约：官方先用
+`ALIKED + SuperPoint + SIFT` 选出 feature keypoints，再查询 TrackHead；r1–r3 一直使用规则 64×64
+网格上的 UV-FPS。TrackHead 的坐标回归可以对任意点输出 finite/in-bounds 值，但 visibility/confidence
+正是在判断局部特征是否可跟踪，因此规则平坦/弱纹理点可能让全部 confidence 失效。
+
+下一修订 `causal_window_keypoint_track_head_ba_r4` 使用 deterministic Shi–Tomasi corners 作为无需训练的
+feature-keypoint query，然后仍在相同候选集合上执行 full-image / SAM mask equal-count 支撑控制。
+它不改变官方 `vis>0.05 && conf>0.05` gate。新结果独立写入 `track_ba_keypoint_candidate/`，并额外报告
+anchor query slot 和 slot 0–4 的 gate 数量；另用同一批 future frames 输出 window length
+`1/2/3/5` 的 temporal-span validity 正控制（只诊断、不参与主 gate、不运行 BA）：
+
+- anchor 自身也为零：checkpoint、预处理或 TrackHead head/query 契约仍有实现错误，终止 BA；
+- anchor 正常、后续 slot 快速归零：15-frame 采样间隔/运动幅度超过 tracker 时间尺度；
+- current 每帧至少 32 条有效：关键点契约成立，原命令自动继续五组 BA 和三折评分。
+
 服务器仍只需运行：
 
 ```text

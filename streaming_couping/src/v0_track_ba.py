@@ -239,6 +239,17 @@ def build_track_window(
         grid_shape=config.query_grid,
         method=method,
         frame_index=anchor,
+        candidate_points=(
+            shi_tomasi_query_candidates(
+                images[0],
+                max_candidates=max(
+                    int(config.query_count) * 16,
+                    int(config.query_grid[0]) * int(config.query_grid[1]),
+                ),
+            )
+            if config.query_source == "shi_tomasi"
+            else None
+        ),
     )
     batch_images = images.unsqueeze(0).to(device=device, dtype=torch.float32)
     batch_queries = queries.unsqueeze(0).to(device=device, dtype=torch.float32)
@@ -446,7 +457,22 @@ def track_validity_and_diagnostics(
             current_tracks[:, 1],
             mask=current_track_finite,
         ),
+        "anchor_track_finite_count": int(track_finite[0].sum()),
+        "anchor_track_in_bounds_count": int(in_bounds[0].sum()),
+        "anchor_visibility_pass_count": int(visibility_pass[0].sum()),
+        "anchor_confidence_pass_count": int(confidence_pass[0].sum()),
+        "anchor_track_gate_pass_count": int(track_gate_pass[0].sum()),
+        "anchor_valid_after_geometry_count": int(valid[0].sum()),
+        **_finite_range("anchor_visibility", visibility[0]),
+        **_finite_range("anchor_confidence", confidence[0]),
     }
+    for slot in range(int(tracks.shape[0])):
+        diagnostics[f"slot_{slot}_track_gate_pass_count"] = int(
+            track_gate_pass[slot].sum()
+        )
+        diagnostics[f"slot_{slot}_valid_after_geometry_count"] = int(
+            valid[slot].sum()
+        )
     return valid, diagnostics
 
 
@@ -531,6 +557,7 @@ def sample_query_points(
     grid_shape: tuple[int, int],
     method: str,
     frame_index: int,
+    candidate_points: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, bool]:
     """Deterministic UV-stratified equal-count sampling.
 
@@ -550,7 +577,16 @@ def sample_query_points(
     grid_y = torch.linspace(0, height - 1, int(grid_shape[0]))
     grid_x = torch.linspace(0, width - 1, int(grid_shape[1]))
     y, x = torch.meshgrid(grid_y, grid_x, indexing="ij")
-    candidates = torch.stack((x.reshape(-1), y.reshape(-1)), dim=-1)
+    grid_candidates = torch.stack((x.reshape(-1), y.reshape(-1)), dim=-1)
+    candidates = (
+        grid_candidates
+        if candidate_points is None
+        else candidate_points.detach().float().cpu()
+    )
+    if candidates.ndim != 2 or candidates.shape[-1] != 2:
+        raise ValueError("Track-BA candidate points must be [N,2].")
+    if not candidates.shape[0]:
+        candidates = grid_candidates
     pixel_x = candidates[:, 0].round().long().clamp(0, width - 1)
     pixel_y = candidates[:, 1].round().long().clamp(0, height - 1)
     candidate_allowed = allowed[pixel_y, pixel_x]
@@ -571,12 +607,17 @@ def sample_query_points(
             )
         else:
             feasible = False
-            selected = farthest_uv(candidates, int(count))
+            selected = _fill_query_points(
+                candidates[candidate_allowed],
+                grid_candidates,
+                int(count),
+            )
     else:
         allowed_points = candidates[inside]
         feasible = allowed_points.shape[0] >= int(count)
-        selected = farthest_uv(
-            allowed_points if feasible else candidates,
+        selected = _fill_query_points(
+            allowed_points if feasible else candidates[candidate_allowed],
+            grid_candidates,
             int(count),
         )
     if selected.shape[0] != int(count):
@@ -585,6 +626,84 @@ def sample_query_points(
             f"frame={frame_index}: {selected.shape[0]}/{count}."
         )
     return selected.float(), bool(feasible)
+
+
+def _fill_query_points(
+    preferred: torch.Tensor,
+    grid: torch.Tensor,
+    count: int,
+) -> torch.Tensor:
+    """Prefer feature points and deterministically fill a rare shortage."""
+
+    preferred_count = min(int(count), int(preferred.shape[0]))
+    selected = ranked_farthest_uv(preferred, preferred_count)
+    if selected.shape[0] >= int(count):
+        return selected
+    needed = int(count) - int(selected.shape[0])
+    filler = farthest_uv(grid, needed)
+    return torch.cat((selected, filler), dim=0)
+
+
+def ranked_farthest_uv(points: torch.Tensor, count: int) -> torch.Tensor:
+    """Spread detector-ranked corners while retaining the strongest seed."""
+
+    count = min(int(count), int(points.shape[0]))
+    if count <= 0:
+        return points[:0]
+    selected = torch.empty(count, dtype=torch.long)
+    selected[0] = 0
+    distance = (points - points[0]).square().sum(dim=-1)
+    for index in range(1, count):
+        current = distance.argmax()
+        selected[index] = current
+        distance = torch.minimum(
+            distance,
+            (points - points[current]).square().sum(dim=-1),
+        )
+    return points.index_select(0, selected)
+
+
+def shi_tomasi_query_candidates(
+    image: torch.Tensor,
+    *,
+    max_candidates: int,
+) -> torch.Tensor:
+    """Deterministic CPU keypoints matching TrackHead's feature-query contract."""
+
+    if image.ndim != 3 or image.shape[0] != 3:
+        raise ValueError("Shi-Tomasi input must be RGB [3,H,W].")
+    try:
+        import cv2
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError(
+            "query_source=shi_tomasi requires opencv-python, which is an "
+            "upstream StreamVGGT dependency."
+        ) from exc
+    rgb = (
+        image.detach()
+        .float()
+        .clamp(0, 1)
+        .mul(255)
+        .byte()
+        .permute(1, 2, 0)
+        .contiguous()
+        .numpy()
+    )
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    cv2.setNumThreads(1)
+    corners = cv2.goodFeaturesToTrack(
+        gray,
+        maxCorners=int(max_candidates),
+        qualityLevel=1e-5,
+        minDistance=2.0,
+        blockSize=3,
+        useHarrisDetector=False,
+    )
+    if corners is None:
+        return torch.empty(0, 2, dtype=torch.float32)
+    points = np.asarray(corners[:, 0], dtype=np.float32)
+    return torch.from_numpy(points.copy()).round()
 
 
 def farthest_uv(points: torch.Tensor, count: int) -> torch.Tensor:
