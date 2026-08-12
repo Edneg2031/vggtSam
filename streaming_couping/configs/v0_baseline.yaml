@@ -1,6 +1,5 @@
-# V0: V7.1-style pose-conditioned camera L0 plus dynamic SAM3.1 frontend.
-# SAM appearance descriptors are disabled; V7.4-style geometry transport is
-# evaluated as a separate candidate and does not overwrite the selected L0.
+# V0: dynamic SAM3.1 tracking plus unmodified StreamVGGT pose.
+# Failed direct SE(3) and geometry-transport pose heads are not instantiated.
 recovery_config: streaming_couping/configs/recovery_dynamic_instance.yaml
 output_dir: outputs/streaming_couping_v0/data_stage
 
@@ -52,38 +51,10 @@ fusion:
   identity_hard_mismatch_max_fitness: 0.02
   dpt_layer_indices: [4, 11, 17, 23]
 
-training:
-  device: cuda:0
-
 baseline:
   version: v0
   output_dir: outputs/streaming_couping_v0
   clip_name: 00a231a370_90_525_step15_37_68_54
-  training_device: cuda:0
-  local_point_count: 32
+  audit_device: cuda:0
   frames:
-    camera_base: [105, 120, 135, 150, 165, 180, 195, 210, 225, 240, 255]
-    geometry_refiner: [270, 285, 300, 315, 330, 345]
     evaluation: [360, 375, 390, 405, 420, 435, 450, 465, 480, 495, 510, 525]
-  model:
-    hidden_dim: 256
-    min_track_confidence: 0.50
-    min_geometry_confidence: 0.20
-    min_static_score: 0.20
-    max_rotation_degrees: 15.0
-    max_translation_native: 0.50
-    affinity_temperature: 0.10
-  optimization:
-    base_steps: 1200
-    refiner_steps: 3000
-    learning_rate: 0.001
-    weight_decay: 0.0
-    grad_clip_norm: 5.0
-    translation_weight: 10.0
-    log_every: 200
-    seed: 0
-    # Training is rejected if it is a no-op. Evaluation always writes an audit;
-    # acceptance requires positive mean center gain and zero worse frames in
-    # every locked four-frame future fold.
-    min_train_loss_drop_percent: 1.0
-    min_evaluation_gain_percent: 0.0

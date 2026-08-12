@@ -200,9 +200,9 @@ loss 下降 85%–95% 仍没有形成训练内高精度 correspondence；因此 
    这把问题定位为真实 `camera_hidden` 下的零初始化 stationary point。r1/r2 已废弃，不能作为
    baseline 证据。
 
-## 8. V0 baseline（恢复 V7.1 后重新验收）
+## 8. V0 r3 pose 候选（已废弃）
 
-名称仍为 `V0`，当前实现修订为 `v71_pose_conditioned_l0_v74_geometry_r3`：
+历史实现修订为 `v71_pose_conditioned_l0_v74_geometry_r3`：
 
 ```text
 RGB stream
@@ -261,29 +261,81 @@ geometry candidate 也不能升级为 selected：它相对 selected 在 short �
 active correction，long 下降约 1.49%；frame 525 的 center 和 rotation 都进一步变差。当前证据不支持
 继续调 geometry transport 阈值。
 
+### V0 r3 参数匹配控制最终结论
+
+四个分支均为 `996,126` 参数，使用相同训练帧、步数、seed、loss 和未来 fold：
+
+| input | short center gain | medium center gain | long center gain | all-fold pass |
+|---|---:|---:|---:|---:|
+| camera token + raw pose | 30.5087% | -26.2753% | 45.2593% | 0 |
+| raw-pose-only | 24.1559% | -9.24560% | 32.2474% | 0 |
+| camera-token-only | 29.3107% | -7.45889% | 47.0595% | 0 |
+| time-only | -3.63138% | -33.3661% | 20.2059% | 0 |
+
+训练审计不是 no-op：normal、pose-only、camera-token-only 的训练 loss 都下降约 100%，time-only 下降
+38.83%。然而所有方法都在 medium 的 4 帧中产生 3 个 center 坏帧。最终 decision 为：
+
+- `normal_all_fold_pass=0`；
+- `normal_beats_pose_only_all_folds=0`；
+- `normal_beats_camera_token_only_all_folds=0`；
+- `normal_beats_time_only_all_folds=1`；
+- `v0_pose_validation_pass=0`。
+
+这证实 camera hidden 和 raw pose 都含有可拟合信息，normal 也不只是 time index 拟合；但它没有建立
+稳定的未来 pose 修正，也没有证明两种输入的融合优于单输入。camera-token-only 在 medium/long 的
+center 反而优于 normal，说明加入 raw pose 会在部分时间段造成负迁移。**到此终止 direct learned
+SE(3) head 路线，不再调 hidden dim、训练步数、loss 权重或 geometry transport 阈值。**
+
+## 9. 当前保留的 V0 r4
+
+当前 active 实现修订为 `raw_streamvggt_dynamic_tracking_r4`：
+
+```text
+RGB stream
+├─ frozen StreamVGGT → raw pose + pointmap/local geometry
+└─ SAM3.1 forward-only prompt sessions
+     → multi-prompt / multiple instances
+     → persistent ID + permanent slot registry
+     → causal late birth + mature observation
+     → historical geometry 生成下一时刻 prompt
+     → raw/corrected mask competition
+
+selected pose = raw StreamVGGT exactly
+```
+
+清理结果：
+
+- 删除 `CameraPoseBaseline`、`DynamicInstanceGeometryRefiner` 及训练 runtime；
+- 删除已完成使命的 parameter-matched control runner；其结果保留在本账本；
+- 不再生成或读取 `camera_baseline.pt`、`geometry_pose_refiner.pt`；
+- `poses.pt` 只保存 raw 和与其完全相同的 selected pose；
+- summary 固定记录 `pose_modification_applied=false`、`pose_improvement_claim=false`；
+- tracking gate 验证 birth registry 与逐帧 discovered 数严格一致、discovery 单调、mature track 只能读取
+  更早的 geometry birth、`(prompt, track ID)` 唯一，并要求至少一个未来 birth。
+
+因此 V0 r4 的 `tracking_baseline_acceptance_pass=1` 只表示流式动态实例工程不变量通过，不表示 SAM
+tracking 精度或 pose 精度提高。几何 correction 的应用次数会被记录，但没有 GT mask 对照时也不能把
+“应用了 correction”写成“tracking accuracy 已提高”。
+
 运行入口：
 
 ```text
 zsh streaming_couping/commands_v0_baseline.txt
 ```
 
-输出目录固定为 `outputs/streaming_couping_v0/`，但复用已有 V7.4 dynamic cache，避免重复保存冻结
-backbone tensor。结果包含 `baseline_summary.json`、
-`frame_diagnostics.csv`、`dynamic_instance_diagnostics.csv` 和 `poses.pt`。summary/checkpoint 签名都记录
-`baseline_version=v0` 和实现修订；旧 no-op checkpoint 会自动失效。控制验证另外输出
-`validation/v0_pose_control_validation.csv` 和 `validation/v0_pose_control_decision.json`。
-科学上的 fail 不会再让命令中断或丢失输出。旧 V4–V9.8 结论只保留在本账本。
+输出目录固定为 `outputs/streaming_couping_v0/`，并复用已有 V7.4 dynamic cache。结果只包含
+`baseline_summary.json`、`frame_diagnostics.csv`、`dynamic_instance_diagnostics.csv` 和 `poses.pt`；旧
+pose checkpoint 即使仍在服务器输出目录也不会被 active code 读取。
 
 这个 baseline 符合“第一帧不需要出现所有物体，未来物体可加入”，但仍有三个限制：
 
 1. SAM3.1 是 open-vocabulary prompt detector，不是 class-agnostic all-object proposal；目前只配置
    `bed`、`wardrobe`，会发现这两个概念的多个实例，但不会自动覆盖任意类别。
-2. selected candidate 的 aggregate 收益来自 V7.1-style learned head，但三折 gate 已失败；dynamic
-   SAM 与 geometry candidate 是否帮助 pose 更不能从 aggregate 指标推出。
+2. selected pose 是 raw StreamVGGT；当前没有 pose 改善方法。
 3. 当前 runner 是按时间顺序的 causal replay；SAM3.1 session 仍由 cache builder 对整段有序帧创建和
    关闭，尚未封装成常驻服务式的 `step(frame)` API。
 
-## 9. DualMap 启发下值得保留的下一条理论路线
+## 10. DualMap 启发下值得保留的下一条理论路线
 
 V0 三折失败后，不应继续扩大或调参当前 direct learned SE(3) head。下一版代码应保留 V0 的动态
 实例前端和 geometry-assisted mask，但把 raw StreamVGGT pose 恢复为未验收阶段的 selected 输出，

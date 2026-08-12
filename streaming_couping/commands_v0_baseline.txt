@@ -16,15 +16,15 @@ export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-echo "V0 smoke: pose-conditioned L0 gradients, late birth and exact fallback"
+echo "V0 smoke: raw pose, causal late birth and geometry-mask fallback"
 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_dynamic_instance_baseline
 
 ARGS=()
-[[ "${BASELINE_FRESH:-0}" == "1" ]] && ARGS+=(--no-resume)
 [[ "${BASELINE_REBUILD_CACHE:-0}" == "1" ]] && ARGS+=(--rebuild-cache)
 
 echo "V0 physical GPUs=$VISIBLE_GPUS"
-echo "logical layout: StreamVGGT=cuda:0,cuda:1 SAM3.1=cuda:2 fit=cuda:0"
+echo "logical layout: StreamVGGT=cuda:0,cuda:1 SAM3.1=cuda:2 audit=cuda:0"
+echo "No pose model is trained; selected pose is exact raw StreamVGGT"
 CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" PYTHONUNBUFFERED=1 PYTHONPATH=. \
   "$PYTHON_BIN" -m streaming_couping.scripts.run_dynamic_instance_baseline \
   --config "$CONFIG" \
@@ -32,7 +32,7 @@ CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" PYTHONUNBUFFERED=1 PYTHONPATH=. \
   --streamvggt-devices cuda:0,cuda:1 \
   --sam3-device cuda:2 \
   --geometry-device cuda:0 \
-  --training-device cuda:0 \
+  --audit-device cuda:0 \
   "${ARGS[@]}"
 
 [[ -s outputs/streaming_couping_v0/baseline_summary.json ]] || {
@@ -44,23 +44,20 @@ import json
 from pathlib import Path
 summary = json.loads(Path("outputs/streaming_couping_v0/baseline_summary.json").read_text())
 assert summary["baseline_version"] == "v0"
-assert summary["implementation_revision"] == "v71_pose_conditioned_l0_v74_geometry_r3"
-assert summary["selected_pose_branch"] == "v71_pose_conditioned_camera_l0"
-assert summary["camera_training"]["no_op_check"] == "passed"
-assert summary["geometry_training"]["no_op_check"] == "passed"
-gain = summary["selected_gain_vs_raw_percent"]
-decision = summary["baseline_acceptance_pass"]
-print(f"V0 all-fold decision={decision} mean-center aggregate gain={gain:.6g}%")
+assert summary["implementation_revision"] == "raw_streamvggt_dynamic_tracking_r4"
+assert summary["selected_pose_branch"] == "raw_streamvggt"
+assert summary["selected_pose_exact_raw"] == 1
+assert summary["pose_modification_applied"] is False
+assert summary["pose_improvement_claim"] is False
+assert summary["tracking_baseline_acceptance_pass"] == 1
+audit = summary["tracking_audit"]
+tracks = audit["discovered_track_count"]
+late_births = audit["late_birth_count"]
+print(
+    "V0 accepted tracking baseline "
+    f"tracks={tracks} "
+    f"late_births={late_births} "
+    "selected_pose=exact_raw"
+)
 '
-
-echo "V0 parameter-matched pose input controls"
-CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" PYTHONUNBUFFERED=1 PYTHONPATH=. \
-  "$PYTHON_BIN" -m streaming_couping.scripts.validate_v0_pose_controls \
-  --config "$CONFIG" \
-  --device cuda:0
-
-[[ -s outputs/streaming_couping_v0/validation/v0_pose_control_decision.json ]] || {
-  echo "missing v0_pose_control_decision.json" >&2
-  exit 1
-}
-echo "V0 baseline audit completed"
+echo "V0 raw-pose dynamic-tracking baseline completed"

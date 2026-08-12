@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and audit V0: restored V7.1 L0 plus dynamic-instance candidates."""
+"""Build and audit V0 dynamic SAM tracking with unmodified StreamVGGT pose."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from dataclasses import asdict, replace
 import hashlib
 import json
 from pathlib import Path
-import time
 
 import torch
 
@@ -18,13 +17,9 @@ from streaming_couping.src.external_repos import maybe_add_repo_to_path
 from streaming_couping.src.learned_pose.baseline_runtime import (
     BaselineRunConfig,
     camera_centers,
-    forward_model,
+    decode_cached_poses,
     load_baseline_run_config,
     pose_metrics,
-    prepare_cached_batch,
-    seed_everything,
-    slice_batch_prefix,
-    train_pose_model,
 )
 from streaming_couping.src.learned_pose.cache import (
     build_feature_caches,
@@ -36,32 +31,26 @@ from streaming_couping.src.learned_pose.config import (
     LearnedPoseConfig,
     load_learned_pose_config,
 )
-from streaming_couping.src.learned_pose.dynamic_instance_baseline import (
-    CameraPoseBaseline,
-    DynamicInstanceGeometryRefiner,
-    relative_pose_to_reference,
-)
 
 
-V0_IMPLEMENTATION_REVISION = "v71_pose_conditioned_l0_v74_geometry_r3"
-
+V0_IMPLEMENTATION_REVISION = "raw_streamvggt_dynamic_tracking_r4"
 
 FRAME_COLUMNS = (
     "sequence_index",
     "frame_index",
     "sam_tracks_discovered",
     "observed_instances",
-    "eligible_instances",
     "mature_instances",
-    "geometry_candidate_active",
-    "geometry_candidate_exact_l0_fallback",
+    "identity_valid_instances",
+    "associated_instances",
+    "birth_slots",
+    "birth_prompts",
+    "geometry_birth_slots",
+    "geometry_birth_prompts",
+    "selected_exact_raw",
     "raw_rotation_error_deg",
-    "l0_rotation_error_deg",
-    "geometry_candidate_rotation_error_deg",
     "selected_rotation_error_deg",
     "raw_center_error_native",
-    "l0_center_error_native",
-    "geometry_candidate_center_error_native",
     "selected_center_error_native",
 )
 
@@ -72,27 +61,11 @@ def main() -> None:
     run = load_baseline_run_config(args.config)
     if args.output_dir:
         run = replace(
-            run, output_dir=Path(args.output_dir).expanduser().resolve()
-        )
-    if args.training_device:
-        run = replace(run, training_device=args.training_device)
-    if args.base_steps is not None or args.refiner_steps is not None:
-        run = replace(
             run,
-            optimizer=replace(
-                run.optimizer,
-                base_steps=(
-                    int(args.base_steps)
-                    if args.base_steps is not None
-                    else run.optimizer.base_steps
-                ),
-                refiner_steps=(
-                    int(args.refiner_steps)
-                    if args.refiner_steps is not None
-                    else run.optimizer.refiner_steps
-                ),
-            ),
+            output_dir=Path(args.output_dir).expanduser().resolve(),
         )
+    if args.audit_device:
+        run = replace(run, audit_device=str(args.audit_device))
     if args.sam3_device or args.geometry_device or args.streamvggt_devices:
         data = replace(
             data,
@@ -112,17 +85,12 @@ def main() -> None:
         data = replace(data, features=replace(data.features, rebuild=True))
     if args.stage in {"all", "cache"}:
         build_feature_caches(data)
-    if args.stage in {"all", "fit"}:
-        result = run_baseline(data, run, resume=not args.no_resume)
-        print(f"dynamic-instance baseline result={result}")
+    if args.stage in {"all", "audit"}:
+        result = run_baseline(data, run)
+        print(f"dynamic-tracking baseline result={result}")
 
 
-def run_baseline(
-    data: LearnedPoseConfig,
-    run: BaselineRunConfig,
-    *,
-    resume: bool,
-) -> Path:
+def run_baseline(data: LearnedPoseConfig, run: BaselineRunConfig) -> Path:
     clip = _find_clip(data, run.clip_name)
     path = cache_path(data, clip)
     if not path.is_file():
@@ -130,436 +98,121 @@ def run_baseline(
             f"Missing baseline cache {path}; run --stage cache or --stage all."
         )
     payload = load_feature_cache(path)
-    _validate_payload(payload, clip=clip, run=run)
+    _validate_payload(payload, clip=clip)
     recovery = load_config(data.recovery_config)
     maybe_add_repo_to_path(recovery.streamvggt_repo)
     from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
 
-    batch, raw_pose, target_pose = prepare_cached_batch(
+    raw_pose, target_pose = decode_cached_poses(
         payload,
         pose_decoder=pose_encoding_to_extri_intri,
-        device=run.training_device,
-        local_point_count=run.local_point_count,
+        device=run.audit_device,
     )
     frames = tuple(int(value) for value in payload["frame_indices"])
     positions = {frame: index for index, frame in enumerate(frames)}
-    reference = int(payload["reference_sequence_index"])
-    if reference != 0:
-        raise ValueError("The retained baseline currently requires reference index 0.")
-    camera_input_audit = _camera_input_audit(
-        batch["camera_hidden"], raw_pose, reference_index=reference
-    )
-    print(
-        "V0 camera input audit "
-        f"hidden_temporal_std={camera_input_audit['camera_hidden_temporal_std']:.8g} "
-        f"raw_relative_pose_std={camera_input_audit['raw_relative_pose_temporal_std']:.8g}"
-    )
-    all_requested = (
-        run.base_train_frames
-        + run.geometry_train_frames
-        + run.evaluation_frames
-    )
-    missing = set(all_requested) - set(frames)
+    missing = set(run.evaluation_frames) - set(frames)
     if missing:
-        raise ValueError(f"Baseline cache lacks requested frames={sorted(missing)}.")
+        raise ValueError(f"Baseline cache lacks evaluation frames={sorted(missing)}.")
+    reference = int(payload["reference_sequence_index"])
+    evaluation_indices = [positions[frame] for frame in run.evaluation_frames]
+    tracking_audit = _tracking_audit(payload, reference_index=reference)
+    if not int(tracking_audit["tracking_audit_pass"]):
+        raise RuntimeError(f"V0 dynamic tracking audit failed: {tracking_audit}")
 
     run.output_dir.mkdir(parents=True, exist_ok=True)
     _clear_stale_result_artifacts(run.output_dir)
-    signature = _signature(run=run, payload=payload, cache_path_value=path)
-    seed_everything(run.optimizer.seed)
-    base = CameraPoseBaseline(
-        camera_dim=int(batch["camera_hidden"].shape[-1]),
-        config=run.model,
-    ).to(run.training_device)
-    base_path = run.output_dir / "camera_baseline.pt"
-    base_training = _load_or_train_base(
-        base,
-        checkpoint=base_path,
-        signature=signature,
-        resume=resume,
-        batch=batch,
-        raw_pose=raw_pose,
-        target_pose=target_pose,
-        reference=reference,
-        positions=positions,
-        run=run,
-    )
-    for parameter in base.parameters():
-        parameter.requires_grad_(False)
-    base.eval()
-    with torch.no_grad():
-        l0 = forward_model(
-            base,
-            batch=batch,
-            baseline=raw_pose,
-            reference_index=reference,
-        )
-
-    refiner = DynamicInstanceGeometryRefiner(
-        base_model=base,
-        geometry_dim=int(batch["local_features"].shape[-1]),
-        config=run.model,
-    ).to(run.training_device)
-    geometry_last = positions[max(run.geometry_train_frames)]
-    training_batch = slice_batch_prefix(batch, length=geometry_last + 1)
-    training_raw = raw_pose[:, : geometry_last + 1]
-    training_target = target_pose[:, : geometry_last + 1]
-    with torch.no_grad():
-        initial = forward_model(
-            refiner,
-            batch=training_batch,
-            baseline=training_raw,
-            reference_index=reference,
-        )
-    requested_indices = [positions[frame] for frame in run.geometry_train_frames]
-    active_indices = [
-        index
-        for index in requested_indices
-        if bool(initial["active_frames"][0, index].cpu())
-    ]
-    if not active_indices:
-        raise RuntimeError(
-            "No mature, static, geometry-valid instance exists on refiner "
-            "training frames. Inspect dynamic_instance_diagnostics.csv."
-        )
-    refiner_path = run.output_dir / "geometry_pose_refiner.pt"
-    refiner_training = _load_or_train_refiner(
-        refiner,
-        checkpoint=refiner_path,
-        signature=signature,
-        active_indices=active_indices,
-        resume=resume,
-        batch=training_batch,
-        raw_pose=training_raw,
-        target_pose=training_target,
-        reference=reference,
-        run=run,
-    )
-    with torch.no_grad():
-        refined = forward_model(
-            refiner,
-            batch=batch,
-            baseline=raw_pose,
-            reference_index=reference,
-        )
-    _assert_causal_prefix_equivalence(
-        refiner,
-        full=refined,
-        batch=batch,
-        raw_pose=raw_pose,
-        reference=reference,
-    )
-    result = _write_outputs(
+    return _write_outputs(
         run=run,
         payload=payload,
         cache_path_value=path,
-        signature=signature,
+        signature=_signature(run=run, payload=payload, cache_path_value=path),
         raw_pose=raw_pose,
-        l0_pose=l0["world_to_camera"],
-        refined=refined,
         target_pose=target_pose,
         reference=reference,
-        evaluation_indices=[positions[frame] for frame in run.evaluation_frames],
-        base_training=base_training,
-        refiner_training=refiner_training,
-        camera_input_audit=camera_input_audit,
+        evaluation_indices=evaluation_indices,
+        tracking_audit=tracking_audit,
     )
-    return result
-
-
-def _load_or_train_base(
-    model,
-    *,
-    checkpoint,
-    signature,
-    resume,
-    batch,
-    raw_pose,
-    target_pose,
-    reference,
-    positions,
-    run,
-):
-    expected = f"{signature}:camera"
-    loaded = _load_checkpoint(checkpoint, expected, model) if resume else None
-    if loaded is not None:
-        print(f"resumed camera baseline: {checkpoint}")
-        return loaded
-    last = positions[max(run.base_train_frames)]
-    training_batch = slice_batch_prefix(batch, length=last + 1)
-    started = time.perf_counter()
-    training = train_pose_model(
-        model,
-        batch=training_batch,
-        baseline=raw_pose[:, : last + 1],
-        target=target_pose[:, : last + 1],
-        reference_index=reference,
-        training_indices=[positions[frame] for frame in run.base_train_frames],
-        steps=run.optimizer.base_steps,
-        config=run.optimizer,
-    )
-    training["seconds"] = time.perf_counter() - started
-    _save_checkpoint(checkpoint, expected, model, training)
-    return training
-
-
-def _load_or_train_refiner(
-    model,
-    *,
-    checkpoint,
-    signature,
-    active_indices,
-    resume,
-    batch,
-    raw_pose,
-    target_pose,
-    reference,
-    run,
-):
-    expected = f"{signature}:geometry:{','.join(str(v) for v in active_indices)}"
-    loaded = _load_checkpoint(checkpoint, expected, model) if resume else None
-    if loaded is not None:
-        print(f"resumed geometry pose refiner: {checkpoint}")
-        return loaded
-    started = time.perf_counter()
-    training = train_pose_model(
-        model,
-        batch=batch,
-        baseline=raw_pose,
-        target=target_pose,
-        reference_index=reference,
-        training_indices=active_indices,
-        steps=run.optimizer.refiner_steps,
-        config=run.optimizer,
-    )
-    training["seconds"] = time.perf_counter() - started
-    training["active_training_indices"] = tuple(active_indices)
-    _save_checkpoint(checkpoint, expected, model, training)
-    return training
-
-
-def _load_checkpoint(path: Path, signature: str, model):
-    if not path.is_file():
-        return None
-    try:
-        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        checkpoint = torch.load(path, map_location="cpu")
-    if checkpoint.get("signature") != signature or "model" not in checkpoint:
-        print(f"invalidating stale checkpoint: {path}")
-        return None
-    model.load_state_dict(checkpoint["model"], strict=True)
-    model.eval()
-    return dict(checkpoint["training"])
-
-
-def _save_checkpoint(path: Path, signature: str, model, training: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    torch.save(
-        {
-            "signature": signature,
-            "model": {
-                name: value.detach().cpu() for name, value in model.state_dict().items()
-            },
-            "training": training,
-        },
-        temporary,
-    )
-    temporary.replace(path)
-
-
-def _clear_stale_result_artifacts(output_dir: Path) -> None:
-    """A failed rerun must not leave an older summary looking accepted."""
-
-    for name in (
-        "baseline_summary.json",
-        "frame_diagnostics.csv",
-        "dynamic_instance_diagnostics.csv",
-        "poses.pt",
-    ):
-        path = output_dir / name
-        if path.is_file():
-            path.unlink()
-
-
-def _assert_causal_prefix_equivalence(
-    model,
-    *,
-    full,
-    batch,
-    raw_pose,
-    reference,
-) -> None:
-    model.eval()
-    sequence = int(batch["camera_hidden"].shape[1])
-    with torch.no_grad():
-        for length in range(2, sequence + 1):
-            prefix = forward_model(
-                model,
-                batch=slice_batch_prefix(batch, length=length),
-                baseline=raw_pose[:, :length],
-                reference_index=reference,
-            )
-            for field in ("world_to_camera", "active_frames", "usable_instance_mask"):
-                expected = full[field][:, :length]
-                equal = (
-                    torch.equal(prefix[field], expected)
-                    if expected.dtype == torch.bool
-                    else torch.allclose(
-                        prefix[field], expected, rtol=0.0, atol=2e-6
-                    )
-                )
-                if not equal:
-                    raise RuntimeError(
-                        f"Causal prefix equivalence failed field={field} length={length}."
-                    )
 
 
 def _write_outputs(
     *,
-    run,
-    payload,
-    cache_path_value,
-    signature,
-    raw_pose,
-    l0_pose,
-    refined,
-    target_pose,
-    reference,
-    evaluation_indices,
-    base_training,
-    refiner_training,
-    camera_input_audit,
+    run: BaselineRunConfig,
+    payload: dict,
+    cache_path_value: Path,
+    signature: str,
+    raw_pose: torch.Tensor,
+    target_pose: torch.Tensor,
+    reference: int,
+    evaluation_indices: list[int],
+    tracking_audit: dict[str, object],
 ) -> Path:
     frames = tuple(int(value) for value in payload["frame_indices"])
+    selected_pose = raw_pose.detach().clone()
+    if not torch.equal(selected_pose, raw_pose):
+        raise RuntimeError("V0 r4 selected pose must be exactly raw StreamVGGT.")
     raw_metrics = pose_metrics(
         raw_pose,
         target_pose,
         reference_index=reference,
-        translation_weight=run.optimizer.translation_weight,
         evaluation_indices=evaluation_indices,
     )
-    l0_metrics = pose_metrics(
-        l0_pose,
-        target_pose,
-        reference_index=reference,
-        translation_weight=run.optimizer.translation_weight,
-        evaluation_indices=evaluation_indices,
-    )
-    geometry_candidate_metrics = pose_metrics(
-        refined["world_to_camera"],
-        target_pose,
-        reference_index=reference,
-        translation_weight=run.optimizer.translation_weight,
-        evaluation_indices=evaluation_indices,
-    )
-    selected_gain = _gain_percent(
-        raw_metrics["center_error_native"], l0_metrics["center_error_native"]
-    )
-    selected_pose_loss_gain = _gain_percent(
-        raw_metrics["loss"], l0_metrics["loss"]
-    )
-    geometry_gain_vs_raw = _gain_percent(
-        raw_metrics["center_error_native"],
-        geometry_candidate_metrics["center_error_native"],
-    )
-    geometry_gain_vs_l0 = _gain_percent(
-        l0_metrics["center_error_native"],
-        geometry_candidate_metrics["center_error_native"],
-    )
-    geometry_pose_loss_gain_vs_raw = _gain_percent(
-        raw_metrics["loss"], geometry_candidate_metrics["loss"]
-    )
-    geometry_pose_loss_gain_vs_l0 = _gain_percent(
-        l0_metrics["loss"], geometry_candidate_metrics["loss"]
-    )
-    fold_results = _temporal_fold_results(
+    fold_results = _raw_temporal_fold_results(
         raw_pose=raw_pose,
-        selected_pose=l0_pose,
-        geometry_pose=refined["world_to_camera"],
         target_pose=target_pose,
         frame_indices=frames,
         reference_index=reference,
         evaluation_indices=evaluation_indices,
-        translation_weight=run.optimizer.translation_weight,
-        minimum_gain_percent=run.optimizer.min_evaluation_gain_percent,
     )
-    baseline_acceptance = int(
-        all(int(row["selected_fold_pass"]) for row in fold_results)
-    )
-    dynamic = {
-        int(row["sequence_index"]): row
-        for row in payload.get("dynamic_instance_diagnostics", ())
-    }
-    rows = []
+    dynamic_rows = list(payload.get("dynamic_instance_diagnostics", ()))
+    dynamic = {int(row["sequence_index"]): row for row in dynamic_rows}
+    frame_rows = []
     for index, frame in enumerate(frames):
-        raw_rotation, raw_center = _frame_errors(raw_pose, target_pose, index)
-        l0_rotation, l0_center = _frame_errors(l0_pose, target_pose, index)
-        geometry_rotation, geometry_center = _frame_errors(
-            refined["world_to_camera"], target_pose, index
-        )
-        selected_rotation, selected_center = l0_rotation, l0_center
-        active = bool(refined["active_frames"][0, index].cpu())
-        fallback = torch.equal(
-            refined["world_to_camera"][:, index], l0_pose[:, index]
-        )
-        diag = dynamic.get(index, {})
-        rows.append(
+        rotation, center = _frame_errors(raw_pose, target_pose, index)
+        diag = dynamic[index]
+        frame_rows.append(
             {
                 "sequence_index": index,
                 "frame_index": frame,
-                "sam_tracks_discovered": int(diag.get("discovered_tracks", 0)),
-                "observed_instances": int(payload["observed"][index].sum()),
-                "eligible_instances": int(
-                    refined["eligible_instances"][0, index].sum().cpu()
+                "sam_tracks_discovered": int(diag["discovered_tracks"]),
+                "observed_instances": int(diag["observed_tracks"]),
+                "mature_instances": int(diag["mature_tracks"]),
+                "identity_valid_instances": int(diag["identity_valid_tracks"]),
+                "associated_instances": int(diag["associated_tracks"]),
+                "birth_slots": str(diag.get("birth_slots", "")),
+                "birth_prompts": str(diag.get("birth_prompts", "")),
+                "geometry_birth_slots": str(
+                    diag.get("geometry_birth_slots", "")
                 ),
-                "mature_instances": int(
-                    refined["usable_instance_mask"][0, index].sum().cpu()
+                "geometry_birth_prompts": str(
+                    diag.get("geometry_birth_prompts", "")
                 ),
-                "geometry_candidate_active": int(active),
-                "geometry_candidate_exact_l0_fallback": int(
-                    (not active) and fallback
-                ),
-                "raw_rotation_error_deg": raw_rotation,
-                "l0_rotation_error_deg": l0_rotation,
-                "geometry_candidate_rotation_error_deg": geometry_rotation,
-                "selected_rotation_error_deg": selected_rotation,
-                "raw_center_error_native": raw_center,
-                "l0_center_error_native": l0_center,
-                "geometry_candidate_center_error_native": geometry_center,
-                "selected_center_error_native": selected_center,
+                "selected_exact_raw": 1,
+                "raw_rotation_error_deg": rotation,
+                "selected_rotation_error_deg": rotation,
+                "raw_center_error_native": center,
+                "selected_center_error_native": center,
             }
         )
-    frame_path = run.output_dir / "frame_diagnostics.csv"
-    _write_csv(frame_path, rows, FRAME_COLUMNS)
-    dynamic_path = run.output_dir / "dynamic_instance_diagnostics.csv"
-    dynamic_rows = list(payload.get("dynamic_instance_diagnostics", ()))
+    _write_csv(run.output_dir / "frame_diagnostics.csv", frame_rows, FRAME_COLUMNS)
     if dynamic_rows:
-        _write_csv(dynamic_path, dynamic_rows, tuple(dynamic_rows[0]))
+        _write_csv(
+            run.output_dir / "dynamic_instance_diagnostics.csv",
+            dynamic_rows,
+            tuple(dynamic_rows[0]),
+        )
 
-    births = tuple(int(value) for value in payload.get("sam_birth_indices", ()))
-    late_births = tuple(value for value in births if value > reference)
-    evaluated_active = sum(
-        bool(refined["active_frames"][0, index].cpu())
-        for index in evaluation_indices
-    )
-    inactive_exact = all(
-        torch.equal(refined["world_to_camera"][:, index], l0_pose[:, index])
-        for index in evaluation_indices
-        if not bool(refined["active_frames"][0, index].cpu())
-    )
     correction_rows = [
         row
         for row in payload.get("segmentation_diagnostics", ())
-        if str(row.get("selected_variant", "")) == "sam31_online_geometry_compete"
+        if str(row.get("selected_variant", ""))
+        == "sam31_online_geometry_compete"
     ]
     summary = {
-        "schema": 3,
+        "schema": 4,
         "baseline_version": run.version,
         "implementation_revision": V0_IMPLEMENTATION_REVISION,
-        "method": "v0_v71_pose_conditioned_l0_dynamic_instance_baseline",
-        "claim_level": "empirical_baseline_not_sam_token_causality",
+        "method": "v0_dynamic_sam_tracking_raw_streamvggt_pose",
+        "claim_level": "engineering_tracking_baseline_raw_pose_reference",
         "config": str(run.source_path),
         "cache": str(cache_path_value),
         "signature": signature,
@@ -567,47 +220,32 @@ def _write_outputs(
         "frames": frames,
         "evaluation_frames": tuple(frames[index] for index in evaluation_indices),
         "sam_role": "prompted_dynamic_discovery_mask_persistent_id",
-        "pose_role": "v71_camera_plus_raw_relative_pose_l0",
-        "geometry_pose_role": "v74_geometry_only_transport_candidate",
-        "selected_pose_branch": "v71_pose_conditioned_camera_l0",
-        "segmentation_variant": payload.get("sam_segmentation_variant"),
-        "geometry_corrections_applied": sum(
+        "geometry_guidance_role": "causal_mask_prompt_and_competition_only",
+        "geometry_guidance_applied_frames": sum(
             int(row.get("correction_applied", 0)) for row in correction_rows
         ),
         "geometry_correction_memory_writeback": False,
         "sam_appearance_cached": bool(payload.get("cache_sam_appearance", True)),
-        "late_birth_count": len(late_births),
-        "late_birth_sequence_indices": late_births,
-        "geometry_candidate_active_frames": evaluated_active,
-        "geometry_candidate_inactive_exact_l0": int(inactive_exact),
-        "causal_prefix_check": "passed_atol_2e-6",
+        "tracking_audit": tracking_audit,
+        "tracking_baseline_acceptance_pass": int(
+            tracking_audit["tracking_audit_pass"]
+        ),
+        "pose_role": "raw_streamvggt_unmodified",
+        "selected_pose_branch": "raw_streamvggt",
+        "selected_pose_exact_raw": 1,
+        "pose_modification_applied": False,
+        "pose_improvement_claim": False,
+        "pose_candidate_status": "disabled_after_v0_r3_validation_failure",
+        "historical_direct_pose_validation_pass": 0,
+        "removed_pose_paths": (
+            "v71_camera_pose_direct_se3",
+            "v74_geometry_transport_pose_refiner",
+        ),
+        "future_pose_factor_backend": "not_implemented_not_selected",
         "raw_metrics": raw_metrics,
-        "camera_baseline_metrics": l0_metrics,
-        "selected_pose_metrics": l0_metrics,
-        "geometry_candidate_metrics": geometry_candidate_metrics,
-        "selected_gain_vs_raw_percent": selected_gain,
-        "selected_pose_loss_gain_vs_raw_percent_secondary": (
-            selected_pose_loss_gain
-        ),
-        "geometry_candidate_gain_vs_raw_percent": geometry_gain_vs_raw,
-        "geometry_candidate_gain_vs_l0_percent": geometry_gain_vs_l0,
-        "geometry_candidate_pose_loss_gain_vs_raw_percent_secondary": (
-            geometry_pose_loss_gain_vs_raw
-        ),
-        "geometry_candidate_pose_loss_gain_vs_l0_percent_secondary": (
-            geometry_pose_loss_gain_vs_l0
-        ),
+        "selected_pose_metrics": raw_metrics,
+        "selected_gain_vs_raw_percent": 0.0,
         "temporal_fold_results": fold_results,
-        "baseline_acceptance_rule": (
-            "mean_center_gain_positive_and_zero_center_worse_frames_"
-            "on_each_4_frame_fold"
-        ),
-        "baseline_acceptance_pass": baseline_acceptance,
-        "camera_training": base_training,
-        "geometry_training": refiner_training,
-        "camera_input_audit": camera_input_audit,
-        "model": asdict(run.model),
-        "optimizer": asdict(run.optimizer),
     }
     result = run.output_dir / "baseline_summary.json"
     result.write_text(
@@ -618,53 +256,181 @@ def _write_outputs(
         {
             "frame_indices": frames,
             "raw_world_to_camera": raw_pose.detach().cpu(),
-            "camera_baseline_world_to_camera": l0_pose.detach().cpu(),
-            "selected_world_to_camera": l0_pose.detach().cpu(),
-            # Compatibility field: V0's accepted refined pose is V7.1 L0.
-            "refined_world_to_camera": l0_pose.detach().cpu(),
-            "geometry_candidate_world_to_camera": refined[
-                "world_to_camera"
-            ].detach().cpu(),
-            "geometry_candidate_active_frames": refined[
-                "active_frames"
-            ].detach().cpu(),
-            "usable_instance_mask": refined["usable_instance_mask"].detach().cpu(),
+            "selected_world_to_camera": raw_pose.detach().cpu(),
+            "selected_pose_branch": "raw_streamvggt",
+            "selected_pose_exact_raw": True,
         },
         run.output_dir / "poses.pt",
     )
-    print("V0 DYNAMIC INSTANCE GEOMETRY BASELINE SUMMARY")
+    print("V0 RAW-POSE DYNAMIC TRACKING BASELINE")
     print(
-        f"  aggregate center gain={selected_gain:.6g}% "
-        f"(diagnostic only)"
+        f"  tracks={tracking_audit['discovered_track_count']} "
+        f"late_births={tracking_audit['late_birth_count']} "
+        f"tracking_audit={tracking_audit['tracking_audit_pass']}"
     )
-    for row in fold_results:
-        print(
-            f"  {row['fold']}: center_gain="
-            f"{float(row['selected_center_gain_vs_raw_percent']):.6g}% "
-            f"worse={row['selected_center_worse_frames']} "
-            f"pass={row['selected_fold_pass']}"
-        )
-    print(f"  all-fold acceptance={baseline_acceptance} output={result}")
+    print(
+        "  selected_pose=raw_streamvggt exact_raw=1 "
+        "pose_improvement_claim=0"
+    )
+    print(f"  output={result}")
     return result
 
 
-def _frame_errors(predicted, target, index: int) -> tuple[float, float]:
+def _tracking_audit(
+    payload: dict,
+    *,
+    reference_index: int,
+) -> dict[str, object]:
+    frames = tuple(int(value) for value in payload.get("frame_indices", ()))
+    births = tuple(int(value) for value in payload.get("sam_birth_indices", ()))
+    geometry_births = tuple(
+        int(value) for value in payload.get("instance_birth_indices", ())
+    )
+    instance_ids = tuple(int(value) for value in payload.get("instance_ids", ()))
+    sam_track_ids = tuple(
+        int(value) for value in payload.get("sam_track_ids", ())
+    )
+    sam_track_prompts = tuple(
+        str(value) for value in payload.get("sam_track_prompts", ())
+    )
+    registry_shapes_match = (
+        len(instance_ids) == len(births)
+        and len(geometry_births) == len(births)
+        and len(sam_track_ids) == len(births)
+        and len(sam_track_prompts) == len(births)
+    )
+    rows = sorted(
+        (dict(row) for row in payload.get("dynamic_instance_diagnostics", ())),
+        key=lambda row: int(row["sequence_index"]),
+    )
+    rows_aligned = len(rows) == len(frames) and all(
+        int(row["sequence_index"]) == index
+        and int(row["frame_index"]) == frames[index]
+        for index, row in enumerate(rows)
+    )
+    expected_discovered = tuple(
+        sum(birth >= 0 and birth <= index for birth in births)
+        for index in range(len(frames))
+    )
+    reported_discovered = tuple(
+        int(row.get("discovered_tracks", -1)) for row in rows
+    )
+    discovery_exact = rows_aligned and reported_discovered == expected_discovered
+    discovery_monotonic = all(
+        left <= right
+        for left, right in zip(
+            reported_discovered,
+            reported_discovered[1:],
+        )
+    )
+    mature_is_causal = rows_aligned and all(
+        int(row.get("mature_tracks", -1))
+        <= sum(birth >= 0 and birth < index for birth in geometry_births)
+        for index, row in enumerate(rows)
+    )
+    valid_track_keys = tuple(
+        (sam_track_prompts[index], track_id)
+        for index, track_id in enumerate(sam_track_ids)
+        if track_id >= 0
+    )
+    track_keys_unique = len(valid_track_keys) == len(set(valid_track_keys))
+    discovered_track_count = sum(birth >= 0 for birth in births)
+    track_count_matches_births = len(valid_track_keys) == discovered_track_count
+    late_births = tuple(
+        birth for birth in births if birth > int(reference_index)
+    )
+    future_birth_supported = bool(late_births)
+    passed = all(
+        (
+            rows_aligned,
+            registry_shapes_match,
+            discovery_exact,
+            discovery_monotonic,
+            mature_is_causal,
+            track_keys_unique,
+            track_count_matches_births,
+            future_birth_supported,
+        )
+    )
+    return {
+        "rows_aligned": int(rows_aligned),
+        "registry_shapes_match": int(registry_shapes_match),
+        "discovery_exact_from_birth_registry": int(discovery_exact),
+        "discovery_monotonic": int(discovery_monotonic),
+        "mature_tracks_require_prior_geometry_birth": int(mature_is_causal),
+        "persistent_prompt_track_keys_unique": int(track_keys_unique),
+        "track_count_matches_birth_registry": int(track_count_matches_births),
+        "future_birth_supported": int(future_birth_supported),
+        "late_birth_count": len(late_births),
+        "late_birth_sequence_indices": late_births,
+        "discovered_track_count": discovered_track_count,
+        "permanent_slot_capacity": len(births),
+        "tracking_audit_pass": int(passed),
+    }
+
+
+def _raw_temporal_fold_results(
+    *,
+    raw_pose: torch.Tensor,
+    target_pose: torch.Tensor,
+    frame_indices: tuple[int, ...],
+    reference_index: int,
+    evaluation_indices: list[int],
+) -> list[dict[str, object]]:
+    if len(evaluation_indices) != 12:
+        raise ValueError("V0 requires exactly twelve future evaluation frames.")
+    output = []
+    for fold_index, fold in enumerate(("short", "medium", "long")):
+        indices = evaluation_indices[4 * fold_index : 4 * (fold_index + 1)]
+        metrics = pose_metrics(
+            raw_pose,
+            target_pose,
+            reference_index=reference_index,
+            evaluation_indices=indices,
+        )
+        output.append(
+            {
+                "fold": fold,
+                "sequence_indices": tuple(indices),
+                "frame_indices": tuple(frame_indices[index] for index in indices),
+                "raw_metrics": metrics,
+                "selected_metrics": metrics,
+                "selected_exact_raw": 1,
+                "pose_improvement_claim": 0,
+            }
+        )
+    return output
+
+
+def _frame_errors(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    index: int,
+) -> tuple[float, float]:
     left = predicted[:, index]
     right = target[:, index]
     relative = left[..., :3, :3] @ right[..., :3, :3].transpose(-1, -2)
-    cosine = (torch.diagonal(relative, dim1=-2, dim2=-1).sum(dim=-1) - 1) * 0.5
+    cosine = (
+        torch.diagonal(relative, dim1=-2, dim2=-1).sum(dim=-1) - 1.0
+    ) * 0.5
     rotation = torch.rad2deg(torch.acos(cosine.clamp(-1, 1))).mean()
     center = torch.linalg.vector_norm(
-        camera_centers(left) - camera_centers(right), dim=-1
+        camera_centers(left) - camera_centers(right),
+        dim=-1,
     ).mean()
     return float(rotation.cpu()), float(center.cpu())
 
 
-def _signature(*, run, payload, cache_path_value: Path) -> str:
+def _signature(
+    *,
+    run: BaselineRunConfig,
+    payload: dict,
+    cache_path_value: Path,
+) -> str:
     identity = {
-        "schema": 2,
+        "schema": 4,
         "implementation_revision": V0_IMPLEMENTATION_REVISION,
-        "purpose": "v0_v71_pose_conditioned_l0_dynamic_instance_baseline",
+        "purpose": "v0_dynamic_sam_tracking_raw_streamvggt_pose",
         "config": asdict(run),
         "cache": str(cache_path_value),
         "clip": payload.get("clip_name"),
@@ -679,146 +445,39 @@ def _signature(*, run, payload, cache_path_value: Path) -> str:
     ).hexdigest()
 
 
-def _gain_percent(reference: float, candidate: float) -> float:
-    return 100.0 * (float(reference) - float(candidate)) / max(
-        abs(float(reference)), 1e-12
-    )
+def _clear_stale_result_artifacts(output_dir: Path) -> None:
+    for name in (
+        "baseline_summary.json",
+        "frame_diagnostics.csv",
+        "dynamic_instance_diagnostics.csv",
+        "poses.pt",
+    ):
+        path = output_dir / name
+        if path.is_file():
+            path.unlink()
 
 
-def _temporal_fold_results(
-    *,
-    raw_pose: torch.Tensor,
-    selected_pose: torch.Tensor,
-    geometry_pose: torch.Tensor,
-    target_pose: torch.Tensor,
-    frame_indices: tuple[int, ...],
-    reference_index: int,
-    evaluation_indices: list[int],
-    translation_weight: float,
-    minimum_gain_percent: float,
-) -> list[dict[str, object]]:
-    if len(evaluation_indices) != 12:
-        raise ValueError("V0 requires exactly twelve future evaluation frames.")
-    output = []
-    for fold_index, fold in enumerate(("short", "medium", "long")):
-        indices = evaluation_indices[4 * fold_index : 4 * (fold_index + 1)]
-        raw = pose_metrics(
-            raw_pose,
-            target_pose,
-            reference_index=reference_index,
-            translation_weight=translation_weight,
-            evaluation_indices=indices,
-        )
-        selected = pose_metrics(
-            selected_pose,
-            target_pose,
-            reference_index=reference_index,
-            translation_weight=translation_weight,
-            evaluation_indices=indices,
-        )
-        geometry = pose_metrics(
-            geometry_pose,
-            target_pose,
-            reference_index=reference_index,
-            translation_weight=translation_weight,
-            evaluation_indices=indices,
-        )
-        raw_errors = _center_errors(raw_pose, target_pose, indices)
-        selected_errors = _center_errors(selected_pose, target_pose, indices)
-        geometry_errors = _center_errors(geometry_pose, target_pose, indices)
-        selected_gain = _gain_percent(
-            raw["center_error_native"], selected["center_error_native"]
-        )
-        geometry_gain = _gain_percent(
-            selected["center_error_native"], geometry["center_error_native"]
-        )
-        selected_worse = int(selected_errors.gt(raw_errors).sum().cpu())
-        geometry_worse = int(
-            geometry_errors.gt(selected_errors).sum().cpu()
-        )
-        output.append(
-            {
-                "fold": fold,
-                "sequence_indices": tuple(indices),
-                "frame_indices": tuple(frame_indices[index] for index in indices),
-                "raw_metrics": raw,
-                "selected_metrics": selected,
-                "geometry_candidate_metrics": geometry,
-                "selected_center_gain_vs_raw_percent": selected_gain,
-                "selected_pose_loss_gain_vs_raw_percent_secondary": (
-                    _gain_percent(raw["loss"], selected["loss"])
-                ),
-                "selected_center_worse_frames": selected_worse,
-                "selected_fold_pass": int(
-                    selected_gain > float(minimum_gain_percent)
-                    and selected_worse == 0
-                ),
-                "geometry_center_gain_vs_selected_percent": geometry_gain,
-                "geometry_center_worse_frames_vs_selected": geometry_worse,
-                "geometry_fold_pass": int(
-                    geometry_gain > float(minimum_gain_percent)
-                    and geometry_worse == 0
-                ),
-            }
-        )
-    return output
-
-
-def _center_errors(
-    predicted: torch.Tensor,
-    target: torch.Tensor,
-    indices: list[int],
-) -> torch.Tensor:
-    index = torch.tensor(indices, dtype=torch.long, device=predicted.device)
-    predicted_center = camera_centers(predicted.index_select(1, index))
-    target_center = camera_centers(target.index_select(1, index))
-    return torch.linalg.vector_norm(predicted_center - target_center, dim=-1)
-
-
-def _camera_input_audit(
-    camera_hidden: torch.Tensor,
-    raw_pose: torch.Tensor,
-    *,
-    reference_index: int,
-) -> dict[str, float]:
-    relative = relative_pose_to_reference(
-        raw_pose.float(), reference_index=reference_index
-    ).reshape(*raw_pose.shape[:2], 12)
-    hidden_centered = camera_hidden.float() - camera_hidden.float().mean(
-        dim=1, keepdim=True
-    )
-    relative_centered = relative - relative.mean(dim=1, keepdim=True)
-    return {
-        "camera_hidden_temporal_std": float(
-            hidden_centered.square().mean().sqrt().detach().cpu()
-        ),
-        "raw_relative_pose_temporal_std": float(
-            relative_centered.square().mean().sqrt().detach().cpu()
-        ),
-    }
-
-
-def _validate_payload(payload: dict, *, clip: ClipConfig, run: BaselineRunConfig) -> None:
+def _validate_payload(payload: dict, *, clip: ClipConfig) -> None:
     if str(payload.get("instance_source")) != "sam31_online":
         raise ValueError("Baseline requires instance_source=sam31_online.")
     if str(payload.get("sam_version")) != "sam3.1":
         raise ValueError("Baseline cache is not SAM3.1.")
     if bool(payload.get("cache_sam_appearance", True)):
-        raise ValueError(
-            "Retained baseline cache must disable SAM appearance extraction."
-        )
+        raise ValueError("V0 must disable SAM appearance extraction.")
     if payload.get("appearance") is not None:
-        raise ValueError("Geometry-only baseline cache unexpectedly contains appearance.")
-    if str(payload.get("sam_segmentation_variant")) != "sam31_online_geometry_compete":
+        raise ValueError("V0 cache unexpectedly contains SAM appearance.")
+    if str(payload.get("sam_segmentation_variant")) != (
+        "sam31_online_geometry_compete"
+    ):
         raise ValueError("Baseline requires causal online geometry mask competition.")
-    if tuple(int(value) for value in payload.get("instance_ids", ())) != clip.instance_ids:
+    if tuple(int(value) for value in payload.get("instance_ids", ())) != (
+        clip.instance_ids
+    ):
         raise ValueError("Baseline cache slot layout differs from config.")
     if not payload.get("dynamic_instance_diagnostics"):
         raise ValueError("Baseline cache lacks dynamic instance diagnostics.")
     if not any(int(value) > 0 for value in payload.get("sam_birth_indices", ())):
         raise ValueError("This audit requires at least one late-born SAM track.")
-    if run.local_point_count > int(payload["instance_uvd"].shape[2]):
-        raise ValueError("Configured local point count exceeds cached support.")
 
 
 def _find_clip(config: LearnedPoseConfig, name: str) -> ClipConfig:
@@ -828,7 +487,11 @@ def _find_clip(config: LearnedPoseConfig, name: str) -> ClipConfig:
     return selected[0]
 
 
-def _write_csv(path: Path, rows: list[dict], columns: tuple[str, ...]) -> None:
+def _write_csv(
+    path: Path,
+    rows: list[dict],
+    columns: tuple[str, ...],
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
@@ -843,16 +506,17 @@ def _parse_args() -> argparse.Namespace:
         "--config",
         default="streaming_couping/configs/v0_baseline.yaml",
     )
-    parser.add_argument("--stage", choices=("all", "cache", "fit"), default="all")
+    parser.add_argument(
+        "--stage",
+        choices=("all", "cache", "audit"),
+        default="all",
+    )
     parser.add_argument("--output-dir")
     parser.add_argument("--sam3-device")
     parser.add_argument("--geometry-device")
     parser.add_argument("--streamvggt-devices")
-    parser.add_argument("--training-device")
-    parser.add_argument("--base-steps", type=int)
-    parser.add_argument("--refiner-steps", type=int)
+    parser.add_argument("--audit-device")
     parser.add_argument("--rebuild-cache", action="store_true")
-    parser.add_argument("--no-resume", action="store_true")
     return parser.parse_args()
 
 
