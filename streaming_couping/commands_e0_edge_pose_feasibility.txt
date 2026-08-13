@@ -1,0 +1,55 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+SCRIPT_PATH="${0:A}"
+SCRIPT_DIR="${SCRIPT_PATH:h}"
+ROOT="${VGGT_SAM_ROOT:-${SCRIPT_DIR:h}}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-}"
+CONFIG="${E0_CONFIG:-streaming_couping/configs/e0_edge_pose_feasibility.yaml}"
+OUTPUT_DIR="${E0_OUTPUT_DIR:-outputs/streaming_couping_e0_edge_feasibility}"
+
+cd "$ROOT"
+
+if [[ -z "$PYTHON_BIN" ]]; then
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+  elif command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python)"
+  else
+    echo "missing Python: set STREAMING_COUPING_PYTHON=/path/to/python" >&2
+    exit 1
+  fi
+fi
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+echo "E0 masked-edge feasibility"
+echo "root=$ROOT"
+echo "python=$PYTHON_BIN"
+echo "config=$CONFIG"
+
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_edge_pose_feasibility
+
+ARGS=()
+[[ "${E0_REBUILD_CACHE:-0}" == "1" ]] && ARGS+=(--rebuild-cache)
+
+PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.run_edge_pose_feasibility \
+  --config "$CONFIG" \
+  --stage all \
+  --output-dir "$OUTPUT_DIR" \
+  "${ARGS[@]}"
+
+REPORT="$OUTPUT_DIR/copyable_result.txt"
+[[ -s "$REPORT" ]] || { echo "missing copyable report: $REPORT" >&2; exit 1; }
+[[ ! -e "$OUTPUT_DIR/poses.pt" ]] || { echo "E0 must not write poses.pt" >&2; exit 1; }
+
+echo ""
+echo "E0 result saved for copying:"
+echo "$REPORT"
+echo ""
+echo "Copy it with:"
+echo "cat $REPORT"

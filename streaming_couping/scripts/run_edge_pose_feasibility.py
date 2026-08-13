@@ -67,7 +67,7 @@ def main() -> None:
         intrinsics=intrinsics.detach().cpu(),
         config=e0,
     )
-    _write_outputs(e0.output_dir, result)
+    report_path = _write_outputs(e0.output_dir, result)
     print("E0 MASKED-EDGE POSE FEASIBILITY")
     print(f"  revision={EDGE_FEASIBILITY_REVISION}")
     for row in result["summary"]:
@@ -80,6 +80,7 @@ def main() -> None:
             f"in_bounds={row['mean_in_bounds_rate']:.4f}"
         )
     print(f"  output={e0.output_dir / 'edge_feasibility_summary.json'}")
+    print(f"  copyable_report={report_path}")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -116,10 +117,10 @@ def _recovery_streamvggt_repo(path: Path) -> Path:
     if repo is None:
         return Path("externals/streamvggt").resolve()
     repo_path = Path(repo).expanduser()
-    return repo_path if repo_path.is_absolute() else (path.parent / repo_path).resolve()
+    return repo_path if repo_path.is_absolute() else repo_path.resolve()
 
 
-def _write_outputs(output_dir: Path, result: dict[str, object]) -> None:
+def _write_outputs(output_dir: Path, result: dict[str, object]) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     rows = list(result["rows"])
     with (output_dir / "edge_pair_diagnostics.csv").open(
@@ -149,6 +150,57 @@ def _write_outputs(output_dir: Path, result: dict[str, object]) -> None:
         json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n",
         encoding="utf8",
     )
+    report = _copyable_report(result, output_dir)
+    report_path = output_dir / "copyable_result.txt"
+    report_path.write_text(report, encoding="utf8")
+    return report_path
+
+
+def _copyable_report(result: dict[str, object], output_dir: Path) -> str:
+    lines = [
+        "===== COPYABLE_E0_RESULT_BEGIN =====",
+        f"revision={result['revision']}",
+        f"clip={result['clip']}",
+        "branches=" + ",".join(str(value) for value in result["branches"]),
+        "evaluation_frames=" + " ".join(str(value) for value in result["evaluation_frames"]),
+        "",
+        "branch,pair_count,mean_dist_px,cycle_pass_rate,in_bounds_rate",
+    ]
+    for row in result["summary"]:
+        lines.append(
+            ",".join(
+                (
+                    str(row["branch"]),
+                    str(row["pair_count"]),
+                    _fmt(row["mean_truncated_edge_distance_px"]),
+                    _fmt(row["mean_depth_cycle_pass_rate"]),
+                    _fmt(row["mean_in_bounds_rate"]),
+                )
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "outputs:",
+            f"summary={output_dir / 'edge_feasibility_summary.json'}",
+            f"branch_csv={output_dir / 'edge_branch_summary.csv'}",
+            f"pair_csv={output_dir / 'edge_pair_diagnostics.csv'}",
+            f"copyable_report={output_dir / 'copyable_result.txt'}",
+            "===== COPYABLE_E0_RESULT_END =====",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _fmt(value: object) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if number != number:
+        return "nan"
+    return f"{number:.6f}"
 
 
 if __name__ == "__main__":
