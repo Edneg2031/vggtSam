@@ -18,3 +18,12 @@ zsh streaming_couping/commands_v0_baseline.txt
 V0 r3 的 direct SE(3) 与 geometry-transport pose 路线已经三折证伪并从 active code 删除。当前 V0
 只声明流式 tracking 工程 baseline，不声明 pose 改善，也不缓存或使用 SAM appearance token。下一条
 pose factor 后端通过独立验证前不会覆盖 raw pose。
+
+当前独立 pose 实验：E0-r2 已证明在当前 clip/protocol 下普通 edge-DTF 对 raw pose不形成局部
+basin；E1 仅用固定
+`0.25° / 0.25% scene-scale` 正负梯度候选判断 edge descent 是否朝向 GT。GT 只在所有候选生成后
+评分，实验不输出 pose，也不会修改 V0：
+
+```bash
+zsh streaming_couping/commands_e1_edge_directional_gt_audit.txt
+```
