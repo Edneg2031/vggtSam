@@ -54,13 +54,19 @@ assert summary["selected_pose_exact_raw"] == 1
 assert summary["pose_modification_applied"] is False
 assert summary["pose_improvement_claim"] is False
 assert summary["tracking_baseline_acceptance_pass"] == 1
+assert summary["configured_instance_prompts"] == [
+    "bed", "wardrobe", "picture", "mat", "chair"
+]
+assert summary["configured_permanent_slot_capacity"] == 16
 audit = summary["tracking_audit"]
 tracks = audit["discovered_track_count"]
 late_births = audit["late_birth_count"]
+slots = audit["permanent_slot_capacity"]
 print(
     "V0 accepted tracking baseline "
     f"tracks={tracks} "
     f"late_births={late_births} "
+    f"slots={slots} "
     "selected_pose=exact_raw"
 )
 '

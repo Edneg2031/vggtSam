@@ -200,8 +200,9 @@ RGB_t
 
 ### 7.2 发现多少物体
 
-当前 `instance_prompts=[bed, wardrobe]` 只会寻找对应概念。SAM3.1 的 text prompt `object` 不能被描述为
-真正 class-agnostic proposal。合理前端是：
+V0 当前已把 `instance_prompts` 扩为 `[bed, wardrobe, picture, mat, chair]`，并把永久 registry 扩为
+16 个 slots；它仍只会寻找配置的概念。SAM3.1 的 text prompt `object` 不能被描述为真正 class-agnostic
+proposal。合理前端是：
 
 1. 用配置的 open-vocabulary detector/proposal vocabulary 周期性发现候选；
 2. SAM3.1 对候选生成 mask，并在后续帧传播；
@@ -349,3 +350,37 @@ TUM RGB-D `fr3/walking` 系列，并覆盖：低/中/高 dynamic area、相机�
 - [4D3R](https://arxiv.org/abs/2511.05229)
 - [4DVGGT-D](https://arxiv.org/abs/2605.12027)
 - [Selfi: Self Improving Reconstruction Engine via 3D Geometric Feature Alignment](https://arxiv.org/abs/2512.08930)
+
+## 12. 静态场景最小候选：SAM region identity + 3D–2D PnP
+
+用户确认当前目标场景是静态的，因此第 7–10 节的 dynamic-mask replay 不作为当前实现。SAM mask 在静态场景
+不能通过“排除动态内容”改善 pose；当前验证的是更窄、可直接归因的命题：persistent region identity 能否删除
+通用局部特征中的跨物体误匹配，从而改善冻结 StreamVGGT pointmap 驱动的 PnP pose。
+
+```text
+processed RGB history/current
+  → SIFT mutual-ratio 2D matches
+  → StreamVGGT raw-pose broad reprojection gate
+  → SAM eroded region label: background↔background or same-ID↔same-ID
+  → historical StreamVGGT world pointmap supplies 3D
+  → spatially uniform equal-count support
+  → PnP-RANSAC + inlier LM
+  → held-out reprojection acceptance and bounded raw fallback
+```
+
+长期 registry 仍保留 16 slots 以支持 late birth；每帧按当前 SAM score、mask area、slot 顺序确定性保留最多
+5 个 pose-active regions，background 不占这 5 个名额且始终保留。
+
+固定消融为 `full_image_match / sam_region_identity / shuffled_instance_identity`。shuffled control 保持 mask
+位置、形状和面积，只轮换 current-frame persistent ID；三组锁定相同 correspondence count。SAM appearance token、
+pose training、pose loss 均不使用。候选生成 API 不含 GT 字段，GT 只在全部候选固定后评分。
+
+所有 mask 必须使用缓存中已经过精确 StreamVGGT crop/resize 的 `tracking_masks_stream`，禁止把 SAM 原图输出
+直接 resize 后参与匹配。首轮仍只生成独立 candidate；即使单 clip 通过，也只说明该场景的 region-filtering
+候选可行，不能宣称跨场景提升，且不能替换 V0 selected raw pose。
+
+运行命令：
+
+```bash
+zsh streaming_couping/commands_v0_sam_region_pose_candidate.txt
+```

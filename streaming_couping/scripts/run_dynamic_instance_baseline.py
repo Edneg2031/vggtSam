@@ -220,7 +220,11 @@ def _write_outputs(
         "clip": payload["clip_name"],
         "frames": frames,
         "evaluation_frames": tuple(frames[index] for index in evaluation_indices),
-        "sam_role": "prompted_dynamic_discovery_mask_persistent_id",
+        "sam_role": "prompted_multi_instance_discovery_mask_persistent_id",
+        "configured_instance_prompts": tuple(
+            str(value) for value in payload.get("instance_prompts", ())
+        ),
+        "configured_permanent_slot_capacity": len(payload["instance_ids"]),
         "geometry_guidance_role": "causal_mask_prompt_and_competition_only",
         "geometry_guidance_applied_frames": sum(
             int(row.get("correction_applied", 0)) for row in correction_rows
@@ -390,6 +394,12 @@ def _validate_payload(payload: dict, *, clip: ClipConfig) -> None:
         clip.instance_ids
     ):
         raise ValueError("Baseline cache slot layout differs from config.")
+    expected_prompts = tuple(clip.instance_prompts) or (clip.instance_prompt,)
+    cached_prompts = tuple(
+        str(value) for value in payload.get("instance_prompts", ())
+    )
+    if cached_prompts != expected_prompts:
+        raise ValueError("Baseline cache prompts differ from config; rebuild it.")
     if not payload.get("dynamic_instance_diagnostics"):
         raise ValueError("Baseline cache lacks dynamic instance diagnostics.")
     if not any(int(value) > 0 for value in payload.get("sam_birth_indices", ())):
