@@ -1,0 +1,47 @@
+# G0: mature RGB-D odometry construction on frozen StreamVGGT geometry.
+# SAM3.1 supplies prompted-object exclusion masks only; no SAM token is read.
+# Candidate generation has no GT fields. GT is decoded only after candidates
+# are immutable, for native/reference-aligned scoring.
+g0:
+  base_config: v0_baseline.yaml
+  output_dir: outputs/streaming_couping_g0_static_projective_icp
+  clip_name: 00a231a370_90_525_step15_37_68_54
+  device: cuda:0
+  branches:
+    - full_image
+    - sam_object_excluded
+    - shifted_object_mask_control
+  primary_branch: sam_object_excluded
+  frames:
+    evaluation: [360, 375, 390, 405, 420, 435, 450, 465, 480, 495, 510, 525]
+  pyramid:
+    downsample_factors: [4, 2, 1]
+    iterations: [8, 6, 5]
+  association:
+    # Every factor is causal: the current frame reads only older geometry.
+    source_offsets: [1, 2, 4]
+    min_depth: 0.05
+    max_depth: 25.0
+    min_depth_confidence: 0.30
+    max_points_per_pair: 2048
+    min_correspondences: 96
+    depth_abs_scene_fraction: 0.01
+    depth_rel_tolerance: 0.05
+    normal_depth_abs_scene_fraction: 0.005
+    normal_depth_rel_tolerance: 0.03
+    min_normal_cosine: 0.50
+    mask_dilation_px: 3
+  solver:
+    huber_delta_scene_fraction: 0.005
+    initial_damping: 0.001
+    damping_up: 10.0
+    damping_down: 0.30
+    max_lm_trials: 5
+    rotation_prior_weight: 0.002
+    translation_prior_weight: 0.002
+    max_rotation_degrees: 2.0
+    max_translation_scene_fraction: 0.02
+    max_step_rotation_degrees: 0.50
+    max_step_translation_scene_fraction: 0.005
+    max_design_condition: 1.0e10
+    minimum_energy_decrease: 1.0e-9

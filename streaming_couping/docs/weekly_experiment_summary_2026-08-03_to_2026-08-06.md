@@ -1,6 +1,6 @@
 # StreamVGGT + SAM3.1：V4–V9.8 证据与 V0 理论重启
 
-> 更新：2026-08-12
+> 更新：2026-08-13
 > 目的：只记录已经证实、已经证伪和下一条路线的理论边界。历史候选实现已删除，结果不因删代码而删除。
 
 ## 1. 当前决定
@@ -9,8 +9,10 @@
   StreamVGGT 几何辅助 mask；selected pose 与 raw StreamVGGT 完全相同。
 - 不再把 SAM appearance/local/memory token 接到 camera token 或直接 SE(3) head。
 - TrackHead-BA、SIFT/Feature-PnP、ALIKED-LightGlue-PnP 的候选代码、命令和配置已经清理。
-- 下一条 pose 路线不是 token fusion，而是先验证 **SAM dynamic exclusion + EPO-style edge
-  reprojection**。在通过独立实验前，它不能写入 V0 selected pose。
+- E0/E1 已证伪固定 depth 的 edge-DTF 完整 SE(3) 优化：梯度实现正确，但 E0 小扰动恢复向 trust-region
+  边界发散，E1 也没有任何 joint/translation 分支三折通过。
+- 下一条 pose 路线直接借鉴成熟 RGB-D odometry：**SAM prompted-object exclusion + StreamVGGT depth/K +
+  multi-history projective association + point-to-plane ICP/LM**。它作为 G0 独立候选；通过前不能写入 V0。
 
 ## 2. 当前证据的数据边界
 
@@ -228,3 +230,27 @@ matching 和 BA 验证；不再训练 SAM descriptor 或 direct pose head。
 - 第一版不应声称“复现 EPO”，而应称 `causal masked edge pose feasibility`；它是 EPO 的受限子问题。
 - 在 E0 上界完成前不写正式 edge optimizer 到 V0；V0 继续保持 raw StreamVGGT pose，避免候选失败污染
   已经可用的因果 tracking baseline。
+
+## 11. E0/E1 实测结论与 G0 成熟路线（2026-08-13）
+
+E0-r2 的可微 edge-DTF 铯路通过梯度检查，但 144 个小扰动试验中没有一帧通过 pose basin gate；平均
+rotation/translation recovery fraction 分别为 `-1.974/-1.998`。E1 在固定 `0.25° / 0.25% scene-scale`
+候选上确认负梯度 100% 降低 edge loss、正梯度 100% 增加 edge loss，说明实现方向可信；但 joint 和
+translation 三折均失败。`sam_object_excluded_edge` 的 rotation-only 在 11/12 帧改善，不足以部署完整
+SE(3)，且 prompted bed/wardrobe mask 不等于完整 dynamic truth。
+
+因此停止 edge-DTF 调参。G0 改为 KinectFusion/ElasticFusion/BundleFusion 一类 RGB-D odometry 的标准几何
+因子：当前 depth 反投影、向 `[1,2,4]` 个历史帧投影、在历史 vertex/normal map 上重关联，使用 robust
+point-to-plane residual，coarse-to-fine LM、raw-pose prior、condition/trust-region 和固定能量下降接受规则。
+SAM 只排除 prompted tracked-object 区域，并与 full-image、shifted-mask 控制等量比较；不读取 appearance
+token、不训练模型。候选生成 API 不接收 GT，GT 只在所有候选固化后评分。V0 selected pose 仍是 raw。
+
+G0 的实现入口是：
+
+```bash
+zsh streaming_couping/commands_g0_static_projective_icp.txt
+```
+
+当前单个静态 ScanNet++ clip 只能回答 projective ICP 是否能修正 pose，不能证明 SAM 动态排除有效；真正的
+SAM-specific claim 仍需在含运动物体且有 camera GT 的多个序列上，使 SAM exclusion 同时优于 full-image
+和同形状 shifted-mask control。

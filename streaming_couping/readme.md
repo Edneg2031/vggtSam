@@ -27,3 +27,30 @@ basin；E1 仅用固定
 ```bash
 zsh streaming_couping/commands_e1_edge_directional_gt_audit.txt
 ```
+# Current pose candidate: G0 static projective ICP
+
+V0 remains the accepted engineering baseline: causal multi-instance SAM3.1
+tracking (including future object births) plus the unmodified raw StreamVGGT
+pose.  G0 is an isolated candidate and never writes selected poses.
+
+G0 follows established RGB-D odometry rather than learning a token-to-camera
+adapter.  It uses frozen StreamVGGT depth, confidence, intrinsics and raw pose
+to form multi-history projective correspondences, then optimizes only the
+current SE(3) with coarse-to-fine robust point-to-plane LM.  SAM is used only
+to exclude prompted tracked-object regions.  The controls are full image and
+the same mask shifted to an unrelated location.  The cache's prompted-object
+mask is not described as complete dynamic ground truth.
+
+Candidate generation receives no GT field.  Native/reference-aligned GT pose
+is decoded only after candidates are immutable and is used only for reporting.
+Run:
+
+```zsh
+zsh streaming_couping/commands_g0_static_projective_icp.txt
+```
+
+An all-fold geometry pass requires all four frames in every fold to be active,
+the fixed deployable geometry energy to decrease, mean rotation and center
+error to improve, and zero worse frames.  A SAM-specific conclusion additionally
+requires the SAM exclusion branch to beat the shifted-mask control in every
+fold.  Until that gate passes, V0 continues to select raw StreamVGGT pose.

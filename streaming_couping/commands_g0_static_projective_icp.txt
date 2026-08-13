@@ -1,0 +1,57 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+SCRIPT_PATH="${0:A}"
+SCRIPT_DIR="${SCRIPT_PATH:h}"
+ROOT="${VGGT_SAM_ROOT:-${SCRIPT_DIR:h}}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-}"
+CONFIG="${G0_CONFIG:-streaming_couping/configs/g0_static_projective_icp.yaml}"
+OUTPUT_DIR="${G0_OUTPUT_DIR:-outputs/streaming_couping_g0_static_projective_icp}"
+
+cd "$ROOT"
+
+if [[ -z "$PYTHON_BIN" ]]; then
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+  elif command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python)"
+  else
+    echo "missing Python: set STREAMING_COUPING_PYTHON=/path/to/python" >&2
+    exit 1
+  fi
+fi
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export CUDA_VISIBLE_DEVICES="${G0_CUDA_VISIBLE_DEVICES:-1}"
+
+echo "G0 smoke: SE3 Jacobian, normals, masked outliers and GT isolation"
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_g0_static_projective_icp
+
+echo "G0 static projective point-to-plane ICP candidate"
+echo "physical GPU=$CUDA_VISIBLE_DEVICES; logical device=cuda:0"
+echo "Uses the existing V0 cache; no model/checkpoint is downloaded or trained"
+echo "SAM supplies prompted-object exclusion only; no SAM token is read"
+echo "GT is scoring-only; V0 selected pose remains raw StreamVGGT"
+
+ARGS=()
+[[ -n "${G0_DEVICE:-}" ]] && ARGS+=(--device "$G0_DEVICE")
+
+PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.run_g0_static_projective_icp \
+  --config "$CONFIG" \
+  --stage audit \
+  --output-dir "$OUTPUT_DIR" \
+  "${ARGS[@]}"
+
+REPORT="$OUTPUT_DIR/copyable_result.txt"
+[[ -s "$REPORT" ]] || { echo "missing G0 copyable report: $REPORT" >&2; exit 1; }
+[[ -s "$OUTPUT_DIR/frame_diagnostics.csv" ]] || { echo "missing G0 frame CSV" >&2; exit 1; }
+[[ -s "$OUTPUT_DIR/fold_summary.csv" ]] || { echo "missing G0 fold CSV" >&2; exit 1; }
+[[ ! -e "$OUTPUT_DIR/poses.pt" ]] || { echo "G0 must not write poses.pt" >&2; exit 1; }
+
+echo ""
+echo "===== G0 COPYABLE RESULT ====="
+cat "$REPORT"
