@@ -1,256 +1,351 @@
-# StreamVGGT + SAM3.1：V4–V9.8 证据与 V0 理论重启
+# StreamVGGT + SAM3.1：V4–V9.8 证据归档与 V0 位姿理论设计
 
-> 更新：2026-08-13
-> 目的：只记录已经证实、已经证伪和下一条路线的理论边界。历史候选实现已删除，结果不因删代码而删除。
+> 最后更新：2026-08-13
+> 用途：这是唯一保留的研究结论与下一阶段设计文档。历史候选代码可以删除，但已经得到的正、负证据不得删除或改写。
 
-## 1. 当前决定
+## 1. 当前仓库与结论
 
-- 正式 baseline 仍叫 **V0**：SAM3.1 做因果多实例发现、mask、永久 ID 和未来 birth；
-  StreamVGGT 几何辅助 mask；selected pose 与 raw StreamVGGT 完全相同。
-- 不再把 SAM appearance/local/memory token 接到 camera token 或直接 SE(3) head。
-- TrackHead-BA、SIFT/Feature-PnP、ALIKED-LightGlue-PnP 的候选代码、命令和配置已经清理。
-- E0/E1 已证伪固定 depth 的 edge-DTF 完整 SE(3) 优化：梯度实现正确，但 E0 小扰动恢复向 trust-region
-  边界发散，E1 也没有任何 joint/translation 分支三折通过。
-- 下一条 pose 路线直接借鉴成熟 RGB-D odometry：**SAM prompted-object exclusion + StreamVGGT depth/K +
-  multi-history projective association + point-to-plane ICP/LM**。它作为 G0 独立候选；通过前不能写入 V0。
+- 唯一 active baseline 是 **V0**。
+- SAM3.1 负责 prompted multi-instance discovery/tracking、mask、persistent ID 和 late birth。
+- StreamVGGT geometry 只辅助 mask prompt/competition；selected pose 是逐元素不变的 raw StreamVGGT pose。
+- V0 不缓存 SAM appearance token，不训练 pose model，当前不声明 pose improvement。
+- E0/E1 edge-DTF 与 G0 projective ICP 已从 active code 删除；G0-r2 只有实现和 smoke、没有服务器结果，不能作为成功或失败证据。
+- 下一步先完成理论和数据协议，不再用新版本号试探性堆代码。
 
-## 2. 当前证据的数据边界
+当前主要数据是 ScanNet++ scene `00a231a370` 的 30 帧长 clip：frame 90–525、step 15。未来测试帧固定为：
 
-主要数据只有 ScanNet++ scene `00a231a370` 的一个长 clip：frame 90–525、step 15、30 帧。
-未来测试固定为：
-
-| fold | 测试帧 |
+| fold | frames |
 |---|---|
-| short | 360、375、390、405 |
-| medium | 420、435、450、465 |
-| long | 480、495、510、525 |
+| short | 360, 375, 390, 405 |
+| medium | 420, 435, 450, 465 |
+| long | 480, 495, 510, 525 |
 
-这个 clip 是静态室内扫描。物体在晚帧首次进入视野属于 **late discovery**，不等于物体真实运动。
-所以它能验证因果 birth 和静态场景 pose，不能验证“dynamic mask 排除运动物体”是否有效。任何 dynamic-mask
-pose 结论必须增加真实动态、带 camera GT 的序列；当前结果也不能称为跨场景泛化。
+这是一个静态室内扫描。晚帧首次进入视野只证明 late discovery，不证明物体发生真实运动；它只能用于
+tracking 因果性和 static-scene no-regression，不能证明 dynamic-mask pose improvement。
 
-## 3. 已经证实
+## 2. 证据等级与不可混淆的命题
 
-1. V7.4/V0 的 forward-only 多实例发现、永久 slot 和未来 birth 已实现；本 clip 有一条 track 在
-   frame 150 才出生，不要求第一帧出现全部物体。
-2. V4/V5 的完整 learned pipeline 在固定参考实例、同场景 clip 上出现过 aggregate pose 收益，但使用
-   reference-frame GT instance 初始化，且没有隔离 SAM token；只能作为旧 E2 结果，不能恢复为新 baseline。
-3. GT 3D geometry + Kabsch、GT depth + GT K，以及正确且宽空间分布的 2D correspondence，均能修正
-   StreamVGGT pose。这证明 pose **存在可修正空间**，solver 也不是根本不可用。
-4. V9.5 中 full-image / instance-background 混合 correspondence 在 0.5–1 px 噪声下通过；V9.6 中
-   72×72 grid 的 bilinear K4 能表达连续坐标。宽空间支撑和亚像素坐标是必要条件。
-5. SIFT + native StreamVGGT world pointmap + all-causal PnP 在 short fold 有局部 center 收益，说明显式
-   2D→3D→pose 链路能启动；但它没有通过全部 fold。
+| 等级 | 含义 |
+|---|---|
+| E0 | 只有实现/运行链路，没有正式科学结果 |
+| E1 | 能拟合训练数据，只证明容量 |
+| E2 | held-out 有改善，但因果变量未完全隔离 |
+| E3 | strict future 超过公平控制，正确输入被破坏后收益消失，并通过预锁判据 |
 
-## 4. 已经证伪或应停止重复
+必须区分：
 
-- Adapter/pose head 把训练 loss 拟合到零，不证明 SAM token 有用；camera-only、geometry-only、time-only
-  或 trained-off 控制同样能拟合。
-- pooled token、mask-local `detector_fpn2`、dense detector-FPN、SAM3.1 memory-read feature 均未在三组
-  future fold 建立 correspondence/pose 因果收益。V9.7/V9.8 的 future PCK@1 基本为 0。
-- history key 从 32 增到 256、mutual/unique assignment、instance-only essential matrix 和多种 robust
-  solver 都没有修复 pose。localized-instance support 对亚像素误差过于脆弱。
-- predicted depth/K 的三维误差不是单一 scale、shift、affine 或 Sim(3) 可以解决。
-- V0 r3 的 direct pose head 只在 short/long 改善，medium center 下降 26.28%，all-fold fail；现已删除。
-- TrackHead-BA 的一帧正控制中 visibility/confidence gate 为 0/3072；它没有进入 BA，说明当前 checkpoint/
-  预处理契约不可用，不应靠把阈值降到接近零继续调。
-- SIFT/Feature-PnP 的预锁主分支只在 short 启动 4/4，medium 1/4，long 0/4；short 仍有 2/4 坏帧。
-  all-causal history 提高了 coverage，但没有形成稳定 pose 改善。
-- ALIKED-LightGlue 下载/依赖阶段曾中断，没有形成完整 pose 结果；因此删除它是停止该候选，不是声称
-  已经科学证伪 LightGlue 本身。
+- **SAM system**：proposal、mask、track ID、置信度和 memory 的整体；
+- **SAM mask/identity**：实例区域和 persistent ID，不包含 appearance descriptor；
+- **SAM token**：`detector_fpn2`、memory-read 或其它 appearance feature；
+- **SAM 帮助 pose**：必须优于 raw、同面积错误 mask 和无 SAM 控制，不能由训练 loss 推断。
 
-## 5. 四篇论文实际支持什么
+截至目前没有“SAM token 改善 StreamVGGT pose”的 E3 证据。存在的是整体 pipeline 的旧 E2 结果、
+mask/identity 的局部 E2 结果，以及若干 GT 几何/对应的 solver upper bound。
 
-### EPO（arXiv:2607.00579）
+## 3. V4–V9.8 实验账本
 
-EPO 确实提供了最直接的新路线：Canny edge、target distance-transform field、foundation-model depth 和
-双向 edge reprojection；用 truncated distance 与 Huber loss，不需要显式 feature track。
+| 阶段 | 实际做法 | 已成立结论 | 没有成立的结论 |
+|---|---|---|---|
+| V4 | pooled instance appearance/geometry → mask-local DPT residual → depth/pointmap/pose | 完整 learned pipeline 在固定参考实例和配置序列上有效，属于 E2 | token、mask、geometry、pose head 未隔离，不能归因 SAM token |
+| V5 | V4 前端 + adaptive pointmap + ray-centre solver | 最终 pointmap/pose 有旧 E2 收益 | 不能单独归因 SAM；不能直接恢复为新 baseline |
+| V6 | camera/instance/fusion + direct SE(3) head | 第二 clip 相对 raw loss 改善约 7.63%/10.67%/11.43% | direct head 可记忆帧，非 E3 |
+| V7/V7.1 | frozen camera L0 + instance residual/control | camera/instance residual 有容量 | future/cross-scene control 未过，所有 causal instance pass=0 |
+| V7.2 | 真正 mask-local SAM `detector_fpn2` token，K=8/16/32 | local token 已真实实现，不是缺失功能 | 22 个正式行 causal local pass=0，geometry-only 更稳定 |
+| V7.3 | SAM affinity Key + StreamVGGT geometry Value | 所有分支可过拟合长训练序列 | uniform/trained-off 也可拟合；held-out causal SAM pass=0 |
+| V7.4 | dynamic birth、永久 slot、causal latest memory、三 future folds | frame 150 late birth 已实际运行；exact L0 fallback 成立 | 三折 SAM causal pass=0，破坏 SAM 输入没有稳定 damage |
+| V7.5 | SAM region/ID + ICP/ray solver，无 token/pose head | short/frozen 有局部 region/identity 收益，E2 | frozen/online region/history 全部 all-fold fail |
+| V8 matcher-first | correspondence supervision 与 pose 解耦、matcher 冻结 | 排除了 joint pose-head shortcut | matcher/pose 仍无 all-fold causal pass；no-match 可更好 |
+| V8 O1–O2.7 | GT pseudo-match + Kabsch/Umeyama，分解 depth/K/calibration | GT geometry、GT depth+GT K 可工作；SAM-instance affine 比 global affine 有上界优势 | predicted depth/K、scale/affine/Sim(3) 均不能稳定修复 pose |
+| V9 O-R1/A0-H | 正确 2D correspondence + fixed essential solver | relative rotation/translation-direction 三折 upper bound 成立 | 不是 metric center、absolute trajectory 或 SAM descriptor 证据 |
+| V9.1 | actual local32 history key oracle + learned Q/K audit | 离散 key support 已是瓶颈之一 | A0-Q、trained top-1、soft expectation 全部 fail |
+| V9.2 | history key 32/64/128/256 + nearest/mutual/unique | 256 keys 可把 coverage/PCK 提到约 0.994/0.917 | 所有策略 pose all-fold fail，不能继续调 detector-FPN matcher |
+| V9.3 | fixed edge，hard/soft coordinate、EPE filter、continuous noise | continuous GT positive control pass | soft-K8、oracle filter 和 0.5 px noise都未全折通过；localized support 极脆弱 |
+| V9.4 | 多种 deterministic/spatial RANSAC robust solver | continuous control 仍成立 | soft-K8 与 0.5/1 px noise无 solver 全折通过；localized essential route 终止 |
+| V9.5 | equal-count instance/full-image/hybrid spatial support | full-image 与 instance/background 在 0.5–1 px noise 下通过 | 失败原因不是 pixel error 单独造成；宽空间支撑是关键 |
+| V9.6 | actual 72×72 grid，hard nearest/soft bilinear K4 | full-grid continuous 与 bilinear K4 通过，亚像素 decoder 表达力足够 | hard grid fail；SAM/bbox/shifted equal-count control 不可行，不能声称 SAM mask 独特有效 |
+| V9.7 | dense detector-FPN matcher，future causal evaluation | train prefix 能部分拟合 | future PCK@1 基本为 0、EPE 约 98–111 px，pose 全折 fail |
+| V9.8 | SAM3.1 genuine memory-read feature vs memory-off | memory feature 链路和 train audit 已完成 | future PCK@1 三折全为 0；train PCK 也仅约 0.095–0.302，causal pass=0 |
 
-但论文的成功条件比“固定 depth，只改当前 pose”更强：
+### 3.1 可以继续引用的正证据
 
-- 输入是整组图像的 `K / pose / depth`，先用双向 cycle reprojection 建 connected viewgraph；
-- 第一阶段共同优化所有 camera pose 和 focal length；
-- 收敛后再放开逐像素 depth scale/shift，与 camera 联合优化；
-- 全 viewgraph 的双向损失提供隐式 multi-view regularization；它不是单边、单帧 streaming optimizer。
+1. V0/V7.4 已经支持 future object birth、永久 ID、forward-only memory；不要求第一帧出现所有物体。
+2. V4/V5/V6 的完整 learned systems 确实出现过 E2 改善，但不能解释成 SAM token 因果收益。
+3. GT 3D geometry + Kabsch、GT depth + GT K、正确且宽分布的 2D correspondence 都能修正 pose，说明 raw
+   StreamVGGT 存在可修正空间，solver 也不是普遍不可用。
+4. V9.5 证明同样 correspondence 数下，full-image/hybrid 的 Hessian 条件远优于 instance-local support。
+5. V9.6 证明 72×72 grid 通过 K4 亚像素坐标可以表达连续对应。
 
-因此 EPO 证明“edge objective 可用于 3DFM 后处理”，**没有证明固定有偏 StreamVGGT depth 的
-current-pose-only 子问题一定成功**。论文也明确列出高频非结构纹理/反射和低连接 viewgraph 两个限制。
+### 3.2 不得再重复的失败路线
 
-### 4D3R（arXiv:2511.05229）
+- pooled/local/memory SAM token → camera token/direct SE(3) head；
+- 只凭训练 loss 降到零声称 token 有效；
+- `detector_fpn2 + local32/dense + Q/K` correspondence；
+- 将 history key 从 32 扩到 256、mutual/unique assignment 或继续 sweep robust essential solver；
+- localized-instance-only essential/PnP；
+- 固定 predicted depth/K 的 edge-DTF 或 current-only projective ICP；
+- TrackHead-BA 当前 checkpoint/preprocess 契约；
+- V0 r3 的 direct learned pose correction：medium center 曾下降 26.28%，all-fold fail。
 
-4D3R 先用 motion model 产生 coarse dynamic cue，再把 top-K 点作为 SAM2 prompt 得到精细 dynamic
-mask；mask 用于 static point selection，随后执行 masked PnP-RANSAC 和 differentiable dense BA。
-DBA 联合更新 pose 与 depth，并使用 optical flow/confidence。它支持“SAM mask 应作为几何 residual 的
-选择器”，不支持“仅有 SAM mask + frozen depth edge 就足够”。
+## 4. E0/E1/G0 删除前的最终证据
 
-### 4DVGGT-D（arXiv:2605.12027）
+### E0/E1 edge-DTF
 
-它不是外部 edge solver，而是从 VGGT attention 得到 dynamic saliency，在第二次 VGGT forward 的早期层
-把 dynamic token 的 key 置零，再使用第二次输出的 pose；之后对两次 depth 做 mask/confidence fusion。
-论文报告 ATE 改善，但 RTE/RRE 反而恶化，说明“去动态能改善全局基准”不等于逐帧 relative pose
-单调改善。它给我们的启发是先稳定 pose、再处理 geometry，以及必须同时报告绝对和相对指标。
+- E0-r2 可微链路通过梯度检查，但 144 个小扰动试验没有一帧通过 pose-basin gate；平均 rotation/
+  translation recovery fraction 为 `-1.974/-1.998`。
+- E1 的负梯度方向 100% 降 edge loss、正方向 100% 升 loss，证明实现方向正确；但 joint 和 translation
+  三折全部失败。
+- `sam_object_excluded_edge` rotation-only 约 11/12 帧改善，仍不足以部署完整 SE(3)，且 bed/wardrobe mask
+  不是 dynamic ground truth。
 
-### Selfi（arXiv:2512.08930）
+结论：edge loss 有方向信息，但固定有偏 depth 的局部目标不等于 GT pose 方向；该路线终止。
 
-Selfi 在 VGGT image tokens 上训练 DPT adapter，用 VGGT depth/pose 生成带 visibility check 的伪
-correspondence；下游仍然是 feature matching + dense BA，并在 pose/K 改变后对 depth 做 affine shift。
-它在大规模跨场景数据上训练约 150K steps，而不是单 scene adapter。该路线比 SAM token→camera token
-更有几何依据，但成本高、仍有 teacher bias；只有 edge 路线的上界成立而真实 edge 失败时才值得进入。
+### G0 projective point-to-plane
 
-论文：
+G0-r1 中 full-image 与 SAM-exclusion 的三个 fold mean center 都小幅改善约 `0.004–0.009 native`，证明
+projective point-to-plane 含有局部 translation signal；但：
 
-- [EPO](https://arxiv.org/abs/2607.00579)
+- medium rotation 分别恶化 `0.589°/0.333°`；
+- long 仍有 rotation/center 坏帧；
+- 所有 branch all-fold pass=0；
+- SAM exclusion 未稳定形成优于 full-image 和 shifted-mask 的因果结论。
+
+G0-r2 hybrid photometric + point-to-plane 只完成代码/smoke，未在服务器评测，证据等级为 E0；现已删除。
+
+## 5. 论文能够支持和不能支持的内容
+
+### DualMap（arXiv:2506.01950）
+
+DualMap 的直接启发不是 pose solver，而是：
+
+- hybrid segmentation frontend；
+- object-level status check；
+- 能随环境变化更新的 persistent object representation；
+- global abstract map 与 local concrete map 分工。
+
+它没有证明 instance mask 会直接提升 camera pose。可迁移到本项目的是“双记忆”：一个保存所有对象状态，
+另一个只保存可用于 static-camera estimation 的稳定几何；不能把 DualMap 当作 pose-improvement 论文引用。
+
+### SceneVGGT（arXiv:2602.15899）
+
+SceneVGGT 的 pose/SLAM 来自 sliding windows、overlap anchors、camera-pose transform 对齐和 depth grounding；
+instance mask 用于 2D semantics lifting、VGGT tracklet、persistent identity、前景/背景地图分离、change detection
+和 navigation。它同样不是“mask 优化 pose”的成功证据。
+
+但它支持 object/background map separation、mask erosion、均匀区域采样、persistent tracklet memory 和 3D
+visibility/re-ID 的系统设计。
+
+### 4D3R、4DVGGT-D 与 Selfi
+
+- 4D3R 支持 `motion cue → SAM mask → static point selection → PnP/DBA`，关键是可靠 correspondence、
+  confidence 和 joint depth/pose optimization，不是 mask 单独求 pose。
+- 4DVGGT-D 支持在第二次 VGGT forward 中抑制 dynamic token key、先稳定 pose 再融合 geometry；它报告
+  ATE 改善但相对指标不总改善，因此必须同时报告 ATE/RPE rotation/translation。
+- Selfi 支持把 VGGT feature 训练成 geometrically localizable feature，再进入 matching + BA；它需要跨场景
+  数据和独立 correspondence 指标，不是单 scene SAM adapter。
+
+## 6. 理论问题：SAM mask 单独能否改善 pose
+
+答案是：**不能保证，甚至一般不可辨识。** 一个实例 mask 只给出像素集合和跨帧 identity；相机运动与
+物体运动存在多种组合可产生相似 mask。mask 本身不是 point correspondence，也不是 3D measurement。
+
+SAM 能改变 pose 的合理机制只有两类：
+
+1. **选择/重加权机制**：从已有 geometric/photometric factors 中删除违反 static-world assumption 的
+   dynamic measurements，并保留 background 与 static objects；
+2. **网络内信息路由机制**：在冻结 StreamVGGT 的第二次 forward 中阻止已确认 dynamic patches 写入/读取
+   static camera memory。
+
+令可靠几何 residual 为 `r_j(T)`、Jacobian 为 `J_j`，局部 normal matrix 为：
+
+```text
+H = Σ_j w_j J_jᵀJ_j + λH_raw
+```
+
+动态点带来有方向的系统误差 `ε_dynamic`。正确 mask 将其权重降为零，可以降低
+`H⁻¹ Σ Jᵀε_dynamic` 的估计偏差；但把所有实例都删除也会减小 `λ_min(H)`，使位姿更不稳定。
+
+所以 SAM 帮助 pose 的必要条件是：
+
+1. 场景中确有足够 dynamic residual 会偏置 raw pose；
+2. dynamic/unknown classification 的 precision 足够高；
+3. 删除后 background + static instances 仍提供宽视野、满秩约束；
+4. 剩余 factor 的 correspondence/depth 足够可靠；
+5. optimizer 位于可收敛 basin 内。
+
+当前 ScanNet++ clip 不满足第 1 个验证条件；E0/G0 也表明当前 frozen predicted-depth residual 尚未满足
+第 4/5 条。因此“多检测几个家具然后全部排除”在理论上反而可能让 pose 更差。
+
+## 7. V0 后续方法设计：实例状态分解，而不是实例全排除
+
+### 7.1 系统数据流
+
+```text
+RGB_t
+ ├─→ StreamVGGT causal raw pass → T⁰_t, D_t/pointmap, K_t, confidence
+ └─→ proposal/discovery → SAM3.1 mask + persistent ID + late birth
+                           ↓
+                   persistent object registry
+             {unknown, static, dynamic, lost/reappeared}
+                           ↓
+       object memory（全部对象） + static pose memory（可信静态内容）
+                           ↓
+        frozen StreamVGGT mask-conditioned replay / static factor window
+                           ↓
+                    candidate refined pose
+                           ↓
+         geometry feedback → SAM prompt/competition/re-ID
+```
+
+参数可以保持冻结；关键改变是 measurement routing 和 memory ownership，不是再训练 token→camera adapter。
+
+### 7.2 发现多少物体
+
+当前 `instance_prompts=[bed, wardrobe]` 只会寻找对应概念。SAM3.1 的 text prompt `object` 不能被描述为
+真正 class-agnostic proposal。合理前端是：
+
+1. 用配置的 open-vocabulary detector/proposal vocabulary 周期性发现候选；
+2. SAM3.1 对候选生成 mask，并在后续帧传播；
+3. 用 causal IoU、prompt/class、3D proximity 和 visibility 去重/re-ID；
+4. 长期 registry 容量先设 16，与现有 recovery capacity 一致；slot 永不复用；
+5. **每帧最多 5 个 pose-active objects**，而不是全视频最多 5 个对象。
+
+active-5 是计算预算，不是理论常数，必须做 `K=1/3/5` 消融。不能只按 mask 面积选；建议在不读取 GT 的
+条件下按下面的分数贪心选取：
+
+```text
+score_k = track_confidence
+        × temporal_persistence
+        × geometry_confidence
+        × motion_or_static_relevance
+        × incremental_logdet_pose_information
+        × (1 - boundary_uncertainty)
+```
+
+选择时对与已选实例的空间覆盖重复施加惩罚。背景始终是一个独立且不可被 active-5 挤掉的 support。
+
+### 7.3 object state machine
+
+每个新对象出生时必须为 `unknown`，不能由 noun class 直接判定 static/dynamic：
+
+```text
+newborn/unknown
+  ├─ 连续 N 次与背景相机运动一致、3D shape/centroid 一致 → static
+  ├─ 连续 M 次出现独立且一致的 2D/3D motion residual → dynamic
+  └─ 证据冲突/遮挡 → 保持 unknown
+
+static  --连续运动证据--> dynamic
+dynamic --长冷却期静止证据--> static candidate（重新建图，不复用旧几何）
+```
+
+部署 cue 至少要组合：raw-pose 下的背景补偿后运动、mask interior 的 3D consistency、track persistence、
+depth/visibility confidence。mask 边界先 erosion；newborn/unknown 不写 static pose memory。状态切换使用
+hysteresis，禁止单帧翻转。
+
+### 7.4 DualMap 启发下的双记忆
+
+- **Object memory**：保存所有 persistent ID、prompt/class、mask history、birth、state、object-local geometry；
+  支持移动、消失和重现。
+- **Static pose memory**：只保存 background 与已成熟 static objects 的 keyframes/features/geometry；专门供
+  camera estimation 使用。
+
+动态或 unknown 对象可以继续被 SAM 追踪，但不能污染 static pose memory。若 static 对象后来被判为 dynamic，
+其旧几何冻结为历史版本，当前运动对象开启新 object-local state；不能悄悄用新位置覆盖 static map。
+
+### 7.5 第一候选：mask-conditioned frozen StreamVGGT replay
+
+比重新做固定-depth edge/ICP 更直接的候选，是借鉴 4DVGGT-D 的两阶段信息路由：
+
+1. raw causal forward 得到 `T⁰_t` 和初始 geometry；
+2. 只用当前及过去可知信息确认 dynamic/unknown masks；
+3. 第二次 forward 保持 StreamVGGT 参数冻结，在 global temporal attention 中禁止 confirmed-dynamic patch
+   作为 camera/static-memory 的 key/value；camera/register/background/static tokens 继续参与；
+4. 对 unknown 使用软降权，不立刻硬删除；static objects 保留；
+5. 输出 candidate pose，未通过 deployable confidence/observability gate 时 exact raw fallback。
+
+为了保持真正 streaming，过去被污染的无限 KV cache不能直接复用。第二次 forward 应只重放一个 bounded
+causal keyframe window，或维护单独的 static KV memory。所有 mask 必须下采样到精确 patch footprint，并对
+boundary 使用 unknown band，不能简单 resize 后当真值。
+
+这一候选相对旧实验的关键差异：SAM 不预测 pose、不提供 appearance correspondence；它只决定哪些视觉
+measurement 能进入 frozen camera memory。它仍没有理论必胜保证，但与“动态像素违反静态场景假设”的动机
+直接对应。
+
+### 7.6 第二候选（仅在第一候选有上界时）：instance-aware sliding-window BA
+
+若 masked replay 在动态数据上产生稳定方向但精度不足，再加入局部 window factor：
+
+```text
+E = λraw Eraw(T)
+  + Ebackground(T, Xbg)
+  + Σ_{k∈static} wk Ek(T, Xk)
+  + λdepth Edepth-affine
+```
+
+- background 与多个 static instances 提供宽空间 support；
+- confirmed dynamic instances 从 camera factor 排除，未来可估计独立 object SE(3)；
+- unknown 只进入 robust low-weight cue；
+- window 联合优化 pose 与有限结构/depth-affine，自身不能重用 G0 的 frozen-depth current-only ICP；
+- correspondence 必须先有独立 PCK/EPE/visibility 证据。没有可靠 correspondence 时不写 BA。
+
+这一步可最终转向 Selfi-style VGGT geometric feature，但必须跨场景训练和独立评估；不再训练 SAM token。
+
+## 8. 预锁消融与通过条件
+
+第一轮不改 V0 selected pose，只生成 candidate：
+
+| branch | 目的 |
+|---|---|
+| `raw` | 原始 StreamVGGT |
+| `replay_unmasked` | 控制第二次 forward/window 本身 |
+| `mask_all_instances` | 验证“所有语义实例都排除”是否有害 |
+| `confirmed_dynamic_mask` | 主候选，只抑制 dynamic，unknown 软降权 |
+| `shifted_dynamic_mask` | 同面积/形状错误位置控制 |
+| `oracle_dynamic_mask` | 仅 upper bound，不是部署方法 |
+
+另做 `active_objects=1/3/5`，以及 `background_only` vs `background+static_instances`。所有分支使用相同
+frame/window、相同计算预算或明确报告额外成本。
+
+通过条件必须在结果前固定：
+
+1. causal prefix check；candidate generation API 不接收 GT；
+2. static ScanNet++ 上 no-regression，late birth/ID/registry 仍通过；
+3. 每个动态数据集组的 rotation RPE 和 translation/center 指标都优于 raw 与 replay-unmasked；
+4. 主候选稳定优于 shifted mask；oracle 只能说明上界；
+5. 报告 mean/median、每帧 worse count、active/fallback rate，不能用 composite loss 掩盖某一 pose 分量；
+6. 不允许用 GT pose error 选择 candidate/fallback，也不允许只展示改善帧；
+7. 只有多场景 all-fold pass 后，才允许 V0 selected pose 从 raw 改为 candidate。
+
+## 9. 数据要求
+
+当前 ScanNet++ clip 继续负责：
+
+- future birth、persistent ID、causal memory；
+- static-object 不应被误判 dynamic；
+- masked replay 的 no-regression 和 exact fallback。
+
+真正的主验证至少加入多个带 camera GT、真实运动物体的 RGB-D 序列，例如 Bonn RGB-D Dynamic 与
+TUM RGB-D `fr3/walking` 系列，并覆盖：低/中/高 dynamic area、相机静止/运动、遮挡和对象重现。
+
+仅在静态 ScanNet++ 上增加到 5 个家具，最多只能测试 object management 和空间覆盖；即使 pose 改善，也不能
+归因于 dynamic removal。
+
+## 10. 实现前的锁定结论
+
+1. **不是物体数量越多越好。** 关键是状态正确、空间信息互补和 Hessian 可观测性；错误地排除 5 个静态
+   家具可能比只跟踪 2 个更差。
+2. **SAM mask 不是 pose measurement。** 它是 measurement ownership/gating；真正 pose information 仍来自
+   StreamVGGT 图像/几何及后续可靠 correspondence。
+3. **最合理的第一实现不是新 BA。** 先做 frozen StreamVGGT 的 causal dynamic-mask replay，验证 mask
+   information routing 是否产生跨动态场景的可归因收益。
+4. **DualMap/SceneVGGT 提供系统结构启发，不提供 pose 成功证明。** 本项目必须自己完成 raw/unmasked/
+   dynamic/shifted/oracle 的因果验证。
+5. 在上述设计进入代码前，V0 保持 raw selected pose；不会恢复已删除的 E0/E1/G0 或 token→camera 路线。
+
+## 11. 参考论文
+
+- [DualMap: Online Open-Vocabulary Semantic Mapping for Natural Language Navigation in Dynamic Changing Scenes](https://arxiv.org/abs/2506.01950)
+- [SceneVGGT: VGGT-based online 3D semantic SLAM for indoor scene understanding and navigation](https://arxiv.org/abs/2602.15899)
+- [EPO: Boosting 3D Foundation Models with Edge-based Pose Optimization](https://arxiv.org/abs/2607.00579)
 - [4D3R](https://arxiv.org/abs/2511.05229)
 - [4DVGGT-D](https://arxiv.org/abs/2605.12027)
-- [Selfi](https://arxiv.org/abs/2512.08930)
-
-## 6. SAM static mask + edge reprojection 的理论模型
-
-对 source edge pixel `u_s`，使用 source depth 和内参反投影：
-
-```text
-X_s = D_s(u_s) K_s^-1 u_s
-u_t(ξ) = project(K_t, T_t(ξ) T_s^-1 X_s)
-```
-
-令 `Φ_t^static` 为 target **静态 edge** 的 distance-transform field，基本 residual 是：
-
-```text
-E_s→t(ξ) = Σ w(u_s) · Huber(min(Φ_t^static(u_t(ξ)), λ))
-E_pair = E_s→t + E_t→s
-```
-
-其中 `w` 必须同时包含：source static gate、target static gate、StreamVGGT depth/point confidence、正深度、
-图内、双向 depth/visibility consistency。还需要 raw-pose prior、bounded SE(3) update、coarse-to-fine 和
-固定 gauge。
-
-它可能改善 pose 的原因不是 SAM 提供了 pose 信息，而是：
-
-1. edge distance field 在 edge normal 方向提供连续、可微、亚像素 image-space gradient；
-2. 多视图重投影把该梯度通过投影 Jacobian 传给 SE(3)；
-3. SAM 若正确排除 independently moving edge，会删除违反静态场景模型的系统残差。
-
-它无法保证成功的原因是：
-
-- distance transform 是 nearest-edge many-to-one，没有 edge identity；重复边、平行线和密集纹理可让错误
-  pose 也得到低 loss；
-- edge 只沿法线约束，长直线存在 aperture/退化方向；camera center 通常比 rotation 更难稳定；
-- depth、K、pose 在投影里耦合。固定错误 depth 时，optimizer 可能用错误 translation 吸收 depth bias；
-- 几何轮廓正是常见 edge，也是 depth 最容易在前/背景间混合的位置；mask 边界需要单独的
-  erosion/dilation band 和 depth-consistency gate，不能默认轮廓 depth 可信；
-- 遮挡、出视野、illumination edge、反射和动态阴影会产生错误梯度；
-- raw pose 已较准时，最近错误 edge 可能比真实 edge 更近，目标高度非凸；
-- current-pose-only 固定历史会把历史 pose/depth 的误差当成当前 pose 的误差，弱于 EPO 的全 viewgraph
-  联合优化。
-
-结论：**方案有明确几何机制，值得做 feasibility；但原始“固定一切、只改当前 SE(3)”不能直接升级成
-baseline，应先验证 pose-only 是否具有上界，并准备一个低维 depth affine 对照。**
-
-## 7. 当前 SAM mask 的真实含义
-
-当前配置只 prompt `bed` 和 `wardrobe`。SAM3.1 会发现这些概念的多个实例并支持晚 birth，但它不是
-class-agnostic motion segmentation。并且家具的 semantic mask 不等于 dynamic mask：床可以静止，未 prompt
-的人可以运动。
-
-当前 `static_score` 来自 StreamVGGT geometry registration/consensus，也依赖 raw pose/pointmap；它可作为
-部署 cue，却不是独立运动真值。新实验中的 `sam_static_edge` 应严格定义为：
-
-```text
-全图 edge
-− 已发现且被 geometry/temporal gate 判为 dynamic 或 identity-unknown 的 SAM mask 内 edge
-```
-
-不能只采样“静态实例内部 edge”，否则会重现 V9 已证伪的局部支撑问题。新物体首次发现前仍会污染
-edge residual，这是部署限制，必须逐帧记录 `discovered_dynamic_area` 和 `unknown_area`。
-
-## 8. 当前代码能否承载该实验
-
-V0 cache 已经包含 `image_paths/stream_images`、raw pose encoding、predicted depth、depth confidence、native
-world pointmap、point confidence，以及 output/StreamVGGT 两套坐标下的 SAM/trusted/associated masks。内参可由
-raw pose encoding 用现有 StreamVGGT decoder 取出，因此 E0 不需要重新缓存任何 SAM token。
-
-工程上仍要先补三项审计：
-
-1. edge、depth、mask、K 必须全部落在同一个 processed pixel-center convention；
-2. source/target 双向投影在 raw pose 下必须通过正深度、图内和 depth-cycle sanity check；
-3. cache 中虽然为评测保留了 `target_*` GT 字段，optimizer 模块必须接收不含这些字段的 deployable view，
-   全部分支写完后再由独立 scorer 读取 GT，防止无意泄漏。
-
-## 9. 推荐的验证顺序
-
-### E0：先回答 edge objective 是否有 pose 信息
-
-在当前 ScanNet++ clip 上做离线、因果 prefix 诊断，不写入 V0：
-
-1. `raw`：不优化；
-2. `all_edge`：所有 edge；
-3. `sam_static_edge`：只排除部署时可知的 dynamic/unknown SAM 区域；
-4. `shuffled_static_mask`：把同帧 dynamic mask 做确定性平移后再取补集，保持面积和形状；
-5. 诊断上界（不算部署方法）：GT depth、GT pose 小扰动恢复、GT static mask。
-
-四个正式分支必须锁定相同 edge 数、viewgraph、pair/window、optimizer、update bound 和初始化。
-`shuffled_static_mask` 不能随机打散每个像素，否则面积/边界统计不公平。
-
-必须额外比较两种优化变量：
-
-- `pose_only`：固定 K/depth，只优化 causal window pose；
-- `pose_plus_depth_affine`：每帧仅增加 `aD+b`，而不是直接放开逐像素 depth。
-
-如果 GT-pose perturbation 都不能被 edge loss拉回，是实现/目标问题；如果 GT depth 能过而 predicted depth
-不能过，瓶颈是 geometry；如果 affine 能过而 pose-only 不能过，说明原方案自由度不足；如果 all-edge
-能过而 SAM/static/shuffle无差异，只能称 EPO 帮助 pose，不能称 SAM 帮助。
-
-### E1：再验证真正的 dynamic-mask 因果收益
-
-当前静态 ScanNet++ clip 不够。至少增加多个有真实 moving object、camera GT 的序列，例如 MPI Sintel、
-Bonn RGB-D Dynamic 或合适的 DyCheck 序列。需要先把 dynamic discovery 从 `[bed, wardrobe]` 升级为覆盖
-测试场景运动物体的 detector/motion cue；否则 `sam_static_edge` 控制没有语义。
-
-通过条件在看结果前锁定：
-
-- causal prefix check 通过，GT 只用于最后评分；
-- 每个 fold 的 optimizer 都 active，不能把 exact-raw fallback 计成改善；
-- `all_edge` 相对 raw 的 center/rotation 分别报告，不用 composite loss 掩盖坏项；
-- `sam_static_edge` 在相同 edge 数下稳定优于 `all_edge` 和 area-matched shuffle；
-- 报告 mean/median、每帧 worse count、ATE/RTE/RRE 和 edge residual；residual 下降本身不是 pose 证据；
-- 当前 scene 成功只能算 sanity check；跨多个动态 scene 后才可升级 V0 pose。
-
-### E2：何时转向 Selfi-style feature
-
-只有在以下组合出现时才进入：GT/部署 mask + edge upper bound 能改善 pose，但真实 RGB edge 因重复纹理、
-遮挡或光照不稳定而失败。届时训练的是跨场景 VGGT geometric-localization feature，并用 visibility、
-matching 和 BA 验证；不再训练 SAM descriptor 或 direct pose head。
-
-## 10. 最终可行性结论
-
-- **方向可行，原方案需修正后再实现。** EPO-style residual 有明确几何 Jacobian，也避开了已经失败的
-  SAM-token correspondence 学习。
-- SAM 的合理角色是剔除违反 static-world assumption 的 residual，不是提供 camera pose token。
-- 最大风险不是优化资源，而是 mask 定义、predicted depth bias、nearest-edge ambiguity 和 viewgraph 连接度。
-- 第一版不应声称“复现 EPO”，而应称 `causal masked edge pose feasibility`；它是 EPO 的受限子问题。
-- 在 E0 上界完成前不写正式 edge optimizer 到 V0；V0 继续保持 raw StreamVGGT pose，避免候选失败污染
-  已经可用的因果 tracking baseline。
-
-## 11. E0/E1 实测结论与 G0 成熟路线（2026-08-13）
-
-E0-r2 的可微 edge-DTF 铯路通过梯度检查，但 144 个小扰动试验中没有一帧通过 pose basin gate；平均
-rotation/translation recovery fraction 分别为 `-1.974/-1.998`。E1 在固定 `0.25° / 0.25% scene-scale`
-候选上确认负梯度 100% 降低 edge loss、正梯度 100% 增加 edge loss，说明实现方向可信；但 joint 和
-translation 三折均失败。`sam_object_excluded_edge` 的 rotation-only 在 11/12 帧改善，不足以部署完整
-SE(3)，且 prompted bed/wardrobe mask 不等于完整 dynamic truth。
-
-因此停止 edge-DTF 调参。G0 改为 KinectFusion/ElasticFusion/BundleFusion 一类 RGB-D odometry 的标准几何
-因子：当前 depth 反投影、向 `[1,2,4]` 个历史帧投影、在历史 vertex/normal map 上重关联，使用 robust
-point-to-plane residual，coarse-to-fine LM、raw-pose prior、condition/trust-region 和固定能量下降接受规则。
-SAM 只排除 prompted tracked-object 区域，并与 full-image、shifted-mask 控制等量比较；不读取 appearance
-token、不训练模型。候选生成 API 不接收 GT，GT 只在所有候选固化后评分。V0 selected pose 仍是 raw。
-
-G0 的实现入口是：
-
-```bash
-zsh streaming_couping/commands_g0_static_projective_icp.txt
-```
-
-当前单个静态 ScanNet++ clip 只能回答 projective ICP 是否能修正 pose，不能证明 SAM 动态排除有效；真正的
-SAM-specific claim 仍需在含运动物体且有 camera GT 的多个序列上，使 SAM exclusion 同时优于 full-image
-和同形状 shifted-mask control。
+- [Selfi: Self Improving Reconstruction Engine via 3D Geometric Feature Alignment](https://arxiv.org/abs/2512.08930)
