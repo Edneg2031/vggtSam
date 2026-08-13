@@ -1,4 +1,4 @@
-# E0: isolated masked-edge pose feasibility diagnostic.
+# E0-r2: differentiable all-edge pose-basin feasibility diagnostic.
 # This reads the retained V0 cache and never writes selected pose outputs.
 e0:
   base_config: v0_baseline.yaml
@@ -7,20 +7,45 @@ e0:
   branches:
     - raw
     - all_edge
-    - sam_static_edge
-    - shuffled_static_mask
+    # The current V0 prompts only bed/wardrobe.  These names deliberately do
+    # not claim that the prompted objects are dynamic or that their complement
+    # is a complete static mask.
+    - sam_object_excluded_edge
+    - shifted_object_mask_control
   frames:
     evaluation: [360, 375, 390, 405, 420, 435, 450, 465, 480, 495, 510, 525]
   edge:
-    # Sobel threshold and top-k cap are fixed across branches.  The SAM/static
-    # branches only change which edge pixels are masked out.
+    # The same Sobel candidates and equal per-frame edge count are used by all
+    # non-raw projection-audit branches.
     sobel_quantile: 0.88
     max_edges_per_frame: 12000
     distance_truncate_px: 12
+    huber_delta_px: 2.0
+    mask_dilation_px: 3
   projection:
     # Causal source frames only: target frame can consume prior offsets.
     source_offsets: [1, 2, 4]
     min_depth: 0.05
     max_depth: 25.0
-    cycle_abs_depth_tolerance: 0.10
-    cycle_rel_depth_tolerance: 0.10
+    min_depth_confidence: 0.30
+    depth_abs_tolerance: 0.05
+    depth_rel_tolerance: 0.05
+    boundary_penalty_weight: 1.0
+    min_locked_points_per_direction: 64
+    # Bound memory/runtime while retaining broad deterministic support.
+    max_locked_points_per_direction: 2048
+  recovery:
+    # E0-r2 first tests only whether raw StreamVGGT pose is a local minimum of
+    # the deployable all-edge objective.  It does not score against GT pose.
+    device: cuda:0
+    axes: [x, y, z]
+    signs: [-1, 1]
+    rotation_degrees: [1.0]
+    translation_scene_fractions: [0.01]
+    optimizer_steps: 120
+    learning_rate: 0.01
+    gradient_probe_step: 0.001
+    max_rotation_degrees: 3.0
+    max_translation_scene_fraction: 0.03
+    min_loss_order_pass_rate: 0.90
+    min_mean_recovery_fraction: 0.50

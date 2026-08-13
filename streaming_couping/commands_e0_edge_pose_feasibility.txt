@@ -26,7 +26,7 @@ export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-echo "E0 masked-edge feasibility"
+echo "E0-r2 differentiable all-edge pose-basin feasibility"
 echo "root=$ROOT"
 echo "python=$PYTHON_BIN"
 echo "config=$CONFIG"
@@ -45,6 +45,7 @@ PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
 
 REPORT="$OUTPUT_DIR/copyable_result.txt"
 [[ -s "$REPORT" ]] || { echo "missing copyable report: $REPORT" >&2; exit 1; }
+[[ -s "$OUTPUT_DIR/perturbation_recovery.csv" ]] || { echo "missing recovery CSV" >&2; exit 1; }
 [[ ! -e "$OUTPUT_DIR/poses.pt" ]] || { echo "E0 must not write poses.pt" >&2; exit 1; }
 
 echo ""

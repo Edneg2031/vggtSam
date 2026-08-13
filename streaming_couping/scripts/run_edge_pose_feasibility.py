@@ -68,7 +68,7 @@ def main() -> None:
         config=e0,
     )
     report_path = _write_outputs(e0.output_dir, result)
-    print("E0 MASKED-EDGE POSE FEASIBILITY")
+    print("E0-r2 DIFFERENTIABLE EDGE POSE-BASIN FEASIBILITY")
     print(f"  revision={EDGE_FEASIBILITY_REVISION}")
     for row in result["summary"]:
         print(
@@ -76,9 +76,21 @@ def main() -> None:
             f"branch={row['branch']} "
             f"pairs={row['pair_count']} "
             f"mean_dist_px={row['mean_truncated_edge_distance_px']:.4f} "
-            f"cycle={row['mean_depth_cycle_pass_rate']:.4f} "
+            f"depth_consistency={row['mean_depth_consistency_pass_rate']:.4f} "
             f"in_bounds={row['mean_in_bounds_rate']:.4f}"
         )
+    recovery = result["recovery_summary"]
+    print(
+        "  "
+        f"recovery_active={recovery['active_trials']}/"
+        f"{recovery['recovery_trials']} "
+        f"frames={recovery['passing_frames']}/{recovery['evaluation_frames']} "
+        f"ordering={recovery['loss_order_pass_rate']:.4f} "
+        f"gradient_probe={recovery['gradient_probe_pass_rate']:.4f} "
+        f"rotation_recovery={recovery['mean_rotation_recovery_fraction']:.4f} "
+        f"translation_recovery={recovery['mean_translation_recovery_fraction']:.4f} "
+        f"pose_basin_pass={recovery['pose_basin_pass']}"
+    )
     print(f"  output={e0.output_dir / 'edge_feasibility_summary.json'}")
     print(f"  copyable_report={report_path}")
 
@@ -140,10 +152,22 @@ def _write_outputs(output_dir: Path, result: dict[str, object]) -> Path:
         writer = csv.DictWriter(handle, fieldnames=csv_columns(summary))
         writer.writeheader()
         writer.writerows(summary)
+    recovery_rows = list(result["recovery_rows"])
+    with (output_dir / "perturbation_recovery.csv").open(
+        "w",
+        newline="",
+        encoding="utf8",
+    ) as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=csv_columns(recovery_rows),
+        )
+        writer.writeheader()
+        writer.writerows(recovery_rows)
     payload = {
         key: value
         for key, value in result.items()
-        if key not in {"rows", "summary"}
+        if key not in {"rows", "summary", "recovery_rows"}
     }
     payload["summary"] = result["summary"]
     (output_dir / "edge_feasibility_summary.json").write_text(
@@ -162,9 +186,11 @@ def _copyable_report(result: dict[str, object], output_dir: Path) -> str:
         f"revision={result['revision']}",
         f"clip={result['clip']}",
         "branches=" + ",".join(str(value) for value in result["branches"]),
+        f"exclusion_mask_source={result['exclusion_mask_source']}",
+        f"exclusion_mask_semantics={result['exclusion_mask_semantics']}",
         "evaluation_frames=" + " ".join(str(value) for value in result["evaluation_frames"]),
         "",
-        "branch,pair_count,mean_dist_px,cycle_pass_rate,in_bounds_rate",
+        "branch,pair_count,mean_dist_px,depth_consistency_pass_rate,in_bounds_rate",
     ]
     for row in result["summary"]:
         lines.append(
@@ -173,11 +199,40 @@ def _copyable_report(result: dict[str, object], output_dir: Path) -> str:
                     str(row["branch"]),
                     str(row["pair_count"]),
                     _fmt(row["mean_truncated_edge_distance_px"]),
-                    _fmt(row["mean_depth_cycle_pass_rate"]),
+                    _fmt(row["mean_depth_consistency_pass_rate"]),
                     _fmt(row["mean_in_bounds_rate"]),
                 )
             )
         )
+    recovery = result["recovery_summary"]
+    lines.extend(
+        [
+            "",
+            "recovery_trials,active_trials,passing_frames,evaluation_frames,loss_order_pass_rate,gradient_probe_pass_rate,mean_rotation_recovery_fraction,mean_translation_recovery_fraction,pose_basin_pass",
+            ",".join(
+                (
+                    str(recovery["recovery_trials"]),
+                    str(recovery["active_trials"]),
+                    str(recovery["passing_frames"]),
+                    str(recovery["evaluation_frames"]),
+                    _fmt(recovery["loss_order_pass_rate"]),
+                    _fmt(recovery["gradient_probe_pass_rate"]),
+                    _fmt(recovery["mean_rotation_recovery_fraction"]),
+                    _fmt(recovery["mean_translation_recovery_fraction"]),
+                    str(recovery["pose_basin_pass"]),
+                )
+            ),
+            "minimum_frame_loss_order_pass_rate,minimum_frame_gradient_probe_pass_rate,minimum_frame_rotation_recovery_fraction,minimum_frame_translation_recovery_fraction",
+            ",".join(
+                (
+                    _fmt(recovery["minimum_frame_loss_order_pass_rate"]),
+                    _fmt(recovery["minimum_frame_gradient_probe_pass_rate"]),
+                    _fmt(recovery["minimum_frame_rotation_recovery_fraction"]),
+                    _fmt(recovery["minimum_frame_translation_recovery_fraction"]),
+                )
+            ),
+        ]
+    )
     lines.extend(
         [
             "",
@@ -185,6 +240,7 @@ def _copyable_report(result: dict[str, object], output_dir: Path) -> str:
             f"summary={output_dir / 'edge_feasibility_summary.json'}",
             f"branch_csv={output_dir / 'edge_branch_summary.csv'}",
             f"pair_csv={output_dir / 'edge_pair_diagnostics.csv'}",
+            f"recovery_csv={output_dir / 'perturbation_recovery.csv'}",
             f"copyable_report={output_dir / 'copyable_result.txt'}",
             "===== COPYABLE_E0_RESULT_END =====",
             "",
