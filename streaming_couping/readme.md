@@ -30,7 +30,7 @@ zsh streaming_couping/commands_v0_semantic_map_ab.txt
 
 该命令固定相同的raw StreamVGGT depth/K、SAM persistent-slot masks/IDs、RGB和
 confidence support，只比较raw pose与selected QK pose。地图先在StreamVGGT native
-reference坐标生成；GT和固定raw-reference Sim(3)只在两份地图完成后用于评分。
+reference坐标生成；GT只在两份地图完成后用于拟合一次固定raw-depth-reference Sim(3)并评分。
 
 输出包括：
 

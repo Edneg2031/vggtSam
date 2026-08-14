@@ -54,7 +54,7 @@ import json
 from pathlib import Path
 summary = json.loads(Path("outputs/streaming_couping_v0/semantic_map_ab/semantic_map_summary.json").read_text())
 assert summary["schema"] == 1
-assert summary["revision"] == "v0_semantic_map_shared_raw_geometry_ab_r1"
+assert summary["revision"] == "v0_semantic_map_shared_raw_geometry_ab_r2"
 assert summary["selected_pose_branch"] == "retrieve_qk"
 assert summary["map_generation_gt_fields"] == 0
 assert summary["shared_support_exact"] == 1

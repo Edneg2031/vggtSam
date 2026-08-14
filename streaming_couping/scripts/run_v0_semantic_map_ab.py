@@ -28,6 +28,7 @@ from streaming_couping.src.learned_pose.config import (
     LearnedPoseConfig,
     load_learned_pose_config,
 )
+from streaming_couping.src.pointmap_alignment import _robust_similarity
 from streaming_couping.src.semantic_map import (
     SemanticMapInputs,
     SemanticMapPair,
@@ -36,7 +37,7 @@ from streaming_couping.src.semantic_map import (
 )
 
 
-REVISION = "v0_semantic_map_shared_raw_geometry_ab_r1"
+REVISION = "v0_semantic_map_shared_raw_geometry_ab_r2"
 
 
 @dataclass(frozen=True)
@@ -158,9 +159,16 @@ def _score_and_write(
 ) -> Path:
     """Introduce fixed evaluation Sim(3) and GT only after map generation."""
 
-    scale = float(payload["point_alignment_scale"])
-    rotation = payload["point_alignment_rotation"].detach().float().cpu()
-    translation = payload["point_alignment_translation"].detach().float().cpu()
+    target = payload["target_world_points"].detach().float().cpu()
+    frames = tuple(int(value) for value in payload["frame_indices"])
+    reference = int(payload["reference_sequence_index"])
+    scale, rotation, translation, alignment_inliers, alignment_rmse = (
+        _fit_raw_depth_reference_similarity(
+            pair.raw_dense_points[reference],
+            target[reference],
+            pair.valid[reference],
+        )
+    )
     raw_aligned = apply_similarity(
         pair.raw_dense_points,
         scale=scale,
@@ -173,9 +181,6 @@ def _score_and_write(
         rotation=rotation,
         translation=translation,
     )
-    target = payload["target_world_points"].detach().float().cpu()
-    frames = tuple(int(value) for value in payload["frame_indices"])
-    reference = int(payload["reference_sequence_index"])
     per_frame_rows = _per_frame_rows(
         frames=frames,
         reference=reference,
@@ -263,17 +268,6 @@ def _score_and_write(
         selected_semantic_fused.get("symmetric_mean", float("nan")),
     )
 
-    pointmap_aligned = apply_similarity(
-        payload["baseline_world_points"].detach().float().cpu(),
-        scale=scale,
-        rotation=rotation,
-        translation=translation,
-    )
-    depth_pointmap_rmse = _dense_rmse(
-        raw_aligned,
-        pointmap_aligned,
-        pair.valid,
-    )
     geometry_pass = int(paired_gain > 0.0 and fused_gain > 0.0)
     semantic_geometry_pass = int(
         semantic_paired_gain > 0.0 and semantic_fused_gain > 0.0
@@ -344,7 +338,11 @@ def _score_and_write(
         "selected_pose_branch": poses["selected_pose_branch"],
         "raw_pose_cache_max_abs_difference": raw_pose_max_abs_difference,
         "map_coordinate_frame": "streamvggt_native_reference",
-        "evaluation_alignment": "fixed_raw_reference_sim3",
+        "evaluation_alignment": "fixed_raw_depth_reference_sim3",
+        "evaluation_alignment_source": "raw_depth_backprojection_reference_frame",
+        "evaluation_alignment_inliers": alignment_inliers,
+        "evaluation_alignment_fit_rmse_metric": alignment_rmse,
+        "legacy_pointmap_sim3_used": 0,
         "confidence_normalization": "per_frame_5_95_quantile",
         "confidence_threshold": run.confidence_threshold,
         "track_score_threshold": run.track_score_threshold,
@@ -352,9 +350,6 @@ def _score_and_write(
         "saved_map_points": int(pair.raw_map_points.shape[0]),
         "saved_semantic_points": int((pair.map_semantic_slots >= 0).sum()),
         "discovered_tracks": discovered,
-        "raw_depth_backprojection_vs_raw_pointmap_rmse_metric": (
-            depth_pointmap_rmse
-        ),
         "raw_paired_metrics": raw_metrics,
         "selected_paired_metrics": selected_metrics,
         "paired_rmse_gain_percent": paired_gain,
@@ -432,6 +427,31 @@ def _per_frame_rows(
     return rows
 
 
+def _fit_raw_depth_reference_similarity(
+    raw_points: torch.Tensor,
+    target_points: torch.Tensor,
+    valid: torch.Tensor,
+) -> tuple[float, torch.Tensor, torch.Tensor, int, float]:
+    """Fit one scoring-only Sim(3) from the geometry actually being mapped."""
+
+    support = (
+        valid.bool()
+        & torch.isfinite(raw_points).all(dim=-1)
+        & torch.isfinite(target_points).all(dim=-1)
+    )
+    source = raw_points[support].float().cpu()
+    target = target_points[support].float().cpu()
+    if source.shape[0] > 30_000:
+        indices = torch.linspace(
+            0,
+            source.shape[0] - 1,
+            steps=30_000,
+        ).round().long()
+        source = source.index_select(0, indices)
+        target = target.index_select(0, indices)
+    return _robust_similarity(source, target, min_points=128)
+
+
 def _aggregate_rows(
     rows: Sequence[dict[str, object]], *, prefix: str
 ) -> dict[str, float | int]:
@@ -473,18 +493,6 @@ def _frame_rmse(
         predicted[valid] - target[valid], dim=-1
     )
     return float(torch.sqrt(distance.square().mean())), count
-
-
-def _dense_rmse(
-    left: torch.Tensor,
-    right: torch.Tensor,
-    valid: torch.Tensor,
-) -> float:
-    support = valid & torch.isfinite(left).all(dim=-1) & torch.isfinite(right).all(dim=-1)
-    if not bool(support.any()):
-        return float("nan")
-    distance = torch.linalg.vector_norm(left[support] - right[support], dim=-1)
-    return float(torch.sqrt(distance.square().mean()))
 
 
 def _bidirectional_metrics_or_empty(
@@ -644,6 +652,8 @@ def _write_copyable(path: Path, summary: dict[str, Any], run: MapRun) -> None:
         "candidate_pointmap_used=0",
         "map_generation_gt_fields=0",
         "gt_role=scoring_only_after_both_maps_are_generated",
+        "evaluation_alignment=fixed_raw_depth_reference_sim3",
+        f"evaluation_alignment_fit_rmse_metric={summary['evaluation_alignment_fit_rmse_metric']}",
         f"saved_map_points={summary['saved_map_points']}",
         f"saved_semantic_points={summary['saved_semantic_points']}",
         "",
@@ -708,9 +718,8 @@ def _validate_baseline_artifacts(
             )
     required = (
         "baseline_depth", "baseline_depth_confidence", "baseline_pose_encoding",
-        "baseline_world_points", "tracking_masks_stream", "tracking_scores",
-        "stream_images", "target_world_points", "point_alignment_scale",
-        "point_alignment_rotation", "point_alignment_translation",
+        "tracking_masks_stream", "tracking_scores", "stream_images",
+        "target_world_points",
     )
     missing = [name for name in required if name not in payload]
     if missing:
