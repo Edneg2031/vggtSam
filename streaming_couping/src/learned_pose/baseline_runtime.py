@@ -1,4 +1,4 @@
-"""Runtime helpers for the retained raw-pose dynamic-tracking baseline."""
+"""Runtime helpers for the retained V0 tracking and pose baseline."""
 
 from __future__ import annotations
 
@@ -17,6 +17,9 @@ class BaselineRunConfig:
     clip_name: str
     audit_device: str
     evaluation_frames: tuple[int, ...]
+    selected_pose_branch: str
+    qk_pose_output: Path
+    allow_raw_pose_fallback: bool
 
 
 def load_baseline_run_config(path: str | Path) -> BaselineRunConfig:
@@ -25,6 +28,14 @@ def load_baseline_run_config(path: str | Path) -> BaselineRunConfig:
         raw = yaml.safe_load(handle) or {}
     section = raw.get("baseline", {})
     frames = section.get("frames", {})
+    pose = section.get("pose", {})
+    qk = raw.get("qk_pose_retrieval", {})
+    qk_output_dir = _path(
+        qk.get(
+            "output_dir",
+            "outputs/streaming_couping_v0/clean_qk_pose_retrieval",
+        )
+    )
     config = BaselineRunConfig(
         source_path=source,
         version=str(section.get("version", "")).strip().lower(),
@@ -37,6 +48,18 @@ def load_baseline_run_config(path: str | Path) -> BaselineRunConfig:
             )
         ),
         evaluation_frames=_int_tuple(frames.get("evaluation", ())),
+        selected_pose_branch=str(
+            pose.get("selected_branch", "raw_streamvggt")
+        ).strip().lower(),
+        qk_pose_output=_path(
+            pose.get(
+                "qk_pose_output",
+                qk_output_dir / "clean_qk_pose_output.pt",
+            )
+        ),
+        allow_raw_pose_fallback=bool(
+            pose.get("allow_raw_fallback", True)
+        ),
     )
     _validate_config(config)
     return config
@@ -239,3 +262,7 @@ def _validate_config(config: BaselineRunConfig) -> None:
         raise ValueError("V0 evaluation frames must be unique.")
     if tuple(sorted(config.evaluation_frames)) != config.evaluation_frames:
         raise ValueError("V0 evaluation frames must be strictly time ordered.")
+    if config.selected_pose_branch not in {"raw_streamvggt", "retrieve_qk"}:
+        raise ValueError(
+            "baseline.pose.selected_branch must be raw_streamvggt or retrieve_qk."
+        )

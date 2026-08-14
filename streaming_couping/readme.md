@@ -1,6 +1,6 @@
 # streaming_couping
 
-本目录只保留 `V0` SAM3.1 × StreamVGGT 因果多实例 tracking baseline。运行：
+本目录保留 `V0` SAM3.1 × StreamVGGT 流式语义 tracking 与无训练 pose baseline。运行：
 
 ```bash
 zsh streaming_couping/commands_v0_baseline.txt
@@ -12,9 +12,13 @@ V0 当前提供：
 - 未来帧 late birth、永久 slot 和 persistent ID；
 - StreamVGGT 几何辅助 mask prompt/competition；
 - 不缓存、不读取 SAM appearance token；
-- 不训练 pose 模型；`selected_world_to_camera` 与 raw StreamVGGT 完全相同。
+- 不训练 pose 模型；用 first-frame anchor + native QK Top-4 重组历史上下文并运行冻结 camera head；
+- QK pose 不读取 SAM/GT、不运行 point head；不可用时明确回退 raw StreamVGGT；
+- depth、intrinsics 与 pointmap 始终使用 raw StreamVGGT，SAM mask/ID 用于后续语义投影。
 
-因此 V0 当前只声明可用的流式实例追踪工程基线，不声明位姿改善。当前配置使用
+干净30帧结果（frame 90为gauge，其余29帧整体评分）为 center error `0.120983 → 0.107762`
+（改善`10.9278%`），rotation `2.55064° → 2.39375°`（改善`6.1511%`）。因此V0只声明
+“无训练QK历史检索在这一条序列上改善pose”，不声明SAM identity改善pose或跨场景泛化。当前配置使用
 `bed/wardrobe/picture/mat/chair` 五类 prompt 和 16 个永久 registry slots。语义实例也不等于动态实例，
 这些 prompts 并不是 class-agnostic object proposal。
 
@@ -72,7 +76,7 @@ depth/K/masks在 raw pose与 candidate pose下的融合结果。
 
 完整序列结果已返回：预锁定 `sam_hybrid_qk` 在29个非参考帧上的 center error由 `0.120983`降至
 `0.110489`（改善 `8.6738%`），rotation由 `2.55064°`降至`2.36414°`（改善 `7.3117%`）。因此它已通过
-单序列、无训练的 engineering pose gate，下一步可以作为 V0 selected pose接入；正确 SAM identity的独立
+单序列、无训练的 engineering pose gate；随后更干净的纯QK分支已接入V0 selected pose。正确SAM identity的独立
 因果结论仍为0。
 
 因此正式 pose候选进一步简化为纯 StreamVGGT native-QK retrieval：candidate generation只读取RGB，固定
@@ -83,4 +87,6 @@ first-frame anchor + QK Top-4，不读取SAM mask/ID/memory、不运行point hea
 zsh streaming_couping/commands_v0_clean_qk_pose_retrieval.txt
 ```
 
-该实验只比较缓存中的raw StreamVGGT pose与单个QK候选；输出候选pose但在结果返回前不替换V0 selected pose。
+该实验只比较缓存中的raw StreamVGGT pose与单个QK候选。干净结果已经通过完整序列工程gate，主V0命令会
+重放该候选、验证revision/clip/帧序/shape/provenance，然后写入
+`outputs/streaming_couping_v0/poses.pt:selected_world_to_camera`；raw pose同时保留为fallback。

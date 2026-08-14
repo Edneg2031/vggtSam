@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
-"""CPU smoke checks for the retained raw-pose dynamic-tracking baseline."""
+"""CPU smoke checks for retained tracking, QK pose and raw fallback."""
 
 from __future__ import annotations
 
 import copy
+from pathlib import Path
 
 import torch
 
 from streaming_couping.src.learned_pose.baseline_runtime import (
+    BaselineRunConfig,
     tracking_audit,
+)
+from streaming_couping.scripts.run_dynamic_instance_baseline import (
+    QK_RETRIEVAL_REVISION,
+    _load_pose_selection,
+    _validate_qk_pose_artifacts,
 )
 from streaming_couping.src.geometry_segmentation import (
     GeometrySegmentationPrompt,
@@ -42,8 +49,64 @@ def main() -> None:
     assert tracking_audit(broken, reference_index=0)["tracking_audit_pass"] == 0
 
     raw_pose = torch.randn(1, 4, 3, 4)
-    selected_pose = raw_pose
-    assert torch.equal(selected_pose, raw_pose)
+    frames = (90, 105, 120, 135)
+    candidate = {
+        "revision": QK_RETRIEVAL_REVISION,
+        "frame_indices": frames,
+        "selected_pose_branch": "retrieve_qk",
+        "raw_world_to_camera": raw_pose.clone(),
+        "selected_world_to_camera": raw_pose + 0.01,
+    }
+    summary = {
+        "revision": QK_RETRIEVAL_REVISION,
+        "clip": "smoke",
+        "method": "retrieve_qk",
+        "frames": frames,
+        "candidate_generation_fields": ["stream_images", "frame_indices"],
+        "candidate_generation_gt_fields": 0,
+        "sam_pose_inputs": 0,
+        "model_trained": 0,
+        "point_head_run": 0,
+    }
+    _validate_qk_pose_artifacts(
+        candidate=candidate,
+        summary=summary,
+        payload={"clip_name": "smoke"},
+        raw_pose=raw_pose,
+        frames=frames,
+    )
+    broken_summary = copy.deepcopy(summary)
+    broken_summary["sam_pose_inputs"] = 1
+    try:
+        _validate_qk_pose_artifacts(
+            candidate=candidate,
+            summary=broken_summary,
+            payload={"clip_name": "smoke"},
+            raw_pose=raw_pose,
+            frames=frames,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("QK provenance validator accepted SAM pose input.")
+    fallback = _load_pose_selection(
+        run=BaselineRunConfig(
+            source_path=Path("smoke.yaml"),
+            version="v0",
+            output_dir=Path("smoke"),
+            clip_name="smoke",
+            audit_device="cpu",
+            evaluation_frames=frames,
+            selected_pose_branch="retrieve_qk",
+            qk_pose_output=Path("missing_clean_qk_pose_output.pt"),
+            allow_raw_pose_fallback=True,
+        ),
+        payload={"clip_name": "smoke"},
+        raw_pose=raw_pose,
+        frames=frames,
+    )
+    assert fallback["fallback_used"] is True
+    assert torch.equal(fallback["selected_pose"], raw_pose)
 
     selected, reason = select_adaptive_correction(
         raw_row={
@@ -65,7 +128,7 @@ def main() -> None:
         birth_index=2,
     )
     assert causal[:3] == (None, None, None) and causal[3] is prompt
-    print("raw-pose dynamic-tracking baseline smoke passed")
+    print("tracking/QK-selection/raw-fallback baseline smoke passed")
 
 
 def _row(

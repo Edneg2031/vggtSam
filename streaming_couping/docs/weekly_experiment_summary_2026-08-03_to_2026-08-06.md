@@ -1,20 +1,20 @@
 # StreamVGGT + SAM3.1：V4–V9.8 证据归档与 V0 位姿理论设计
 
-> 最后更新：2026-08-13
+> 最后更新：2026-08-14
 > 用途：这是唯一保留的研究结论与下一阶段设计文档。历史候选代码可以删除，但已经得到的正、负证据不得删除或改写。
 
 ## 1. 当前仓库与结论
 
 - 唯一 active baseline 是 **V0**。
 - SAM3.1 负责 prompted multi-instance discovery/tracking、mask、persistent ID 和 late birth。
-- StreamVGGT geometry 只辅助 mask prompt/competition；selected pose 是逐元素不变的 raw StreamVGGT pose。
-- V0 不缓存 SAM appearance token，不训练 pose model，当前不声明 pose improvement。
+- StreamVGGT geometry辅助mask prompt/competition；纯RGB/native-QK检索负责selected pose，raw pose保留fallback。
+- V0不缓存SAM appearance token、不训练pose model；只声明这一条30帧序列上的training-free pose improvement。
 - E0/E1 edge-DTF 与 G0 projective ICP 已从 active code 删除；G0-r2 只有实现和 smoke、没有服务器结果，不能作为成功或失败证据。
 - 下一步先完成理论和数据协议，不再用新版本号试探性堆代码。
 
 当前主要数据是 ScanNet++ scene `00a231a370` 的 30 帧长 clip：frame 90–525、step 15。未来测试帧固定为：
 
-| fold | frames |
+| diagnostic window | frames |
 |---|---|
 | short | 360, 375, 390, 405 |
 | medium | 420, 435, 450, 465 |
@@ -491,3 +491,13 @@ zsh streaming_couping/commands_v0_clean_qk_pose_retrieval.txt
 
 SAM仍负责prompted discovery、persistent tracking、late birth和semantic lifting；若干净QK pose通过，它只替换
 语义地图融合使用的camera pose，depth/K继续来自raw StreamVGGT。
+
+干净QK重放已完成：30帧causal stream、frame 90为gauge、其余29帧整体评分。center error由
+`0.1209831685`降至`0.1077623591`（改善`10.9278%`），rotation由`2.55063653°`降至
+`2.39374542°`（改善`6.1511%`），两项同时通过。candidate generation字段严格为
+`stream_images/frame_indices`，SAM pose input、GT candidate field、训练和point head均为0。
+
+因此V0正式selected pose改为`retrieve_qk`；候选artifact缺失时回退raw StreamVGGT。部署仍使用raw
+StreamVGGT depth/K/pointmap，禁止使用先前退化的candidate pointmap。允许的结论是“training-free native-QK
+history retrieval在这一条30帧序列上改善pose”；SAM identity因果结论和跨场景泛化结论仍为0。下一步只做
+语义地图闭环：在完全相同raw depth/K/SAM masks/IDs下分别用raw pose与selected QK pose融合点云。

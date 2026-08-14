@@ -1,5 +1,5 @@
-# V0: dynamic SAM3.1 tracking plus unmodified StreamVGGT pose.
-# Failed direct SE(3) and geometry-transport pose heads are not instantiated.
+# V0: SAM3.1 semantic tracking plus training-free StreamVGGT QK retrieval pose.
+# Failed direct SE(3), geometry-transport and SAM-token pose heads are absent.
 recovery_config: streaming_couping/configs/recovery_dynamic_instance.yaml
 output_dir: outputs/streaming_couping_v0/data_stage
 
@@ -60,8 +60,12 @@ baseline:
   audit_device: cuda:0
   frames:
     evaluation: [360, 375, 390, 405, 420, 435, 450, 465, 480, 495, 510, 525]
-  # Pose is intentionally unmodified. A new pose idea must first pass an
-  # independent causal feasibility experiment before entering this baseline.
+  pose:
+    # The selection is fixed before GT scoring. It consumes the RGB/QK-only
+    # artifact below; raw StreamVGGT remains an explicit runtime fallback.
+    selected_branch: retrieve_qk
+    qk_pose_output: outputs/streaming_couping_v0/clean_qk_pose_retrieval/clean_qk_pose_output.pt
+    allow_raw_fallback: true
 
 # Clean deployable pose candidate. It reads RGB and native StreamVGGT Q/K only;
 # SAM remains in the tracking/semantic-map path and does not enter pose retrieval.
@@ -72,7 +76,8 @@ qk_pose_retrieval:
 
 # Training-free RetrieveVGGT-style candidate inside V0. SAM supplies only the
 # persistent masks/identity; StreamVGGT supplies mask-pooled first-layer Q/K,
-# every selected frame still contributes its full native KV, and raw remains selected.
+# every selected frame still contributes its full native KV. This historical
+# SAM-conditioned experiment never directly edits the deployed selected pose.
 # Completed r2 failed the SAM-identity causal claim, but its fixed hybrid pose
 # improved all three diagnostic windows and the full 29/non-reference-frame
 # aggregate. It is accepted as an engineering pose candidate, not as evidence

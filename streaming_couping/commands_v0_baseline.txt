@@ -16,24 +16,45 @@ export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-echo "V0 smoke: raw pose, causal late birth and geometry-mask fallback"
+echo "V0 smoke: causal tracking, clean QK pose selection and raw fallback"
 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_dynamic_instance_baseline
 
 ARGS=()
 [[ "${BASELINE_REBUILD_CACHE:-0}" == "1" ]] && ARGS+=(--rebuild-cache)
 
 echo "V0 physical GPUs=$VISIBLE_GPUS"
-echo "logical layout: StreamVGGT=cuda:0,cuda:1 SAM3.1=cuda:2 audit=cuda:0"
-echo "No pose model is trained; selected pose is exact raw StreamVGGT"
+echo "stage 1/3: cache StreamVGGT geometry and SAM3.1 semantic tracks"
+echo "logical layout: StreamVGGT=cuda:0,cuda:1 SAM3.1=cuda:2"
 CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" PYTHONUNBUFFERED=1 PYTHONPATH=. \
   "$PYTHON_BIN" -m streaming_couping.scripts.run_dynamic_instance_baseline \
   --config "$CONFIG" \
-  --stage all \
+  --stage cache \
   --streamvggt-devices cuda:0,cuda:1 \
   --sam3-device cuda:2 \
   --geometry-device cuda:0 \
-  --audit-device cuda:0 \
   "${ARGS[@]}"
+
+QK_OUTPUT=outputs/streaming_couping_v0/clean_qk_pose_retrieval
+QK_POSE="$QK_OUTPUT/clean_qk_pose_output.pt"
+QK_SUMMARY="$QK_OUTPUT/clean_qk_pose_summary.json"
+if [[ "${BASELINE_REBUILD_QK:-0}" == "1" || ! -s "$QK_POSE" || ! -s "$QK_SUMMARY" ]]; then
+  rm -rf "$QK_OUTPUT"
+  echo "stage 2/3: clean training-free RGB/QK history retrieval"
+  echo "No SAM/GT/point-head input enters candidate generation"
+  CUDA_VISIBLE_DEVICES="$STREAM_GPU0,$STREAM_GPU1" PYTHONUNBUFFERED=1 PYTHONPATH=. \
+    "$PYTHON_BIN" -m streaming_couping.scripts.run_v0_qk_pose_retrieval \
+    --config "$CONFIG" \
+    --streamvggt-devices cuda:0,cuda:1
+else
+  echo "stage 2/3: reuse existing clean QK artifact (strictly validated in stage 3)"
+fi
+
+echo "stage 3/3: select QK pose, audit tracking and score the 29-frame sequence"
+CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" PYTHONUNBUFFERED=1 PYTHONPATH=. \
+  "$PYTHON_BIN" -m streaming_couping.scripts.run_dynamic_instance_baseline \
+  --config "$CONFIG" \
+  --stage audit \
+  --audit-device cuda:0
 
 [[ -s outputs/streaming_couping_v0/baseline_summary.json ]] || {
   echo "missing baseline_summary.json" >&2
@@ -48,11 +69,20 @@ import json
 from pathlib import Path
 summary = json.loads(Path("outputs/streaming_couping_v0/baseline_summary.json").read_text())
 assert summary["baseline_version"] == "v0"
-assert summary["implementation_revision"] == "raw_streamvggt_dynamic_tracking_r4"
-assert summary["selected_pose_branch"] == "raw_streamvggt"
-assert summary["selected_pose_exact_raw"] == 1
-assert summary["pose_modification_applied"] is False
-assert summary["pose_improvement_claim"] is False
+assert summary["schema"] == 5
+assert summary["implementation_revision"] == "qk_retrieved_pose_semantic_tracking_r5"
+assert summary["selected_pose_branch"] == "retrieve_qk"
+assert summary["selected_pose_exact_raw"] == 0
+assert summary["pose_modification_applied"] is True
+assert summary["pose_selection_fallback_used"] == 0
+assert summary["pose_improvement_claim"] is True
+assert summary["selected_center_gain_vs_raw_percent"] > 0
+assert summary["selected_rotation_gain_vs_raw_percent"] > 0
+assert len(summary["pose_evaluation_frames"]) == 29
+assert summary["sam_pose_inputs"] == 0
+assert summary["candidate_pointmap_used"] is False
+assert summary["depth_source"] == "raw_streamvggt"
+assert summary["intrinsics_source"] == "raw_streamvggt"
 assert summary["tracking_baseline_acceptance_pass"] == 1
 assert summary["configured_instance_prompts"] == [
     "bed", "wardrobe", "picture", "mat", "chair"
@@ -63,11 +93,13 @@ tracks = audit["discovered_track_count"]
 late_births = audit["late_birth_count"]
 slots = audit["permanent_slot_capacity"]
 print(
-    "V0 accepted tracking baseline "
+    "V0 accepted tracking + QK-pose baseline "
     f"tracks={tracks} "
     f"late_births={late_births} "
     f"slots={slots} "
-    "selected_pose=exact_raw"
+    f"center_gain={summary['selected_center_gain_vs_raw_percent']:.4f}% "
+    f"R_gain={summary['selected_rotation_gain_vs_raw_percent']:.4f}%"
 )
 '
-echo "V0 raw-pose dynamic-tracking baseline completed"
+echo "V0 selected-pose artifact: outputs/streaming_couping_v0/poses.pt"
+echo "V0 SAM semantic tracking + clean QK pose baseline completed"
