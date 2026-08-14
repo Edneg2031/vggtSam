@@ -66,6 +66,9 @@ baseline:
 # Training-free RetrieveVGGT-style candidate inside V0. SAM supplies only the
 # persistent masks/identity; StreamVGGT supplies mask-pooled first-layer Q/K,
 # every selected frame still contributes its full native KV, and raw remains selected.
+# Completed r2 failed the SAM-identity causal claim, but its fixed hybrid pose
+# improved all three diagnostic windows. Full 30-frame pose evaluation is
+# pending; do not reinterpret the windows as train/test folds.
 sam_memory_retrieval:
   output_dir: outputs/streaming_couping_v0/sam_memory_retrieval
   methods:

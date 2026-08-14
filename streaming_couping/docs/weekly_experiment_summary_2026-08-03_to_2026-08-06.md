@@ -446,3 +446,29 @@ support上的 paired pointmap RMSE均改善，
 ```bash
 zsh streaming_couping/commands_v0_sam_memory_retrieval.txt
 ```
+
+r2 已完成并构成有效证伪。raw pose/point/confidence replay 的 maximum absolute difference仍全部为 0；selection
+intervention audit通过：`sam_gated` 相对 global-QK有23帧不同，hybrid相对 global-QK与 shuffled-ID各有20帧
+不同，因此 r1 的“分支未真正分开”问题已经排除。
+
+`sam_hybrid_qk` 的 center/R gain 在 short、medium、long 分别为 `17.4730%/14.3846%`、
+`20.4084%/17.0375%`、`7.3359%/1.0037%`，说明重构历史上下文可以改变并在该 clip 上改善 pose。
+但对应 pointmap gain 为 `-2.3418%/-53.4971%/-12.8757%`，三折全部退化。更关键的是 shuffled-ID 的
+center gain 为 `21.8477%/31.7279%/20.8457%`，三折均高于正确 ID；正确 identity也没有逐折超过
+global-QK或 shuffled control。故 pose变化只能归因于固定预算造成的 context truncation/reordering，不能归因于
+SAM memory identity，且不能作为 pose+pointmap改进部署。
+
+正确结论分两层：r2 已证伪“正确 SAM identity 是收益来源”的因果命题，因此停止围绕 frame budget、SAM
+quota 或 masked-QK ranking做因果调参；但该方法无训练，short/medium/long只是同一序列的诊断窗口，不是
+train/test folds。hybrid pose在三个窗口的 center与rotation均改善，因此仍是单序列 engineering pose候选。
+最终是否启用改由完整30帧流（frame 90作为gauge reference，其余29帧评分）的整体 pose结果决定。
+
+完整序列评价直接复用已经生成的30帧 causal candidates，不重跑模型：
+
+```bash
+zsh streaming_couping/commands_v0_sam_memory_full_sequence_eval.txt
+```
+
+candidate point-head RMSE不再作为 pose acceptance gate。最终 semantic-map结论必须使用相同 raw depth/K/SAM
+masks，分别配 raw pose和candidate pose完成点云融合后再评价；这一步尚未完成。V0 selected pose在完整序列结果
+返回前仍保持 raw StreamVGGT。
