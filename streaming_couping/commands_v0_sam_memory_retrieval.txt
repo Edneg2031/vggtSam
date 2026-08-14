@@ -18,7 +18,7 @@ export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-echo "V0 SAM-memory retrieval smoke: native QK, fixed budget and identity controls"
+echo "V0 SAM-memory retrieval smoke: masked native QK and identity controls"
 PYTHONPATH=. "$PYTHON_BIN" -m \
   streaming_couping.scripts.smoke_v0_sam_memory_retrieval
 
@@ -34,7 +34,7 @@ CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" PYTHONUNBUFFERED=1 PYTHONPATH=. \
 [[ -s "$CACHE" ]] || { echo "missing V0 cache: $CACHE" >&2; exit 1; }
 rm -rf "$OUTPUT"
 
-echo "V0 frozen RetrieveVGGT-style full-frame KV intervention"
+echo "V0 frozen SAM-mask-pooled QK + full-frame KV intervention"
 echo "physical GPUs=$VISIBLE_GPUS logical StreamVGGT=cuda:0,cuda:1"
 echo "SAM hidden features are not read; no model is trained"
 echo "GT is introduced only after every frozen branch is generated"
@@ -57,7 +57,7 @@ import json
 from pathlib import Path
 path = Path("outputs/streaming_couping_v0/sam_memory_retrieval/retrieval_summary.json")
 summary = json.loads(path.read_text())
-assert summary["revision"] == "v0_sam_memory_retrievevggt_probe_r1"
+assert summary["revision"] == "v0_sam_memory_masked_qk_retrievevggt_probe_r2"
 assert summary["model_trained"] == 0
 assert summary["sam_hidden_features_used"] == 0
 assert summary["raw_replay_equivalence"]["pass"] == 1

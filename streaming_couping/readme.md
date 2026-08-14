@@ -41,8 +41,9 @@ instance correspondence，并与 shuffled-ID control 完全相同。因此该实
 
 ## V0 SAM memory → StreamVGGT KV retrieval probe
 
-当前无训练候选不读取 SAM hidden/appearance token。SAM3.1 的 causal persistent track registry 只给出
-same-instance 历史帧集合，StreamVGGT 第一层原生 Q–K 在集合内排序；选中帧的完整原生 KV 在24层复用。
+当前无训练候选不读取 SAM hidden/appearance token。SAM3.1 的 causal persistent track registry 只提供
+masks/ID；StreamVGGT 第一层原生 Q–K 分别在同一 persistent-ID 的 current/history masks 内池化并排序。
+选中历史帧仍贡献完整原生 KV，并在24层复用。
 `raw_full_history / retrieve_qk / sam_gated_qk / sam_hybrid_qk /
 shuffled_instance_memory` 五支按锁定协议运行，raw selected pose保持不变：
 
@@ -53,3 +54,6 @@ zsh streaming_couping/commands_v0_sam_memory_retrieval.txt
 只有 `sam_hybrid_qk` 三折同时改善 center、rotation、固定 raw-reference Sim(3) 与固定 raw-confidence support
 下的 paired pointmap RMSE，
 并逐折优于同预算 `retrieve_qk`，且 shuffled identity 破坏收益，才允许建立 SAM memory 因果结论。
+
+r1 的 binary same-instance frame gate 在本静态场景退化：四个非 raw 分支输出完全相同，说明“共享任一实例”
+没有改变最终有效检索。当前 r2 因而使用 mask-pooled native QK，并用历史 ID 循环错配作为等计算量 control。

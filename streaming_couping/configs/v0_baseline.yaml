@@ -64,8 +64,8 @@ baseline:
   # independent causal feasibility experiment before entering this baseline.
 
 # Training-free RetrieveVGGT-style candidate inside V0. SAM supplies only the
-# persistent instance-to-history index; StreamVGGT supplies first-layer Q/K,
-# every selected frame contributes its full native KV, and raw remains selected.
+# persistent masks/identity; StreamVGGT supplies mask-pooled first-layer Q/K,
+# every selected frame still contributes its full native KV, and raw remains selected.
 sam_memory_retrieval:
   output_dir: outputs/streaming_couping_v0/sam_memory_retrieval
   methods:
@@ -79,8 +79,8 @@ sam_memory_retrieval:
   # four retrieved frames. All branches use the same budget once history > 5.
   total_frame_budget: 5
   anchor_frames: 1
-  # Hybrid allocates two of the four retrieved slots to persistent-instance
-  # candidates, then fills every unused slot by native global QK rank.
+  # Hybrid allocates two slots by same-ID, mask-pooled native QK, then fills
+  # every unused slot by native full-image QK rank.
   sam_frame_quota: 2
   minimum_track_score: 0.50
   point_confidence_threshold: 0.30

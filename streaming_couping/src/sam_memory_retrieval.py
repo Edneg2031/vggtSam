@@ -102,6 +102,8 @@ def select_retrieval_history(
     method: str,
     frame_index: int,
     qk_scores: torch.Tensor,
+    sam_region_scores: torch.Tensor,
+    shuffled_region_scores: torch.Tensor,
     sam_candidates: Sequence[int],
     shuffled_candidates: Sequence[int],
     policy: RetrievalPolicy,
@@ -117,6 +119,14 @@ def select_retrieval_history(
         raise ValueError(
             f"Expected {frame} QK scores, got {tuple(qk_scores.shape)}."
         )
+    for name, scores in (
+        ("sam_region_scores", sam_region_scores),
+        ("shuffled_region_scores", shuffled_region_scores),
+    ):
+        if scores.ndim != 1 or scores.numel() != frame:
+            raise ValueError(
+                f"Expected {frame} {name}, got {tuple(scores.shape)}."
+            )
     if method == "raw_full_history":
         return tuple(range(frame))
     budget = min(int(policy.total_frame_budget), frame)
@@ -135,12 +145,17 @@ def select_retrieval_history(
         if method == "shuffled_instance_memory"
         else sam_candidates
     )
+    candidate_scores = (
+        shuffled_region_scores
+        if method == "shuffled_instance_memory"
+        else sam_region_scores
+    )
     candidate_pool = tuple(
         index
         for index in candidates
-        if index in available
+        if index in available and bool(torch.isfinite(candidate_scores[index]))
     )
-    candidate_rank = _ranked_indices(qk_scores, candidate_pool)
+    candidate_rank = _ranked_indices(candidate_scores, candidate_pool)
     if method == "sam_gated_qk":
         chosen = list(candidate_rank[:remaining])
     else:

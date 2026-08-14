@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 import yaml
 
 from streaming_couping.src.backbones.streamvggt_parallel import (
@@ -48,7 +49,7 @@ from streaming_couping.src.sam_memory_retrieval import (
 )
 
 
-REVISION = "v0_sam_memory_retrievevggt_probe_r1"
+REVISION = "v0_sam_memory_masked_qk_retrievevggt_probe_r2"
 FOLDS = ("short", "medium", "long")
 
 
@@ -119,10 +120,18 @@ def main() -> None:
         candidate_payload["sam_track_ids"],
         minimum_score=run.minimum_track_score,
     )
+    region_patch_masks = _region_patch_masks(
+        candidate_payload["tracking_masks_stream"],
+        visibility,
+        patch_shape=tuple(
+            int(value) for value in candidate_payload["patch_shape"]
+        ),
+    )
     generation = _generate_candidates(
         runner=runner,
         payload=candidate_payload,
         visibility=visibility,
+        region_patch_masks=region_patch_masks,
         methods=run.methods,
         policy=run.policy,
     )
@@ -151,6 +160,7 @@ def _generate_candidates(
     runner: LayerShardedStreamVGGT,
     payload: dict,
     visibility: torch.Tensor,
+    region_patch_masks: torch.Tensor,
     methods: tuple[str, ...],
     policy: RetrievalPolicy,
 ) -> dict[str, dict[str, Any]]:
@@ -167,7 +177,12 @@ def _generate_candidates(
         confidences = []
         retrieval_rows: list[dict[str, object]] = []
 
-        def selector(frame_index: int, scores: torch.Tensor) -> tuple[int, ...]:
+        def selector(
+            frame_index: int,
+            scores: torch.Tensor,
+            sam_region_scores: torch.Tensor,
+            shuffled_region_scores: torch.Tensor,
+        ) -> tuple[int, ...]:
             sam_candidates = same_instance_history_frames(
                 visibility,
                 frame_index,
@@ -181,6 +196,8 @@ def _generate_candidates(
                 method=method,
                 frame_index=frame_index,
                 qk_scores=scores,
+                sam_region_scores=sam_region_scores,
+                shuffled_region_scores=shuffled_region_scores,
                 sam_candidates=sam_candidates,
                 shuffled_candidates=shuffled_candidates,
                 policy=policy,
@@ -196,6 +213,10 @@ def _generate_candidates(
                 selected,
             )
             qk_rank = tuple(int(value) for value in rank["qk_ranked_history"])
+            sam_region_rank = _finite_score_rank(sam_region_scores)
+            shuffled_region_rank = _finite_score_rank(
+                shuffled_region_scores
+            )
             current_slots = tuple(
                 int(value)
                 for value in torch.nonzero(
@@ -227,6 +248,23 @@ def _generate_candidates(
                     ),
                     "qk_scores": " ".join(
                         f"{float(value):.8g}" for value in scores
+                    ),
+                    "sam_region_scores": _score_text(sam_region_scores),
+                    "shuffled_region_scores": _score_text(
+                        shuffled_region_scores
+                    ),
+                    "sam_region_ranked_sequence_indices": _space(
+                        sam_region_rank
+                    ),
+                    "sam_region_ranked_frame_indices": _space(
+                        frame_numbers[index] for index in sam_region_rank
+                    ),
+                    "shuffled_region_ranked_sequence_indices": _space(
+                        shuffled_region_rank
+                    ),
+                    "shuffled_region_ranked_frame_indices": _space(
+                        frame_numbers[index]
+                        for index in shuffled_region_rank
                     ),
                     "current_visible_slots": _space(current_slots),
                     "current_visible_sam_track_ids": _space(
@@ -272,6 +310,7 @@ def _generate_candidates(
                 batch_frame,
                 frame_index,
                 history_selector=selector,
+                region_patch_masks=region_patch_masks,
             )
             pose_encoding = runner.camera(selected_tokens)
             points, confidence = runner.points(selected_tokens, batch_frame)
@@ -329,15 +368,42 @@ def _candidate_generation_payload(payload: dict) -> dict[str, Any]:
     allowed = (
         "stream_images",
         "tracking_masks_output",
+        "tracking_masks_stream",
         "tracking_scores",
         "sam_track_ids",
         "sam_track_prompts",
         "frame_indices",
+        "patch_shape",
     )
     deployable = {name: payload[name] for name in allowed}
     if any(name.startswith("target_") for name in deployable):
         raise RuntimeError("Candidate generation payload unexpectedly contains GT.")
     return deployable
+
+
+def _region_patch_masks(
+    masks: torch.Tensor,
+    visibility: torch.Tensor,
+    *,
+    patch_shape: tuple[int, int],
+) -> torch.Tensor:
+    """Convert causal SAM regions to fractional StreamVGGT patch occupancy."""
+
+    if masks.ndim != 4 or visibility.shape != masks.shape[:2]:
+        raise ValueError(
+            "Region masks/visibility must be [T,N,H,W] and [T,N]."
+        )
+    height, width = (int(patch_shape[0]), int(patch_shape[1]))
+    if height <= 0 or width <= 0:
+        raise ValueError(f"Invalid StreamVGGT patch shape {patch_shape}.")
+    frames, instances = masks.shape[:2]
+    active = masks.detach().float().cpu()
+    active = active * visibility.detach().float().cpu()[..., None, None]
+    pooled = F.adaptive_avg_pool2d(
+        active.reshape(-1, 1, *active.shape[-2:]),
+        output_size=(height, width),
+    )
+    return pooled.reshape(frames, instances, height, width).clamp(0, 1)
 
 
 def _score_and_write(
@@ -496,6 +562,7 @@ def _score_and_write(
         for method in run.methods
         if method != "raw_full_history"
     }
+    selection_audit = _selection_intervention_audit(generation)
     hybrid_vs_qk = _all_fold_better(
         method_state["sam_hybrid_qk"],
         method_state["retrieve_qk"],
@@ -508,6 +575,7 @@ def _score_and_write(
     )
     causal_pass = int(
         branch_all_fold.get(run.primary_method, 0)
+        and int(selection_audit["pass"])
         and hybrid_vs_qk
         and shuffled_damage
     )
@@ -520,6 +588,9 @@ def _score_and_write(
             shuffled_damage
         ),
         "sam_memory_retrieval_causal_pass": causal_pass,
+        "selection_intervention_audit": selection_audit,
+        "r1_whole_frame_candidate_gate_identifiable": 0,
+        "r1_result": "all_non_raw_branches_identical",
         "selected_pose_modified": 0,
         "candidate_generation_gt_fields": 0,
         "gt_role": "scoring_only_after_all_frozen_branches",
@@ -553,14 +624,15 @@ def _score_and_write(
         "total_frame_budget": run.policy.total_frame_budget,
         "anchor_frames": run.policy.anchor_frames,
         "sam_frame_quota": run.policy.sam_frame_quota,
-        "sam_role": "persistent_instance_history_index_only",
-        "streamvggt_role": "native_first_global_qk_and_whole_frame_kv",
+        "sam_role": "persistent_instance_masks_and_identity_for_qk_pooling",
+        "streamvggt_role": "native_mask_pooled_first_global_qk_and_whole_frame_kv",
         "pointmap_scoring_support": "fixed_raw_streamvggt_confidence",
         "sam_hidden_features_used": 0,
         "sam_appearance_tokens_used": 0,
         "model_trained": 0,
         "pose_loss_used": 0,
         "raw_replay_equivalence": raw_audit,
+        "selection_intervention_audit": selection_audit,
         "decision": decision,
         "fold_results": fold_rows,
     }
@@ -692,6 +764,40 @@ def _all_fold_better(
     return True
 
 
+def _selection_intervention_audit(
+    generation: dict[str, dict[str, Any]],
+) -> dict[str, int]:
+    selected = {
+        method: tuple(
+            str(row["selected_sequence_indices"])
+            for row in branch["retrieval_rows"]
+        )
+        for method, branch in generation.items()
+    }
+    lengths = {len(values) for values in selected.values()}
+    if len(lengths) != 1:
+        raise ValueError("Retrieval branches produced different frame counts.")
+
+    def difference(left: str, right: str) -> int:
+        return sum(
+            first != second
+            for first, second in zip(selected[left], selected[right])
+        )
+
+    hybrid_qk = difference("sam_hybrid_qk", "retrieve_qk")
+    hybrid_shuffled = difference(
+        "sam_hybrid_qk",
+        "shuffled_instance_memory",
+    )
+    gated_qk = difference("sam_gated_qk", "retrieve_qk")
+    return {
+        "sam_hybrid_vs_retrieve_qk_different_frames": hybrid_qk,
+        "sam_hybrid_vs_shuffled_different_frames": hybrid_shuffled,
+        "sam_gated_vs_retrieve_qk_different_frames": gated_qk,
+        "pass": int(hybrid_qk > 0 and hybrid_shuffled > 0),
+    }
+
+
 def _finite_mean(values: torch.Tensor, indices: list[int]) -> float:
     selected = values.index_select(0, torch.tensor(indices, dtype=torch.long))
     selected = selected[torch.isfinite(selected)]
@@ -735,10 +841,11 @@ def _write_copyable_report(
         f"total_frame_budget={run.policy.total_frame_budget}",
         f"anchor_frames={run.policy.anchor_frames}",
         f"sam_frame_quota={run.policy.sam_frame_quota}",
-        "sam_role=persistent_instance_history_index_only",
+        "sam_role=persistent_instance_masks_and_identity_for_qk_pooling",
+        "sam_hidden_features_used=0",
+        "retrieval_score=native_streamvggt_qk_pooled_inside_same_id_masks",
         "streamvggt_context=whole_frame_native_kv",
         "pointmap_scoring_support=fixed_raw_streamvggt_confidence",
-        "sam_hidden_features_used=0",
         "model_trained=0",
         "candidate_generation_gt_fields=0",
         f"raw_replay_equivalence={json.dumps(raw_audit, sort_keys=True)}",
@@ -809,6 +916,7 @@ def _validate_payload(payload: dict, *, clip: ClipConfig) -> None:
     required = (
         "stream_images",
         "tracking_masks_output",
+        "tracking_masks_stream",
         "tracking_scores",
         "sam_track_ids",
         "sam_track_prompts",
@@ -820,6 +928,7 @@ def _validate_payload(payload: dict, *, clip: ClipConfig) -> None:
         "point_alignment_scale",
         "point_alignment_rotation",
         "point_alignment_translation",
+        "patch_shape",
     )
     missing = [name for name in required if name not in payload]
     if missing:
@@ -855,6 +964,26 @@ def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
 
 def _space(values) -> str:
     return " ".join(str(int(value)) for value in values)
+
+
+def _finite_score_rank(scores: torch.Tensor) -> tuple[int, ...]:
+    return tuple(
+        sorted(
+            (
+                index
+                for index in range(scores.numel())
+                if bool(torch.isfinite(scores[index]))
+            ),
+            key=lambda index: (-float(scores[index]), index),
+        )
+    )
+
+
+def _score_text(scores: torch.Tensor) -> str:
+    return " ".join(
+        "nan" if not bool(torch.isfinite(value)) else f"{float(value):.8g}"
+        for value in scores
+    )
 
 
 def _csv_text(value: object) -> str:

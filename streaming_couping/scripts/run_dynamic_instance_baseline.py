@@ -240,7 +240,9 @@ def _write_outputs(
         "selected_pose_exact_raw": 1,
         "pose_modification_applied": False,
         "pose_improvement_claim": False,
-        "pose_candidate_status": "sam_memory_retrieval_implemented_not_selected",
+        "pose_candidate_status": (
+            "sam_memory_masked_qk_retrieval_implemented_not_selected"
+        ),
         "historical_direct_pose_validation_pass": 0,
         "removed_pose_paths": (
             "v71_camera_pose_direct_se3",

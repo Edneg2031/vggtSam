@@ -416,15 +416,28 @@ correspondence precision/coverage，再允许进入 pose。不能直接把 SAM t
 ## 14. V0 SAM persistent-memory → native StreamVGGT KV 检索协议
 
 该候选采用 RetrieveVGGT 的 training-free context construction，而不恢复已经证伪的 SAM-token camera fusion。
-SAM3.1 hidden/appearance feature不进入 StreamVGGT；V0 causal persistent track registry只生成当前实例的历史帧
-候选集合。StreamVGGT 首个 global block 使用经过 QK norm/RoPE 的 current Q 与逐历史帧 native K计算
-frame relevance，第一层选择的帧索引在后续24层复用，选中帧始终贡献完整图像 KV，不裁成实例局部 support。
+SAM3.1 hidden/appearance feature不进入 StreamVGGT；V0 causal persistent track registry只提供 masks 与 ID。
+StreamVGGT 首个 global block 使用经过 QK norm/RoPE 的 current Q 与逐历史帧 native K：global control在全图
+patch上池化，SAM branch则分别在 current/history 同一 persistent-ID mask内池化后计算 frame relevance。第一层
+选择的帧索引在后续24层复用，选中帧始终贡献完整图像 KV，不裁成实例局部 support。
 
 锁定分支为 `raw_full_history / retrieve_qk / sam_gated_qk / sam_hybrid_qk /
 shuffled_instance_memory`。除 raw 外，历史预算均为 first-frame anchor 1 + retrieved 4；hybrid预留2个槽位给
-same-instance候选内的 QK Top帧，缺额由 global QK顺序补齐。所有 candidate先完整生成，GT pose/pointmap只在
+same-ID masked-QK Top帧，缺额由 global QK顺序补齐。所有 candidate先完整生成，GT pose/pointmap只在
 之后评分。raw repository replay必须与原 rolling full-history cache通过数值等价检查；候选不会修改 V0 selected
 pose。
+
+r1 已完成且 raw replay 三项 max difference 均为 0，但 `retrieve_qk / sam_gated / sam_hybrid / shuffled`
+四支输出完全相同。原因不是模型数值错误，而是“当前帧与历史帧是否共享任一实例”在该静态场景中几乎总为真，
+该 binary gate没有改变最终有效检索（候选集合退化或 Top选择与 global-QK重合）。因此 r1 证伪了 binary whole-frame
+same-instance gate的可识别性，不能据此声称 SAM memory有效或无效。r2 改用上述 same-ID mask-pooled native
+QK；shuffled control使用相同 masks/计算量但循环错配历史 ID，使正确/错误 identity必然是可区分干预。
+
+r1 的四个非 raw 分支共同结果为：short 的 center/R/pointmap gain = `15.6335% / 11.8429% /
+6.1630%`；medium = `19.0376% / 21.0348% / -34.2773%`；long = `19.0775% / -5.8340% /
+-41.5120%`。这给出一个独立但有限的正结果：固定预算 native global-QK retrieval 能稳定降低三折 camera-center
+error；同时它没有通过完整 pose/geometry gate，且不能归因于 SAM。medium/long pointmap大幅退化以及 long rotation
+退化明确禁止把该分支直接部署为 V0 输出。
 
 SAM memory causal pass要求：primary三折 center、rotation、固定 raw-reference Sim(3) 与固定 raw-confidence
 support上的 paired pointmap RMSE均改善，
