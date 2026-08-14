@@ -69,3 +69,18 @@ zsh streaming_couping/commands_v0_sam_memory_full_sequence_eval.txt
 
 candidate point-head RMSE只保留为诊断，不作为 pose acceptance gate。最终 semantic map应另行比较相同 raw
 depth/K/masks在 raw pose与 candidate pose下的融合结果。
+
+完整序列结果已返回：预锁定 `sam_hybrid_qk` 在29个非参考帧上的 center error由 `0.120983`降至
+`0.110489`（改善 `8.6738%`），rotation由 `2.55064°`降至`2.36414°`（改善 `7.3117%`）。因此它已通过
+单序列、无训练的 engineering pose gate，下一步可以作为 V0 selected pose接入；正确 SAM identity的独立
+因果结论仍为0。
+
+因此正式 pose候选进一步简化为纯 StreamVGGT native-QK retrieval：candidate generation只读取RGB，固定
+first-frame anchor + QK Top-4，不读取SAM mask/ID/memory、不运行point head。SAM保留在tracking与semantic-map
+路径。干净30帧复现实验运行：
+
+```bash
+zsh streaming_couping/commands_v0_clean_qk_pose_retrieval.txt
+```
+
+该实验只比较缓存中的raw StreamVGGT pose与单个QK候选；输出候选pose但在结果返回前不替换V0 selected pose。

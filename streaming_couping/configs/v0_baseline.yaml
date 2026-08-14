@@ -63,12 +63,20 @@ baseline:
   # Pose is intentionally unmodified. A new pose idea must first pass an
   # independent causal feasibility experiment before entering this baseline.
 
+# Clean deployable pose candidate. It reads RGB and native StreamVGGT Q/K only;
+# SAM remains in the tracking/semantic-map path and does not enter pose retrieval.
+qk_pose_retrieval:
+  output_dir: outputs/streaming_couping_v0/clean_qk_pose_retrieval
+  total_frame_budget: 5
+  anchor_frames: 1
+
 # Training-free RetrieveVGGT-style candidate inside V0. SAM supplies only the
 # persistent masks/identity; StreamVGGT supplies mask-pooled first-layer Q/K,
 # every selected frame still contributes its full native KV, and raw remains selected.
 # Completed r2 failed the SAM-identity causal claim, but its fixed hybrid pose
-# improved all three diagnostic windows. Full 30-frame pose evaluation is
-# pending; do not reinterpret the windows as train/test folds.
+# improved all three diagnostic windows and the full 29/non-reference-frame
+# aggregate. It is accepted as an engineering pose candidate, not as evidence
+# that correct SAM identity caused the gain.
 sam_memory_retrieval:
   output_dir: outputs/streaming_couping_v0/sam_memory_retrieval
   methods:

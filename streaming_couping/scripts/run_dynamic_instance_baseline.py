@@ -241,7 +241,7 @@ def _write_outputs(
         "pose_modification_applied": False,
         "pose_improvement_claim": False,
         "pose_candidate_status": (
-            "sam_memory_retrieval_full_sequence_pose_evaluation_pending"
+            "clean_streamvggt_qk_pose_retrieval_pending_replay"
         ),
         "historical_direct_pose_validation_pass": 0,
         "removed_pose_paths": (
@@ -249,7 +249,7 @@ def _write_outputs(
             "v74_geometry_transport_pose_refiner",
         ),
         "future_pose_factor_backend": (
-            "training_free_retrieval_candidate_not_yet_selected"
+            "training_free_native_qk_retrieval_candidate"
         ),
         "raw_metrics": raw_metrics,
         "selected_pose_metrics": raw_metrics,

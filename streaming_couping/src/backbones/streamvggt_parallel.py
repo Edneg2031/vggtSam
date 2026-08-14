@@ -462,20 +462,23 @@ class LayerShardedStreamVGGT:
                     patch_start_idx=self.patch_start_idx,
                 )
                 if region_patch_masks is None:
-                    raise ValueError(
-                        "Region patch masks are required for SAM-memory retrieval."
+                    sam_region_scores = torch.full_like(scores, float("nan"))
+                    shuffled_region_scores = torch.full_like(
+                        scores,
+                        float("nan"),
                     )
-                sam_region_scores, shuffled_region_scores = (
-                    _first_global_layer_instance_frame_scores(
-                        aggregator.global_blocks[layer_index],
-                        frame_tokens,
-                        position=layer_position,
-                        frame_key_values=self.frame_key_values[layer_index],
-                        patch_start_idx=self.patch_start_idx,
-                        region_patch_masks=region_patch_masks,
-                        frame_index=frame_index,
+                else:
+                    sam_region_scores, shuffled_region_scores = (
+                        _first_global_layer_instance_frame_scores(
+                            aggregator.global_blocks[layer_index],
+                            frame_tokens,
+                            position=layer_position,
+                            frame_key_values=self.frame_key_values[layer_index],
+                            patch_start_idx=self.patch_start_idx,
+                            region_patch_masks=region_patch_masks,
+                            frame_index=frame_index,
+                        )
                     )
-                )
                 requested = tuple(
                     int(value)
                     for value in history_selector(
