@@ -240,13 +240,15 @@ def _write_outputs(
         "selected_pose_exact_raw": 1,
         "pose_modification_applied": False,
         "pose_improvement_claim": False,
-        "pose_candidate_status": "theory_redesign_not_implemented",
+        "pose_candidate_status": "sam_memory_retrieval_implemented_not_selected",
         "historical_direct_pose_validation_pass": 0,
         "removed_pose_paths": (
             "v71_camera_pose_direct_se3",
             "v74_geometry_transport_pose_refiner",
         ),
-        "future_pose_factor_backend": "not_implemented_not_selected",
+        "future_pose_factor_backend": (
+            "retrievevggt_style_full_frame_kv_candidate_not_selected"
+        ),
         "raw_metrics": raw_metrics,
         "selected_pose_metrics": raw_metrics,
         "selected_gain_vs_raw_percent": 0.0,

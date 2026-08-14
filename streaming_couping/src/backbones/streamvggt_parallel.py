@@ -10,7 +10,7 @@ from __future__ import annotations
 import copy
 from contextlib import nullcontext
 from types import MethodType
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -204,6 +204,68 @@ def assert_processed_key_cache_equivalence() -> None:
             )
 
 
+def assert_frame_repository_cache_equivalence() -> None:
+    """Verify that gathering per-frame KV reproduces a rolling full cache."""
+
+    from streamvggt.layers.attention import Attention
+    from streamvggt.layers.rope import RotaryPositionEmbedding2D
+
+    with torch.random.fork_rng(devices=[]), torch.inference_mode():
+        torch.manual_seed(2027)
+        rolling = Attention(
+            dim=32,
+            num_heads=4,
+            qk_norm=True,
+            rope=RotaryPositionEmbedding2D(frequency=100),
+        ).eval()
+        repository = copy.deepcopy(rolling).eval()
+        _install_processed_key_cache(rolling)
+        _install_processed_key_cache(repository)
+        positions = torch.tensor(
+            [[[0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [1, 2]]],
+            dtype=torch.long,
+        )
+        rolling_cache = None
+        frame_repository: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for _ in range(4):
+            tokens = torch.randn(1, 6, 32)
+            rolling_output, rolling_cache = rolling(
+                tokens,
+                pos=positions,
+                past_key_values=rolling_cache,
+                use_cache=True,
+            )
+            selected_cache = _gather_frame_key_values(
+                frame_repository,
+                tuple(range(len(frame_repository))),
+            )
+            repository_output, combined = repository(
+                tokens,
+                pos=positions,
+                past_key_values=selected_cache,
+                use_cache=True,
+            )
+            frame_repository.append(_last_frame_key_values(combined))
+            torch.testing.assert_close(
+                repository_output,
+                rolling_output,
+                rtol=1e-5,
+                atol=1e-6,
+            )
+            torch.testing.assert_close(
+                torch.cat([value[0] for value in frame_repository], dim=2),
+                rolling_cache[0],
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                torch.cat([value[1] for value in frame_repository], dim=2),
+                rolling_cache[1],
+                rtol=0,
+                atol=0,
+            )
+
+
 class LayerShardedStreamVGGT:
     """Run full-history StreamVGGT with aggregator layers split across GPUs."""
 
@@ -264,9 +326,13 @@ class LayerShardedStreamVGGT:
         """Release the previous clip history before starting a new clip."""
 
         self.past_key_values: list[Any] = [None] * self.aggregator.depth
+        self.frame_key_values: list[
+            list[tuple[torch.Tensor, torch.Tensor]]
+        ] = [[] for _ in range(self.aggregator.depth)]
         self.past_key_values_camera: list[Any] = [
             None
         ] * self.model.camera_head.trunk_depth
+        self.last_retrieval: dict[str, Any] | None = None
 
     def layout_summary(self) -> tuple[str, ...]:
         lines = []
@@ -293,6 +359,9 @@ class LayerShardedStreamVGGT:
         self,
         images: torch.Tensor,
         frame_index: int,
+        *,
+        history_selector: Callable[[int, torch.Tensor], Sequence[int]]
+        | None = None,
     ) -> dict[int, torch.Tensor]:
         """Run one frame and retain only levels consumed by downstream heads."""
 
@@ -309,12 +378,19 @@ class LayerShardedStreamVGGT:
             else nullcontext()
         )
         with context:
-            return self._aggregate_frame_impl(images, frame_index)
+            return self._aggregate_frame_impl(
+                images,
+                frame_index,
+                history_selector=history_selector,
+            )
 
     def _aggregate_frame_impl(
         self,
         images: torch.Tensor,
         frame_index: int,
+        *,
+        history_selector: Callable[[int, torch.Tensor], Sequence[int]]
+        | None,
     ) -> dict[int, torch.Tensor]:
         aggregator = self.aggregator
         first = self.first_device
@@ -353,6 +429,8 @@ class LayerShardedStreamVGGT:
             position = torch.cat([special, position], dim=1)
 
         selected: dict[int, torch.Tensor] = {}
+        selected_history: tuple[int, ...] | None = None
+        self.last_retrieval = None
         for layer_index, device_index in enumerate(self.layer_devices):
             device = self.devices[device_index]
             if tokens.device != device:
@@ -366,13 +444,53 @@ class LayerShardedStreamVGGT:
                 tokens,
                 pos=layer_position,
             )
+            if history_selector is not None and layer_index == 0:
+                scores = _first_global_layer_frame_scores(
+                    aggregator.global_blocks[layer_index],
+                    frame_tokens,
+                    position=layer_position,
+                    frame_key_values=self.frame_key_values[layer_index],
+                    patch_start_idx=self.patch_start_idx,
+                )
+                requested = tuple(
+                    int(value)
+                    for value in history_selector(frame_index, scores.clone())
+                )
+                _validate_history_selection(
+                    requested,
+                    history_frames=len(self.frame_key_values[layer_index]),
+                    frame_index=frame_index,
+                )
+                selected_history = requested
+                self.last_retrieval = {
+                    "frame_index": int(frame_index),
+                    "history_frames": len(self.frame_key_values[layer_index]),
+                    "qk_scores": scores.clone(),
+                    "selected_history_indices": selected_history,
+                }
+            if history_selector is not None:
+                if selected_history is None:
+                    raise RuntimeError(
+                        "Frame retrieval selection was not initialized at layer 0."
+                    )
+                past_key_values = _gather_frame_key_values(
+                    self.frame_key_values[layer_index],
+                    selected_history,
+                )
+            else:
+                past_key_values = self.past_key_values[layer_index]
             tokens, new_key_values = aggregator.global_blocks[layer_index](
                 frame_tokens,
                 pos=layer_position,
-                past_key_values=self.past_key_values[layer_index],
+                past_key_values=past_key_values,
                 use_cache=True,
             )
-            self.past_key_values[layer_index] = new_key_values
+            if history_selector is None:
+                self.past_key_values[layer_index] = new_key_values
+            else:
+                self.frame_key_values[layer_index].append(
+                    _last_frame_key_values(new_key_values)
+                )
             if layer_index in self.selected_layers:
                 selected[layer_index] = torch.cat(
                     [frame_tokens[:, None], tokens[:, None]],
@@ -480,6 +598,104 @@ class LayerShardedStreamVGGT:
         self.model.depth_head.to(first)
         self.model.point_head.to(point_device)
         self.model.camera_head.to(camera_device)
+
+
+def _first_global_layer_frame_scores(
+    block: torch.nn.Module,
+    frame_tokens: torch.Tensor,
+    *,
+    position: torch.Tensor | None,
+    frame_key_values: Sequence[tuple[torch.Tensor, torch.Tensor]],
+    patch_start_idx: int,
+) -> torch.Tensor:
+    """Return exact processed-Q/processed-K frame relevance on CPU."""
+
+    if not frame_key_values:
+        return torch.empty(0, dtype=torch.float32)
+    attention = block.attn
+    batch, token_count, channels = frame_tokens.shape
+    qkv = (
+        attention.qkv(block.norm1(frame_tokens))
+        .reshape(
+            batch,
+            token_count,
+            3,
+            attention.num_heads,
+            attention.head_dim,
+        )
+        .permute(2, 0, 3, 1, 4)
+    )
+    query = attention.q_norm(qkv[0])
+    if attention.rope is not None:
+        query = attention.rope(query, position)
+    start = int(patch_start_idx)
+    if not 0 <= start < token_count:
+        raise ValueError(
+            f"Invalid patch_start_idx={start} for {token_count} tokens."
+        )
+    query_descriptor = query[:, :, start:, :].mean(dim=2)
+    key_descriptors = torch.stack(
+        [
+            key[:, :, 0, start:, :].mean(dim=2)
+            for key, _ in frame_key_values
+        ],
+        dim=2,
+    )
+    scores = (
+        query_descriptor.unsqueeze(2)
+        .mul(key_descriptors)
+        .sum(dim=-1)
+        .mean(dim=(0, 1))
+    )
+    return scores.detach().float().cpu()
+
+
+def _gather_frame_key_values(
+    repository: Sequence[tuple[torch.Tensor, torch.Tensor]],
+    indices: Sequence[int],
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if not indices:
+        return None
+    return (
+        torch.cat([repository[int(index)][0] for index in indices], dim=2),
+        torch.cat([repository[int(index)][1] for index in indices], dim=2),
+    )
+
+
+def _last_frame_key_values(
+    values: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key, value = values
+    if key.ndim != 5 or value.ndim != 5 or key.shape[2] < 1:
+        raise ValueError(
+            "Frame KV repository requires [B,H,F,P,D] key/value tensors."
+        )
+    # clone() is required: a detached last-frame view would still retain the
+    # storage for the full selected-history tensor and grow quadratically.
+    return (
+        key[:, :, -1:, :, :].detach().clone(),
+        value[:, :, -1:, :, :].detach().clone(),
+    )
+
+
+def _validate_history_selection(
+    indices: Sequence[int],
+    *,
+    history_frames: int,
+    frame_index: int,
+) -> None:
+    values = tuple(int(value) for value in indices)
+    if len(values) != len(set(values)):
+        raise ValueError(f"Retrieval selected duplicate history frames: {values}.")
+    if tuple(sorted(values)) != values:
+        raise ValueError(
+            f"Retrieval history frames must be time ordered, got {values}."
+        )
+    if any(value < 0 or value >= int(history_frames) for value in values):
+        raise ValueError(
+            "Retrieval selected a non-causal or unavailable frame: "
+            f"frame={frame_index} history={history_frames} selected={values}."
+        )
 
 
 def _move_parameter(

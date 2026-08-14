@@ -34,3 +34,22 @@ zsh streaming_couping/commands_v0_sam_region_pose_candidate.txt
 
 该命令比较 `full_image_match / sam_region_identity / shuffled_instance_identity` 三组等量对应。
 候选 pose 只单独保存和评分，不替换 V0 的 raw StreamVGGT pose。
+
+首次单场景运行已经得到 all-fold pass=0：medium/long 的 SIFT 对应不足，short fold 唯一接受的更新没有
+instance correspondence，并与 shuffled-ID control 完全相同。因此该实现只作为已记录的失败候选保留，
+不得启用为 V0 pose；完整证据见实验总结第 13 节。
+
+## V0 SAM memory → StreamVGGT KV retrieval probe
+
+当前无训练候选不读取 SAM hidden/appearance token。SAM3.1 的 causal persistent track registry 只给出
+same-instance 历史帧集合，StreamVGGT 第一层原生 Q–K 在集合内排序；选中帧的完整原生 KV 在24层复用。
+`raw_full_history / retrieve_qk / sam_gated_qk / sam_hybrid_qk /
+shuffled_instance_memory` 五支按锁定协议运行，raw selected pose保持不变：
+
+```bash
+zsh streaming_couping/commands_v0_sam_memory_retrieval.txt
+```
+
+只有 `sam_hybrid_qk` 三折同时改善 center、rotation、固定 raw-reference Sim(3) 与固定 raw-confidence support
+下的 paired pointmap RMSE，
+并逐折优于同预算 `retrieve_qk`，且 shuffled identity 破坏收益，才允许建立 SAM memory 因果结论。

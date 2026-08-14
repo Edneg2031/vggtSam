@@ -384,3 +384,52 @@ pose training、pose loss 均不使用。候选生成 API 不含 GT 字段，GT 
 ```bash
 zsh streaming_couping/commands_v0_sam_region_pose_candidate.txt
 ```
+
+## 13. 静态场景 SAM region-ID + SIFT/PnP 实验结论
+
+服务器完成 `v0_mesa_style_sam_region_sift_pointmap_pnp_r1`。配置为五个 prompts、16-slot registry、
+每帧最多 5 个 pose-active regions；实际发现 4 条 tracks。V0 selected pose 始终保持 raw StreamVGGT。
+
+结果为：
+
+- short fold 的 `sam_region_identity` 仅 1/4 帧生成被接受的候选，center/rotation gain 分别只有
+  `0.117% / 0.740%`，fold pass=0；
+- 该唯一接受帧是 frame 390，但其 selected instance correspondences=0，结果与
+  `shuffled_instance_identity` 完全相同，因此改善来自 background support selection，不能归因于 SAM；
+- frame 405 虽有 13 条 instance correspondences，但三组 equal-count 被 shuffled control 锁到 26，低于预锁
+  minimum 32，没有生成候选；frame 360 只有 5 条 instance correspondences，且 PnP update 超出部署边界；
+- medium/long folds 的 primary active frames 都是 0/4。后半序列每帧 pool 只有 4–42 条对应，大多不足以
+  支持固定 PnP/held-out gate；
+- 三折 `primary_all_fold_pose_pass=0`，`primary_all_fold_sam_causal_pass=0`。
+
+因此已经证伪的是：**在当前稀疏时间采样、当前五类 SAM regions 和 SIFT mutual-ratio 对应下，使用
+persistent region identity 过滤 StreamVGGT pointmap 3D–2D matches，不能形成可部署、可归因于 SAM 的 pose
+改善。** 这不证明所有 mask-guided pose 方法均无效，但明确排除了继续调低 PnP minimum、放宽 update bound
+或围绕这一 SIFT 后端调参；那些改动既不能补足 medium/long correspondence，也不能让 background-only gain
+变成 SAM 因果收益。
+
+本候选保留为独立失败实验，不进入 V0 selected pose。若以后重开 mask-guided pose，前置条件应是一个独立
+验证过、在 medium/long folds 仍有足量且准确对应的 generic matcher；先比较 matcher raw 与 region-gated
+correspondence precision/coverage，再允许进入 pose。不能直接把 SAM token 接回 camera token，也不能把当前
+结果描述成 SAM pose improvement。
+
+## 14. V0 SAM persistent-memory → native StreamVGGT KV 检索协议
+
+该候选采用 RetrieveVGGT 的 training-free context construction，而不恢复已经证伪的 SAM-token camera fusion。
+SAM3.1 hidden/appearance feature不进入 StreamVGGT；V0 causal persistent track registry只生成当前实例的历史帧
+候选集合。StreamVGGT 首个 global block 使用经过 QK norm/RoPE 的 current Q 与逐历史帧 native K计算
+frame relevance，第一层选择的帧索引在后续24层复用，选中帧始终贡献完整图像 KV，不裁成实例局部 support。
+
+锁定分支为 `raw_full_history / retrieve_qk / sam_gated_qk / sam_hybrid_qk /
+shuffled_instance_memory`。除 raw 外，历史预算均为 first-frame anchor 1 + retrieved 4；hybrid预留2个槽位给
+same-instance候选内的 QK Top帧，缺额由 global QK顺序补齐。所有 candidate先完整生成，GT pose/pointmap只在
+之后评分。raw repository replay必须与原 rolling full-history cache通过数值等价检查；候选不会修改 V0 selected
+pose。
+
+SAM memory causal pass要求：primary三折 center、rotation、固定 raw-reference Sim(3) 与固定 raw-confidence
+support上的 paired pointmap RMSE均改善，
+逐折优于等预算 `retrieve_qk`，并且 shuffled identity逐折破坏这三项收益。运行：
+
+```bash
+zsh streaming_couping/commands_v0_sam_memory_retrieval.txt
+```

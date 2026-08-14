@@ -38,6 +38,8 @@ features:
   sam_batch_size: 0
   cache_sam_local_tokens: false
   geometry_prompt_point_confidence_threshold: 0.30
+  # All branches are scored on the same raw-StreamVGGT confidence support;
+  # candidate confidence cannot hide newly bad points.
   point_confidence_threshold: 0.30
   min_instance_points: 128
   sampled_instance_points: 128
@@ -60,6 +62,30 @@ baseline:
     evaluation: [360, 375, 390, 405, 420, 435, 450, 465, 480, 495, 510, 525]
   # Pose is intentionally unmodified. A new pose idea must first pass an
   # independent causal feasibility experiment before entering this baseline.
+
+# Training-free RetrieveVGGT-style candidate inside V0. SAM supplies only the
+# persistent instance-to-history index; StreamVGGT supplies first-layer Q/K,
+# every selected frame contributes its full native KV, and raw remains selected.
+sam_memory_retrieval:
+  output_dir: outputs/streaming_couping_v0/sam_memory_retrieval
+  methods:
+    - raw_full_history
+    - retrieve_qk
+    - sam_gated_qk
+    - sam_hybrid_qk
+    - shuffled_instance_memory
+  primary_method: sam_hybrid_qk
+  # Match RetrieveVGGT's compact default: one first-frame gauge anchor plus
+  # four retrieved frames. All branches use the same budget once history > 5.
+  total_frame_budget: 5
+  anchor_frames: 1
+  # Hybrid allocates two of the four retrieved slots to persistent-instance
+  # candidates, then fills every unused slot by native global QK rank.
+  sam_frame_quota: 2
+  minimum_track_score: 0.50
+  point_confidence_threshold: 0.30
+  # The raw repository replay must reproduce the existing rolling full cache.
+  raw_equivalence_atol: 0.0002
 
 # Offline MESA-style candidate. SAM masks/IDs filter generic SIFT matches;
 # frozen StreamVGGT world points and one fixed PnP solver provide pose.
