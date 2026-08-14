@@ -5,7 +5,11 @@ from __future__ import annotations
 
 import torch
 
-from streaming_couping.src.semantic_map import build_semantic_pointmap
+from streaming_couping.src.semantic_map import (
+    BACKGROUND_SEMANTIC_RGB8,
+    INSTANCE_PALETTE_RGB8,
+    build_semantic_pointmap,
+)
 
 
 def main() -> None:
@@ -38,6 +42,12 @@ def main() -> None:
     assert torch.equal(result.semantic_slots, torch.tensor([1, -1, -1, 1]))
     assert torch.equal(result.sequence_indices, torch.zeros(4, dtype=torch.long))
     assert torch.equal(result.rgb, torch.full((4, 3), 0.5))
+    slot_one = torch.tensor(INSTANCE_PALETTE_RGB8[1], dtype=torch.float32) / 255.0
+    background = torch.tensor(BACKGROUND_SEMANTIC_RGB8, dtype=torch.float32) / 255.0
+    assert torch.allclose(result.semantic_rgb[0], slot_one)
+    assert torch.allclose(result.semantic_rgb[3], slot_one)
+    assert torch.allclose(result.semantic_rgb[1], background)
+    assert not torch.allclose(slot_one, background)
     assert bool(result.dense_valid.all())
     print("V0 raw-pointmap semantic lifting smoke passed")
 

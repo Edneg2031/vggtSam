@@ -23,12 +23,14 @@ from streaming_couping.src.learned_pose.config import (
     load_learned_pose_config,
 )
 from streaming_couping.src.semantic_map import (
+    BACKGROUND_SEMANTIC_RGB8,
+    INSTANCE_PALETTE_RGB8,
     SemanticPointMap,
     build_semantic_pointmap,
 )
 
 
-REVISION = "v0_frozen_semantic_map_export_r1"
+REVISION = "v0_frozen_semantic_map_export_r2"
 BASELINE_REVISION = "v0_frozen_semantic_mapping_pipeline_r1"
 
 
@@ -111,7 +113,7 @@ def _write_outputs(
     artifact_path = run.output_dir / "semantic_map.pt"
     torch.save(
         {
-            "schema": 1,
+            "schema": 2,
             "revision": REVISION,
             "baseline_revision": BASELINE_REVISION,
             "clip": payload["clip_name"],
@@ -120,12 +122,15 @@ def _write_outputs(
             "coordinate_frame": "streamvggt_first_frame_reference_world",
             "world_points": semantic.world_points,
             "rgb": semantic.rgb,
+            "semantic_rgb": semantic.semantic_rgb,
             "semantic_slots": semantic.semantic_slots,
             "semantic_track_ids": semantic_track_ids,
             "confidence": semantic.confidence,
             "sequence_indices": semantic.sequence_indices,
             "flat_indices": semantic.flat_indices,
             "track_metadata": tracks,
+            "slot_palette_rgb8": INSTANCE_PALETTE_RGB8,
+            "unlabeled_background_rgb8": BACKGROUND_SEMANTIC_RGB8,
             "raw_world_to_camera": poses["raw_world_to_camera"],
             "selected_world_to_camera": poses["selected_world_to_camera"],
             "selected_pose_branch": poses["selected_pose_branch"],
@@ -139,6 +144,15 @@ def _write_outputs(
     _write_binary_ply(
         ply_path,
         points=semantic.world_points,
+        rgb=semantic.semantic_rgb,
+        slots=semantic.semantic_slots,
+        track_ids=semantic_track_ids,
+        confidence=semantic.confidence,
+    )
+    rgb_ply_path = run.output_dir / "rgb_map.ply"
+    _write_binary_ply(
+        rgb_ply_path,
+        points=semantic.world_points,
         rgb=semantic.rgb,
         slots=semantic.semantic_slots,
         track_ids=semantic_track_ids,
@@ -147,7 +161,7 @@ def _write_outputs(
     tracks_path = run.output_dir / "tracks.csv"
     _write_tracks_csv(tracks_path, tracks)
     output = {
-        "schema": 1,
+        "schema": 2,
         "revision": REVISION,
         "baseline_version": "v0",
         "baseline_status": "frozen",
@@ -173,6 +187,8 @@ def _write_outputs(
         "pose_source": "streamvggt_native_qk_history_retrieval",
         "pointmap_source": "raw_full_history_streamvggt_world_pointmap",
         "semantic_source": "sam31_persistent_mask_and_id",
+        "semantic_color_policy": "fixed_color_per_persistent_slot_gray_unlabeled",
+        "unlabeled_background_rgb8": BACKGROUND_SEMANTIC_RGB8,
         "sam_hidden_features_used": 0,
         "sam_pose_inputs": 0,
         "selected_pose_branch": poses["selected_pose_branch"],
@@ -195,7 +211,8 @@ def _write_outputs(
         "claim": "frozen_v0_semantic_mapping_pipeline",
         "outputs": {
             "artifact": str(artifact_path),
-            "ply": str(ply_path),
+            "semantic_ply": str(ply_path),
+            "rgb_ply": str(rgb_ply_path),
             "tracks_csv": str(tracks_path),
         },
     }
@@ -242,6 +259,15 @@ def _track_metadata(
                 "birth_frame": frames[int(birth)],
                 "visible_frames": int(visible.sum()),
                 "saved_points": int((semantic.semantic_slots == slot).sum()),
+                "color_red": INSTANCE_PALETTE_RGB8[
+                    slot % len(INSTANCE_PALETTE_RGB8)
+                ][0],
+                "color_green": INSTANCE_PALETTE_RGB8[
+                    slot % len(INSTANCE_PALETTE_RGB8)
+                ][1],
+                "color_blue": INSTANCE_PALETTE_RGB8[
+                    slot % len(INSTANCE_PALETTE_RGB8)
+                ][2],
             }
         )
     return output
@@ -386,6 +412,7 @@ def _write_copyable(path: Path, summary: dict[str, Any]) -> None:
         "pose=retrieve_qk",
         "pointmap=raw_full_history_streamvggt_world_pointmap",
         "semantics=sam31_persistent_mask_and_id",
+        "semantic_colors=fixed_color_per_persistent_slot_gray_unlabeled",
         "model_trained=0",
         "sam_pose_inputs=0",
         "sam_hidden_features_used=0",
@@ -396,23 +423,26 @@ def _write_copyable(path: Path, summary: dict[str, Any]) -> None:
         f"discovered_track_count={summary['discovered_track_count']}",
         f"semantic_map_pipeline_ready={summary['semantic_map_pipeline_ready']}",
         "",
-        "slot,sam_track_id,prompt,birth_frame,visible_frames,saved_points",
+        "slot,sam_track_id,prompt,birth_frame,visible_frames,saved_points,color_rgb8",
     ]
     for track in summary["tracks"]:
-        lines.append(
-            ",".join(
-                str(track[name])
-                for name in (
-                    "slot", "sam_track_id", "prompt", "birth_frame",
-                    "visible_frames", "saved_points",
-                )
+        values = [
+            str(track[name])
+            for name in (
+                "slot", "sam_track_id", "prompt", "birth_frame",
+                "visible_frames", "saved_points",
             )
+        ]
+        values.append(
+            f"{track['color_red']} {track['color_green']} {track['color_blue']}"
         )
+        lines.append(",".join(values))
     lines.extend(
         [
             "",
             f"artifact={summary['outputs']['artifact']}",
-            f"ply={summary['outputs']['ply']}",
+            f"semantic_ply={summary['outputs']['semantic_ply']}",
+            f"rgb_ply={summary['outputs']['rgb_ply']}",
             f"tracks_csv={summary['outputs']['tracks_csv']}",
             f"summary={path.with_name('semantic_map_summary.json')}",
             "===== COPYABLE_V0_SEMANTIC_MAP_END =====",

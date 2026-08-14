@@ -7,10 +7,34 @@ from dataclasses import dataclass
 import torch
 
 
+# Fixed by permanent slot, so one tracked instance keeps the same color in
+# every frame and every export. Colors are distinct at the configured 16 slots.
+INSTANCE_PALETTE_RGB8: tuple[tuple[int, int, int], ...] = (
+    (230, 25, 75),
+    (60, 180, 75),
+    (0, 130, 200),
+    (245, 130, 48),
+    (145, 30, 180),
+    (70, 240, 240),
+    (240, 50, 230),
+    (210, 245, 60),
+    (250, 190, 212),
+    (0, 128, 128),
+    (220, 190, 255),
+    (170, 110, 40),
+    (255, 250, 200),
+    (128, 0, 0),
+    (170, 255, 195),
+    (128, 128, 0),
+)
+BACKGROUND_SEMANTIC_RGB8 = (96, 96, 96)
+
+
 @dataclass(frozen=True)
 class SemanticPointMap:
     world_points: torch.Tensor
     rgb: torch.Tensor
+    semantic_rgb: torch.Tensor
     semantic_slots: torch.Tensor
     confidence: torch.Tensor
     sequence_indices: torch.Tensor
@@ -86,10 +110,12 @@ def build_semantic_pointmap(
         .expand(sequence, height, width)
         .reshape(-1)
     )
+    selected_slots = slots.reshape(-1).index_select(0, flat_indices)
     return SemanticPointMap(
         world_points=points.reshape(-1, 3).index_select(0, flat_indices),
         rgb=rgb.index_select(0, flat_indices),
-        semantic_slots=slots.reshape(-1).index_select(0, flat_indices),
+        semantic_rgb=semantic_instance_colors(selected_slots),
+        semantic_slots=selected_slots,
         confidence=confidence.reshape(-1).index_select(0, flat_indices),
         sequence_indices=frame_grid.index_select(0, flat_indices),
         flat_indices=flat_indices,
@@ -138,6 +164,22 @@ def semantic_slot_map(
     )
     best = weighted.argmax(dim=1).long()
     return torch.where(eligible.any(dim=1), best, torch.full_like(best, -1))
+
+
+def semantic_instance_colors(slots: torch.Tensor) -> torch.Tensor:
+    """Return categorical RGB in [0,1], with unlabeled points in gray."""
+
+    slots = slots.detach().long().cpu()
+    palette = torch.tensor(INSTANCE_PALETTE_RGB8, dtype=torch.float32) / 255.0
+    background = torch.tensor(BACKGROUND_SEMANTIC_RGB8, dtype=torch.float32) / 255.0
+    colors = background.expand(*slots.shape, 3).clone()
+    labeled = slots >= 0
+    if bool(labeled.any()):
+        colors[labeled] = palette.index_select(
+            0,
+            slots[labeled].remainder(palette.shape[0]),
+        )
+    return colors
 
 
 def _squeeze_scalar_map(value: torch.Tensor, name: str) -> torch.Tensor:

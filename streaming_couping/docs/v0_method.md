@@ -46,6 +46,8 @@ SAM3.1 根据配置中的 prompt 在线发现并追踪实例。每个实例第�
 4. 没有被任何 mask 覆盖的点保留在地图中，语义 slot/track ID 为 `-1`。
 
 点坐标只经过置信度过滤和固定数量采样，不进行 ICP、BA、object fusion 或几何修正。
+每个永久slot对应一个固定的高区分度颜色，因此同一实例跨帧始终同色，不同实例使用不同颜色；
+未标注点显示为灰色。原始RGB另外保存，不被语义着色覆盖。
 
 ## 3. 坐标和模块边界
 
@@ -62,12 +64,13 @@ SAM3.1 根据配置中的 prompt 在线发现并追踪实例。每个实例第�
 - `outputs/streaming_couping_v0/baseline_summary.json`：tracking 与 pose 结果；
 - `outputs/streaming_couping_v0/poses.pt`：raw/QK 相机轨迹；
 - `outputs/streaming_couping_v0/semantic_map/semantic_map.pt`：完整结构化语义地图；
-- `outputs/streaming_couping_v0/semantic_map/semantic_map.ply`：可视化点云；
+- `outputs/streaming_couping_v0/semantic_map/semantic_map.ply`：按persistent slot着色的语义点云；
+- `outputs/streaming_couping_v0/semantic_map/rgb_map.ply`：保留原始图像颜色的点云；
 - `outputs/streaming_couping_v0/semantic_map/tracks.csv`：实例元数据；
 - `outputs/streaming_couping_v0/semantic_map/semantic_map_summary.json`：pipeline 审计。
 
-`semantic_map.pt`保存 world point、RGB、confidence、frame index、semantic slot、SAM track ID、
-track metadata，以及 raw/QK 两条相机轨迹。
+`semantic_map.pt`保存 world point、原始RGB、语义RGB、固定slot调色板、confidence、frame index、
+semantic slot、SAM track ID、track metadata，以及raw/QK两条相机轨迹。
 
 ## 5. 运行
 

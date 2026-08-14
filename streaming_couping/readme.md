@@ -31,7 +31,8 @@ outputs/streaming_couping_v0/
 │   └── qk_pose_summary.json
 └── semantic_map/
     ├── semantic_map.pt
-    ├── semantic_map.ply
+    ├── semantic_map.ply  # 不同persistent instance使用固定不同颜色
+    ├── rgb_map.ply       # 原始RGB外观
     ├── semantic_map_summary.json
     └── tracks.csv
 ```

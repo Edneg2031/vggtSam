@@ -125,18 +125,23 @@ PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
   echo "missing semantic_map.ply" >&2
   exit 1
 }
+[[ -s "$SEMANTIC_OUTPUT/rgb_map.ply" ]] || {
+  echo "missing rgb_map.ply" >&2
+  exit 1
+}
 PYTHONPATH=. "$PYTHON_BIN" -c '
 import json
 from pathlib import Path
 summary = json.loads(Path(
     "outputs/streaming_couping_v0/semantic_map/semantic_map_summary.json"
 ).read_text())
-assert summary["schema"] == 1
-assert summary["revision"] == "v0_frozen_semantic_map_export_r1"
+assert summary["schema"] == 2
+assert summary["revision"] == "v0_frozen_semantic_map_export_r2"
 assert summary["baseline_revision"] == "v0_frozen_semantic_mapping_pipeline_r1"
 assert summary["selected_pose_branch"] == "retrieve_qk"
 assert summary["pointmap_source"] == "raw_full_history_streamvggt_world_pointmap"
 assert summary["semantic_source"] == "sam31_persistent_mask_and_id"
+assert summary["semantic_color_policy"] == "fixed_color_per_persistent_slot_gray_unlabeled"
 assert summary["map_generation_gt_fields"] == 0
 assert summary["pointmap_modified"] == 0
 assert summary["saved_map_points"] > 0
