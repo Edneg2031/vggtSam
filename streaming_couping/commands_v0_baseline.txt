@@ -92,13 +92,15 @@ audit = summary["tracking_audit"]
 tracks = audit["discovered_track_count"]
 late_births = audit["late_birth_count"]
 slots = audit["permanent_slot_capacity"]
+center_gain = summary["selected_center_gain_vs_raw_percent"]
+rotation_gain = summary["selected_rotation_gain_vs_raw_percent"]
 print(
     "V0 accepted tracking + QK-pose baseline "
     f"tracks={tracks} "
     f"late_births={late_births} "
     f"slots={slots} "
-    f"center_gain={summary['selected_center_gain_vs_raw_percent']:.4f}% "
-    f"R_gain={summary['selected_rotation_gain_vs_raw_percent']:.4f}%"
+    f"center_gain={center_gain:.4f}% "
+    f"R_gain={rotation_gain:.4f}%"
 )
 '
 echo "V0 selected-pose artifact: outputs/streaming_couping_v0/poses.pt"
