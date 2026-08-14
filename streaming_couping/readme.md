@@ -1,6 +1,6 @@
 # streaming_couping
 
-本目录保留两个正式 V0 入口和两个不修改正式输出的诊断入口。
+本目录只保留两个 V0 入口。V0 已冻结，不再包含 SAM mask/identity 位姿优化实验。
 
 ## 1. Baseline
 
@@ -64,39 +64,11 @@ r3联合回放也已完成：
 `raw_semantic_map.ply`。r3证伪了“QK稀疏历史上下文联合重跑冻结geometry heads就能改善整体点云”，
 但保留了逐SAM实例分析作为后续显式几何约束的依据。
 
-## 3. Incremental audit（当前实验）
-
-```bash
-zsh streaming_couping/commands_v0_incremental_audit.txt
-```
-
-一条命令依次完成：
-
-- `raw world_pointmap + raw/QK pose`的self-reprojection、depth、positive-Z和in-bounds一致性审计；
-- `full history / QK Top-4 / recent Top-4 / random Top-4 × 3 seeds`的等预算因果对照；
-- 同时评分29帧pose、固定raw-reference Sim(3)下的pointmap以及raw-confidence共同支持下的depth。
-
-该实验不读取SAM作为pose候选输入、不训练模型，也不替换正式V0 pose/pointmap。GT只在各RGB-only
-候选完全生成后评分。SAM persistent-ID pose探针要等这两个gate的结果明确后再实现。
-
-## 4. SAM persistent-ID pose probe（当前实验）
-
-```bash
-zsh streaming_couping/commands_v0_sam_identity_pose_probe.txt
-```
-
-该命令在incremental audit通过后运行，不重新加载模型：
-
-- 以QK pose为初值，使用`frames < t`的raw full-history world pointmap建立因果实例点memory；
-- 当前帧只读取raw depth、SAM persistent mask/ID和track score；
-- global、foreground union、correct ID、shuffled ID、shifted mask五分支使用严格相等的source-point数量；
-- 每个active frame只在identity和12个固定单轴SE(3)方向中按几何/ownership loss选择一次；
-- GT在所有候选冻结后才评分，不训练、不迭代、不替换正式V0 pose或pointmap。
-
-只有correct persistent ID同时改善QK的center/rotation，并严格优于四个control，才进入迭代pose residual。
-
 ## Evidence archive
 
-失败候选的代码、配置和命令已删除；V4–V9.8及后续验证/证伪结论保存在：
+失败候选的代码、配置和命令已删除。增量审计确认QK不是普通截断：它优于recent和3-seed random
+pose对照，同时QK pose与raw pointmap的一致性指标改善。随后SAM persistent-ID probe未通过：
+correct ID没有同时改善center/rotation，也没有优于shuffled-ID和shifted-mask controls。因此V0中
+SAM固定为语义追踪/投影角色，不参与pose候选生成。V4–V9.8及其他验证/证伪结论保存在：
 
 [实验正负证据归档](docs/weekly_experiment_summary_2026-08-03_to_2026-08-06.md)

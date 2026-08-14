@@ -16,7 +16,7 @@ export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-echo "V0 smoke: causal tracking, QK joint geometry and raw fallback"
+echo "V0 smoke: causal tracking, QK pose selection and raw fallback"
 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_dynamic_instance_baseline
 
 ARGS=()
@@ -70,7 +70,8 @@ from pathlib import Path
 summary = json.loads(Path("outputs/streaming_couping_v0/baseline_summary.json").read_text())
 assert summary["baseline_version"] == "v0"
 assert summary["schema"] == 5
-assert summary["implementation_revision"] == "qk_joint_geometry_semantic_tracking_r6"
+assert summary["baseline_status"] == "frozen"
+assert summary["implementation_revision"] == "v0_frozen_qk_pose_raw_pointmap_semantic_tracking_r7"
 assert summary["selected_pose_branch"] == "retrieve_qk"
 assert summary["selected_pose_exact_raw"] == 0
 assert summary["pose_modification_applied"] is True
@@ -80,6 +81,9 @@ assert summary["selected_center_gain_vs_raw_percent"] > 0
 assert summary["selected_rotation_gain_vs_raw_percent"] > 0
 assert len(summary["pose_evaluation_frames"]) == 29
 assert summary["sam_pose_inputs"] == 0
+assert summary["formal_pose_output"] == "retrieve_qk"
+assert summary["formal_pointmap_output"] == "raw_full_history_world_pointmap"
+assert summary["formal_semantic_output"] == "sam_persistent_id_lifted_raw_world_pointmap"
 assert summary["candidate_geometry_available"] is True
 assert summary["candidate_pointmap_used"] is False
 assert summary["candidate_pointmap_used_for_pose"] is False
@@ -106,4 +110,4 @@ print(
 )
 '
 echo "V0 selected-pose artifact: outputs/streaming_couping_v0/poses.pt"
-echo "V0 SAM semantic tracking + QK joint-geometry baseline completed"
+echo "V0 frozen baseline completed: QK pose + raw pointmap + SAM semantics"

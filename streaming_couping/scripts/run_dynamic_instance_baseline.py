@@ -34,7 +34,7 @@ from streaming_couping.src.learned_pose.config import (
 )
 
 
-V0_IMPLEMENTATION_REVISION = "qk_joint_geometry_semantic_tracking_r6"
+V0_IMPLEMENTATION_REVISION = "v0_frozen_qk_pose_raw_pointmap_semantic_tracking_r7"
 QK_RETRIEVAL_REVISION = "v0_streamvggt_qk_joint_geometry_replay_r2"
 
 FRAME_COLUMNS = (
@@ -253,6 +253,7 @@ def _write_outputs(
     summary = {
         "schema": 5,
         "baseline_version": run.version,
+        "baseline_status": "frozen",
         "implementation_revision": V0_IMPLEMENTATION_REVISION,
         "method": "v0_sam_semantic_tracking_qk_retrieved_streamvggt_pose",
         "claim_level": (
@@ -307,6 +308,9 @@ def _write_outputs(
             "training_free_native_qk_retrieval_selected"
         ),
         "sam_pose_inputs": 0,
+        "formal_pose_output": "retrieve_qk",
+        "formal_pointmap_output": "raw_full_history_world_pointmap",
+        "formal_semantic_output": "sam_persistent_id_lifted_raw_world_pointmap",
         "candidate_geometry_available": bool(
             pose_selection["provenance"].get("joint_geometry_emitted", 0)
         ),

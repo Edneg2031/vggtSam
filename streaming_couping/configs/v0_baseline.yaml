@@ -1,5 +1,5 @@
-# V0: SAM3.1 semantic tracking plus training-free StreamVGGT QK retrieval pose.
-# Failed direct SE(3), geometry-transport and SAM-token pose heads are absent.
+# Frozen V0: QK-retrieved pose, raw full-history world pointmap and SAM3.1
+# persistent semantic lifting. SAM mask/ID never enters pose generation.
 recovery_config: streaming_couping/configs/recovery_dynamic_instance.yaml
 output_dir: outputs/streaming_couping_v0/data_stage
 
@@ -21,10 +21,10 @@ dataset:
       split: baseline
 
 runtime:
-  streamvggt_devices: [cuda:0, cuda:1]
+  streamvggt_devices: ["cuda:0", "cuda:1"]
   streamvggt_amp_dtype: bfloat16
-  geometry_device: cuda:0
-  sam3_device: cuda:2
+  geometry_device: "cuda:0"
+  sam3_device: "cuda:2"
 
 features:
   # Stable V0-owned cache. Rebuild explicitly when it is absent or stale.
@@ -55,9 +55,10 @@ fusion:
 
 baseline:
   version: v0
+  status: frozen
   output_dir: outputs/streaming_couping_v0
   clip_name: 00a231a370_90_525_step15_37_68_54
-  audit_device: cuda:0
+  audit_device: "cuda:0"
   frames:
     evaluation: [360, 375, 390, 405, 420, 435, 450, 465, 480, 495, 510, 525]
   pose:
@@ -74,41 +75,6 @@ qk_pose_retrieval:
   output_dir: outputs/streaming_couping_v0/qk_joint_geometry_retrieval
   total_frame_budget: 5
   anchor_frames: 1
-
-# Two gated, training-free diagnostics run by one command.  All sparse
-# policies receive the same causal history budget: first-frame anchor plus
-# four selected historical frames.  Random controls use fixed independent
-# seeds and never enter the formal V0 output selection.
-incremental_audit:
-  output_dir: outputs/streaming_couping_v0/incremental_audit
-  total_history_budget: 5
-  anchor_frames: 1
-  random_seeds: [0, 1, 2]
-  confidence_threshold: 0.30
-
-# Training-free information probe after the context audit passes.  Historical
-# raw world points are written only after each frame is probed.  Five branches
-# use equal source-point counts and choose among the same identity plus twelve
-# signed one-axis SE(3) candidates before GT is exposed for scoring.
-sam_identity_pose_probe:
-  output_dir: outputs/streaming_couping_v0/sam_identity_pose_probe
-  confidence_threshold: 0.30
-  track_score_threshold: 0.50
-  mask_erosion_radius: 2
-  min_mask_pixels: 128
-  min_history_observations: 2
-  min_history_points: 128
-  points_per_instance: 1024
-  points_per_frame_write: 4096
-  instance_max_points: 8192
-  global_max_points: 32768
-  relative_depth_cap: 0.25
-  mask_miss_weight: 0.05
-  min_loss_decrease: 0.00001
-  rotation_step_degrees: 0.25
-  translation_step_scene_fraction: 0.0025
-  shifted_mask_x_fraction: 0.10
-  shifted_mask_y_fraction: 0.07
 
 # Final map audit retains the pose-only/raw-depth negative control and adds
 # self-consistent QK depth-pose and QK point-head branches. SAM support is fixed.

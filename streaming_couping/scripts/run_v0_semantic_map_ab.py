@@ -967,7 +967,8 @@ def _validate_baseline_artifacts(
     summary = json.loads(summary_path.read_text(encoding="utf8"))
     expected = {
         "schema": 5,
-        "implementation_revision": "qk_joint_geometry_semantic_tracking_r6",
+        "baseline_status": "frozen",
+        "implementation_revision": "v0_frozen_qk_pose_raw_pointmap_semantic_tracking_r7",
         "selected_pose_branch": "retrieve_qk",
         "selected_pose_exact_raw": 0,
         "pose_selection_fallback_used": 0,
