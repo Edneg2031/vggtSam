@@ -34,10 +34,10 @@ from streaming_couping.src.learned_pose.config import (
     LearnedPoseConfig,
     load_learned_pose_config,
 )
-from streaming_couping.src.sam_memory_retrieval import (
-    RetrievalPolicy,
-    qk_rank_diagnostics,
-    select_retrieval_history,
+from streaming_couping.src.qk_pose_retrieval import (
+    QKRetrievalPolicy,
+    rank_qk_history,
+    select_qk_history,
 )
 
 
@@ -48,7 +48,7 @@ REVISION = "v0_clean_streamvggt_qk_pose_retrieval_r1"
 class QKRun:
     source_path: Path
     output_dir: Path
-    policy: RetrievalPolicy
+    policy: QKRetrievalPolicy
 
 
 def main() -> None:
@@ -117,7 +117,7 @@ def _generate_qk_candidate(
     runner: LayerShardedStreamVGGT,
     payload: dict[str, Any],
     *,
-    policy: RetrievalPolicy,
+    policy: QKRetrievalPolicy,
 ) -> dict[str, Any]:
     """Generate pose using RGB and native StreamVGGT QK only."""
 
@@ -130,25 +130,13 @@ def _generate_qk_candidate(
     def selector(
         frame_index: int,
         qk_scores: torch.Tensor,
-        sam_region_scores: torch.Tensor,
-        shuffled_region_scores: torch.Tensor,
     ) -> tuple[int, ...]:
-        if sam_region_scores.numel() and not bool(
-            torch.isnan(sam_region_scores).all()
-        ):
-            raise RuntimeError("Clean QK retrieval unexpectedly received SAM scores.")
-        selected = select_retrieval_history(
-            method="retrieve_qk",
-            frame_index=frame_index,
-            qk_scores=qk_scores,
-            sam_region_scores=sam_region_scores,
-            shuffled_region_scores=shuffled_region_scores,
-            sam_candidates=(),
-            shuffled_candidates=(),
+        selected = select_qk_history(
+            frame_index,
+            qk_scores,
             policy=policy,
         )
-        rank = qk_rank_diagnostics(qk_scores, (), selected)
-        ranked = tuple(int(value) for value in rank["qk_ranked_history"])
+        ranked = rank_qk_history(qk_scores)
         retrieval_rows.append(
             {
                 "sequence_index": int(frame_index),
@@ -179,7 +167,6 @@ def _generate_qk_candidate(
             batch_frame,
             frame_index,
             history_selector=selector,
-            region_patch_masks=None,
         )
         pose_encoding = runner.camera(selected_tokens)
         pose_encodings.append(pose_encoding[0, 0].detach().float().cpu())
@@ -460,10 +447,9 @@ def _load_run(path: str | Path) -> QKRun:
     with source.open("r", encoding="utf8") as handle:
         raw = yaml.safe_load(handle) or {}
     section = raw.get("qk_pose_retrieval", {})
-    policy = RetrievalPolicy(
+    policy = QKRetrievalPolicy(
         total_frame_budget=int(section.get("total_frame_budget", 5)),
         anchor_frames=int(section.get("anchor_frames", 1)),
-        sam_frame_quota=1,
     )
     policy.validate()
     return QKRun(

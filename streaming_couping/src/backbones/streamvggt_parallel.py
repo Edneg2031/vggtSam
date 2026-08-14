@@ -361,11 +361,10 @@ class LayerShardedStreamVGGT:
         frame_index: int,
         *,
         history_selector: Callable[
-            [int, torch.Tensor, torch.Tensor, torch.Tensor],
+            [int, torch.Tensor],
             Sequence[int],
         ]
         | None = None,
-        region_patch_masks: torch.Tensor | None = None,
     ) -> dict[int, torch.Tensor]:
         """Run one frame and retain only levels consumed by downstream heads."""
 
@@ -386,7 +385,6 @@ class LayerShardedStreamVGGT:
                 images,
                 frame_index,
                 history_selector=history_selector,
-                region_patch_masks=region_patch_masks,
             )
 
     def _aggregate_frame_impl(
@@ -395,11 +393,10 @@ class LayerShardedStreamVGGT:
         frame_index: int,
         *,
         history_selector: Callable[
-            [int, torch.Tensor, torch.Tensor, torch.Tensor],
+            [int, torch.Tensor],
             Sequence[int],
         ]
         | None,
-        region_patch_masks: torch.Tensor | None,
     ) -> dict[int, torch.Tensor]:
         aggregator = self.aggregator
         first = self.first_device
@@ -461,31 +458,11 @@ class LayerShardedStreamVGGT:
                     frame_key_values=self.frame_key_values[layer_index],
                     patch_start_idx=self.patch_start_idx,
                 )
-                if region_patch_masks is None:
-                    sam_region_scores = torch.full_like(scores, float("nan"))
-                    shuffled_region_scores = torch.full_like(
-                        scores,
-                        float("nan"),
-                    )
-                else:
-                    sam_region_scores, shuffled_region_scores = (
-                        _first_global_layer_instance_frame_scores(
-                            aggregator.global_blocks[layer_index],
-                            frame_tokens,
-                            position=layer_position,
-                            frame_key_values=self.frame_key_values[layer_index],
-                            patch_start_idx=self.patch_start_idx,
-                            region_patch_masks=region_patch_masks,
-                            frame_index=frame_index,
-                        )
-                    )
                 requested = tuple(
                     int(value)
                     for value in history_selector(
                         frame_index,
                         scores.clone(),
-                        sam_region_scores.clone(),
-                        shuffled_region_scores.clone(),
                     )
                 )
                 _validate_history_selection(
@@ -498,8 +475,6 @@ class LayerShardedStreamVGGT:
                     "frame_index": int(frame_index),
                     "history_frames": len(self.frame_key_values[layer_index]),
                     "qk_scores": scores.clone(),
-                    "sam_region_scores": sam_region_scores.clone(),
-                    "shuffled_region_scores": shuffled_region_scores.clone(),
                     "selected_history_indices": selected_history,
                 }
             if history_selector is not None:
@@ -682,137 +657,6 @@ def _first_global_layer_frame_scores(
         .mean(dim=(0, 1))
     )
     return scores.detach().float().cpu()
-
-
-def _first_global_layer_instance_frame_scores(
-    block: torch.nn.Module,
-    frame_tokens: torch.Tensor,
-    *,
-    position: torch.Tensor | None,
-    frame_key_values: Sequence[tuple[torch.Tensor, torch.Tensor]],
-    patch_start_idx: int,
-    region_patch_masks: torch.Tensor,
-    frame_index: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Score history with native Q/K pooled inside persistent-instance masks.
-
-    The first output compares the same persistent slot.  The second applies a
-    deterministic causal cyclic permutation to historical slots, providing an
-    equal-compute wrong-identity control.  SAM features never enter this path;
-    masks only choose which native StreamVGGT patch Q/K vectors are pooled.
-    """
-
-    history_frames = len(frame_key_values)
-    if history_frames == 0:
-        empty = torch.empty(0, dtype=torch.float32)
-        return empty, empty.clone()
-    frame = int(frame_index)
-    if frame != history_frames:
-        raise ValueError(
-            "Instance QK scoring expects one repository entry per prior frame: "
-            f"frame={frame} repository={history_frames}."
-        )
-    if region_patch_masks.ndim != 4:
-        raise ValueError(
-            "Expected region_patch_masks [T,N,H,W], got "
-            f"{tuple(region_patch_masks.shape)}."
-        )
-    if region_patch_masks.shape[0] <= frame:
-        raise ValueError("Region patch masks do not include the current frame.")
-
-    attention = block.attn
-    batch, token_count, channels = frame_tokens.shape
-    qkv = (
-        attention.qkv(block.norm1(frame_tokens))
-        .reshape(
-            batch,
-            token_count,
-            3,
-            attention.num_heads,
-            attention.head_dim,
-        )
-        .permute(2, 0, 3, 1, 4)
-    )
-    query = attention.q_norm(qkv[0])
-    if attention.rope is not None:
-        query = attention.rope(query, position)
-    start = int(patch_start_idx)
-    patch_count = token_count - start
-    mask_height, mask_width = tuple(
-        int(value) for value in region_patch_masks.shape[-2:]
-    )
-    if patch_count <= 0 or mask_height * mask_width != patch_count:
-        raise ValueError(
-            "Region-mask patch grid does not match StreamVGGT patch tokens: "
-            f"grid={(mask_height, mask_width)} patches={patch_count}."
-        )
-
-    masks = region_patch_masks[: frame + 1].detach().float().cpu().flatten(2)
-    active_slots = torch.nonzero(
-        masks.sum(dim=-1).gt(0).any(dim=0),
-        as_tuple=False,
-    ).flatten()
-    if active_slots.numel() == 0:
-        empty = torch.full((history_frames,), float("nan"))
-        return empty, empty.clone()
-    masks = masks.index_select(1, active_slots)
-    current_masks = masks[frame]
-    current_descriptor, current_valid = _masked_patch_descriptors(
-        query[:, :, start:, :],
-        current_masks,
-    )
-    shuffled_source = torch.arange(masks.shape[1], dtype=torch.long)
-    if shuffled_source.numel() > 1:
-        shuffled_source = torch.roll(shuffled_source, shifts=1)
-
-    same_scores = torch.full((history_frames,), float("nan"))
-    shuffled_scores = torch.full((history_frames,), float("nan"))
-    for history_index, (key, _) in enumerate(frame_key_values):
-        history_descriptor, history_valid = _masked_patch_descriptors(
-            key[:, :, 0, start:, :],
-            masks[history_index],
-        )
-        per_instance = (
-            current_descriptor * history_descriptor
-        ).sum(dim=-1).mean(dim=(0, 2)).detach().float().cpu()
-        valid = current_valid & history_valid
-        if bool(valid.any()):
-            same_scores[history_index] = per_instance[valid].mean()
-
-        source = shuffled_source.to(history_descriptor.device)
-        shuffled_descriptor = history_descriptor.index_select(1, source)
-        shuffled_valid = history_valid.index_select(0, shuffled_source)
-        shuffled_per_instance = (
-            current_descriptor * shuffled_descriptor
-        ).sum(dim=-1).mean(dim=(0, 2)).detach().float().cpu()
-        valid = current_valid & shuffled_valid
-        if bool(valid.any()):
-            shuffled_scores[history_index] = shuffled_per_instance[valid].mean()
-    return same_scores, shuffled_scores
-
-
-def _masked_patch_descriptors(
-    patch_vectors: torch.Tensor,
-    masks: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pool [B,H,P,D] native vectors into [B,N,H,D] region descriptors."""
-
-    if patch_vectors.ndim != 4 or masks.ndim != 2:
-        raise ValueError("Masked QK pooling expects [B,H,P,D] and [N,P].")
-    if patch_vectors.shape[2] != masks.shape[1]:
-        raise ValueError("Mask patch count differs from Q/K patch count.")
-    weight = masks.to(
-        device=patch_vectors.device,
-        dtype=patch_vectors.dtype,
-        non_blocking=True,
-    ).clamp_min(0)
-    mass = weight.sum(dim=-1)
-    descriptor = torch.einsum(
-        "np,bhpd->bnhd",
-        weight,
-        patch_vectors,
-    ) / mass.clamp_min(1e-6)[None, :, None, None]
-    return descriptor.float(), mass.detach().float().cpu().gt(1e-6)
 
 
 def _gather_frame_key_values(

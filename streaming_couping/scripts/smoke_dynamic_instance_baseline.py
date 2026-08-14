@@ -12,6 +12,10 @@ from streaming_couping.src.learned_pose.baseline_runtime import (
     BaselineRunConfig,
     tracking_audit,
 )
+from streaming_couping.src.qk_pose_retrieval import (
+    QKRetrievalPolicy,
+    select_qk_history,
+)
 from streaming_couping.scripts.run_dynamic_instance_baseline import (
     QK_RETRIEVAL_REVISION,
     _load_pose_selection,
@@ -107,6 +111,13 @@ def main() -> None:
     )
     assert fallback["fallback_used"] is True
     assert torch.equal(fallback["selected_pose"], raw_pose)
+
+    selected_history = select_qk_history(
+        6,
+        torch.tensor([0.0, 0.2, 0.9, 0.1, 0.8, 0.7]),
+        policy=QKRetrievalPolicy(total_frame_budget=5, anchor_frames=1),
+    )
+    assert selected_history == (0, 1, 2, 4, 5)
 
     selected, reason = select_adaptive_correction(
         raw_row={

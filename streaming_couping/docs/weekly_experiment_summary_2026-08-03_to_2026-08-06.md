@@ -381,9 +381,7 @@ pose training、pose loss 均不使用。候选生成 API 不含 GT 字段，GT 
 
 运行命令：
 
-```bash
-zsh streaming_couping/commands_v0_sam_region_pose_candidate.txt
-```
+历史命令 `commands_v0_sam_region_pose_candidate.txt` 已随失败实现删除；以下结果仅作证据归档。
 
 ## 13. 静态场景 SAM region-ID + SIFT/PnP 实验结论
 
@@ -443,9 +441,7 @@ SAM memory causal pass要求：primary三折 center、rotation、固定 raw-refe
 support上的 paired pointmap RMSE均改善，
 逐折优于等预算 `retrieve_qk`，并且 shuffled identity逐折破坏这三项收益。运行：
 
-```bash
-zsh streaming_couping/commands_v0_sam_memory_retrieval.txt
-```
+历史命令 `commands_v0_sam_memory_retrieval.txt` 已随失败实现删除；以下结果仅作证据归档。
 
 r2 已完成并构成有效证伪。raw pose/point/confidence replay 的 maximum absolute difference仍全部为 0；selection
 intervention audit通过：`sam_gated` 相对 global-QK有23帧不同，hybrid相对 global-QK与 shuffled-ID各有20帧
@@ -465,9 +461,7 @@ train/test folds。hybrid pose在三个窗口的 center与rotation均改善，�
 
 完整序列评价直接复用已经生成的30帧 causal candidates，不重跑模型：
 
-```bash
-zsh streaming_couping/commands_v0_sam_memory_full_sequence_eval.txt
-```
+历史汇总命令 `commands_v0_sam_memory_full_sequence_eval.txt` 已删除；以下结果仅作证据归档。
 
 candidate point-head RMSE不再作为 pose acceptance gate。最终 semantic-map结论必须使用相同 raw depth/K/SAM
 masks，分别配 raw pose和candidate pose完成点云融合后再评价；这一步尚未完成。V0 selected pose在完整序列结果
@@ -485,9 +479,7 @@ candidate generation只读取 `stream_images/frame_indices`，执行 first-frame
 运行冻结camera head；不读取SAM mask/ID/memory，不运行point head，也不生成candidate pointmap。完整30帧
 干净重放命令：
 
-```bash
-zsh streaming_couping/commands_v0_clean_qk_pose_retrieval.txt
-```
+独立 clean-QK 命令已删除；相同的最小 QK replay 现由 `commands_v0_baseline.txt` 内部执行。
 
 SAM仍负责prompted discovery、persistent tracking、late birth和semantic lifting；若干净QK pose通过，它只替换
 语义地图融合使用的camera pose，depth/K继续来自raw StreamVGGT。
