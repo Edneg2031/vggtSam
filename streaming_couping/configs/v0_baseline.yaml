@@ -38,8 +38,7 @@ features:
   sam_batch_size: 0
   cache_sam_local_tokens: false
   geometry_prompt_point_confidence_threshold: 0.30
-  # All branches are scored on the same raw-StreamVGGT confidence support;
-  # candidate confidence cannot hide newly bad points.
+  # Confidence support used by the exported raw world pointmap.
   point_confidence_threshold: 0.30
   min_instance_points: 128
   sampled_instance_points: 128
@@ -65,23 +64,20 @@ baseline:
     # The selection is fixed before GT scoring. It consumes the RGB/QK-only
     # artifact below; raw StreamVGGT remains an explicit runtime fallback.
     selected_branch: retrieve_qk
-    qk_pose_output: outputs/streaming_couping_v0/qk_joint_geometry_retrieval/qk_joint_geometry_output.pt
+    qk_pose_output: outputs/streaming_couping_v0/qk_pose_retrieval/qk_pose_output.pt
     allow_raw_fallback: true
 
-# Training-free joint candidate. RGB/native QK selects history once, then the
-# same replay emits pose, depth, intrinsics and pointmap from frozen heads.
-# SAM remains outside candidate generation.
+# Training-free pose candidate. RGB/native QK selects history and the frozen
+# camera head emits pose. Depth/point heads and SAM are not run here.
 qk_pose_retrieval:
-  output_dir: outputs/streaming_couping_v0/qk_joint_geometry_retrieval
+  output_dir: outputs/streaming_couping_v0/qk_pose_retrieval
   total_frame_budget: 5
   anchor_frames: 1
 
-# Final map audit retains the pose-only/raw-depth negative control and adds
-# self-consistent QK depth-pose and QK point-head branches. SAM support is fixed.
-semantic_map_ab:
-  output_dir: outputs/streaming_couping_v0/semantic_map_ab
+# Deployable semantic map: raw full-history world pointmap plus SAM persistent
+# slot/ID labels. The selected QK pose trajectory is stored alongside the map.
+semantic_map:
+  output_dir: outputs/streaming_couping_v0/semantic_map
   confidence_threshold: 0.30
   track_score_threshold: 0.50
   max_map_points: 400000
-  metric_max_points: 4096
-  metric_thresholds: [0.05, 0.10]

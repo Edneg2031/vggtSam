@@ -33,7 +33,7 @@ def load_baseline_run_config(path: str | Path) -> BaselineRunConfig:
     qk_output_dir = _path(
         qk.get(
             "output_dir",
-            "outputs/streaming_couping_v0/qk_joint_geometry_retrieval",
+            "outputs/streaming_couping_v0/qk_pose_retrieval",
         )
     )
     config = BaselineRunConfig(
@@ -54,7 +54,7 @@ def load_baseline_run_config(path: str | Path) -> BaselineRunConfig:
         qk_pose_output=_path(
             pose.get(
                 "qk_pose_output",
-                qk_output_dir / "qk_joint_geometry_output.pt",
+                qk_output_dir / "qk_pose_output.pt",
             )
         ),
         allow_raw_pose_fallback=bool(

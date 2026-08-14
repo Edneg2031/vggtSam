@@ -16,14 +16,15 @@ export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-echo "V0 smoke: causal tracking, QK pose selection and raw fallback"
+echo "V0 smoke: causal tracking, QK pose and raw-pointmap semantic lifting"
 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_dynamic_instance_baseline
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_v0_semantic_map
 
 ARGS=()
 [[ "${BASELINE_REBUILD_CACHE:-0}" == "1" ]] && ARGS+=(--rebuild-cache)
 
 echo "V0 physical GPUs=$VISIBLE_GPUS"
-echo "stage 1/3: cache StreamVGGT geometry and SAM3.1 semantic tracks"
+echo "stage 1/4: cache StreamVGGT geometry and SAM3.1 semantic tracks"
 echo "logical layout: StreamVGGT=cuda:0,cuda:1 SAM3.1=cuda:2"
 CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" PYTHONUNBUFFERED=1 PYTHONPATH=. \
   "$PYTHON_BIN" -m streaming_couping.scripts.run_dynamic_instance_baseline \
@@ -34,22 +35,22 @@ CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" PYTHONUNBUFFERED=1 PYTHONPATH=. \
   --geometry-device cuda:0 \
   "${ARGS[@]}"
 
-QK_OUTPUT=outputs/streaming_couping_v0/qk_joint_geometry_retrieval
-QK_POSE="$QK_OUTPUT/qk_joint_geometry_output.pt"
-QK_SUMMARY="$QK_OUTPUT/qk_joint_geometry_summary.json"
+QK_OUTPUT=outputs/streaming_couping_v0/qk_pose_retrieval
+QK_POSE="$QK_OUTPUT/qk_pose_output.pt"
+QK_SUMMARY="$QK_OUTPUT/qk_pose_summary.json"
 if [[ "${BASELINE_REBUILD_QK:-0}" == "1" || ! -s "$QK_POSE" || ! -s "$QK_SUMMARY" ]]; then
   rm -rf "$QK_OUTPUT"
-  echo "stage 2/3: training-free RGB/QK joint geometry replay"
-  echo "No SAM or GT enters candidate generation; frozen camera/depth/point heads run"
+  echo "stage 2/4: training-free RGB/QK pose retrieval"
+  echo "No SAM or GT enters candidate generation; only the frozen camera head runs"
   CUDA_VISIBLE_DEVICES="$STREAM_GPU0,$STREAM_GPU1" PYTHONUNBUFFERED=1 PYTHONPATH=. \
     "$PYTHON_BIN" -m streaming_couping.scripts.run_v0_qk_pose_retrieval \
     --config "$CONFIG" \
     --streamvggt-devices cuda:0,cuda:1
 else
-  echo "stage 2/3: reuse existing clean QK artifact (strictly validated in stage 3)"
+  echo "stage 2/4: reuse existing QK pose artifact (strictly validated in stage 3)"
 fi
 
-echo "stage 3/3: select QK pose, audit tracking and score the 29-frame sequence"
+echo "stage 3/4: select QK pose, audit tracking and score the 29-frame sequence"
 CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" PYTHONUNBUFFERED=1 PYTHONPATH=. \
   "$PYTHON_BIN" -m streaming_couping.scripts.run_dynamic_instance_baseline \
   --config "$CONFIG" \
@@ -60,18 +61,14 @@ CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" PYTHONUNBUFFERED=1 PYTHONPATH=. \
   echo "missing baseline_summary.json" >&2
   exit 1
 }
-[[ ! -e outputs/streaming_couping_v0/validation/v0_pose_control_validation.csv ]] || {
-  echo "retired V0 r3 validation CSV still exists" >&2
-  exit 1
-}
 PYTHONPATH=. "$PYTHON_BIN" -c '
 import json
 from pathlib import Path
 summary = json.loads(Path("outputs/streaming_couping_v0/baseline_summary.json").read_text())
 assert summary["baseline_version"] == "v0"
-assert summary["schema"] == 5
+assert summary["schema"] == 6
 assert summary["baseline_status"] == "frozen"
-assert summary["implementation_revision"] == "v0_frozen_qk_pose_raw_pointmap_semantic_tracking_r7"
+assert summary["implementation_revision"] == "v0_frozen_semantic_mapping_pipeline_r1"
 assert summary["selected_pose_branch"] == "retrieve_qk"
 assert summary["selected_pose_exact_raw"] == 0
 assert summary["pose_modification_applied"] is True
@@ -84,11 +81,9 @@ assert summary["sam_pose_inputs"] == 0
 assert summary["formal_pose_output"] == "retrieve_qk"
 assert summary["formal_pointmap_output"] == "raw_full_history_world_pointmap"
 assert summary["formal_semantic_output"] == "sam_persistent_id_lifted_raw_world_pointmap"
-assert summary["candidate_geometry_available"] is True
+assert summary["candidate_geometry_available"] is False
 assert summary["candidate_pointmap_used"] is False
 assert summary["candidate_pointmap_used_for_pose"] is False
-assert summary["depth_source"] == "raw_streamvggt"
-assert summary["intrinsics_source"] == "raw_streamvggt"
 assert summary["tracking_baseline_acceptance_pass"] == 1
 assert summary["configured_instance_prompts"] == [
     "bed", "wardrobe", "picture", "mat", "chair"
@@ -109,5 +104,55 @@ print(
     f"R_gain={rotation_gain:.4f}%"
 )
 '
-echo "V0 selected-pose artifact: outputs/streaming_couping_v0/poses.pt"
-echo "V0 frozen baseline completed: QK pose + raw pointmap + SAM semantics"
+
+SEMANTIC_OUTPUT=outputs/streaming_couping_v0/semantic_map
+rm -rf "$SEMANTIC_OUTPUT"
+echo "stage 4/4: lift SAM persistent instances onto the raw world pointmap"
+echo "No GT is read; QK pose is stored alongside the unchanged raw pointmap"
+PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.run_v0_semantic_map \
+  --config "$CONFIG"
+
+[[ -s "$SEMANTIC_OUTPUT/semantic_map_summary.json" ]] || {
+  echo "missing semantic_map_summary.json" >&2
+  exit 1
+}
+[[ -s "$SEMANTIC_OUTPUT/semantic_map.pt" ]] || {
+  echo "missing semantic_map.pt" >&2
+  exit 1
+}
+[[ -s "$SEMANTIC_OUTPUT/semantic_map.ply" ]] || {
+  echo "missing semantic_map.ply" >&2
+  exit 1
+}
+PYTHONPATH=. "$PYTHON_BIN" -c '
+import json
+from pathlib import Path
+summary = json.loads(Path(
+    "outputs/streaming_couping_v0/semantic_map/semantic_map_summary.json"
+).read_text())
+assert summary["schema"] == 1
+assert summary["revision"] == "v0_frozen_semantic_map_export_r1"
+assert summary["baseline_revision"] == "v0_frozen_semantic_mapping_pipeline_r1"
+assert summary["selected_pose_branch"] == "retrieve_qk"
+assert summary["pointmap_source"] == "raw_full_history_streamvggt_world_pointmap"
+assert summary["semantic_source"] == "sam31_persistent_mask_and_id"
+assert summary["map_generation_gt_fields"] == 0
+assert summary["pointmap_modified"] == 0
+assert summary["saved_map_points"] > 0
+assert summary["saved_semantic_points"] > 0
+assert summary["semantic_map_pipeline_ready"] == 1
+points = summary["saved_map_points"]
+semantic = summary["saved_semantic_points"]
+tracks = summary["discovered_track_count"]
+print(
+    "V0 semantic map accepted "
+    f"points={points} "
+    f"semantic={semantic} "
+    f"tracks={tracks}"
+)
+'
+
+echo ""
+sed -n '1,120p' "$SEMANTIC_OUTPUT/copyable_result.txt"
+echo "V0 frozen pipeline completed: QK pose + raw pointmap + SAM semantics"

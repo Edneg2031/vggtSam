@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run training-free StreamVGGT QK retrieval with all geometry heads."""
+"""Run the frozen training-free StreamVGGT QK pose retrieval policy."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ import torch
 import yaml
 
 from streaming_couping.src.backbones.streamvggt_latent import (
-    ensure_thwc,
     load_streamvggt_latent_model,
 )
 from streaming_couping.src.backbones.streamvggt_parallel import (
@@ -42,7 +41,7 @@ from streaming_couping.src.qk_pose_retrieval import (
 )
 
 
-REVISION = "v0_streamvggt_qk_joint_geometry_replay_r2"
+REVISION = "v0_streamvggt_qk_pose_retrieval_r1"
 
 
 @dataclass(frozen=True)
@@ -82,7 +81,7 @@ def main() -> None:
     maybe_add_repo_to_path(recovery.streamvggt_repo)
     assert_processed_key_cache_equivalence()
     assert_frame_repository_cache_equivalence()
-    print("V0 QK joint-geometry processed-key/repository equivalence passed")
+    print("V0 QK pose processed-key/repository equivalence passed")
     model = load_streamvggt_latent_model(
         repo_path=recovery.streamvggt_repo,
         checkpoint_path=recovery.streamvggt_checkpoint,
@@ -110,7 +109,7 @@ def main() -> None:
         run=run,
         candidate=candidate,
     )
-    print(f"V0 QK joint-geometry result={result}")
+    print(f"V0 QK pose result={result}")
 
 
 @torch.inference_mode()
@@ -120,15 +119,11 @@ def _generate_qk_candidate(
     *,
     policy: QKRetrievalPolicy,
 ) -> dict[str, Any]:
-    """Generate pose, depth and pointmap from one RGB/QK replay."""
+    """Generate camera pose from one RGB/QK replay."""
 
     images = payload["stream_images"].detach().float().cpu()
     frame_numbers = tuple(int(value) for value in payload["frame_indices"])
     pose_encodings = []
-    depths = []
-    depth_confidences = []
-    pointmaps = []
-    pointmap_confidences = []
     retrieval_rows = []
     runner.reset()
 
@@ -174,35 +169,11 @@ def _generate_qk_candidate(
             history_selector=selector,
         )
         pose_encoding = runner.camera(selected_tokens)
-        depth, depth_confidence = runner.depth(selected_tokens, batch_frame)
-        pointmap, pointmap_confidence = runner.points(
-            selected_tokens,
-            batch_frame,
-        )
         pose_encodings.append(pose_encoding[0, 0].detach().float().cpu())
-        depths.append(ensure_thwc(depth[0]).detach().float().cpu())
-        depth_confidences.append(
-            ensure_thwc(depth_confidence[0]).detach().float().cpu()
-        )
-        pointmaps.append(ensure_thwc(pointmap[0]).detach().float().cpu())
-        pointmap_confidences.append(
-            ensure_thwc(pointmap_confidence[0]).detach().float().cpu()
-        )
-        del (
-            selected_tokens,
-            pose_encoding,
-            depth,
-            depth_confidence,
-            pointmap,
-            pointmap_confidence,
-        )
+        del selected_tokens, pose_encoding
     runner.reset()
     return {
         "pose_encoding": torch.stack(pose_encodings),
-        "depth": torch.cat(depths, dim=0),
-        "depth_confidence": torch.cat(depth_confidences, dim=0),
-        "pointmap": torch.cat(pointmaps, dim=0),
-        "pointmap_confidence": torch.cat(pointmap_confidences, dim=0),
         "retrieval_rows": retrieval_rows,
     }
 
@@ -240,7 +211,7 @@ def _score_and_write(
         payload["baseline_pose_encoding"].unsqueeze(0).float(),
         image_size_hw=image_size,
     )
-    candidate_pose, candidate_intrinsics = pose_encoding_to_extri_intri(
+    candidate_pose, _ = pose_encoding_to_extri_intri(
         candidate["pose_encoding"].unsqueeze(0).float(),
         image_size_hw=image_size,
     )
@@ -328,9 +299,9 @@ def _score_and_write(
         "sam_hidden_features_used": 0,
         "model_trained": 0,
         "pose_loss_used": 0,
-        "depth_head_run": 1,
-        "point_head_run": 1,
-        "joint_geometry_emitted": 1,
+        "depth_head_run": 0,
+        "point_head_run": 0,
+        "pose_only_artifact": 1,
         "raw_metrics": raw_metrics,
         "candidate_metrics": candidate_metrics,
         "center_gain_percent": center_gain,
@@ -342,7 +313,7 @@ def _score_and_write(
         "claim": (
             "training_free_qk_retrieval_improves_pose_on_single_sequence"
             if pose_pass
-            else "qk_joint_replay_pose_candidate_not_improved"
+            else "qk_pose_candidate_not_improved"
         ),
     }
     run.output_dir.mkdir(parents=True, exist_ok=True)
@@ -351,36 +322,30 @@ def _score_and_write(
         run.output_dir / "retrieval_diagnostics.csv",
         candidate["retrieval_rows"],
     )
-    result = run.output_dir / "qk_joint_geometry_summary.json"
+    result = run.output_dir / "qk_pose_summary.json"
     result.write_text(
         json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n",
         encoding="utf8",
     )
     torch.save(
         {
+            "schema": 1,
             "revision": REVISION,
             "frame_indices": frames,
             "pose_encoding": candidate["pose_encoding"],
             "selected_world_to_camera": candidate_pose.detach().float().cpu(),
-            "selected_intrinsics": candidate_intrinsics[0].detach().float().cpu(),
-            "selected_depth": candidate["depth"],
-            "selected_depth_confidence": candidate["depth_confidence"],
-            "selected_pointmap": candidate["pointmap"],
-            "selected_pointmap_confidence": candidate[
-                "pointmap_confidence"
-            ],
             "raw_world_to_camera": raw_pose.detach().float().cpu(),
             "selected_pose_branch": "retrieve_qk",
-            "geometry_branch": "retrieve_qk_joint_heads",
+            "artifact_role": "pose_only",
         },
-        run.output_dir / "qk_joint_geometry_output.pt",
+        run.output_dir / "qk_pose_output.pt",
     )
     _write_copyable(
         run.output_dir / "copyable_result.txt",
         summary=summary,
         output_dir=run.output_dir,
     )
-    print("V0 TRAINING-FREE STREAMVGGT QK JOINT GEOMETRY REPLAY")
+    print("V0 TRAINING-FREE STREAMVGGT QK POSE RETRIEVAL")
     print(
         f"  frames={len(frames)} evaluated={len(evaluation_indices)} "
         f"center_gain={center_gain:.4f}% R_gain={rotation_gain:.4f}% "
@@ -428,7 +393,7 @@ def _gain(raw: float, candidate: float) -> float:
 
 def _write_copyable(path: Path, *, summary: dict, output_dir: Path) -> None:
     lines = [
-        "===== COPYABLE_V0_QK_JOINT_GEOMETRY_BEGIN =====",
+        "===== COPYABLE_V0_QK_POSE_BEGIN =====",
         f"revision={REVISION}",
         f"clip={summary['clip']}",
         f"stream_frames={summary['stream_frames']}",
@@ -440,9 +405,9 @@ def _write_copyable(path: Path, *, summary: dict, output_dir: Path) -> None:
         "candidate_generation_fields=stream_images,frame_indices",
         "sam_pose_inputs=0",
         "model_trained=0",
-        "depth_head_run=1",
-        "point_head_run=1",
-        "joint_geometry_emitted=1",
+        "depth_head_run=0",
+        "point_head_run=0",
+        "pose_only_artifact=1",
         "",
         "raw_center_error_native,candidate_center_error_native,center_gain_percent,center_worse_frames,raw_rotation_degrees,candidate_rotation_degrees,rotation_gain_percent,rotation_worse_frames,full_sequence_pose_pass",
         ",".join(
@@ -464,12 +429,12 @@ def _write_copyable(path: Path, *, summary: dict, output_dir: Path) -> None:
         f"selected_v0_pose_modified={summary['selected_v0_pose_modified']}",
         "",
         "outputs:",
-        f"summary={output_dir / 'qk_joint_geometry_summary.json'}",
-        f"geometry={output_dir / 'qk_joint_geometry_output.pt'}",
+        f"summary={output_dir / 'qk_pose_summary.json'}",
+        f"pose={output_dir / 'qk_pose_output.pt'}",
         f"frame_csv={output_dir / 'frame_metrics.csv'}",
         f"retrieval_csv={output_dir / 'retrieval_diagnostics.csv'}",
         f"copyable_report={path}",
-        "===== COPYABLE_V0_QK_JOINT_GEOMETRY_END =====",
+        "===== COPYABLE_V0_QK_POSE_END =====",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf8")
 
@@ -498,7 +463,7 @@ def _load_run(path: str | Path) -> QKRun:
         output_dir=Path(
             section.get(
                 "output_dir",
-                "outputs/streaming_couping_v0/qk_joint_geometry_retrieval",
+                "outputs/streaming_couping_v0/qk_pose_retrieval",
             )
         ).expanduser().resolve(),
         policy=policy,
@@ -517,9 +482,9 @@ def _validate_payload(payload: dict, *, clip: ClipConfig) -> None:
     )
     missing = [name for name in required if name not in payload]
     if missing:
-        raise ValueError(f"V0 cache lacks QK joint-replay fields: {missing}.")
+        raise ValueError(f"V0 cache lacks QK pose-retrieval fields: {missing}.")
     if tuple(int(value) for value in payload["frame_indices"]) != clip.frame_indices:
-        raise ValueError("V0 QK joint-replay cache frames differ from config.")
+        raise ValueError("V0 QK pose-retrieval cache frames differ from config.")
 
 
 def _find_clip(config: LearnedPoseConfig, name: str) -> ClipConfig:

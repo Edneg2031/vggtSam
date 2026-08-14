@@ -55,19 +55,16 @@ def main() -> None:
     raw_pose = torch.randn(1, 4, 3, 4)
     frames = (90, 105, 120, 135)
     candidate = {
+        "schema": 1,
         "revision": QK_RETRIEVAL_REVISION,
         "frame_indices": frames,
         "selected_pose_branch": "retrieve_qk",
-        "geometry_branch": "retrieve_qk_joint_heads",
+        "artifact_role": "pose_only",
         "raw_world_to_camera": raw_pose.clone(),
         "selected_world_to_camera": raw_pose + 0.01,
-        "selected_intrinsics": torch.eye(3).repeat(4, 1, 1),
-        "selected_depth": torch.ones(4, 2, 2, 1),
-        "selected_depth_confidence": torch.ones(4, 2, 2, 1),
-        "selected_pointmap": torch.ones(4, 2, 2, 3),
-        "selected_pointmap_confidence": torch.ones(4, 2, 2, 1),
     }
     summary = {
+        "schema": 1,
         "revision": QK_RETRIEVAL_REVISION,
         "clip": "smoke",
         "method": "retrieve_qk",
@@ -76,9 +73,9 @@ def main() -> None:
         "candidate_generation_gt_fields": 0,
         "sam_pose_inputs": 0,
         "model_trained": 0,
-        "depth_head_run": 1,
-        "point_head_run": 1,
-        "joint_geometry_emitted": 1,
+        "depth_head_run": 0,
+        "point_head_run": 0,
+        "pose_only_artifact": 1,
     }
     _validate_qk_pose_artifacts(
         candidate=candidate,
@@ -110,7 +107,7 @@ def main() -> None:
             audit_device="cpu",
             evaluation_frames=frames,
             selected_pose_branch="retrieve_qk",
-            qk_pose_output=Path("missing_qk_joint_geometry_output.pt"),
+            qk_pose_output=Path("missing_qk_pose_output.pt"),
             allow_raw_pose_fallback=True,
         ),
         payload={"clip_name": "smoke"},

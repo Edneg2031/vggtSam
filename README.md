@@ -1,13 +1,10 @@
 # SAM3.1-assisted StreamVGGT
 
-The active implementation is the V0 causal tracking baseline: SAM3.1 provides
-prompted multi-instance masks, persistent identities, and future object births;
-StreamVGGT provides geometry guidance and the unmodified selected camera pose.
-No SAM appearance token or learned pose adapter is active.
-
-Completed V4–V9.8 experiments, retired E0/E1/G0 candidates, positive evidence,
-negative evidence, and the next instance-aware pose design are preserved in the
-[weekly experiment summary](streaming_couping/docs/weekly_experiment_summary_2026-08-03_to_2026-08-06.md).
+The active implementation is the frozen V0 semantic mapping pipeline. StreamVGGT
+provides a QK-retrieved camera trajectory and an unmodified full-history world
+pointmap. SAM3.1 provides prompted multi-instance masks, persistent identities,
+and future object births. No SAM appearance token, learned pose adapter, or
+point-cloud refinement is active.
 
 Initialize the two upstream model repositories once:
 
@@ -25,5 +22,6 @@ The commands use `externals/sam3` and `externals/streamvggt`, while datasets,
 checkpoints, caches, and generated evaluations remain local under `data/` and
 `outputs/`.
 
-See [the package README](streaming_couping/readme.md) for the exact claim boundary.
-The weekly summary is the only retained research-results/design document.
+See the [package README](streaming_couping/readme.md) for outputs and the
+[V0 method](streaming_couping/docs/v0_method.md) for the exact design and claim
+boundary.
