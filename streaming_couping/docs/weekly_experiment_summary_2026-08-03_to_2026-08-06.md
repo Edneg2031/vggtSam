@@ -476,8 +476,8 @@ SAM-conditioned hybrid pipeline在该序列改善pose”，不能表述为“正
 
 鉴于工程目标不要求 SAM identity独立改善pose，正式候选进一步简化为纯 StreamVGGT native-QK retrieval。
 candidate generation只读取 `stream_images/frame_indices`，执行 first-frame anchor + first-layer QK Top-4，
-运行冻结camera head；不读取SAM mask/ID/memory，不运行point head，也不生成candidate pointmap。完整30帧
-干净重放命令：
+不读取SAM mask/ID/memory。最初r1只运行camera head；现在r2在完全相同的QK replay内继续运行冻结
+depth/point heads，联合保存pose/depth/K/pointmap，供下游地图验证。完整30帧重放由baseline内部执行：
 
 独立 clean-QK 命令已删除；相同的最小 QK replay 现由 `commands_v0_baseline.txt` 内部执行。
 
@@ -488,6 +488,10 @@ SAM仍负责prompted discovery、persistent tracking、late birth和semantic lif
 `0.1209831685`降至`0.1077623591`（改善`10.9278%`），rotation由`2.55063653°`降至
 `2.39374542°`（改善`6.1511%`），两项同时通过。candidate generation字段严格为
 `stream_images/frame_indices`，SAM pose input、GT candidate field、训练和point head均为0。
+
+这里的`point head=0`是已完成的历史pose-only结果。当前joint-r2不会改变已生成的camera candidate逻辑，
+但会把`depth_head_run/point_head_run/joint_geometry_emitted`均置1；其地图结果必须由后续r3重新运行后填写，
+不能沿用历史SAM-hybrid candidate pointmap的退化数字。
 
 因此V0正式selected pose改为`retrieve_qk`；候选artifact缺失时回退raw StreamVGGT。部署仍使用raw
 StreamVGGT depth/K/pointmap，禁止使用先前退化的candidate pointmap。允许的结论是“training-free native-QK
@@ -511,3 +515,24 @@ r1曾得到全场景paired RMSE `+4.5521%`、fused symmetric `+4.1640%`，但SAM
 原因是r1用point-head reference拟合的Sim(3)评价depth-head地图，混用了两个冻结head的尺度。故r1的相对
 趋势只作诊断，不作为最终map gate。r2改为从raw-depth reference backprojection拟合一次Sim(3)，随后固定
 应用于raw/QK两支；地图生成与native-coordinate artifacts仍完全不读取GT。
+
+r2已完成：raw-depth reference Sim(3) fit RMSE=`0.0236998 m`，说明新对齐有效。QK分支相对raw的
+paired point-weighted RMSE gain=`-0.4588%`，fused symmetric gain=`-2.7279%`，全场景与SAM语义区域
+map pass均为0。至此证伪“保持raw depth/K不变、只替换QK pose即可改善semantic map”。原因是冻结depth
+head与原始full-history camera/context具有补偿性耦合，单换外参会破坏几何自洽。
+
+r2结束了“只替换外参”的map调参：相机轨迹输出保留单序列上有效的`retrieve_qk`；语义点云暂时部署
+`raw_semantic_map.ply`（raw depth/K/raw pose + SAM persistent labels）。若要求同一分支联合改善pose与map，
+必须联合重算depth/geometry，而不是再次单独替换pose。
+
+### QK joint geometry r3（待服务器结果）
+
+按照RetrieveVGGT的完整信息流，V0现已把QK replay从camera-only扩为同一次冻结forward的
+camera/depth/point heads。地图审计固定五个分支：`raw_depth_pose`、历史负对照
+`qk_pose_raw_depth`、`qk_joint_depth_pose`、`raw_pointmap`、`qk_joint_pointmap`。所有分支使用相同
+SAM masks/RGB与raw-confidence像素索引；depth-backprojection和point-head各自从本族raw reference拟合
+一次Sim(3)，随后固定给本族candidate，禁止跨head尺度混用。GT仍只在全部native maps生成后进入评分。
+
+输出现在同时报告：全场景、所有SAM区域聚合，以及每个persistent slot/prompt的paired RMSE和fused
+symmetric distance。只有joint depth或joint pointmap同时通过全场景和SAM区域gate，才允许替换raw semantic
+map；否则raw map继续部署。该实验无训练，也不恢复旧ICP。

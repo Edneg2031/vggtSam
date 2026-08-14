@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and audit V0 SAM tracking with clean QK-retrieved StreamVGGT pose."""
+"""Build and audit V0 SAM tracking with QK-retrieved StreamVGGT outputs."""
 
 from __future__ import annotations
 
@@ -34,8 +34,8 @@ from streaming_couping.src.learned_pose.config import (
 )
 
 
-V0_IMPLEMENTATION_REVISION = "qk_retrieved_pose_semantic_tracking_r5"
-QK_RETRIEVAL_REVISION = "v0_clean_streamvggt_qk_pose_retrieval_r1"
+V0_IMPLEMENTATION_REVISION = "qk_joint_geometry_semantic_tracking_r6"
+QK_RETRIEVAL_REVISION = "v0_streamvggt_qk_joint_geometry_replay_r2"
 
 FRAME_COLUMNS = (
     "sequence_index",
@@ -307,7 +307,11 @@ def _write_outputs(
             "training_free_native_qk_retrieval_selected"
         ),
         "sam_pose_inputs": 0,
+        "candidate_geometry_available": bool(
+            pose_selection["provenance"].get("joint_geometry_emitted", 0)
+        ),
         "candidate_pointmap_used": False,
+        "candidate_pointmap_used_for_pose": False,
         "depth_source": "raw_streamvggt",
         "intrinsics_source": "raw_streamvggt",
         "raw_metrics": raw_metrics,
@@ -414,12 +418,12 @@ def _load_pose_selection(
         return _raw_pose_selection(raw_pose, status="raw_pose_selected_by_config")
 
     path = run.qk_pose_output
-    summary_path = path.with_name("clean_qk_pose_summary.json")
+    summary_path = path.with_name("qk_joint_geometry_summary.json")
     missing = [value for value in (path, summary_path) if not value.is_file()]
     if missing:
         if not run.allow_raw_pose_fallback:
             raise FileNotFoundError(
-                f"Missing required clean QK pose artifacts: {missing}."
+                f"Missing required QK joint-geometry artifacts: {missing}."
             )
         return _raw_pose_selection(
             raw_pose,
@@ -447,18 +451,18 @@ def _load_pose_selection(
     raw_max_abs_diff = float((raw_copy - raw_pose).abs().max().detach().cpu())
     if not torch.allclose(raw_copy, raw_pose, atol=2e-5, rtol=1e-5):
         raise RuntimeError(
-            "Clean QK artifact was generated from a different raw pose; "
+            "QK joint artifact was generated from a different raw pose; "
             f"maximum absolute difference={raw_max_abs_diff}."
         )
     exact_raw = bool(torch.equal(selected, raw_pose))
     if exact_raw:
-        raise RuntimeError("Clean QK selected pose is unexpectedly exact raw pose.")
+        raise RuntimeError("QK joint selected pose is unexpectedly exact raw pose.")
     return {
         "selected_pose": selected,
         "selected_pose_branch": "retrieve_qk",
         "selected_pose_exact_raw": False,
         "fallback_used": False,
-        "status": "selected_fixed_clean_qk_retrieval",
+        "status": "selected_fixed_qk_joint_geometry_retrieval",
         "provenance": {
             "revision": QK_RETRIEVAL_REVISION,
             "pose_output": str(path),
@@ -471,7 +475,9 @@ def _load_pose_selection(
             "candidate_generation_gt_fields": 0,
             "sam_pose_inputs": 0,
             "model_trained": 0,
-            "point_head_run": 0,
+            "depth_head_run": 1,
+            "point_head_run": 1,
+            "joint_geometry_emitted": 1,
             "raw_pose_max_abs_difference": raw_max_abs_diff,
         },
     }
@@ -493,36 +499,80 @@ def _validate_qk_pose_artifacts(
         "candidate_generation_gt_fields": 0,
         "sam_pose_inputs": 0,
         "model_trained": 0,
-        "point_head_run": 0,
+        "depth_head_run": 1,
+        "point_head_run": 1,
+        "joint_geometry_emitted": 1,
     }
     for name, expected in expected_summary.items():
         if summary.get(name) != expected:
             raise ValueError(
-                f"Clean QK summary field {name!r}={summary.get(name)!r}; "
+                f"QK joint summary field {name!r}={summary.get(name)!r}; "
                 f"expected {expected!r}."
             )
     expected_candidate = {
         "revision": QK_RETRIEVAL_REVISION,
         "selected_pose_branch": "retrieve_qk",
+        "geometry_branch": "retrieve_qk_joint_heads",
     }
     for name, expected in expected_candidate.items():
         if candidate.get(name) != expected:
             raise ValueError(
-                f"Clean QK pose field {name!r}={candidate.get(name)!r}; "
+                f"QK joint field {name!r}={candidate.get(name)!r}; "
                 f"expected {expected!r}."
             )
     if tuple(int(value) for value in summary.get("frames", ())) != frames:
-        raise ValueError("Clean QK summary frame order differs from V0 cache.")
+        raise ValueError("QK joint summary frame order differs from V0 cache.")
     if tuple(int(value) for value in candidate.get("frame_indices", ())) != frames:
-        raise ValueError("Clean QK pose frame order differs from V0 cache.")
+        raise ValueError("QK joint frame order differs from V0 cache.")
     for name in ("selected_world_to_camera", "raw_world_to_camera"):
         value = candidate.get(name)
         if not torch.is_tensor(value) or value.shape != raw_pose.shape:
             raise ValueError(
-                f"Clean QK {name} must have shape {tuple(raw_pose.shape)}."
+                f"QK joint {name} must have shape {tuple(raw_pose.shape)}."
             )
         if not bool(torch.isfinite(value).all()):
-            raise ValueError(f"Clean QK {name} contains non-finite values.")
+            raise ValueError(f"QK joint {name} contains non-finite values.")
+
+    sequence = len(frames)
+    intrinsics = candidate.get("selected_intrinsics")
+    if (
+        not torch.is_tensor(intrinsics)
+        or tuple(intrinsics.shape) != (sequence, 3, 3)
+        or not bool(torch.isfinite(intrinsics).all())
+    ):
+        raise ValueError("QK joint selected_intrinsics must be finite [S,3,3].")
+    depth = candidate.get("selected_depth")
+    depth_confidence = candidate.get("selected_depth_confidence")
+    pointmap = candidate.get("selected_pointmap")
+    pointmap_confidence = candidate.get("selected_pointmap_confidence")
+    if (
+        not torch.is_tensor(depth)
+        or depth.ndim != 4
+        or depth.shape[0] != sequence
+        or depth.shape[-1] != 1
+        or not bool(torch.isfinite(depth).all())
+    ):
+        raise ValueError("QK joint selected_depth must be finite [S,H,W,1].")
+    if (
+        not torch.is_tensor(depth_confidence)
+        or depth_confidence.shape != depth.shape
+        or not bool(torch.isfinite(depth_confidence).all())
+    ):
+        raise ValueError("QK joint depth confidence shape/content is invalid.")
+    if (
+        not torch.is_tensor(pointmap)
+        or pointmap.ndim != 4
+        or pointmap.shape[:3] != depth.shape[:3]
+        or pointmap.shape[-1] != 3
+        or not bool(torch.isfinite(pointmap).all())
+    ):
+        raise ValueError("QK joint selected_pointmap must be finite [S,H,W,3].")
+    if (
+        not torch.is_tensor(pointmap_confidence)
+        or pointmap_confidence.shape != depth.shape
+        or not bool(torch.isfinite(pointmap_confidence).all())
+    ):
+        raise ValueError("QK joint pointmap confidence shape/content is invalid.")
 
 
 def _raw_pose_selection(
@@ -543,7 +593,9 @@ def _raw_pose_selection(
             "candidate_generation_gt_fields": 0,
             "sam_pose_inputs": 0,
             "model_trained": 0,
+            "depth_head_run": 0,
             "point_head_run": 0,
+            "joint_geometry_emitted": 0,
         },
     }
 

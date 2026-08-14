@@ -16,7 +16,7 @@ export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-echo "V0 smoke: causal tracking, clean QK pose selection and raw fallback"
+echo "V0 smoke: causal tracking, QK joint geometry and raw fallback"
 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_dynamic_instance_baseline
 
 ARGS=()
@@ -34,13 +34,13 @@ CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" PYTHONUNBUFFERED=1 PYTHONPATH=. \
   --geometry-device cuda:0 \
   "${ARGS[@]}"
 
-QK_OUTPUT=outputs/streaming_couping_v0/clean_qk_pose_retrieval
-QK_POSE="$QK_OUTPUT/clean_qk_pose_output.pt"
-QK_SUMMARY="$QK_OUTPUT/clean_qk_pose_summary.json"
+QK_OUTPUT=outputs/streaming_couping_v0/qk_joint_geometry_retrieval
+QK_POSE="$QK_OUTPUT/qk_joint_geometry_output.pt"
+QK_SUMMARY="$QK_OUTPUT/qk_joint_geometry_summary.json"
 if [[ "${BASELINE_REBUILD_QK:-0}" == "1" || ! -s "$QK_POSE" || ! -s "$QK_SUMMARY" ]]; then
   rm -rf "$QK_OUTPUT"
-  echo "stage 2/3: clean training-free RGB/QK history retrieval"
-  echo "No SAM/GT/point-head input enters candidate generation"
+  echo "stage 2/3: training-free RGB/QK joint geometry replay"
+  echo "No SAM or GT enters candidate generation; frozen camera/depth/point heads run"
   CUDA_VISIBLE_DEVICES="$STREAM_GPU0,$STREAM_GPU1" PYTHONUNBUFFERED=1 PYTHONPATH=. \
     "$PYTHON_BIN" -m streaming_couping.scripts.run_v0_qk_pose_retrieval \
     --config "$CONFIG" \
@@ -70,7 +70,7 @@ from pathlib import Path
 summary = json.loads(Path("outputs/streaming_couping_v0/baseline_summary.json").read_text())
 assert summary["baseline_version"] == "v0"
 assert summary["schema"] == 5
-assert summary["implementation_revision"] == "qk_retrieved_pose_semantic_tracking_r5"
+assert summary["implementation_revision"] == "qk_joint_geometry_semantic_tracking_r6"
 assert summary["selected_pose_branch"] == "retrieve_qk"
 assert summary["selected_pose_exact_raw"] == 0
 assert summary["pose_modification_applied"] is True
@@ -80,7 +80,9 @@ assert summary["selected_center_gain_vs_raw_percent"] > 0
 assert summary["selected_rotation_gain_vs_raw_percent"] > 0
 assert len(summary["pose_evaluation_frames"]) == 29
 assert summary["sam_pose_inputs"] == 0
+assert summary["candidate_geometry_available"] is True
 assert summary["candidate_pointmap_used"] is False
+assert summary["candidate_pointmap_used_for_pose"] is False
 assert summary["depth_source"] == "raw_streamvggt"
 assert summary["intrinsics_source"] == "raw_streamvggt"
 assert summary["tracking_baseline_acceptance_pass"] == 1
@@ -104,4 +106,4 @@ print(
 )
 '
 echo "V0 selected-pose artifact: outputs/streaming_couping_v0/poses.pt"
-echo "V0 SAM semantic tracking + clean QK pose baseline completed"
+echo "V0 SAM semantic tracking + QK joint-geometry baseline completed"

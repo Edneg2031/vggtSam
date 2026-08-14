@@ -64,18 +64,19 @@ baseline:
     # The selection is fixed before GT scoring. It consumes the RGB/QK-only
     # artifact below; raw StreamVGGT remains an explicit runtime fallback.
     selected_branch: retrieve_qk
-    qk_pose_output: outputs/streaming_couping_v0/clean_qk_pose_retrieval/clean_qk_pose_output.pt
+    qk_pose_output: outputs/streaming_couping_v0/qk_joint_geometry_retrieval/qk_joint_geometry_output.pt
     allow_raw_fallback: true
 
-# Clean deployable pose candidate. It reads RGB and native StreamVGGT Q/K only;
-# SAM remains in the tracking/semantic-map path and does not enter pose retrieval.
+# Training-free joint candidate. RGB/native QK selects history once, then the
+# same replay emits pose, depth, intrinsics and pointmap from frozen heads.
+# SAM remains outside candidate generation.
 qk_pose_retrieval:
-  output_dir: outputs/streaming_couping_v0/clean_qk_pose_retrieval
+  output_dir: outputs/streaming_couping_v0/qk_joint_geometry_retrieval
   total_frame_budget: 5
   anchor_frames: 1
 
-# Final map A/B keeps raw depth, raw intrinsics, RGB, SAM masks/IDs and point
-# support exactly fixed. Only raw versus QK-retrieved camera extrinsics differ.
+# Final map audit retains the pose-only/raw-depth negative control and adds
+# self-consistent QK depth-pose and QK point-head branches. SAM support is fixed.
 semantic_map_ab:
   output_dir: outputs/streaming_couping_v0/semantic_map_ab
   confidence_threshold: 0.30

@@ -21,10 +21,10 @@ export PYTHONHASHSEED=0
 export OMP_NUM_THREADS="${SEMANTIC_MAP_CPU_THREADS:-8}"
 export MKL_NUM_THREADS="$OMP_NUM_THREADS"
 
-echo "V0 semantic map A/B: raw pose versus selected QK pose"
-echo "Shared inputs: raw depth/K, SAM masks/IDs, RGB and confidence support"
-echo "No model is loaded or trained; candidate pointmap is not used"
-echo "GT enters only after both native-coordinate maps are generated"
+echo "V0 semantic map A/B: raw, pose-only QK and joint-QK geometry"
+echo "Shared inputs: SAM masks/IDs, RGB and locked raw-confidence pixel support"
+echo "No model is loaded or trained; the baseline joint artifact is replayed"
+echo "GT enters only after all native-coordinate maps are generated"
 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_v0_semantic_map_ab
 
 rm -rf "$OUTPUT"
@@ -44,8 +44,16 @@ PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
   echo "missing raw_semantic_map.ply" >&2
   exit 1
 }
-[[ -s "$OUTPUT/selected_semantic_map.ply" ]] || {
-  echo "missing selected_semantic_map.ply" >&2
+[[ -s "$OUTPUT/qk_joint_depth_semantic_map.ply" ]] || {
+  echo "missing qk_joint_depth_semantic_map.ply" >&2
+  exit 1
+}
+[[ -s "$OUTPUT/qk_joint_pointmap_semantic_map.ply" ]] || {
+  echo "missing qk_joint_pointmap_semantic_map.ply" >&2
+  exit 1
+}
+[[ -s "$OUTPUT/instance_metrics.csv" ]] || {
+  echo "missing instance_metrics.csv" >&2
   exit 1
 }
 
@@ -53,20 +61,20 @@ PYTHONPATH=. "$PYTHON_BIN" -c '
 import json
 from pathlib import Path
 summary = json.loads(Path("outputs/streaming_couping_v0/semantic_map_ab/semantic_map_summary.json").read_text())
-assert summary["schema"] == 1
-assert summary["revision"] == "v0_semantic_map_shared_raw_geometry_ab_r2"
+assert summary["schema"] == 2
+assert summary["revision"] == "v0_semantic_map_qk_joint_geometry_ab_r3"
 assert summary["selected_pose_branch"] == "retrieve_qk"
 assert summary["map_generation_gt_fields"] == 0
-assert summary["shared_support_exact"] == 1
-assert summary["raw_depth_shared"] == 1
-assert summary["raw_intrinsics_shared"] == 1
+assert summary["shared_pixel_support_exact"] == 1
 assert summary["sam_masks_shared"] == 1
-assert summary["candidate_pointmap_used"] == 0
+assert summary["candidate_depth_used"] == 1
+assert summary["candidate_pointmap_used"] == 1
 assert summary["saved_map_points"] > 0
-geometry_pass = summary["geometry_map_pass"]
+assert summary["instance_metric_rows"] > 0
+joint_pass = summary["qk_joint_any_semantic_map_pass"]
 print(
     "V0 semantic map schema passed "
-    f"geometry_pass={geometry_pass}"
+    f"joint_map_pass={joint_pass}"
 )
 '
 

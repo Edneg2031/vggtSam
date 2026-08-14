@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CPU smoke for shared-support raw/QK semantic point-map construction."""
+"""CPU smoke for shared-support QK joint semantic-map scoring."""
 
 from __future__ import annotations
 
@@ -9,6 +9,10 @@ from streaming_couping.src.semantic_map import (
     SemanticMapInputs,
     apply_similarity,
     build_shared_semantic_maps,
+)
+from streaming_couping.scripts.run_v0_semantic_map_ab import (
+    _per_instance_rows,
+    _score_family,
 )
 
 
@@ -59,7 +63,68 @@ def main() -> None:
         2.0 * pair.raw_map_points + torch.tensor([1.0, 2.0, 3.0]),
     )
     assert torch.equal(pair.map_rgb, torch.full((4, 3), 0.5))
-    print("V0 shared-support semantic map smoke passed")
+
+    target = torch.tensor(
+        [
+            [[[0.0, 0.0, 1.0], [1.0, 0.0, 1.0]],
+             [[0.0, 1.0, 1.0], [1.0, 1.0, 1.0]]],
+            [[[0.0, 0.0, 2.0], [1.0, 0.0, 2.0]],
+             [[0.0, 1.0, 2.0], [1.0, 1.0, 2.0]]],
+        ]
+    )
+    valid = torch.ones(2, 2, 2, dtype=torch.bool)
+    slots = torch.zeros(2, 2, 2, dtype=torch.long)
+    flat_indices = torch.arange(8)
+    metrics, rows, _ = _score_family(
+        family="smoke",
+        branches={
+            "raw": target + 0.10,
+            "candidate": target + 0.02,
+        },
+        raw_branch="raw",
+        frames=(90, 105),
+        reference=0,
+        target=target,
+        valid=valid,
+        semantic_slots=slots,
+        map_flat_indices=flat_indices,
+        map_semantic_slots=slots.reshape(-1),
+        max_points=8,
+        thresholds=(0.05, 0.10),
+    )
+    assert len(rows) == 4
+    assert metrics["candidate"]["overall_pass"] == 1
+    assert metrics["candidate"]["semantic_pass"] == 1
+    instance_rows = _per_instance_rows(
+        families={
+            "smoke": {
+                "raw": target + 0.10,
+                "candidate": target + 0.02,
+            }
+        },
+        family_raw={"smoke": "raw"},
+        tracks=[
+            {
+                "slot": 0,
+                "sam_track_id": 7,
+                "prompt": "chair",
+                "birth_sequence_index": 0,
+                "birth_frame": 90,
+            }
+        ],
+        frames=(90, 105),
+        reference=0,
+        target=target,
+        valid=valid,
+        semantic_slots=slots,
+        map_flat_indices=flat_indices,
+        map_semantic_slots=slots.reshape(-1),
+        max_points=8,
+        thresholds=(0.05, 0.10),
+    )
+    assert len(instance_rows) == 2
+    assert instance_rows[1]["instance_pass"] == 1
+    print("V0 QK joint semantic map smoke passed")
 
 
 if __name__ == "__main__":
