@@ -86,6 +86,9 @@ SAM 的作用：
 - 路线 A 是当前可用 baseline；`commands_v0_incremental_audit.txt`一次完成pose–pointmap一致性审计，
   以及full/recent/3-seed random/QK的等预算上下文对照。
 - 一致性审计先输出连续指标，不在看到结果后临时设置通过阈值；上下文对照不读取SAM。
-- 只有QK同时优于recent与random均值，才进入correct-ID/global/shuffled/shifted的SAM信息探针。
+- QK已同时优于recent与3-seed random均值；raw pointmap与QK pose的一致性指标也相对raw pose改善。
+- `commands_v0_sam_identity_pose_probe.txt`现用于correct-ID/global/foreground-union/shuffled-ID/
+  shifted-mask五分支的等点数、因果、固定方向信息探针；该探针不修改正式V0。
+- 只有correct persistent ID同时改善QK的center/rotation并严格优于四个control，才进入迭代优化。
 - 路线 B 是后续改善 semantic pointmap 的候选，目前只是方法设计，尚无实验结果。
 - 已失败的 joint-QK geometry、SAM-token camera fusion 和 object ICP 仅保留为证伪记录。

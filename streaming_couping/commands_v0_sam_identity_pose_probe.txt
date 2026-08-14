@@ -1,0 +1,121 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+CONFIG=streaming_couping/configs/v0_baseline.yaml
+OUTPUT=outputs/streaming_couping_v0/sam_identity_pose_probe
+CACHE=outputs/streaming_couping_v0/cache/00a231a370_90_525_step15_37_68_54.pt
+QK_OUTPUT=outputs/streaming_couping_v0/qk_joint_geometry_retrieval/qk_joint_geometry_output.pt
+AUDIT_SUMMARY=outputs/streaming_couping_v0/incremental_audit/incremental_audit_summary.json
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+
+export PYTHONHASHSEED=0
+
+echo "V0 causal SAM persistent-ID fixed-direction pose probe"
+echo "No model is loaded or trained; formal V0 pose/pointmap remain unchanged"
+echo "QK pose initialization + causal raw-world-point history + current raw depth"
+echo "Controls: global, foreground union, correct ID, shuffled ID and shifted mask"
+
+if [[ ! -s "$CACHE" || ! -s "$QK_OUTPUT" ]]; then
+  echo "required V0 cache/QK artifact missing; running baseline first"
+  zsh streaming_couping/commands_v0_baseline.txt
+fi
+
+[[ -s "$AUDIT_SUMMARY" ]] || {
+  echo "missing passed incremental audit: $AUDIT_SUMMARY" >&2
+  echo "run zsh streaming_couping/commands_v0_incremental_audit.txt first" >&2
+  exit 1
+}
+PYTHONPATH=. "$PYTHON_BIN" -c '
+import json
+from pathlib import Path
+summary = json.loads(Path(
+    "outputs/streaming_couping_v0/incremental_audit/incremental_audit_summary.json"
+).read_text())
+assert summary["revision"] == "v0_pose_pointmap_and_context_policy_audit_r1"
+assert summary["decisions"]["qk_beats_recent_and_random_pose_controls"] == 1
+print("V0 incremental-audit gate passed; SAM identity probe is authorized")
+'
+
+echo "V0 SAM identity probe CPU smoke"
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_v0_sam_identity_pose_probe
+
+rm -rf "$OUTPUT"
+PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.run_v0_sam_identity_pose_probe \
+  --config "$CONFIG"
+
+SUMMARY="$OUTPUT/sam_identity_pose_probe_summary.json"
+REPORT="$OUTPUT/copyable_result.txt"
+[[ -s "$SUMMARY" ]] || { echo "missing $SUMMARY" >&2; exit 1; }
+[[ -s "$REPORT" ]] || { echo "missing $REPORT" >&2; exit 1; }
+[[ -s "$OUTPUT/branch_summary.csv" ]] || {
+  echo "missing branch summary CSV" >&2
+  exit 1
+}
+[[ -s "$OUTPUT/candidate_diagnostics.csv" ]] || {
+  echo "missing candidate diagnostics CSV" >&2
+  exit 1
+}
+
+PYTHONPATH=. "$PYTHON_BIN" -c '
+import json
+import math
+from pathlib import Path
+
+path = Path("outputs/streaming_couping_v0/sam_identity_pose_probe/sam_identity_pose_probe_summary.json")
+summary = json.loads(path.read_text())
+assert summary["schema"] == 1
+assert summary["revision"] == "v0_causal_sam_identity_fixed_direction_pose_probe_r1"
+assert summary["baseline_version"] == "v0"
+assert summary["evaluated_pose_frames"] == 29
+assert summary["initial_pose"] == "retrieve_qk"
+assert summary["mask_source"] == "tracking_masks_stream"
+assert summary["sam_hidden_features_used"] == 0
+assert summary["model_trained"] == 0
+assert summary["candidate_generation_gt_fields"] == 0
+assert summary["candidate_count_per_active_branch_frame"] == 13
+assert summary["minimum_loss_decrease"] == 1e-5
+assert set(summary["branches"]) == {
+    "global_geometry",
+    "foreground_union",
+    "correct_persistent_id",
+    "shuffled_persistent_id",
+    "shifted_mask_control",
+}
+assert len(summary["branch_results"]) == 5
+active_counts = {row["active_frames"] for row in summary["branch_results"]}
+assert len(active_counts) == 1
+assert next(iter(active_counts)) >= 0
+for row in summary["branch_results"]:
+    for key in (
+        "center_error_native",
+        "center_gain_vs_qk_percent",
+        "rotation_degrees",
+        "rotation_gain_vs_qk_percent",
+    ):
+        assert math.isfinite(row[key]), (row["branch"], key, row[key])
+    assert row["branch_pose_pass"] in (0, 1)
+decision = summary["decisions"]
+assert decision["equal_source_point_protocol"] == 1
+assert decision["equal_active_frames"] == 1
+assert decision["probe_feasible"] in (0, 1)
+assert decision["candidate_generation_gt_fields"] == 0
+assert decision["formal_v0_pose_modified"] == 0
+assert decision["formal_v0_pointmap_modified"] == 0
+assert decision["correct_id_pose_pass"] in (0, 1)
+assert decision["correct_id_unique_vs_all_controls_pass"] in (0, 1)
+assert decision["sam_identity_pose_direction_evidence"] in (0, 1)
+print(
+    "V0 SAM identity pose probe schema passed "
+    f"active_frames={next(iter(active_counts))} "
+    f"identity_evidence={decision['"'"'sam_identity_pose_direction_evidence'"'"']}"
+)
+'
+
+echo ""
+echo "===== V0 SAM IDENTITY POSE PROBE COPYABLE RESULT ====="
+cat "$REPORT"

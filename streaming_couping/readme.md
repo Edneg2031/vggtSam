@@ -1,6 +1,6 @@
 # streaming_couping
 
-本目录保留两个正式 V0 入口和一个不修改正式输出的诊断入口。
+本目录保留两个正式 V0 入口和两个不修改正式输出的诊断入口。
 
 ## 1. Baseline
 
@@ -78,6 +78,22 @@ zsh streaming_couping/commands_v0_incremental_audit.txt
 
 该实验不读取SAM作为pose候选输入、不训练模型，也不替换正式V0 pose/pointmap。GT只在各RGB-only
 候选完全生成后评分。SAM persistent-ID pose探针要等这两个gate的结果明确后再实现。
+
+## 4. SAM persistent-ID pose probe（当前实验）
+
+```bash
+zsh streaming_couping/commands_v0_sam_identity_pose_probe.txt
+```
+
+该命令在incremental audit通过后运行，不重新加载模型：
+
+- 以QK pose为初值，使用`frames < t`的raw full-history world pointmap建立因果实例点memory；
+- 当前帧只读取raw depth、SAM persistent mask/ID和track score；
+- global、foreground union、correct ID、shuffled ID、shifted mask五分支使用严格相等的source-point数量；
+- 每个active frame只在identity和12个固定单轴SE(3)方向中按几何/ownership loss选择一次；
+- GT在所有候选冻结后才评分，不训练、不迭代、不替换正式V0 pose或pointmap。
+
+只有correct persistent ID同时改善QK的center/rotation，并严格优于四个control，才进入迭代pose residual。
 
 ## Evidence archive
 
