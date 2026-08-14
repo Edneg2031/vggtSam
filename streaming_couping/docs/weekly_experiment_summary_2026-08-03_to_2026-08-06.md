@@ -501,3 +501,15 @@ SAM仍负责prompted discovery、persistent tracking、late birth和semantic lif
 StreamVGGT depth/K/pointmap，禁止使用先前退化的candidate pointmap。允许的结论是“training-free native-QK
 history retrieval在这一条30帧序列上改善pose”；SAM identity因果结论和跨场景泛化结论仍为0。下一步只做
 语义地图闭环：在完全相同raw depth/K/SAM masks/IDs下分别用raw pose与selected QK pose融合点云。
+
+语义地图A/B现已实现为独立、无训练后处理：地图生成只读取raw depth、raw K、raw/QK pose、SAM
+persistent-slot masks/scores与RGB，在StreamVGGT native reference坐标输出两份共享支持点云；GT和固定
+raw-reference Sim(3)只在两份地图完成后用于评分。输出保留binary PLY、带prompt/track metadata的PT artifact、
+非reference帧paired RMSE及融合点云双向nearest-neighbor/F-score。运行：
+
+```bash
+zsh streaming_couping/commands_v0_semantic_map_ab.txt
+```
+
+判定只回答“相同raw geometry与SAM语义支持下，QK pose是否改善地图几何”；不把prompt标签当GT语义分类
+评价，也不读取已经证实退化的QK candidate pointmap。

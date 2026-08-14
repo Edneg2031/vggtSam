@@ -90,3 +90,17 @@ zsh streaming_couping/commands_v0_clean_qk_pose_retrieval.txt
 该实验只比较缓存中的raw StreamVGGT pose与单个QK候选。干净结果已经通过完整序列工程gate，主V0命令会
 重放该候选、验证revision/clip/帧序/shape/provenance，然后写入
 `outputs/streaming_couping_v0/poses.pt:selected_world_to_camera`；raw pose同时保留为fallback。
+
+## V0 shared-geometry semantic map A/B
+
+正式V0 pose接入后，语义地图闭环固定使用相同的raw StreamVGGT depth/K、相同SAM3.1 persistent-slot
+masks/IDs、相同RGB和confidence support，只比较raw pose与`retrieve_qk` pose。地图在StreamVGGT native
+reference坐标生成，不读取GT；两支生成完毕后才使用同一个raw-reference Sim(3)和GT pointmap评分：
+
+```bash
+zsh streaming_couping/commands_v0_semantic_map_ab.txt
+```
+
+输出包含raw/selected binary PLY、带prompt/track metadata的`semantic_maps.pt`、逐帧paired RMSE与融合点云
+双向nearest-neighbor指标。该实验不使用QK candidate pointmap，也不评价prompt语义分类准确率；它只判断
+selected pose是否在共享深度和语义支持下改善几何地图。

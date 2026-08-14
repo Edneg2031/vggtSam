@@ -74,6 +74,16 @@ qk_pose_retrieval:
   total_frame_budget: 5
   anchor_frames: 1
 
+# Final map A/B keeps raw depth, raw intrinsics, RGB, SAM masks/IDs and point
+# support exactly fixed. Only raw versus QK-retrieved camera extrinsics differ.
+semantic_map_ab:
+  output_dir: outputs/streaming_couping_v0/semantic_map_ab
+  confidence_threshold: 0.30
+  track_score_threshold: 0.50
+  max_map_points: 400000
+  metric_max_points: 4096
+  metric_thresholds: [0.05, 0.10]
+
 # Training-free RetrieveVGGT-style candidate inside V0. SAM supplies only the
 # persistent masks/identity; StreamVGGT supplies mask-pooled first-layer Q/K,
 # every selected frame still contributes its full native KV. This historical
