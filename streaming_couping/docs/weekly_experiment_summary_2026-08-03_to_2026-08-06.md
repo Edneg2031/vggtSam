@@ -525,7 +525,7 @@ r2结束了“只替换外参”的map调参：相机轨迹输出保留单序列
 `raw_semantic_map.ply`（raw depth/K/raw pose + SAM persistent labels）。若要求同一分支联合改善pose与map，
 必须联合重算depth/geometry，而不是再次单独替换pose。
 
-### QK joint geometry r3（待服务器结果）
+### QK joint geometry r3（已完成）
 
 按照RetrieveVGGT的完整信息流，V0现已把QK replay从camera-only扩为同一次冻结forward的
 camera/depth/point heads。地图审计固定五个分支：`raw_depth_pose`、历史负对照
@@ -536,3 +536,17 @@ SAM masks/RGB与raw-confidence像素索引；depth-backprojection和point-head�
 输出现在同时报告：全场景、所有SAM区域聚合，以及每个persistent slot/prompt的paired RMSE和fused
 symmetric distance。只有joint depth或joint pointmap同时通过全场景和SAM区域gate，才允许替换raw semantic
 map；否则raw map继续部署。该实验无训练，也不恢复旧ICP。
+
+r3服务器结果：pose仍复现center `+10.9278%`、rotation `+6.1511%`，但联合geometry没有
+复现这个收益。`qk_joint_depth_pose`的全场景paired RMSE gain=`-2.8689%`、fused
+symmetric gain=`-5.0488%`；`qk_joint_pointmap`分别为`-8.8613%/-16.3464%`。两者overall pass均为0。
+
+SAM区域聚合结果更细分：joint depth的semantic paired/fused gain=`+1.0502%/+7.1129%`，semantic
+pass=1；但逐实例中两个bed track改善，wardrobe paired/fused退化`8.4031%/8.1394%`，chair只在
+2个评价帧出现、322个 paired points，paired退化`86.7989%`，不具备稳定结论的支持量。joint
+pointmap只有bed slot 0同时改善paired/fused，其余实例不通过。
+
+最终判定：`qk_joint_depth_map_pass=0`、`qk_joint_pointmap_pass=0`、
+`qk_joint_any_semantic_map_pass=0`。成立的只是“无训练QK检索在当前单序列改善camera pose”；不成立的是
+“同一QK稀疏历史上下文联合运行冻结depth/point heads会改善整体或稳定改善逐实例点云”。
+因此pose保留`retrieve_qk`，semantic map保留raw分支，不部署两个joint geometry分支。

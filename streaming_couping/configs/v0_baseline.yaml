@@ -75,6 +75,17 @@ qk_pose_retrieval:
   total_frame_budget: 5
   anchor_frames: 1
 
+# Two gated, training-free diagnostics run by one command.  All sparse
+# policies receive the same causal history budget: first-frame anchor plus
+# four selected historical frames.  Random controls use fixed independent
+# seeds and never enter the formal V0 output selection.
+incremental_audit:
+  output_dir: outputs/streaming_couping_v0/incremental_audit
+  total_history_budget: 5
+  anchor_frames: 1
+  random_seeds: [0, 1, 2]
+  confidence_threshold: 0.30
+
 # Final map audit retains the pose-only/raw-depth negative control and adds
 # self-consistent QK depth-pose and QK point-head branches. SAM support is fixed.
 semantic_map_ab:

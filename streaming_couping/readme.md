@@ -1,6 +1,6 @@
 # streaming_couping
 
-本目录只保留两个 V0 入口。
+本目录保留两个正式 V0 入口和一个不修改正式输出的诊断入口。
 
 ## 1. Baseline
 
@@ -49,14 +49,35 @@ depth-backprojection与point-head分别从各自raw reference拟合一次固定S
 该路径同时验证QK joint depth/pointmap，但不把prompt标签当作GT语义分类评价。
 
 r2最终结果：raw-depth reference Sim(3)拟合RMSE为`0.02370 m`，协议有效；把QK pose用于相同raw depth
-后，paired RMSE退化`0.4588%`、融合点云双向距离退化`2.7279%`，map pass为0。该结论现在作为
-`qk_pose_raw_depth`负对照保留，而不是用来判断joint replay。
+后，paired RMSE退化`0.4588%`、融合点云双向距离退化`2.7279%`，map pass为0。该结论作为
+`qk_pose_raw_depth`负对照保留。
 
-- pose输出：`retrieve_qk`（当前单序列center/rotation均改善）；
-- semantic map部署在r3结果出来前仍为`raw_semantic_map.ply`；
-- 只有joint depth或joint pointmap同时通过全场景与SAM区域gate，才允许替换raw map。
+r3联合回放也已完成：
 
-这次r3不是恢复旧ICP或单独调外参，而是直接验证RetrieveVGGT式的上下文联合几何输出。
+- `qk_joint_depth_pose`的全场景paired/fused分别退化`2.8689%/5.0488%`；
+- `qk_joint_pointmap`的全场景paired/fused分别退化`8.8613%/16.3464%`；
+- joint depth在全部SAM区域聚合上改善`1.0502%/7.1129%`，但逐实例只有两个bed track改善，
+  wardrobe和只可见2帧的chair退化；
+- 两个joint分支的全场景+SAM区域联合gate都为0。
+
+因此当前只保留`retrieve_qk` pose输出（单序列center/rotation均改善）；semantic map仍部署
+`raw_semantic_map.ply`。r3证伪了“QK稀疏历史上下文联合重跑冻结geometry heads就能改善整体点云”，
+但保留了逐SAM实例分析作为后续显式几何约束的依据。
+
+## 3. Incremental audit（当前实验）
+
+```bash
+zsh streaming_couping/commands_v0_incremental_audit.txt
+```
+
+一条命令依次完成：
+
+- `raw world_pointmap + raw/QK pose`的self-reprojection、depth、positive-Z和in-bounds一致性审计；
+- `full history / QK Top-4 / recent Top-4 / random Top-4 × 3 seeds`的等预算因果对照；
+- 同时评分29帧pose、固定raw-reference Sim(3)下的pointmap以及raw-confidence共同支持下的depth。
+
+该实验不读取SAM作为pose候选输入、不训练模型，也不替换正式V0 pose/pointmap。GT只在各RGB-only
+候选完全生成后评分。SAM persistent-ID pose探针要等这两个gate的结果明确后再实现。
 
 ## Evidence archive
 
