@@ -53,6 +53,19 @@ SAM tracking。重点检查：
 如果整条序列少于两个成熟实例，先停止几何实验。此时应该增加合适的小型静态物体 prompt
 或更换包含更多物体的序列，而不是调整几何优化器。
 
+### 3.1 当前无 bed 基线结果
+
+2026-08-17 的 30 帧运行发现两个 track：
+
+| slot | prompt | birth frame | visible frames | semantic-map saved points |
+|---|---|---:|---:|---:|
+| 0 | wardrobe | 90 | 22 | 55,765 |
+| 1 | chair | 135 | 14 | 23 |
+
+整体语义覆盖为 13.947%。当前结果只证明 SAM 找到了两个跨帧 track；`saved_points=23` 来自语义地图
+40 万点全局置信度抽样，不能据此断言 chair 的原始 mask 只有 23 个点。I0 必须读取 cache 中未抽样的
+dense mask、confidence 与 pointmap，再决定 chair 是否满足 256 个 interior point 的成熟门槛。
+
 ## 4. I0：Instance Geometry Feasibility Audit
 
 I0 不修改点，只回答：正确 persistent ID 是否组织出了更一致的跨帧三维观测？
@@ -73,8 +86,11 @@ I0 不修改点，只回答：正确 persistent ID 是否组织出了更一致�
 ### I0 Go 条件
 
 - 至少两个成熟实例参与；
-- `correct_id` 的跨帧距离和 surface thickness 同时优于 shuffled 与 shifted；
+- `correct_id` 的跨帧最近距离和法向残差同时优于 shuffled 与 shifted；
 - 优势不能只来自单个实例或单帧。
+
+Surface thickness 继续记录为诊断，但不作为 I0 硬门槛：错误区域也可能恰好是很薄的平面，单独
+依赖 thickness 不能证明 persistent ID 正确。
 
 如果 I0 不通过，停止 SAM 几何优化主线：SAM 保留 semantic lifting，不声称改善 pointmap。
 
@@ -164,10 +180,10 @@ x' = x - clamp(alpha * r, -delta, delta) * n
 6. 根据固定验收条件决定是否保留 `correct_id` candidate；
 7. 无论结果如何，V0 raw pointmap 始终保留且不会被覆盖。
 
-计划中的统一命令名：
+统一命令：
 
 ```bash
 zsh streaming_couping/commands_v1_instance_geometry.txt
 ```
 
-该命令尚未实现；当前应先完成第 1 步，取得移除 `bed` 后的实际 track 统计。
+命令先运行 I0。I0 不通过时安全停止并只输出审计；I0 通过时在同一次运行中继续 I1 六分支评分。
