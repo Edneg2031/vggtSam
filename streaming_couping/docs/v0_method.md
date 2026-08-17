@@ -40,8 +40,11 @@ StreamVGGT 第一帧参考的共享世界坐标系，不再用 QK pose 对它进
 SAM3.1 根据配置中的 prompt 在线发现并追踪实例。每个实例第一次出现时占用一个永久 slot，slot
 不复用，因此支持 late birth。每个像素的语义归属规则是：
 
-当前静态物体 prompt 为 `wardrobe / picture / mat / chair`。不使用覆盖范围接近场景区域的大物体
-prompt；这些标签用于获得有明确局部边界、可跨帧重复观测的实例区域。
+当前静态物体 prompt 为 `wardrobe / chair / picture / picture frame / mat / rug /
+table / desk / cabinet / nightstand / shelf / lamp`。其中保留 `picture ↔ picture frame` 和
+`mat ↔ rug` 两组常见表达，用逐 prompt 统计判断零检测究竟来自类别不存在还是提示词表达不匹配。
+不使用覆盖范围接近场景区域的大物体 prompt；这些标签用于获得有明确局部边界、可跨帧重复观测的
+实例区域。提示词负责提高发现召回率，不限制同类实例数量；后续 V1 几何审计仍最多选择 5 个成熟实例。
 
 1. 过滤低于 `track_score_threshold` 的 mask；
 2. mask 重叠时选择 track score 更高的 slot；
@@ -70,6 +73,7 @@ prompt；这些标签用于获得有明确局部边界、可跨帧重复观测�
 - `outputs/streaming_couping_v0/semantic_map/semantic_map.ply`：按persistent slot着色的语义点云；
 - `outputs/streaming_couping_v0/semantic_map/rgb_map.ply`：保留原始图像颜色的点云；
 - `outputs/streaming_couping_v0/semantic_map/tracks.csv`：实例元数据；
+- `outputs/streaming_couping_v0/semantic_map/prompt_discovery.csv`：逐提示词的原始发现、出生门控、最终保留和 mask 支持统计；
 - `outputs/streaming_couping_v0/semantic_map/semantic_map_summary.json`：pipeline 审计。
 
 `semantic_map.pt`保存 world point、原始RGB、语义RGB、固定slot调色板、confidence、frame index、

@@ -86,8 +86,10 @@ assert summary["candidate_pointmap_used"] is False
 assert summary["candidate_pointmap_used_for_pose"] is False
 assert summary["tracking_baseline_acceptance_pass"] == 1
 assert summary["configured_instance_prompts"] == [
-    "wardrobe", "picture", "mat", "chair"
+    "wardrobe", "chair", "picture", "picture frame", "mat", "rug",
+    "table", "desk", "cabinet", "nightstand", "shelf", "lamp"
 ]
+assert len(summary["sam_prompt_diagnostics"]) == 12
 assert summary["configured_permanent_slot_capacity"] == 16
 audit = summary["tracking_audit"]
 tracks = audit["discovered_track_count"]
@@ -147,6 +149,8 @@ assert summary["pointmap_modified"] == 0
 assert summary["saved_map_points"] > 0
 assert summary["saved_semantic_points"] > 0
 assert summary["semantic_map_pipeline_ready"] == 1
+assert len(summary["prompt_discovery_diagnostics"]) == 12
+assert Path(summary["outputs"]["prompt_discovery_csv"]).is_file()
 points = summary["saved_map_points"]
 semantic = summary["saved_semantic_points"]
 tracks = summary["discovered_track_count"]

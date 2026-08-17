@@ -18,7 +18,8 @@
 - 位姿：保留 V0 的 first-frame anchor + native QK Top-4 camera pose；
 - 点云初值：保留 full-history StreamVGGT raw world pointmap；
 - 实例信息：SAM3.1 persistent mask、slot、track ID 与 track score；
-- 当前 prompt：`wardrobe / picture / mat / chair`；
+- 当前 prompt：`wardrobe / chair / picture / picture frame / mat / rug / table / desk /
+  cabinet / nightstand / shelf / lamp`；
 - `bed` 不参与，因为大面积实例会接近全局场景约束，削弱局部实例实验的可归因性；
 - 最多同时使用 5 个成熟实例，但 SAM registry 继续保留 16 个永久 slot；
 - GT 只能在候选点云完全生成后用于评分，不能参与实例筛选、匹配或位移计算。
@@ -27,15 +28,16 @@ V0 是不可覆盖的 fallback。任何 V1 分支失败时，正式输出仍然�
 
 ## 3. 第一步：重新建立无 bed 的观测基线
 
-服务器运行：
+服务器运行（提示词改变后必须重建 SAM/StreamVGGT 联合 cache；QK pose artifact 可以复用）：
 
 ```bash
 BASELINE_REBUILD_CACHE=1 zsh streaming_couping/commands_v0_baseline.txt
 ```
 
-QK pose 只依赖 RGB，可以复用已有 artifact；本次强制重建 cache 是为了重新运行四类 prompt 的
+QK pose 只依赖 RGB，可以复用已有 artifact；本次强制重建 cache 是为了重新运行十二类 prompt 的
 SAM tracking。重点检查：
 
+- `semantic_map/prompt_discovery.csv` 中每个 prompt 的 raw / eligible / retained 数量；
 - `semantic_map/copyable_result.txt` 中的 `discovered_track_count`；
 - 每个 track 的 `prompt / visible_frames / saved_points`；
 - `semantic_map/tracks.csv` 是否至少包含两个可重复观测的局部物体。

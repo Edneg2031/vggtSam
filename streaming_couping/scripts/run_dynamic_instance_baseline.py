@@ -250,6 +250,15 @@ def _write_outputs(
         if str(row.get("selected_variant", ""))
         == "sam31_online_geometry_compete"
     ]
+    prompt_rows = [
+        dict(row) for row in payload.get("sam_prompt_diagnostics", ())
+    ]
+    if prompt_rows:
+        _write_csv(
+            run.output_dir / "prompt_discovery.csv",
+            prompt_rows,
+            tuple(prompt_rows[0]),
+        )
     summary = {
         "schema": 6,
         "baseline_version": run.version,
@@ -277,6 +286,7 @@ def _write_outputs(
             str(value) for value in payload.get("instance_prompts", ())
         ),
         "configured_permanent_slot_capacity": len(payload["instance_ids"]),
+        "sam_prompt_diagnostics": prompt_rows,
         "geometry_guidance_role": "causal_mask_prompt_and_competition_only",
         "geometry_guidance_applied_frames": sum(
             int(row.get("correction_applied", 0)) for row in correction_rows
@@ -622,6 +632,7 @@ def _clear_stale_result_artifacts(output_dir: Path) -> None:
         "baseline_summary.json",
         "frame_diagnostics.csv",
         "dynamic_instance_diagnostics.csv",
+        "prompt_discovery.csv",
         "poses.pt",
     ):
         path = output_dir / name
@@ -654,6 +665,18 @@ def _validate_payload(payload: dict, *, clip: ClipConfig) -> None:
         raise ValueError("Baseline cache prompts differ from config; rebuild it.")
     if not payload.get("dynamic_instance_diagnostics"):
         raise ValueError("Baseline cache lacks dynamic instance diagnostics.")
+    prompt_rows = payload.get("sam_prompt_diagnostics")
+    if not isinstance(prompt_rows, list) or len(prompt_rows) != len(
+        expected_prompts
+    ):
+        raise ValueError(
+            "Baseline cache lacks one SAM discovery diagnostic per prompt; "
+            "rebuild it."
+        )
+    if tuple(str(row.get("prompt", "")) for row in prompt_rows) != (
+        expected_prompts
+    ):
+        raise ValueError("SAM prompt diagnostics differ from config order.")
     if not any(int(value) > 0 for value in payload.get("sam_birth_indices", ())):
         raise ValueError("This audit requires at least one late-born SAM track.")
 

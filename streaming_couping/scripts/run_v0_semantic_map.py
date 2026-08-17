@@ -160,6 +160,11 @@ def _write_outputs(
     )
     tracks_path = run.output_dir / "tracks.csv"
     _write_tracks_csv(tracks_path, tracks)
+    prompt_rows = [
+        dict(row) for row in payload.get("sam_prompt_diagnostics", ())
+    ]
+    prompt_path = run.output_dir / "prompt_discovery.csv"
+    _write_prompt_csv(prompt_path, prompt_rows)
     output = {
         "schema": 2,
         "revision": REVISION,
@@ -206,6 +211,8 @@ def _write_outputs(
             100.0 * semantic_points / int(semantic.world_points.shape[0])
         ),
         "discovered_track_count": len(tracks),
+        "configured_instance_prompts": tuple(payload["instance_prompts"]),
+        "prompt_discovery_diagnostics": prompt_rows,
         "tracks": tracks,
         "semantic_map_pipeline_ready": pipeline_ready,
         "claim": "frozen_v0_semantic_mapping_pipeline",
@@ -214,6 +221,7 @@ def _write_outputs(
             "semantic_ply": str(ply_path),
             "rgb_ply": str(rgb_ply_path),
             "tracks_csv": str(tracks_path),
+            "prompt_discovery_csv": str(prompt_path),
         },
     }
     result = run.output_dir / "semantic_map_summary.json"
@@ -250,6 +258,9 @@ def _track_metadata(
             continue
         dense = (semantic.dense_semantic_slots == slot) & semantic.dense_valid
         visible = dense.flatten(1).any(dim=1)
+        raw_mask = payload["tracking_masks_stream"][:, slot].detach().bool()
+        raw_frame_pixels = raw_mask.flatten(1).sum(dim=1)
+        raw_visible_pixels = raw_frame_pixels[raw_frame_pixels > 0]
         output.append(
             {
                 "slot": slot,
@@ -258,6 +269,17 @@ def _track_metadata(
                 "birth_sequence_index": int(birth),
                 "birth_frame": frames[int(birth)],
                 "visible_frames": int(visible.sum()),
+                "raw_mask_visible_frames": int(
+                    (raw_frame_pixels > 0).sum()
+                ),
+                "raw_mask_pixels_total": int(raw_frame_pixels.sum()),
+                "raw_mask_pixels_median_visible": int(
+                    raw_visible_pixels.median()
+                    if raw_visible_pixels.numel()
+                    else 0
+                ),
+                "raw_mask_pixels_max": int(raw_frame_pixels.max()),
+                "dense_owned_valid_points": int(dense.sum()),
                 "saved_points": int((semantic.semantic_slots == slot).sum()),
                 "color_red": INSTANCE_PALETTE_RGB8[
                     slot % len(INSTANCE_PALETTE_RGB8)
@@ -310,6 +332,8 @@ def _validate_inputs(
         "sam_track_ids",
         "sam_track_prompts",
         "sam_birth_indices",
+        "instance_prompts",
+        "sam_prompt_diagnostics",
         "frame_indices",
         "reference_sequence_index",
         "clip_name",
@@ -317,6 +341,18 @@ def _validate_inputs(
     missing = [name for name in required if name not in payload]
     if missing:
         raise ValueError(f"V0 cache lacks semantic-map fields: {missing}.")
+    prompt_rows = payload["sam_prompt_diagnostics"]
+    expected_prompts = tuple(clip.instance_prompts) or (clip.instance_prompt,)
+    if (
+        not isinstance(prompt_rows, list)
+        or len(prompt_rows) != len(expected_prompts)
+        or tuple(str(row.get("prompt", "")) for row in prompt_rows)
+        != expected_prompts
+    ):
+        raise ValueError(
+            "V0 cache prompt discovery audit differs from the config; "
+            "rebuild it."
+        )
     slot_count = int(payload["tracking_masks_stream"].shape[1])
     if any(
         len(payload[name]) != slot_count
@@ -403,6 +439,15 @@ def _write_tracks_csv(path: Path, tracks: list[dict[str, object]]) -> None:
         writer.writerows(tracks)
 
 
+def _write_prompt_csv(path: Path, rows: list[dict[str, object]]) -> None:
+    if not rows:
+        raise ValueError("Cannot audit semantic discovery without prompt rows.")
+    with path.open("w", encoding="utf8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=tuple(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def _write_copyable(path: Path, summary: dict[str, Any]) -> None:
     lines = [
         "===== COPYABLE_V0_SEMANTIC_MAP_BEGIN =====",
@@ -423,14 +468,33 @@ def _write_copyable(path: Path, summary: dict[str, Any]) -> None:
         f"discovered_track_count={summary['discovered_track_count']}",
         f"semantic_map_pipeline_ready={summary['semantic_map_pipeline_ready']}",
         "",
-        "slot,sam_track_id,prompt,birth_frame,visible_frames,saved_points,color_rgb8",
+        "prompt,raw_detections,birth_eligible_tracks,retained_tracks,raw_visible_track_frames,raw_mask_pixels",
     ]
+    for row in summary["prompt_discovery_diagnostics"]:
+        lines.append(
+            ",".join(
+                str(row[name])
+                for name in (
+                    "prompt", "raw_detections", "birth_eligible_tracks",
+                    "retained_tracks", "raw_visible_track_frames",
+                    "raw_mask_pixels",
+                )
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "slot,sam_track_id,prompt,birth_frame,visible_frames,raw_mask_visible_frames,raw_mask_pixels_total,dense_owned_valid_points,saved_points,color_rgb8",
+        ]
+    )
     for track in summary["tracks"]:
         values = [
             str(track[name])
             for name in (
                 "slot", "sam_track_id", "prompt", "birth_frame",
-                "visible_frames", "saved_points",
+                "visible_frames", "raw_mask_visible_frames",
+                "raw_mask_pixels_total", "dense_owned_valid_points",
+                "saved_points",
             )
         ]
         values.append(
@@ -444,6 +508,7 @@ def _write_copyable(path: Path, summary: dict[str, Any]) -> None:
             f"semantic_ply={summary['outputs']['semantic_ply']}",
             f"rgb_ply={summary['outputs']['rgb_ply']}",
             f"tracks_csv={summary['outputs']['tracks_csv']}",
+            f"prompt_discovery_csv={summary['outputs']['prompt_discovery_csv']}",
             f"summary={path.with_name('semantic_map_summary.json')}",
             "===== COPYABLE_V0_SEMANTIC_MAP_END =====",
         ]

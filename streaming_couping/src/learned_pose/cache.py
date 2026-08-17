@@ -619,6 +619,15 @@ def _build_geometry_cache(
     geometry_birth_indices = [
         int(value) for value in observations["instance_birth_indices"]
     ]
+    sam_prompt_diagnostics = next(
+        (
+            list(row["prompt_discovery_diagnostics"])
+            for row in segmentation_diagnostics
+            if isinstance(row.get("prompt_discovery_diagnostics"), list)
+            and row["prompt_discovery_diagnostics"]
+        ),
+        [],
+    )
     dynamic_instance_diagnostics = []
     if clip.instance_source == "sam31_online":
         for frame, frame_index in enumerate(clip.frame_indices):
@@ -724,6 +733,7 @@ def _build_geometry_cache(
         "instance_prompts": list(_clip_instance_prompts(clip)),
         "sam_track_ids": sam_track_ids,
         "sam_track_prompts": sam_track_prompts,
+        "sam_prompt_diagnostics": sam_prompt_diagnostics,
         "sam_birth_indices": sam_birth_indices,
         "instance_birth_indices": geometry_birth_indices,
         "dynamic_instance_diagnostics": dynamic_instance_diagnostics,
@@ -1040,6 +1050,7 @@ def _load_or_run_sam31_online_tracking(
 
     sam3 = _sam_video_model(recovery, sam_video_holder)
     raw_candidates: list[dict[str, object]] = []
+    prompt_diagnostics: list[dict[str, object]] = []
     detected_count = 0
     per_prompt_limit = max(
         int(recovery.sam3_max_num_objects),
@@ -1058,15 +1069,27 @@ def _load_or_run_sam31_online_tracking(
             f"clip={clip.name} concept={prompt!r} "
             f"discovered={len(tracked.obj_ids)}"
         )
+        eligible_count = 0
+        raw_visible_track_frames = 0
+        raw_mask_pixels = 0
+        raw_maximum_pixels = 0
         for source_slot, obj_id in enumerate(tracked.obj_ids):
             masks = tracked.masks[:, source_slot].detach().cpu().bool()
             birth = int(tracked.birth_indices[source_slot])
             birth_pixels = int(masks[birth].sum())
             birth_ratio = float(masks[birth].float().mean())
+            frame_pixels = masks.flatten(1).sum(dim=1)
+            raw_visible_track_frames += int((frame_pixels > 0).sum())
+            raw_mask_pixels += int(frame_pixels.sum())
+            raw_maximum_pixels = max(
+                raw_maximum_pixels,
+                int(frame_pixels.max()),
+            )
             # Slot admission consults only the birth frame. Later observations
             # may diagnose the track but can never retroactively create it.
             if birth_pixels < int(recovery.min_pixels) or birth_ratio > 0.90:
                 continue
+            eligible_count += 1
             raw_candidates.append(
                 {
                     "prompt_index": int(prompt_index),
@@ -1081,6 +1104,20 @@ def _load_or_run_sam31_online_tracking(
                     .float(),
                 }
             )
+        prompt_diagnostics.append(
+            {
+                "prompt_index": int(prompt_index),
+                "prompt": str(prompt),
+                "raw_detections": int(len(tracked.obj_ids)),
+                "birth_eligible_tracks": int(eligible_count),
+                "birth_filtered_tracks": int(
+                    len(tracked.obj_ids) - eligible_count
+                ),
+                "raw_visible_track_frames": int(raw_visible_track_frames),
+                "raw_mask_pixels": int(raw_mask_pixels),
+                "raw_maximum_mask_pixels": int(raw_maximum_pixels),
+            }
+        )
 
     raw_candidates.sort(
         key=lambda item: (
@@ -1101,6 +1138,16 @@ def _load_or_run_sam31_online_tracking(
         candidates.append(candidate)
         if len(candidates) == len(clip.instance_ids):
             break
+    for diagnostic in prompt_diagnostics:
+        prompt_index = int(diagnostic["prompt_index"])
+        retained = sum(
+            int(candidate["prompt_index"]) == prompt_index
+            for candidate in candidates
+        )
+        diagnostic["retained_tracks"] = int(retained)
+        diagnostic["not_retained_after_dedup_or_capacity"] = int(
+            int(diagnostic["birth_eligible_tracks"]) - retained
+        )
     if not candidates:
         raise RuntimeError(
             "SAM3.1 online discovery found no usable instance for concrete "
@@ -1156,6 +1203,12 @@ def _load_or_run_sam31_online_tracking(
                 ),
                 "propagation_direction": "forward",
                 "causal_confirmation": 1,
+                # The tracking cache requires one row per permanent slot.
+                # Store this audit once so zero-hit prompts remain observable
+                # after the SAM session has closed.
+                "prompt_discovery_diagnostics": (
+                    prompt_diagnostics if slot == 0 else []
+                ),
             }
         )
     print(

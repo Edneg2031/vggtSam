@@ -17,7 +17,23 @@ dataset:
       # SAM3.1 detects all instances of each configured open-vocabulary noun.
       # Keep object-scale concepts here. Scene-dominant regions are excluded
       # because the next local-geometry audit needs bounded instance support.
-      instance_prompts: [wardrobe, picture, mat, chair]
+      # Prompt breadth controls semantic recall; it does not change the V0
+      # pose or pointmap branches. Keep both common synonyms for the two
+      # labels that previously returned no detections so recall is auditable.
+      # V1 still admits at most five mature instances.
+      instance_prompts:
+        - wardrobe
+        - chair
+        - picture
+        - picture frame
+        - mat
+        - rug
+        - table
+        - desk
+        - cabinet
+        - nightstand
+        - shelf
+        - lamp
       reference_sequence_index: 0
       split: baseline
 
