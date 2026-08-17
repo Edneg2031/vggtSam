@@ -1,0 +1,83 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+PHYSICAL_GPU="${V1_CORRESPONDENCE_GPU:-1}"
+CONFIG=streaming_couping/configs/v1_correspondence_sweep.yaml
+OUTPUT=outputs/streaming_couping_v1/correspondence_sweep
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+echo "V1 smoke: fixed non-GT correspondence-radius gate"
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_v1_correspondence_sweep
+
+echo "V1 read-only SAM-indexed correspondence radius sweep"
+echo "physical GPU=$PHYSICAL_GPU logical device=cuda:0"
+echo "Reads the existing V0 dense cache only; no model/checkpoint is loaded or run"
+echo "No pointmap candidate is generated; GT geometry is not read or scored"
+CUDA_VISIBLE_DEVICES="$PHYSICAL_GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. \
+  "$PYTHON_BIN" -m streaming_couping.scripts.run_v1_correspondence_sweep \
+  --config "$CONFIG" \
+  --device cuda:0
+
+[[ -s "$OUTPUT/correspondence_sweep_summary.json" ]] || {
+  echo "missing V1 correspondence sweep summary" >&2
+  exit 1
+}
+PYTHONPATH=. "$PYTHON_BIN" -c '
+import json
+from pathlib import Path
+
+path = Path(
+    "outputs/streaming_couping_v1/correspondence_sweep/"
+    "correspondence_sweep_summary.json"
+)
+summary = json.loads(path.read_text())
+assert summary["schema"] == 1
+assert summary["revision"] == "v1_causal_correspondence_radius_sweep_r1"
+assert summary["radius_scene_fractions"] == [0.01, 0.025, 0.05]
+assert set(summary["branches"]) == {
+    "correct_id", "shuffled_id", "shifted_mask"
+}
+assert summary["eligibility"]["min_mask_area_ratio"] == 0.001
+assert summary["model_loaded_or_run"] == 0
+assert summary["sam_rerun"] == 0
+assert summary["streamvggt_rerun"] == 0
+assert summary["pointmap_candidate_generated"] == 0
+assert summary["selected_pointmap_modified"] == 0
+assert summary["candidate_generation_gt_fields"] == 0
+assert summary["target_geometry_fields_read"] == 0
+assert summary["gt_role"] == "not_read_or_scored"
+assert summary["decision"]["i1_run"] == 0
+for radius in summary["radius_scene_fractions"]:
+    rows = [
+        row for row in summary["radius_branches"]
+        if row["radius_scene_fraction"] == radius
+    ]
+    assert len(rows) == 3
+    assert len({row["selected_track_frames"] for row in rows}) == 1
+    assert len({row["selected_points"] for row in rows}) == 1
+    assert len({row["history_points"] for row in rows}) == 1
+passing = [
+    row for row in summary["radius_gates"] if row["radius_gate_pass"]
+]
+selected = summary["decision"]["selected_radius_scene_fraction"]
+assert selected == (
+    min(row["radius_scene_fraction"] for row in passing) if passing else None
+)
+accepted_units = summary["equal_support"]["accepted_units"]
+print(
+    "V1 correspondence sweep schema accepted "
+    f"units={accepted_units} "
+    f"selected_radius={selected}"
+)
+'
+
+echo ""
+sed -n '1,260p' "$OUTPUT/copyable_result.txt"

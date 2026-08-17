@@ -189,3 +189,31 @@ zsh streaming_couping/commands_v1_instance_geometry.txt
 ```
 
 命令先运行 I0。I0 不通过时安全停止并只输出审计；I0 通过时在同一次运行中继续 I1 六分支评分。
+
+## 10. r2 结论与独立 correspondence sweep
+
+r2 在 `box / cabinet / rug` 三个成熟实例上通过 I0，说明正确 persistent ID 确实组织出了
+更一致的跨帧三维观测；但 I1 只修改了 149 个点，整体和实例 pointmap 都没有正收益。因此 r2
+候选不部署，正式点云继续保持 V0 raw world pointmap。
+
+下一步不继续调位移或混入 GT，而是把 correspondence coverage 单独测清楚：
+
+- 只读取现有 V0 dense cache，不重新运行 StreamVGGT、SAM 或 checkpoint；
+- 把独立实验的最小 mask 面积从 0.5% 降到 0.1%，让小型静态物体有机会进入诊断；
+- 每帧最多仍为 5 个成熟实例，并继续在 geometry ownership 前排除 `wardrobe`；
+- 固定扫描 scene diagonal 的 `0.01 / 0.025 / 0.05` 三个匹配半径；
+- 在每个 frame-instance 单元内，让 correct、shuffled、shifted 使用完全相同的当前点数和历史点数；
+- 不生成点云 candidate、不运行 I1、不读取或评分 GT。
+
+半径必须同时满足以下预注册门槛：至少 2 个 correct-ID active track、correct valid surfel rate
+至少 10%、至少为最高 control rate 的 2 倍，并且 nearest median 与 normal residual 均低于两个
+control。若多个半径通过，只选最小半径；若都不通过，就停止当前 instance surfel adjustment 路线。
+
+服务器运行：
+
+```bash
+zsh streaming_couping/commands_v1_correspondence_sweep.txt
+```
+
+结果独立写入 `outputs/streaming_couping_v1/correspondence_sweep`，不会覆盖 r2 结果。只有这个
+无 GT sweep 通过后，才另开一次固定半径 I1 candidate audit；sweep 本身不能声称 pointmap 提升。
