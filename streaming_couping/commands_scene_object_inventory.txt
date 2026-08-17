@@ -1,0 +1,50 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+CONFIG=streaming_couping/configs/v0_baseline.yaml
+OUTPUT=outputs/streaming_couping_v0/scene_object_inventory
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+
+echo "Scene object inventory for manual SAM prompt planning"
+echo "Reads dataset annotations/masks only; no model, checkpoint or GPU is used"
+echo "The inventory is never consumed by V0/V1 candidate generation"
+PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.report_scene_object_inventory \
+  --config "$CONFIG" \
+  --output-dir "$OUTPUT"
+
+[[ -s "$OUTPUT/scene_object_inventory.json" ]] || {
+  echo "missing scene object inventory summary" >&2
+  exit 1
+}
+[[ -s "$OUTPUT/copyable_result.txt" ]] || {
+  echo "missing scene object inventory copyable report" >&2
+  exit 1
+}
+PYTHONPATH=. "$PYTHON_BIN" -c '
+import json
+from pathlib import Path
+summary = json.loads(Path(
+    "outputs/streaming_couping_v0/scene_object_inventory/scene_object_inventory.json"
+).read_text())
+assert summary["schema"] == 1
+assert summary["revision"] == "scene_annotation_object_inventory_r1"
+assert summary["role"] == "manual_prompt_planning_only"
+assert summary["annotation_gt_used"] == 1
+assert summary["consumed_by_v0_or_v1_candidate_generation"] == 0
+assert summary["visible_label_count"] > 0
+assert summary["visible_instance_count"] > 0
+print(
+    "scene inventory accepted "
+    f"labels={summary['"'"'visible_label_count'"'"']} "
+    f"instances={summary['"'"'visible_instance_count'"'"']} "
+    f"candidates={summary['"'"'candidate_prompt_count'"'"']}"
+)
+'
+
+echo ""
+sed -n '1,240p' "$OUTPUT/copyable_result.txt"

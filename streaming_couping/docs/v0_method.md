@@ -85,6 +85,16 @@ semantic slot、SAM track ID、track metadata，以及raw/QK两条相机轨迹�
 zsh streaming_couping/commands_v0_baseline.txt
 ```
 
+如果需要先人工选择更合适的 SAM prompt，可以单独运行：
+
+```bash
+zsh streaming_couping/commands_scene_object_inventory.txt
+```
+
+该命令只读取数据集实例标注与 mask，输出当前 30 帧可见的类别、实例数、可见帧数和面积，且明确
+标记为 `manual_prompt_planning_only`。其结果不会被 V0/V1 候选生成读取，因此不能作为模型自动识别
+场景物体的实验结论；它只相当于人工查看场景后整理提示词。
+
 该命令依次完成缓存、QK pose、tracking/pose审计和语义地图导出。通常复用已有缓存；显式重建方式：
 
 ```bash
