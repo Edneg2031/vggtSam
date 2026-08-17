@@ -40,6 +40,9 @@ StreamVGGT 第一帧参考的共享世界坐标系，不再用 QK pose 对它进
 SAM3.1 根据配置中的 prompt 在线发现并追踪实例。每个实例第一次出现时占用一个永久 slot，slot
 不复用，因此支持 late birth。每个像素的语义归属规则是：
 
+当前静态物体 prompt 为 `wardrobe / picture / mat / chair`。不使用覆盖范围接近场景区域的大物体
+prompt；这些标签用于获得有明确局部边界、可跨帧重复观测的实例区域。
+
 1. 过滤低于 `track_score_threshold` 的 mask；
 2. mask 重叠时选择 track score 更高的 slot；
 3. 将 slot、SAM track ID 和 prompt 投影到同位置的 raw world pointmap；

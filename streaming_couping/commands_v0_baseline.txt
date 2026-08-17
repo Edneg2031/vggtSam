@@ -86,7 +86,7 @@ assert summary["candidate_pointmap_used"] is False
 assert summary["candidate_pointmap_used_for_pose"] is False
 assert summary["tracking_baseline_acceptance_pass"] == 1
 assert summary["configured_instance_prompts"] == [
-    "bed", "wardrobe", "picture", "mat", "chair"
+    "wardrobe", "picture", "mat", "chair"
 ]
 assert summary["configured_permanent_slot_capacity"] == 16
 audit = summary["tracking_audit"]

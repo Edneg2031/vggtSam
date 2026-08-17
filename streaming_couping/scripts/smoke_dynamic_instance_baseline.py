@@ -36,7 +36,7 @@ def main() -> None:
         "sam_birth_indices": [0, 2, -1],
         "instance_birth_indices": [0, 2, -1],
         "sam_track_ids": [7, 11, -1],
-        "sam_track_prompts": ["bed", "wardrobe", ""],
+        "sam_track_prompts": ["chair", "wardrobe", ""],
         "dynamic_instance_diagnostics": [
             _row(0, 90, discovered=1, mature=0),
             _row(1, 105, discovered=1, mature=1),

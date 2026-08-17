@@ -15,8 +15,9 @@ dataset:
       instance_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
       instance_source: sam31_online
       # SAM3.1 detects all instances of each configured open-vocabulary noun.
-      # Add scene-relevant static concepts here; this is not class-agnostic.
-      instance_prompts: [bed, wardrobe, picture, mat, chair]
+      # Keep object-scale concepts here. Scene-dominant regions are excluded
+      # because the next local-geometry audit needs bounded instance support.
+      instance_prompts: [wardrobe, picture, mat, chair]
       reference_sequence_index: 0
       split: baseline
 
