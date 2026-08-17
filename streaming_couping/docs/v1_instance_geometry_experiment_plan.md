@@ -217,3 +217,26 @@ zsh streaming_couping/commands_v1_correspondence_sweep.txt
 
 结果独立写入 `outputs/streaming_couping_v1/correspondence_sweep`，不会覆盖 r2 结果。只有这个
 无 GT sweep 通过后，才另开一次固定半径 I1 candidate audit；sweep 本身不能声称 pointmap 提升。
+
+## 11. I1-A：固定 correspondence 的 pointmap 候选
+
+correspondence sweep 的三个半径全部通过预注册门槛，按规则选择最小的 `0.01`。在 5 个实例、
+19 个 equal-support frame-instance 单元上，correct-ID valid surfel rate 为 12.85%，而 shuffled
+为 0、shifted 为 0.051%。这支持 persistent ID correspondence，但仍不等于 pointmap 改善。
+
+I1-A 不再搜索任何半径或阈值，而是精确 replay 这 19 个单元，以 r2 已固定的 `alpha=0.5` 和
+scene-fraction displacement cap 生成 `raw / correct_id / shuffled_id / shifted_mask` 四个候选。
+候选 sparse delta 必须先写盘冻结，之后才能读取 GT pointmap/alignment 评分。
+
+验收条件保持简单：correct 整体 RMSE 不下降、实例 RMSE 提升、至少两个实例改善、correct 优于
+两个 control、背景 exact raw、位移不超过固定上限。额外报告 correct correspondence support
+RMSE 和 cap-hit rate，但不把它们事后加入硬门槛。无论结果如何，formal pointmap 仍为 V0 raw。
+
+服务器运行：
+
+```bash
+zsh streaming_couping/commands_v1_fixed_correspondence_i1.txt
+```
+
+若 I1-A 失败，停止逐点 normal displacement，不继续调 alpha/cap；下一方法应改为多个静态实例
+共同约束的低自由度 rigid SE(3) correction。若通过，也只进入跨序列验证，不直接部署。

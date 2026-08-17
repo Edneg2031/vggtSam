@@ -77,7 +77,9 @@ class EqualSupportUnit:
     shuffled_history_slot: int
     prompt: str
     correct_current: torch.Tensor
+    correct_indices: torch.Tensor
     shifted_current: torch.Tensor
+    shifted_indices: torch.Tensor
     histories: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
 
     @property
@@ -249,13 +251,13 @@ def _build_equal_support_units(
         for slot in active_slots:
             if slot not in shuffled:
                 continue
-            correct_current, _, _ = select_mask_points(
+            correct_current, _, correct_indices = select_mask_points(
                 points[sequence_index],
                 confidence[sequence_index],
                 interior_masks[sequence_index, slot] & valid_points[sequence_index],
                 limit=run.max_current_points_per_instance,
             )
-            shifted_current, _, _ = select_mask_points(
+            shifted_current, _, shifted_indices = select_mask_points(
                 points[sequence_index],
                 confidence[sequence_index],
                 shifted_masks[sequence_index, slot] & valid_points[sequence_index],
@@ -268,7 +270,9 @@ def _build_equal_support_units(
                 skipped["insufficient_equal_current_points"] += 1
                 continue
             correct_current = _even_subsample(correct_current, equal_current_count)
+            correct_indices = _even_subsample(correct_indices, equal_current_count)
             shifted_current = _even_subsample(shifted_current, equal_current_count)
+            shifted_indices = _even_subsample(shifted_indices, equal_current_count)
 
             history_specs = {
                 "correct_id": interior_masks[:, slot],
@@ -311,7 +315,9 @@ def _build_equal_support_units(
                     shuffled_history_slot=shuffled[slot],
                     prompt=prompts[slot],
                     correct_current=correct_current,
+                    correct_indices=correct_indices,
                     shifted_current=shifted_current,
+                    shifted_indices=shifted_indices,
                     histories=histories,
                 )
             )

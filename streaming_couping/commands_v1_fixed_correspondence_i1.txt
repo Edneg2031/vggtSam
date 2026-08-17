@@ -1,0 +1,82 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+PHYSICAL_GPU="${V1_FIXED_I1_GPU:-1}"
+CONFIG=streaming_couping/configs/v1_fixed_correspondence_i1.yaml
+OUTPUT=outputs/streaming_couping_v1/fixed_correspondence_i1
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+echo "V1 I1-A smoke: frozen-candidate acceptance and raw fallback"
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_v1_fixed_correspondence_i1
+
+echo "V1 fixed 0.01 equal-support instance surfel pointmap candidate"
+echo "physical GPU=$PHYSICAL_GPU logical device=cuda:0"
+echo "No model/checkpoint is loaded or run; the passed sweep is replayed exactly"
+echo "Candidate is written first; GT fields are accessed only for later scoring"
+echo "Formal pointmap output remains V0 raw regardless of the candidate result"
+CUDA_VISIBLE_DEVICES="$PHYSICAL_GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. \
+  "$PYTHON_BIN" -m streaming_couping.scripts.run_v1_fixed_correspondence_i1 \
+  --config "$CONFIG" \
+  --device cuda:0
+
+[[ -s "$OUTPUT/fixed_correspondence_i1_summary.json" ]] || {
+  echo "missing fixed correspondence I1 summary" >&2
+  exit 1
+}
+[[ -s "$OUTPUT/candidate_deltas.pt" ]] || {
+  echo "missing frozen fixed correspondence candidate" >&2
+  exit 1
+}
+PYTHONPATH=. "$PYTHON_BIN" -c '
+import json
+from pathlib import Path
+
+path = Path(
+    "outputs/streaming_couping_v1/fixed_correspondence_i1/"
+    "fixed_correspondence_i1_summary.json"
+)
+summary = json.loads(path.read_text())
+assert summary["schema"] == 1
+assert summary["revision"] == "v1_fixed_equal_support_instance_surfel_i1_r1"
+assert summary["source_sweep_pass"] == 1
+assert summary["fixed_radius_scene_fraction"] == 0.01
+assert summary["accepted_equal_support_units"] == 19
+assert summary["eligible_track_count"] == 5
+assert summary["branches"] == [
+    "raw", "correct_id", "shuffled_id", "shifted_mask"
+]
+assert summary["model_loaded_or_run"] == 0
+assert summary["pose_modified"] == 0
+assert summary["history_candidate_writeback"] == 0
+assert summary["pointmap_candidate_generated"] == 1
+assert summary["candidate_frozen_before_gt_access"] == 1
+assert summary["candidate_generation_gt_fields"] == 0
+assert summary["target_geometry_fields_accessed_before_freeze"] == 0
+assert summary["target_geometry_fields_accessed_after_freeze"] == 4
+assert summary["selected_pointmap_modified"] == 0
+assert summary["decision"]["selected_pointmap_modified"] == 0
+correct = next(
+    row for row in summary["branch_results"]
+    if row["branch"] == "correct_id"
+)
+assert correct["selected_points"] == 15665
+assert correct["candidate_support_points"] == 2013
+i1_pass = summary["decision"]["i1_pass"]
+modified_points = correct["nonzero_modified_points"]
+print(
+    "V1 fixed correspondence I1 schema accepted "
+    f"pass={i1_pass} "
+    f"modified={modified_points}"
+)
+'
+
+echo ""
+sed -n '1,260p' "$OUTPUT/copyable_result.txt"

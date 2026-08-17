@@ -1,0 +1,9 @@
+# Fixed follow-up to the passed read-only correspondence sweep. Geometry and
+# eligibility parameters are inherited verbatim; there is no new sweep.
+correspondence_config: streaming_couping/configs/v1_correspondence_sweep.yaml
+source_sweep_summary: outputs/streaming_couping_v1/correspondence_sweep/correspondence_sweep_summary.json
+output_dir: outputs/streaming_couping_v1/fixed_correspondence_i1
+fixed_radius_scene_fraction: 0.010
+
+acceptance:
+  minimum_improved_tracks: 2
