@@ -85,11 +85,16 @@ assert summary["candidate_geometry_available"] is False
 assert summary["candidate_pointmap_used"] is False
 assert summary["candidate_pointmap_used_for_pose"] is False
 assert summary["tracking_baseline_acceptance_pass"] == 1
+assert summary["prompt_selection_scope"] == (
+    "this_clip_annotation_assisted_manual_prompt_planning"
+)
+assert summary["prompt_selection_annotation_gt_used"] == 1
+assert summary["runtime_prompt_selection_gt_fields"] == 0
 assert summary["configured_instance_prompts"] == [
-    "wardrobe", "chair", "picture", "picture frame", "mat", "rug",
-    "table", "desk", "cabinet", "nightstand", "shelf", "lamp"
+    "wardrobe", "chair", "rug", "desk", "cabinet", "nightstand",
+    "dustbin", "box", "guitar case"
 ]
-assert len(summary["sam_prompt_diagnostics"]) == 12
+assert len(summary["sam_prompt_diagnostics"]) == 9
 assert summary["configured_permanent_slot_capacity"] == 16
 audit = summary["tracking_audit"]
 tracks = audit["discovered_track_count"]
@@ -143,13 +148,15 @@ assert summary["baseline_revision"] == "v0_frozen_semantic_mapping_pipeline_r1"
 assert summary["selected_pose_branch"] == "retrieve_qk"
 assert summary["pointmap_source"] == "raw_full_history_streamvggt_world_pointmap"
 assert summary["semantic_source"] == "sam31_persistent_mask_and_id"
+assert summary["prompt_selection_annotation_gt_used"] == 1
+assert summary["runtime_prompt_selection_gt_fields"] == 0
 assert summary["semantic_color_policy"] == "fixed_color_per_persistent_slot_gray_unlabeled"
 assert summary["map_generation_gt_fields"] == 0
 assert summary["pointmap_modified"] == 0
 assert summary["saved_map_points"] > 0
 assert summary["saved_semantic_points"] > 0
 assert summary["semantic_map_pipeline_ready"] == 1
-assert len(summary["prompt_discovery_diagnostics"]) == 12
+assert len(summary["prompt_discovery_diagnostics"]) == 9
 assert Path(summary["outputs"]["prompt_discovery_csv"]).is_file()
 points = summary["saved_map_points"]
 semantic = summary["saved_semantic_points"]

@@ -192,6 +192,13 @@ def _write_outputs(
         "pose_source": "streamvggt_native_qk_history_retrieval",
         "pointmap_source": "raw_full_history_streamvggt_world_pointmap",
         "semantic_source": "sam31_persistent_mask_and_id",
+        "prompt_selection_scope": baseline_summary["prompt_selection_scope"],
+        "prompt_selection_annotation_gt_used": int(
+            baseline_summary["prompt_selection_annotation_gt_used"]
+        ),
+        "runtime_prompt_selection_gt_fields": int(
+            baseline_summary["runtime_prompt_selection_gt_fields"]
+        ),
         "semantic_color_policy": "fixed_color_per_persistent_slot_gray_unlabeled",
         "unlabeled_background_rgb8": BACKGROUND_SEMANTIC_RGB8,
         "sam_hidden_features_used": 0,
@@ -317,6 +324,11 @@ def _validate_inputs(
         "formal_pointmap_output": "raw_full_history_world_pointmap",
         "formal_semantic_output": "sam_persistent_id_lifted_raw_world_pointmap",
         "candidate_geometry_available": False,
+        "prompt_selection_scope": (
+            "this_clip_annotation_assisted_manual_prompt_planning"
+        ),
+        "prompt_selection_annotation_gt_used": 1,
+        "runtime_prompt_selection_gt_fields": 0,
     }
     for name, value in expected.items():
         if summary.get(name) != value:
@@ -462,6 +474,8 @@ def _write_copyable(path: Path, summary: dict[str, Any]) -> None:
         "sam_pose_inputs=0",
         "sam_hidden_features_used=0",
         "map_generation_gt_fields=0",
+        "prompt_selection_annotation_gt_used=1",
+        "runtime_prompt_selection_gt_fields=0",
         f"saved_map_points={summary['saved_map_points']}",
         f"saved_semantic_points={summary['saved_semantic_points']}",
         f"semantic_coverage_percent={summary['semantic_coverage_percent']}",

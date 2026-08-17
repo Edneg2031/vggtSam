@@ -5,6 +5,9 @@ device: cuda:0
 
 eligibility:
   max_active_instances: 5
+  # Wardrobe remains a V0 semantic-map label but is scene-dominant in this
+  # clip. Remove it before mask ownership so it cannot steal local pixels.
+  geometry_excluded_prompts: [wardrobe]
   min_history_visible_frames: 4
   min_track_score: 0.50
   min_mask_area_ratio: 0.005
@@ -31,4 +34,3 @@ controls:
 
 evaluation:
   symmetric_metric_points: 2048
-

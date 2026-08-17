@@ -13,9 +13,17 @@ from streaming_couping.src.instance_geometry import (
     select_mask_points,
     shift_instance_masks,
 )
+from streaming_couping.scripts.run_v1_instance_geometry import (
+    geometry_excluded_slots,
+)
 
 
 def main() -> None:
+    assert geometry_excluded_slots(
+        ("wardrobe", "chair", "Nightstand"),
+        (" wardrobe ",),
+    ) == (0,)
+
     masks = torch.zeros(2, 1, 7, 7, dtype=torch.bool)
     masks[:, :, 1:6, 1:6] = True
     eroded = erode_instance_masks(masks, radius=1)
@@ -82,4 +90,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

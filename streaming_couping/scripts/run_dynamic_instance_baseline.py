@@ -282,6 +282,11 @@ def _write_outputs(
         "pose_evaluation_role": "full_sequence_except_gauge_reference",
         "diagnostic_window_role": "not_train_test_folds",
         "sam_role": "prompted_multi_instance_discovery_mask_persistent_id",
+        "prompt_selection_scope": (
+            "this_clip_annotation_assisted_manual_prompt_planning"
+        ),
+        "prompt_selection_annotation_gt_used": 1,
+        "runtime_prompt_selection_gt_fields": 0,
         "configured_instance_prompts": tuple(
             str(value) for value in payload.get("instance_prompts", ())
         ),

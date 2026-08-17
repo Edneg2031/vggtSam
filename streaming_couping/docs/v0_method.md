@@ -40,11 +40,11 @@ StreamVGGT 第一帧参考的共享世界坐标系，不再用 QK pose 对它进
 SAM3.1 根据配置中的 prompt 在线发现并追踪实例。每个实例第一次出现时占用一个永久 slot，slot
 不复用，因此支持 late birth。每个像素的语义归属规则是：
 
-当前静态物体 prompt 为 `wardrobe / chair / picture / picture frame / mat / rug /
-table / desk / cabinet / nightstand / shelf / lamp`。其中保留 `picture ↔ picture frame` 和
-`mat ↔ rug` 两组常见表达，用逐 prompt 统计判断零检测究竟来自类别不存在还是提示词表达不匹配。
-不使用覆盖范围接近场景区域的大物体 prompt；这些标签用于获得有明确局部边界、可跨帧重复观测的
-实例区域。提示词负责提高发现召回率，不限制同类实例数量；后续 V1 几何审计仍最多选择 5 个成熟实例。
+当前语义地图 prompt 为 `wardrobe / chair / rug / desk / cabinet / nightstand / dustbin /
+box / guitar case`。它们来自独立的 annotation-only 场景盘点；盘点结果只用于模拟人工查看 RGB 后
+选择 prompt，不进入模型候选生成。`wardrobe` 作为重要场景语义保留在 V0 地图中，但因区域过大被
+V1 明确排除；其余 8 类是边界明确、重复可见的局部物体。提示词不限制同类实例数量，V1 每帧仍
+最多选择 5 个成熟实例。
 
 1. 过滤低于 `track_score_threshold` 的 mask；
 2. mask 重叠时选择 track score 更高的 slot；

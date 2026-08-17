@@ -18,8 +18,10 @@
 - 位姿：保留 V0 的 first-frame anchor + native QK Top-4 camera pose；
 - 点云初值：保留 full-history StreamVGGT raw world pointmap；
 - 实例信息：SAM3.1 persistent mask、slot、track ID 与 track score；
-- 当前 prompt：`wardrobe / chair / picture / picture frame / mat / rug / table / desk /
-  cabinet / nightstand / shelf / lamp`；
+- V0 语义 prompt：`wardrobe / chair / rug / desk / cabinet / nightstand / dustbin / box /
+  guitar case`；
+- V1 几何 prompt：`chair / rug / desk / cabinet / nightstand / dustbin / box / guitar case`；
+- `wardrobe` 只用于语义地图，在 mask ownership 之前即从 V1 几何分支移除；
 - `bed` 不参与，因为大面积实例会接近全局场景约束，削弱局部实例实验的可归因性；
 - 最多同时使用 5 个成熟实例，但 SAM registry 继续保留 16 个永久 slot；
 - GT 只能在候选点云完全生成后用于评分，不能参与实例筛选、匹配或位移计算。
@@ -34,7 +36,7 @@ V0 是不可覆盖的 fallback。任何 V1 分支失败时，正式输出仍然�
 BASELINE_REBUILD_CACHE=1 zsh streaming_couping/commands_v0_baseline.txt
 ```
 
-QK pose 只依赖 RGB，可以复用已有 artifact；本次强制重建 cache 是为了重新运行十二类 prompt 的
+QK pose 只依赖 RGB，可以复用已有 artifact；本次强制重建 cache 是为了重新运行九类语义 prompt 的
 SAM tracking。重点检查：
 
 - `semantic_map/prompt_discovery.csv` 中每个 prompt 的 raw / eligible / retained 数量；
@@ -55,18 +57,16 @@ SAM tracking。重点检查：
 如果整条序列少于两个成熟实例，先停止几何实验。此时应该增加合适的小型静态物体 prompt
 或更换包含更多物体的序列，而不是调整几何优化器。
 
-### 3.1 当前无 bed 基线结果
+### 3.1 Prompt 选择依据
 
-2026-08-17 的 30 帧运行发现两个 track：
+annotation-only 盘点在当前 30 帧找到 42 类、78 个可见实例。第一轮只保留 8 个适合局部几何的
+类别：`chair / rug / desk / cabinet / nightstand / dustbin / box / guitar case`。它们至少在 11 帧
+可见，最大单帧面积约为 0.86%–7.93%，同时覆盖多个实例和不同空间位置。
 
-| slot | prompt | birth frame | visible frames | semantic-map saved points |
-|---|---|---:|---:|---:|
-| 0 | wardrobe | 90 | 22 | 55,765 |
-| 1 | chair | 135 | 14 | 23 |
-
-整体语义覆盖为 13.947%。当前结果只证明 SAM 找到了两个跨帧 track；`saved_points=23` 来自语义地图
-40 万点全局置信度抽样，不能据此断言 chair 的原始 mask 只有 23 个点。I0 必须读取 cache 中未抽样的
-dense mask、confidence 与 pointmap，再决定 chair 是否满足 256 个 interior point 的成熟门槛。
+历史 12-prompt 扫描曾得到 14 个 raw detection、10 个 retained track，但其中 `picture / mat /
+table` 无检测，`lamp` 过小，`shelf` 仅最后一帧可见，因此不再保留。`wardrobe` 的标注最大面积为
+35.35%，只保留作语义地图标签。I0 使用 cache 中未抽样的 dense mask、confidence 与 pointmap，
+不能用 40 万点语义 PLY 的 `saved_points` 判断实例成熟度。
 
 ## 4. I0：Instance Geometry Feasibility Audit
 

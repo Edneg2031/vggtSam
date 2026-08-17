@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 import torch
 import yaml
@@ -34,7 +34,7 @@ from streaming_couping.src.learned_pose.config import (
 from streaming_couping.src.semantic_map import normalize_confidence, semantic_slot_map
 
 
-REVISION = "v1_causal_instance_surfel_audit_r1"
+REVISION = "v1_causal_instance_surfel_audit_r2"
 BASELINE_REVISION = "v0_frozen_semantic_mapping_pipeline_r1"
 I0_BRANCHES = ("correct_id", "shuffled_id", "shifted_mask")
 I1_BRANCHES = (
@@ -54,6 +54,7 @@ class V1Run:
     output_dir: Path
     device: str
     max_active_instances: int
+    geometry_excluded_prompts: tuple[str, ...]
     min_history_visible_frames: int
     min_track_score: float
     min_mask_area_ratio: float
@@ -119,13 +120,34 @@ def main() -> None:
         clip=clip,
         baseline_output_dir=baseline.output_dir,
     )
+    configured_prompts = {
+        _normalize_prompt(value) for value in payload["instance_prompts"]
+    }
+    missing_exclusions = set(run.geometry_excluded_prompts) - configured_prompts
+    if missing_exclusions:
+        raise ValueError(
+            "V1 geometry exclusions are absent from the V0 semantic prompts: "
+            f"{sorted(missing_exclusions)}"
+        )
+    if configured_prompts <= set(run.geometry_excluded_prompts):
+        raise ValueError("V1 geometry exclusions remove every configured prompt.")
 
     points = payload["baseline_world_points"].detach().float().cpu()
     confidence = normalize_confidence(payload["baseline_world_confidence"])
     masks = payload["tracking_masks_stream"].detach().bool().cpu()
     scores = payload["tracking_scores"].detach().float().cpu()
+    track_prompts = tuple(
+        str(value) for value in payload["sam_track_prompts"]
+    )
+    excluded_slots = geometry_excluded_slots(
+        track_prompts,
+        run.geometry_excluded_prompts,
+    )
+    geometry_masks = masks.clone()
+    if excluded_slots:
+        geometry_masks[:, list(excluded_slots)] = False
     slot_map = semantic_slot_map(
-        masks,
+        geometry_masks,
         scores,
         score_threshold=run.min_track_score,
     )
@@ -167,7 +189,7 @@ def main() -> None:
         shifted_masks=shifted_masks,
         active_pairs=active_pairs,
         discovered_slots=discovered_slots,
-        prompts=tuple(str(value) for value in payload["sam_track_prompts"]),
+        prompts=track_prompts,
         frame_indices=tuple(int(value) for value in payload["frame_indices"]),
         run=run,
         match_radius=match_radius,
@@ -541,6 +563,9 @@ def _active_instance_pairs(
             if bool(qualifying[frame, slot]):
                 history_count[slot] += 1
     prompts = tuple(str(value) for value in payload["sam_track_prompts"])
+    excluded_prompts = {
+        _normalize_prompt(value) for value in run.geometry_excluded_prompts
+    }
     track_ids = tuple(int(value) for value in payload["sam_track_ids"])
     births = tuple(int(value) for value in payload["sam_birth_indices"])
     frame_indices = tuple(int(value) for value in payload["frame_indices"])
@@ -552,6 +577,9 @@ def _active_instance_pairs(
                 "slot": slot,
                 "sam_track_id": track_ids[slot],
                 "prompt": prompts[slot],
+                "geometry_excluded_by_prompt": int(
+                    _normalize_prompt(prompts[slot]) in excluded_prompts
+                ),
                 "birth_sequence_index": births[slot],
                 "birth_frame": frame_indices[births[slot]],
                 "visible_frames": int(visible.sum()),
@@ -910,6 +938,13 @@ def _write_outputs(
         "baseline_revision": BASELINE_REVISION,
         "baseline_pose_branch": baseline_summary["selected_pose_branch"],
         "baseline_pointmap": "raw_full_history_world_pointmap",
+        "prompt_selection_scope": baseline_summary["prompt_selection_scope"],
+        "prompt_selection_annotation_gt_used": int(
+            baseline_summary["prompt_selection_annotation_gt_used"]
+        ),
+        "runtime_prompt_selection_gt_fields": int(
+            baseline_summary["runtime_prompt_selection_gt_fields"]
+        ),
         "prompts": tuple(str(value) for value in payload["instance_prompts"]),
         "frames": tuple(int(value) for value in payload["frame_indices"]),
         "model_trained": 0,
@@ -926,6 +961,7 @@ def _write_outputs(
         "shifted_mask_pixels": (shift_y, shift_x),
         "eligibility": {
             "max_active_instances": run.max_active_instances,
+            "geometry_excluded_prompts": run.geometry_excluded_prompts,
             "min_history_visible_frames": run.min_history_visible_frames,
             "min_track_score": run.min_track_score,
             "min_mask_area_ratio": run.min_mask_area_ratio,
@@ -997,19 +1033,22 @@ def _write_copyable(path: Path, summary: dict[str, Any]) -> None:
         "pose_modified=0",
         "history_candidate_writeback=0",
         "candidate_generation_gt_fields=0",
+        "prompt_selection_annotation_gt_used=1",
+        "runtime_prompt_selection_gt_fields=0",
         f"scene_diagonal_raw={summary['scene_diagonal_raw']}",
         f"match_radius_raw={summary['match_radius_raw']}",
         f"max_displacement_raw={summary['max_displacement_raw']}",
         "",
-        "slot,prompt,visible_frames,qualifying_frames,active_frames,dense_valid_interior_points,median_interior_area_ratio,eligible_track",
+        "slot,prompt,geometry_excluded_by_prompt,visible_frames,qualifying_frames,active_frames,dense_valid_interior_points,median_interior_area_ratio,eligible_track",
     ]
     for row in summary["track_eligibility"]:
         lines.append(
             ",".join(
                 str(row[name])
                 for name in (
-                    "slot", "prompt", "visible_frames", "qualifying_frames",
-                    "active_frames", "dense_valid_interior_points",
+                    "slot", "prompt", "geometry_excluded_by_prompt",
+                    "visible_frames", "qualifying_frames", "active_frames",
+                    "dense_valid_interior_points",
                     "median_interior_area_ratio", "eligible_track",
                 )
             )
@@ -1100,6 +1139,11 @@ def _validate_inputs(
         "selected_pose_branch": "retrieve_qk",
         "formal_pointmap_output": "raw_full_history_world_pointmap",
         "tracking_baseline_acceptance_pass": 1,
+        "prompt_selection_scope": (
+            "this_clip_annotation_assisted_manual_prompt_planning"
+        ),
+        "prompt_selection_annotation_gt_used": 1,
+        "runtime_prompt_selection_gt_fields": 0,
     }
     for name, value in expected.items():
         if summary.get(name) != value:
@@ -1244,12 +1288,22 @@ def _load_run(path: str | Path) -> V1Run:
     surfel = raw.get("surfel", {})
     controls = raw.get("controls", {})
     evaluation = raw.get("evaluation", {})
+    raw_geometry_excluded = eligibility.get("geometry_excluded_prompts", ())
+    if not isinstance(raw_geometry_excluded, (list, tuple)):
+        raise TypeError("eligibility.geometry_excluded_prompts must be a list.")
     run = V1Run(
         source_path=source,
         baseline_config=Path(raw["baseline_config"]).expanduser().resolve(),
         output_dir=Path(raw["output_dir"]).expanduser().resolve(),
         device=str(raw.get("device", "cuda:0")),
         max_active_instances=int(eligibility.get("max_active_instances", 5)),
+        geometry_excluded_prompts=tuple(
+            dict.fromkeys(
+                _normalize_prompt(value)
+                for value in raw_geometry_excluded
+                if _normalize_prompt(value)
+            )
+        ),
         min_history_visible_frames=int(
             eligibility.get("min_history_visible_frames", 4)
         ),
@@ -1318,6 +1372,22 @@ def _validate_run(run: V1Run) -> None:
         raise ValueError("normal_variance_max must be in [0,1].")
     if not 0.0 < run.alpha <= 1.0:
         raise ValueError("surfel alpha must be in (0,1].")
+
+
+def geometry_excluded_slots(
+    prompts: Sequence[str],
+    excluded_prompts: Sequence[str],
+) -> tuple[int, ...]:
+    excluded = {_normalize_prompt(value) for value in excluded_prompts}
+    return tuple(
+        slot
+        for slot, prompt in enumerate(prompts)
+        if _normalize_prompt(prompt) in excluded
+    )
+
+
+def _normalize_prompt(value: object) -> str:
+    return " ".join(str(value).strip().lower().split())
 
 
 def _replace_device(run: V1Run, device: str) -> V1Run:

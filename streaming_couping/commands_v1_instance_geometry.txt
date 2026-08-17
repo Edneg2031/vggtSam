@@ -37,7 +37,7 @@ summary = json.loads(Path(
     "outputs/streaming_couping_v1/instance_geometry/instance_geometry_summary.json"
 ).read_text())
 assert summary["schema"] == 1
-assert summary["revision"] == "v1_causal_instance_surfel_audit_r1"
+assert summary["revision"] == "v1_causal_instance_surfel_audit_r2"
 assert summary["baseline_revision"] == "v0_frozen_semantic_mapping_pipeline_r1"
 assert summary["baseline_pose_branch"] == "retrieve_qk"
 assert summary["baseline_pointmap"] == "raw_full_history_world_pointmap"
@@ -46,7 +46,16 @@ assert summary["sam_hidden_features_used"] == 0
 assert summary["pose_modified"] == 0
 assert summary["history_candidate_writeback"] == 0
 assert summary["candidate_generation_gt_fields"] == 0
+assert summary["prompt_selection_annotation_gt_used"] == 1
+assert summary["runtime_prompt_selection_gt_fields"] == 0
 assert "bed" not in summary["prompts"]
+assert summary["eligibility"]["geometry_excluded_prompts"] == ["wardrobe"]
+wardrobe_rows = [
+    row for row in summary["track_eligibility"]
+    if row["prompt"] == "wardrobe"
+]
+assert all(row["geometry_excluded_by_prompt"] == 1 for row in wardrobe_rows)
+assert all(row["eligible_track"] == 0 for row in wardrobe_rows)
 assert set(row["branch"] for row in summary["i0_branches"]) == {
     "correct_id", "shuffled_id", "shifted_mask"
 }
