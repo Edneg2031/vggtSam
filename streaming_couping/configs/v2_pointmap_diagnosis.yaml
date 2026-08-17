@@ -1,0 +1,48 @@
+# Read-only diagnosis of the frozen V0 artifacts.  This file never changes
+# V0 pose, pointmap, semantic map, cache or checkpoints.
+v0_config: streaming_couping/configs/v0_baseline.yaml
+output_dir: outputs/streaming_couping_v0/pointmap_diagnosis_v2
+
+d0:
+  paired_max_points_per_frame: 8192
+  symmetric_max_points_per_frame: 512
+  sanity_max_paired_rmse_metric: 0.03
+  sanity_max_p90_metric: 0.05
+  sanity_min_valid_ratio: 0.50
+
+d1:
+  track_score_threshold: 0.50
+  boundary_widths: [3, 5]
+  boundary_signal_min_median_ratio: 1.25
+
+t0:
+  enabled: true
+  track_score_threshold: 0.50
+  excluded_prompts: [wardrobe]
+  min_mask_pixels: 128
+  query_stride: 10
+  max_queries_per_pair: 64
+  history_candidate_stride: 6
+  max_history_candidates: 2048
+  patch_radius: 2
+  descriptor_ratio_threshold: 0.85
+  history_pairs_per_instance_frame: 1
+  oracle_depth_tolerance_metric: 0.03
+  min_ray_angle_degrees: 1.0
+  max_ray_angle_degrees: 60.0
+  max_condition: 1000000.0
+  max_reprojection_px: 3.0
+  high_quality_min_ray_angle_degrees: 2.0
+  high_quality_max_reprojection_px: 1.5
+  high_quality_max_condition: 100000.0
+  min_high_quality_anchors_for_go: 32
+  trackhead_preflight:
+    enabled: true
+    device: cuda:0
+    streamvggt_repo: externals/streamvggt
+    checkpoint: /home/bod/86Nas/95_data_bak/FoundationModels/StreamVGGT/checkpoints.pth
+    query_count: 32
+    window_frames: 4
+    iterations: 4
+    visibility_threshold: 0.50
+    confidence_threshold: 0.50

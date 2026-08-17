@@ -42,9 +42,9 @@ SAM3.1 根据配置中的 prompt 在线发现并追踪实例。每个实例第�
 
 当前语义地图 prompt 为 `wardrobe / chair / rug / desk / cabinet / nightstand / dustbin /
 box / guitar case`。它们来自独立的 annotation-only 场景盘点；盘点结果只用于模拟人工查看 RGB 后
-选择 prompt，不进入模型候选生成。`wardrobe` 作为重要场景语义保留在 V0 地图中，但因区域过大被
-V1 明确排除；其余 8 类是边界明确、重复可见的局部物体。提示词不限制同类实例数量，V1 每帧仍
-最多选择 5 个成熟实例。
+选择 prompt，不进入模型候选生成。`wardrobe` 作为重要场景语义保留在 V0 地图中；只读几何诊断
+可单独排除或分组统计大区域，但不会改变这组 V0 prompts。其余 8 类是边界明确、重复可见的局部物体。
+提示词不限制同类实例数量，永久 registry 总容量仍为 16。
 
 1. 过滤低于 `track_score_threshold` 的 mask；
 2. mask 重叠时选择 track score 更高的 slot；
@@ -92,7 +92,7 @@ zsh streaming_couping/commands_scene_object_inventory.txt
 ```
 
 该命令只读取数据集实例标注与 mask，输出当前 30 帧可见的类别、实例数、可见帧数和面积，且明确
-标记为 `manual_prompt_planning_only`。其结果不会被 V0/V1 候选生成读取，因此不能作为模型自动识别
+标记为 `manual_prompt_planning_only`。其结果不会被正式 V0 或 V2 候选生成读取，因此不能作为模型自动识别
 场景物体的实验结论；它只相当于人工查看场景后整理提示词。
 
 该命令依次完成缓存、QK pose、tracking/pose审计和语义地图导出。通常复用已有缓存；显式重建方式：

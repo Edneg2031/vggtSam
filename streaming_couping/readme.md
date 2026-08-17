@@ -13,6 +13,15 @@ V0 是冻结、免训练的 StreamVGGT + SAM3.1 语义地图 pipeline：
 zsh streaming_couping/commands_v0_baseline.txt
 ```
 
+冻结 V0 之后的只读 pointmap 诊断入口是：
+
+```bash
+zsh streaming_couping/commands_v2_pointmap_diagnosis.txt
+```
+
+它按 D0（depth × pose 坐标闭环）、D1（区域/置信度误差分解）、T0（独立稀疏三角化）顺序运行，
+不会覆盖 V0 的 pose、pointmap 或 semantic map。
+
 命令包含四个阶段：
 
 1. 缓存full-history StreamVGGT几何和SAM3.1多prompt实例轨迹；

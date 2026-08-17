@@ -16,12 +16,12 @@ dataset:
       instance_source: sam31_online
       # SAM3.1 detects all instances of each configured open-vocabulary noun.
       # Keep object-scale concepts here. A scene-dominant semantic label may
-      # remain for map export only and is separately excluded by V1 geometry.
+      # remain for map export, while read-only diagnosis can exclude it.
       # Prompt breadth controls semantic recall; it does not change the V0
       # pose or pointmap branches. Wardrobe is retained for semantic mapping
       # only. The other prompts are bounded, repeatedly visible objects chosen
-      # by the annotation-only planning audit. V1 separately excludes wardrobe
-      # and still admits at most five mature instances per frame.
+      # by the annotation-only planning audit. Diagnosis never changes this
+      # frozen semantic prompt set.
       instance_prompts:
         - wardrobe
         - chair
