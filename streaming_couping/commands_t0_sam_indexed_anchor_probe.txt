@@ -59,11 +59,14 @@ assert summary["decision"]["formal_v0_pointmap_modified"] == 0
 assert summary["decision"]["formal_v0_semantic_map_modified"] == 0
 assert summary["decision"]["equal_attempted_query_protocol"] == 1
 primary = summary["branch_lookup"]["correct_persistent_id"]
+anchors = primary["evaluated_anchor_count"]
+tri_gain = primary["tri_gain_vs_raw_percent"]
+decision = summary["decision"]["t0_decision"]
 print(
     "T0 output schema accepted "
-    f"anchors={primary['evaluated_anchor_count']} "
-    f"tri_gain={primary['tri_gain_vs_raw_percent']:.4f}% "
-    f"decision={summary['decision']['t0_decision']}"
+    f"anchors={anchors} "
+    f"tri_gain={tri_gain:.4f}% "
+    f"decision={decision}"
 )
 '
 
