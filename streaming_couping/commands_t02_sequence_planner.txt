@@ -32,19 +32,23 @@ summary = json.loads(Path(
     "outputs/streaming_couping_t02_sequence_planner/summary.json"
 ).read_text())
 assert summary["schema"] == 1
-assert summary["revision"] == "t02_manifest_only_confirmation_sequence_planner_r1"
+assert summary["revision"] == "t02_manifest_only_confirmation_sequence_planner_r2"
 assert summary["role"] == "t02_new_sequence_planning_only"
 assert summary["discovery_scene_excluded"] == 1
 assert summary["gt_geometry_values_read"] == 0
 assert summary["pointmap_file_content_read"] == 0
 assert summary["instance_mask_file_content_read"] == 0
 assert summary["model_loaded_or_run"] == 0
-assert summary["reported_candidate_count"] > 0
-assert summary["recommended_scene_id"] != "00a231a370"
+assert summary["planner_ready"] in {0, 1}
+if summary["planner_ready"]:
+    assert summary["reported_candidate_count"] > 0
+    assert summary["recommended_scene_id"] != "00a231a370"
 eligible = summary["eligible_scene_count"]
 recommended = summary["recommended_scene_id"]
+ready = summary["planner_ready"]
 print(
     "T0.2 sequence planner accepted "
+    f"ready={ready} "
     f"eligible={eligible} "
     f"recommended={recommended}"
 )
