@@ -1,21 +1,26 @@
 # NAS 存储与 ScanNet++ 重新处理
 
-大体积数据统一放在挂载目录：
+原始 ScanNet++ 不搬动，继续从已有只读位置读取：
+
+```text
+/home/bod/184Nas/open_source/scannet_pp_pinhole/
+├── data/<scene_id>/
+│   ├── images/
+│   ├── colmap/
+│   └── mesh_aligned_0.05.ply
+├── metadata/semantic_classes.txt
+└── scannetpp_part_valid_scenes.txt
+
+/home/bod/184Nas/open_source/scannet_pp/data/<scene_id>/scans/
+├── mesh_aligned_0.05_semantic.ply
+├── segments.json
+└── segments_anno.json
+```
+
+新生成的大体积数据统一写到：
 
 ```text
 /home/bod/184Nas/process_data/vggtSam/
-├── source/
-│   ├── scannetpp_pinhole/
-│   │   ├── data/<scene_id>/
-│   │   │   ├── images/
-│   │   │   ├── colmap/
-│   │   │   └── mesh_aligned_0.05.ply
-│   │   ├── metadata/semantic_classes.txt
-│   │   └── scannetpp_part_valid_scenes.txt
-│   └── scannetpp/data/<scene_id>/scans/
-│       ├── mesh_aligned_0.05_semantic.ply
-│       ├── segments.json
-│       └── segments_anno.json
 ├── data/processed/scannetpp_pinhole_2d/
 │   ├── manifest.json
 │   └── <scene_id>/
@@ -44,10 +49,8 @@ ScanNet++ 预处理配置都会展开该变量。
 
 ## 推荐处理顺序
 
-先把原始场景文件放进上面的 `source/` 结构。然后依次执行：
-
-直接运行一次命令也可以只初始化并检查 NAS 目录；如果还没有放入任何场景，
-它会正常提示放置位置后退出，不再产生 Python traceback。
+不需要复制原始场景。命令会直接读取旧的 `open_source` 路径，只把生成结果
+写到新的 `process_data/vggtSam`。
 
 如果服务器环境缺少预处理依赖，先运行一次：
 
@@ -74,8 +77,9 @@ SCANNETPP_SCENES="00a231a370 1d34f56de8" \
 zsh streaming_couping/commands_prepare_scannetpp_nas.txt
 ```
 
-也可以不设置 `SCANNETPP_SCENES`，此时优先读取
-`scannetpp_part_valid_scenes.txt`，不存在时扫描 `data/` 下的场景。
+`preflight` 和 `debug` 不设置 `SCANNETPP_SCENES` 时，默认只检查
+`00a231a370`。`full` 模式必须显式指定场景，避免意外处理整个 release；
+只有明确设置 `SCANNETPP_USE_SCENE_LIST=1` 才会读取完整 scene list。
 
 每次非预检运行后会进行只读资产审计，检查 RGB 和 pointmap 是否齐全，
 并把结果写到：

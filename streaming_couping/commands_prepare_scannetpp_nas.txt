@@ -3,12 +3,16 @@ set -euo pipefail
 
 ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/home/bod/184Nas/process_data/vggtSam}"
+PINHOLE_ROOT="${SCANNETPP_PINHOLE_ROOT:-/home/bod/184Nas/open_source/scannet_pp_pinhole}"
+ANNOTATION_ROOT="${SCANNETPP_ANNOTATION_ROOT:-/home/bod/184Nas/open_source/scannet_pp}"
 PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
 MODE="${SCANNETPP_PREPROCESS_MODE:-preflight}"
 CONFIG=configs/scannetpp_pinhole_2d.yaml
 PROCESSED_ROOT="$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d"
 MANIFEST="$PROCESSED_ROOT/manifest.json"
-SCENE_LIST="$STORAGE_ROOT/source/scannetpp_pinhole/scannetpp_part_valid_scenes.txt"
+SCENE_ROOT="$PINHOLE_ROOT/data"
+SCENE_LIST="$PINHOLE_ROOT/scannetpp_part_valid_scenes.txt"
+ANNOTATION_DATA_ROOT="$ANNOTATION_ROOT/data"
 
 cd "$ROOT"
 [[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
@@ -20,18 +24,24 @@ cd "$ROOT"
 export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
 
 mkdir -p \
-  "$STORAGE_ROOT/source/scannetpp_pinhole/data" \
-  "$STORAGE_ROOT/source/scannetpp_pinhole/metadata" \
-  "$STORAGE_ROOT/source/scannetpp/data" \
   "$STORAGE_ROOT/data/processed" \
   "$STORAGE_ROOT/outputs"
 
 echo "ScanNet++ NAS preprocessing mode=$MODE"
 echo "storage=$STORAGE_ROOT"
-echo "pinhole scenes=$STORAGE_ROOT/source/scannetpp_pinhole/data/<scene_id>"
-echo "annotations=$STORAGE_ROOT/source/scannetpp/data/<scene_id>/scans"
+echo "pinhole scenes=$SCENE_ROOT/<scene_id> (read-only source)"
+echo "annotations=$ANNOTATION_DATA_ROOT/<scene_id>/scans (read-only source)"
 echo "processed=$PROCESSED_ROOT"
 df -h "$STORAGE_ROOT" | tail -n 1
+
+[[ -d "$SCENE_ROOT" ]] || {
+  echo "missing historical pinhole source: $SCENE_ROOT" >&2
+  exit 1
+}
+[[ -d "$ANNOTATION_DATA_ROOT" ]] || {
+  echo "missing historical annotation source: $ANNOTATION_DATA_ROOT" >&2
+  exit 1
+}
 
 if [[ "$MODE" == "preflight" ]]; then
   PYTHONPATH="$ROOT/src" "$PYTHON_BIN" -c '
@@ -56,24 +66,23 @@ fi
 SCENE_ARGS=()
 if [[ -n "${SCANNETPP_SCENES:-}" ]]; then
   SCENE_ARGS+=(--scene-ids ${=SCANNETPP_SCENES})
+elif [[ "$MODE" == "preflight" || "$MODE" == "debug" ]]; then
+  SCENE_ARGS=(--scene-ids "${SCANNETPP_DEFAULT_SCENE:-00a231a370}")
 fi
 
-if [[ "$MODE" == "preflight" && ${#SCENE_ARGS[@]} == 0 && ! -s "$SCENE_LIST" ]]; then
-  SCENE_ROOT="$STORAGE_ROOT/source/scannetpp_pinhole/data"
-  SCENE_DIRS=("$SCENE_ROOT"/*(N/))
-  if (( ${#SCENE_DIRS[@]} == 0 )); then
-    echo "No source scene is present yet; NAS directory initialization passed"
-    echo "Place scenes under: $SCENE_ROOT/<scene_id>"
-    echo "Then rerun with SCANNETPP_SCENES=\"scene_id ...\""
-    exit 0
-  fi
-fi
+SOURCE_ARGS=(
+  --data-root "$SCENE_ROOT"
+  --annotation-root "$ANNOTATION_DATA_ROOT"
+  --metadata-root "$PINHOLE_ROOT/metadata"
+  --scene-list "$SCENE_LIST"
+)
 
 case "$MODE" in
   preflight)
     echo "Read-only asset preflight; no masks or pointmaps are generated"
     PYTHONPATH="$ROOT/src" "$PYTHON_BIN" scripts/prepare_scannetpp_2d.py \
       --config "$CONFIG" \
+      "${SOURCE_ARGS[@]}" \
       "${SCENE_ARGS[@]}" \
       --max-frames "${SCANNETPP_DEBUG_FRAMES:-5}" \
       --dry-run
@@ -85,15 +94,22 @@ case "$MODE" in
     echo "Generate a five-frame visual/debug slice on NAS"
     PYTHONPATH="$ROOT/src" "$PYTHON_BIN" scripts/prepare_scannetpp_2d.py \
       --config "$CONFIG" \
+      "${SOURCE_ARGS[@]}" \
       "${SCENE_ARGS[@]}" \
       --max-frames "${SCANNETPP_DEBUG_FRAMES:-5}" \
       --overwrite \
       --save-visualizations
     ;;
   full)
+    if (( ${#SCENE_ARGS[@]} == 0 )) && [[ "${SCANNETPP_USE_SCENE_LIST:-0}" != "1" ]]; then
+      echo "full mode requires SCANNETPP_SCENES to avoid processing the entire release" >&2
+      echo "Set SCANNETPP_USE_SCENE_LIST=1 only when the full scene list is intended" >&2
+      exit 2
+    fi
     echo "Generate/resume full selected scenes; existing complete frames are kept"
     PYTHONPATH="$ROOT/src" "$PYTHON_BIN" scripts/prepare_scannetpp_2d.py \
       --config "$CONFIG" \
+      "${SOURCE_ARGS[@]}" \
       "${SCENE_ARGS[@]}" \
       --skip-existing \
       --no-visualizations
