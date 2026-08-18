@@ -1,0 +1,80 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+CONFIG=streaming_couping/configs/t02_multiview_confirmation.yaml
+SOURCE=outputs/streaming_couping_t02_new_sequence_anchor_probe
+OUTPUT=outputs/streaming_couping_t02_multiview_confirmation
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+if [[ ! -s "$SOURCE/anchors_candidate.pt" || ! -s "$SOURCE/anchor_scores.csv" || ! -s "$SOURCE/summary.json" ]]; then
+  echo "missing independent new-sequence T0 artifacts in $SOURCE" >&2
+  echo "prepare a new clip that was not used by T0/T0.1, then run the unchanged T0 anchor probe into this directory" >&2
+  echo "required: anchors_candidate.pt, anchor_scores.csv, summary.json" >&2
+  exit 1
+fi
+
+export PYTHONHASHSEED=0
+
+echo "T0.2 smoke: strict condition<100 and 4+ view confirmation gate"
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_t02_multiview_confirmation
+
+rm -rf "$OUTPUT"
+echo "T0.2 read-only new-sequence multi-view triangulation confirmation"
+echo "No model, matching, pose or pointmap update is performed by this scorer"
+PYTHONUNBUFFERED=1 PYTHONPATH=. \
+  "$PYTHON_BIN" -m streaming_couping.scripts.run_t02_multiview_confirmation \
+  --config "$CONFIG"
+
+[[ -s "$OUTPUT/summary.json" ]] || { echo "missing T0.2 summary" >&2; exit 1; }
+[[ -s "$OUTPUT/frozen_gate_assignments.pt" ]] || { echo "missing frozen T0.2 gate artifact" >&2; exit 1; }
+[[ -s "$OUTPUT/frozen_gate_manifest.json" ]] || { echo "missing frozen T0.2 gate manifest" >&2; exit 1; }
+PYTHONPATH=. "$PYTHON_BIN" -c '
+import json
+from pathlib import Path
+
+path = Path("outputs/streaming_couping_t02_multiview_confirmation/summary.json")
+summary = json.loads(path.read_text())
+assert summary["schema"] == 1
+assert summary["revision"] == "t02_new_sequence_multiview_triangulation_confirmation_r1"
+assert summary["baseline_version"] == "v0"
+assert summary["baseline_status"] == "frozen_unchanged"
+assert summary["new_sequence_confirmation"] == 1
+assert summary["confirmation_clip"] != summary["discovery_clip"]
+assert summary["gate_rule"] == "positive_depth AND condition_number < 100 AND num_views >= 4"
+assert summary["candidate_generation_raw_pointmap_fields"] == 0
+assert summary["candidate_generation_gt_fields"] == 0
+assert summary["source_new_sequence_gt_scores_read_after_gate_freeze"] == 1
+assert summary["model_loaded_or_run"] == 0
+assert summary["model_trained"] == 0
+assert summary["pose_modified"] == 0
+assert summary["pointmap_modified"] == 0
+assert [row["branch"] for row in summary["branches"]] == [
+    "correct_persistent_id",
+    "foreground_union",
+    "shuffled_persistent_id",
+]
+decision = summary["decision"]
+assert decision["t02_decision"] in {"GO", "NO_GO"}
+assert decision["same_frozen_gate_all_branches"] == 1
+assert decision["new_sequence_differs_from_discovery_clip"] == 1
+assert decision["gate_thresholds_selected_with_new_sequence_gt"] == 0
+assert decision["formal_v0_pose_modified"] == 0
+assert decision["formal_v0_pointmap_modified"] == 0
+assert decision["formal_v0_semantic_map_modified"] == 0
+correct = summary["branch_lookup"]["correct_persistent_id"]
+correct_count = correct["anchor_count"]
+result = decision["t02_decision"]
+sam = decision["sam_geometry_interpretation"]
+print(
+    "T0.2 output schema accepted "
+    f"correct_anchors={correct_count} "
+    f"decision={result} "
+    f"sam={sam}"
+)
+'
+
+echo ""
+sed -n '1,220p' "$OUTPUT/copyable_result.txt"

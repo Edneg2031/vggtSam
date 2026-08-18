@@ -1,0 +1,15 @@
+# Confirm the post-T0.1 hypothesis on a genuinely new sequence.
+discovery_clip: 00a231a370_90_525_step15_37_68_54
+source_t0_output_dir: outputs/streaming_couping_t02_new_sequence_anchor_probe
+output_dir: outputs/streaming_couping_t02_multiview_confirmation
+
+# Frozen protocol: changing either value is rejected by the runner.
+gate:
+  maximum_condition_number: 100.0  # strict condition_number < 100
+  minimum_views: 4
+
+evaluation:
+  minimum_correct_anchor_count: 30
+  # Used only for the descriptive correct/foreground/shuffled interpretation.
+  sam_comparison_tolerance_percent: 2.0
+  minimum_control_anchor_count: 10

@@ -1,0 +1,54 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+MANIFEST=data/processed/scannetpp_pinhole_2d/manifest.json
+OUTPUT=outputs/streaming_couping_t02_sequence_planner
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+[[ -s "$MANIFEST" ]] || { echo "missing manifest: $MANIFEST" >&2; exit 1; }
+
+rm -rf "$OUTPUT"
+echo "T0.2 independent confirmation sequence planning"
+echo "Reads manifest metadata/file existence only; no mask, pointmap, model or GPU"
+PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.plan_t02_confirmation_sequence \
+  --manifest "$MANIFEST" \
+  --discovery-scene-id 00a231a370 \
+  --frame-count 30 \
+  --frame-stride 15 \
+  --maximum-candidates 20 \
+  --output-dir "$OUTPUT"
+
+[[ -s "$OUTPUT/summary.json" ]] || { echo "missing T0.2 planner summary" >&2; exit 1; }
+[[ -s "$OUTPUT/copyable_result.txt" ]] || { echo "missing T0.2 planner report" >&2; exit 1; }
+PYTHONPATH=. "$PYTHON_BIN" -c '
+import json
+from pathlib import Path
+
+summary = json.loads(Path(
+    "outputs/streaming_couping_t02_sequence_planner/summary.json"
+).read_text())
+assert summary["schema"] == 1
+assert summary["revision"] == "t02_manifest_only_confirmation_sequence_planner_r1"
+assert summary["role"] == "t02_new_sequence_planning_only"
+assert summary["discovery_scene_excluded"] == 1
+assert summary["gt_geometry_values_read"] == 0
+assert summary["pointmap_file_content_read"] == 0
+assert summary["instance_mask_file_content_read"] == 0
+assert summary["model_loaded_or_run"] == 0
+assert summary["reported_candidate_count"] > 0
+assert summary["recommended_scene_id"] != "00a231a370"
+eligible = summary["eligible_scene_count"]
+recommended = summary["recommended_scene_id"]
+print(
+    "T0.2 sequence planner accepted "
+    f"eligible={eligible} "
+    f"recommended={recommended}"
+)
+'
+
+echo ""
+sed -n '1,180p' "$OUTPUT/copyable_result.txt"

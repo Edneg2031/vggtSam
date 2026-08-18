@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""CPU smoke checks for the frozen T0.2 confirmation protocol."""
+
+from __future__ import annotations
+
+import torch
+
+from streaming_couping.scripts.run_t02_multiview_confirmation import (
+    T02Gate,
+    confirmation_gate_pass,
+    interpret_sam_geometry,
+    t02_gate_mask,
+)
+
+
+def main() -> None:
+    test_strict_condition_and_multiview_gate()
+    test_confirmation_go_rule()
+    test_sam_interpretation()
+    print("T0.2 frozen new-sequence confirmation smoke passed")
+
+
+def test_strict_condition_and_multiview_gate() -> None:
+    metrics = {
+        "condition_number": torch.tensor([99.0, 100.0, 20.0, 20.0]),
+        "num_views": torch.tensor([4, 4, 3, 5]),
+        "positive_depth": torch.tensor([True, True, True, False]),
+    }
+    gate = T02Gate(maximum_condition_number_exclusive=100.0, minimum_views=4)
+    assert t02_gate_mask(metrics, gate).tolist() == [True, False, False, False]
+
+
+def test_confirmation_go_rule() -> None:
+    passing = {
+        "anchor_count": 30,
+        "tri_rmse": 0.4,
+        "raw_rmse": 0.6,
+        "tri_p90": 0.7,
+        "raw_p90": 0.8,
+    }
+    assert confirmation_gate_pass(passing, minimum_anchor_count=30)
+    failing = {**passing, "tri_p90": 0.9}
+    assert not confirmation_gate_pass(failing, minimum_anchor_count=30)
+
+
+def test_sam_interpretation() -> None:
+    def row(gain: float) -> dict[str, float | int]:
+        return {"anchor_count": 40, "tri_gain_vs_raw_percent": gain}
+
+    identity = {
+        "correct_persistent_id": row(20.0),
+        "foreground_union": row(10.0),
+        "shuffled_persistent_id": row(0.0),
+    }
+    assert interpret_sam_geometry(
+        identity, tolerance_percent=2.0, minimum_anchor_count=10
+    ) == "persistent_identity_geometry_evidence"
+    foreground = {
+        "correct_persistent_id": row(20.0),
+        "foreground_union": row(19.0),
+        "shuffled_persistent_id": row(0.0),
+    }
+    assert interpret_sam_geometry(
+        foreground, tolerance_percent=2.0, minimum_anchor_count=10
+    ) == "foreground_gating_geometry_evidence"
+    no_identity = {
+        "correct_persistent_id": row(10.0),
+        "foreground_union": row(0.0),
+        "shuffled_persistent_id": row(9.0),
+    }
+    assert interpret_sam_geometry(
+        no_identity, tolerance_percent=2.0, minimum_anchor_count=10
+    ) == "no_persistent_identity_geometry_evidence"
+
+
+if __name__ == "__main__":
+    main()

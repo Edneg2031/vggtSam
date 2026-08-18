@@ -1171,8 +1171,17 @@ def _load_run(path: str | Path) -> T0Run:
 
 
 def _validate_run(run: T0Run) -> None:
-    if run.v0_config.name != "v0_baseline.yaml":
-        raise ValueError("T0 must consume the frozen V0 configuration.")
+    source = yaml.safe_load(run.v0_config.read_text(encoding="utf8")) or {}
+    baseline = source.get("baseline", {})
+    if str(baseline.get("version", "")).strip().lower() != "v0":
+        raise ValueError("T0 must consume a baseline.version=v0 configuration.")
+    if str(baseline.get("status", "")).strip().lower() != "frozen":
+        raise ValueError("T0 must consume a frozen V0 configuration.")
+    selected = str(
+        baseline.get("pose", {}).get("selected_branch", "")
+    ).strip().lower()
+    if selected != "retrieve_qk":
+        raise ValueError("T0 requires the frozen retrieve_qk V0 pose branch.")
     if run.descriptor_token_half not in {"frame", "global"}:
         raise ValueError("descriptor_token_half must be frame/global.")
     for value in (
