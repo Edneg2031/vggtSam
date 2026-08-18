@@ -6,5 +6,11 @@ __pycache__/
 
 # Local datasets, checkpoints, caches, and generated evaluations.
 data/
+# This is source code, not a generated dataset. Keep the restored ScanNet++
+# preprocessing package trackable despite the generic data/ rule above.
+!src/vggtsam/data/
+!src/vggtsam/data/**
+src/vggtsam/data/**/__pycache__/
+src/vggtsam/data/**/*.py[cod]
 outputs/
 *.log

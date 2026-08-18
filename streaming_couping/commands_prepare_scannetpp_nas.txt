@@ -8,9 +8,15 @@ MODE="${SCANNETPP_PREPROCESS_MODE:-preflight}"
 CONFIG=configs/scannetpp_pinhole_2d.yaml
 PROCESSED_ROOT="$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d"
 MANIFEST="$PROCESSED_ROOT/manifest.json"
+SCENE_LIST="$STORAGE_ROOT/source/scannetpp_pinhole/scannetpp_part_valid_scenes.txt"
 
 cd "$ROOT"
 [[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+[[ -f "$ROOT/src/vggtsam/data/scannetpp/preprocess.py" ]] || {
+  echo "missing ScanNet++ preprocessing package: $ROOT/src/vggtsam/data/scannetpp" >&2
+  echo "sync/pull the restored src/vggtsam/data source files before running" >&2
+  exit 1
+}
 export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
 
 mkdir -p \
@@ -28,13 +34,13 @@ echo "processed=$PROCESSED_ROOT"
 df -h "$STORAGE_ROOT" | tail -n 1
 
 if [[ "$MODE" == "preflight" ]]; then
-  PYTHONPATH=src "$PYTHON_BIN" -c '
+  PYTHONPATH="$ROOT/src" "$PYTHON_BIN" -c '
 import numpy
 import yaml
 print("preflight dependencies passed")
 '
 else
-  PYTHONPATH=src "$PYTHON_BIN" -c '
+  PYTHONPATH="$ROOT/src" "$PYTHON_BIN" -c '
 import cv2
 import numpy
 import plyfile
@@ -52,10 +58,21 @@ if [[ -n "${SCANNETPP_SCENES:-}" ]]; then
   SCENE_ARGS+=(--scene-ids ${=SCANNETPP_SCENES})
 fi
 
+if [[ "$MODE" == "preflight" && ${#SCENE_ARGS[@]} == 0 && ! -s "$SCENE_LIST" ]]; then
+  SCENE_ROOT="$STORAGE_ROOT/source/scannetpp_pinhole/data"
+  SCENE_DIRS=("$SCENE_ROOT"/*(N/))
+  if (( ${#SCENE_DIRS[@]} == 0 )); then
+    echo "No source scene is present yet; NAS directory initialization passed"
+    echo "Place scenes under: $SCENE_ROOT/<scene_id>"
+    echo "Then rerun with SCANNETPP_SCENES=\"scene_id ...\""
+    exit 0
+  fi
+fi
+
 case "$MODE" in
   preflight)
     echo "Read-only asset preflight; no masks or pointmaps are generated"
-    PYTHONPATH=src "$PYTHON_BIN" scripts/prepare_scannetpp_2d.py \
+    PYTHONPATH="$ROOT/src" "$PYTHON_BIN" scripts/prepare_scannetpp_2d.py \
       --config "$CONFIG" \
       "${SCENE_ARGS[@]}" \
       --max-frames "${SCANNETPP_DEBUG_FRAMES:-5}" \
@@ -66,7 +83,7 @@ case "$MODE" in
       SCENE_ARGS=(--scene-ids 00a231a370)
     fi
     echo "Generate a five-frame visual/debug slice on NAS"
-    PYTHONPATH=src "$PYTHON_BIN" scripts/prepare_scannetpp_2d.py \
+    PYTHONPATH="$ROOT/src" "$PYTHON_BIN" scripts/prepare_scannetpp_2d.py \
       --config "$CONFIG" \
       "${SCENE_ARGS[@]}" \
       --max-frames "${SCANNETPP_DEBUG_FRAMES:-5}" \
@@ -75,7 +92,7 @@ case "$MODE" in
     ;;
   full)
     echo "Generate/resume full selected scenes; existing complete frames are kept"
-    PYTHONPATH=src "$PYTHON_BIN" scripts/prepare_scannetpp_2d.py \
+    PYTHONPATH="$ROOT/src" "$PYTHON_BIN" scripts/prepare_scannetpp_2d.py \
       --config "$CONFIG" \
       "${SCENE_ARGS[@]}" \
       --skip-existing \
