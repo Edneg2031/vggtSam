@@ -3,21 +3,26 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 
 from streaming_couping.scripts.run_t02_multiview_confirmation import (
+    T02Run,
     T02Gate,
     confirmation_gate_pass,
     interpret_sam_geometry,
     t02_gate_mask,
+    validate_temporal_holdout_source,
 )
 
 
 def main() -> None:
     test_strict_condition_and_multiview_gate()
+    test_same_scene_unseen_time_protocol()
     test_confirmation_go_rule()
     test_sam_interpretation()
-    print("T0.2 frozen new-sequence confirmation smoke passed")
+    print("T0.2 frozen same-scene temporal-holdout smoke passed")
 
 
 def test_strict_condition_and_multiview_gate() -> None:
@@ -28,6 +33,47 @@ def test_strict_condition_and_multiview_gate() -> None:
     }
     gate = T02Gate(maximum_condition_number_exclusive=100.0, minimum_views=4)
     assert t02_gate_mask(metrics, gate).tolist() == [True, False, False, False]
+
+
+def test_same_scene_unseen_time_protocol() -> None:
+    run = T02Run(
+        source_path=Path("config.yaml"),
+        discovery_clip="scene_90_525",
+        discovery_scene_id="scene",
+        discovery_last_frame=525,
+        validation_scope="same_scene_unseen_temporal_holdout",
+        confirmation_clip="scene_533_591",
+        confirmation_frames=tuple(range(533, 592, 2)),
+        source_t0_output_dir=Path("source"),
+        output_dir=Path("output"),
+        gate=T02Gate(100.0, 4),
+        minimum_correct_anchor_count=30,
+        sam_comparison_tolerance_percent=2.0,
+        minimum_control_anchor_count=10,
+    )
+    metadata = validate_temporal_holdout_source(
+        run,
+        {
+            "clip_name": "scene_533_591",
+            "scene_id": "scene",
+            "frame_indices": tuple(range(533, 592, 2)),
+        },
+    )
+    assert metadata["same_scene_as_discovery"] == 1
+    assert metadata["frame_overlap_with_discovery"] == 0
+    try:
+        validate_temporal_holdout_source(
+            run,
+            {
+                "clip_name": "scene_500_558",
+                "scene_id": "scene",
+                "frame_indices": tuple(range(500, 559, 2)),
+            },
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("T0.2 accepted frames overlapping discovery time.")
 
 
 def test_confirmation_go_rule() -> None:

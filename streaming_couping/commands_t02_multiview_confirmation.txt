@@ -4,14 +4,14 @@ set -euo pipefail
 ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
 CONFIG=streaming_couping/configs/t02_multiview_confirmation.yaml
-SOURCE=outputs/streaming_couping_t02_new_sequence_anchor_probe
+SOURCE=outputs/streaming_couping_t02_temporal_holdout_anchor_probe
 OUTPUT=outputs/streaming_couping_t02_multiview_confirmation
 
 cd "$ROOT"
 [[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
 if [[ ! -s "$SOURCE/anchors_candidate.pt" || ! -s "$SOURCE/anchor_scores.csv" || ! -s "$SOURCE/summary.json" ]]; then
-  echo "missing independent new-sequence T0 artifacts in $SOURCE" >&2
-  echo "prepare a new clip that was not used by T0/T0.1, then run the unchanged T0 anchor probe into this directory" >&2
+  echo "missing same-scene temporal-holdout T0 artifacts in $SOURCE" >&2
+  echo "run commands_t02_temporal_holdout.txt to build them" >&2
   echo "required: anchors_candidate.pt, anchor_scores.csv, summary.json" >&2
   exit 1
 fi
@@ -22,7 +22,7 @@ echo "T0.2 smoke: strict condition<100 and 4+ view confirmation gate"
 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_t02_multiview_confirmation
 
 rm -rf "$OUTPUT"
-echo "T0.2 read-only new-sequence multi-view triangulation confirmation"
+echo "T0.2 read-only same-scene unseen-time triangulation confirmation"
 echo "No model, matching, pose or pointmap update is performed by this scorer"
 PYTHONUNBUFFERED=1 PYTHONPATH=. \
   "$PYTHON_BIN" -m streaming_couping.scripts.run_t02_multiview_confirmation \
@@ -38,15 +38,22 @@ from pathlib import Path
 path = Path("outputs/streaming_couping_t02_multiview_confirmation/summary.json")
 summary = json.loads(path.read_text())
 assert summary["schema"] == 1
-assert summary["revision"] == "t02_new_sequence_multiview_triangulation_confirmation_r1"
+assert summary["revision"] == "t02_same_scene_temporal_holdout_confirmation_r2"
 assert summary["baseline_version"] == "v0"
 assert summary["baseline_status"] == "frozen_unchanged"
-assert summary["new_sequence_confirmation"] == 1
-assert summary["confirmation_clip"] != summary["discovery_clip"]
+assert summary["validation_scope"] == "same_scene_unseen_temporal_holdout"
+assert summary["same_scene_unseen_temporal_holdout"] == 1
+assert summary["same_scene_as_discovery"] == 1
+assert summary["frame_overlap_with_discovery"] == 0
+assert summary["all_confirmation_frames_after_discovery"] == 1
+assert summary["cross_scene_generalization_claimed"] == 0
+assert summary["holdout_frame_selection_gt_fields"] == 0
+assert summary["confirmation_scene_id"] == summary["discovery_scene_id"]
+assert min(summary["frames"]) > summary["discovery_last_frame"]
 assert summary["gate_rule"] == "positive_depth AND condition_number < 100 AND num_views >= 4"
 assert summary["candidate_generation_raw_pointmap_fields"] == 0
 assert summary["candidate_generation_gt_fields"] == 0
-assert summary["source_new_sequence_gt_scores_read_after_gate_freeze"] == 1
+assert summary["source_temporal_holdout_gt_scores_read_after_gate_freeze"] == 1
 assert summary["model_loaded_or_run"] == 0
 assert summary["model_trained"] == 0
 assert summary["pose_modified"] == 0
@@ -59,8 +66,11 @@ assert [row["branch"] for row in summary["branches"]] == [
 decision = summary["decision"]
 assert decision["t02_decision"] in {"GO", "NO_GO"}
 assert decision["same_frozen_gate_all_branches"] == 1
-assert decision["new_sequence_differs_from_discovery_clip"] == 1
-assert decision["gate_thresholds_selected_with_new_sequence_gt"] == 0
+assert decision["same_scene_unseen_temporal_holdout"] == 1
+assert decision["same_scene_as_discovery"] == 1
+assert decision["frame_overlap_with_discovery"] == 0
+assert decision["all_confirmation_frames_after_discovery"] == 1
+assert decision["gate_thresholds_selected_with_holdout_gt"] == 0
 assert decision["formal_v0_pose_modified"] == 0
 assert decision["formal_v0_pointmap_modified"] == 0
 assert decision["formal_v0_semantic_map_modified"] == 0

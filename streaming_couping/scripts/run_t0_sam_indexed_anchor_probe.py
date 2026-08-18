@@ -115,6 +115,8 @@ def main() -> None:
             "schema": 1,
             "revision": REVISION,
             "artifact_role": "frozen_independent_3d_anchor_candidates",
+            "clip_name": str(payload["clip_name"]),
+            "scene_id": str(payload["scene_id"]),
             "frame_indices": tuple(int(value) for value in payload["frame_indices"]),
             "candidate_generation_fields": (
                 "cached_streamvggt_patch_tokens",
@@ -677,6 +679,7 @@ def _score_candidates(
         "baseline_version": "v0",
         "baseline_status": "frozen_unchanged",
         "clip": payload["clip_name"],
+        "scene_id": str(payload["scene_id"]),
         "frames": tuple(int(value) for value in payload["frame_indices"]),
         "branches": branch_rows,
         "branch_lookup": lookup,
@@ -1031,6 +1034,7 @@ def _validate_inputs(
         "patch_start_idx",
         "patch_shape",
         "image_size",
+        "scene_id",
         "frame_indices",
         "tracking_masks_stream",
         "tracking_scores",
@@ -1047,6 +1051,8 @@ def _validate_inputs(
     frames = tuple(int(value) for value in payload["frame_indices"])
     if frames != clip.frame_indices or payload.get("clip_name") != clip.name:
         raise ValueError("V0 cache does not match the configured clip.")
+    if str(payload.get("scene_id", "")) != clip.scene_id:
+        raise ValueError("V0 cache scene does not match the configured clip.")
     if qk.get("selected_pose_branch") != "retrieve_qk":
         raise ValueError("T0 requires the frozen retrieve_qk pose artifact.")
     if tuple(int(value) for value in qk.get("frame_indices", ())) != frames:
@@ -1081,6 +1087,7 @@ def _write_copyable(path: Path, summary: dict[str, Any]) -> None:
         "===== COPYABLE_T0_SAM_INDEXED_ANCHOR_PROBE_BEGIN =====",
         f"revision={summary['revision']}",
         f"clip={summary['clip']}",
+        f"scene_id={summary['scene_id']}",
         f"frames={len(summary['frames'])}",
         "branches=" + ",".join(row["branch"] for row in summary["branches"]),
         f"descriptor_source={summary['descriptor']['source']}",

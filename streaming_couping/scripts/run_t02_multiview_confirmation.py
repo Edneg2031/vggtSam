@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Confirm a frozen low-condition, multi-view triangulation gate on a new clip."""
+"""Confirm the frozen multi-view gate on an unseen same-scene time holdout."""
 
 from __future__ import annotations
 
@@ -26,7 +26,8 @@ from streaming_couping.scripts.run_t01_triangulation_reliability import (
 )
 
 
-REVISION = "t02_new_sequence_multiview_triangulation_confirmation_r1"
+REVISION = "t02_same_scene_temporal_holdout_confirmation_r2"
+VALIDATION_SCOPE = "same_scene_unseen_temporal_holdout"
 BRANCHES = (
     "correct_persistent_id",
     "foreground_union",
@@ -40,6 +41,11 @@ FIXED_MINIMUM_VIEWS = 4
 class T02Run:
     source_path: Path
     discovery_clip: str
+    discovery_scene_id: str
+    discovery_last_frame: int
+    validation_scope: str
+    confirmation_clip: str
+    confirmation_frames: tuple[int, ...]
     source_t0_output_dir: Path
     output_dir: Path
     gate: "T02Gate"
@@ -60,6 +66,7 @@ def main() -> None:
     run = _load_run(args.config)
     artifact_path = run.source_t0_output_dir / "anchors_candidate.pt"
     candidate = torch.load(artifact_path, map_location="cpu", weights_only=False)
+    temporal_protocol = validate_temporal_holdout_source(run, candidate)
 
     anchors_by_branch: dict[str, dict[str, torch.Tensor]] = {}
     metrics_by_branch: dict[str, dict[str, torch.Tensor]] = {}
@@ -80,14 +87,16 @@ def main() -> None:
         {
             "schema": 1,
             "revision": REVISION,
-            "artifact_role": "new_sequence_gt_blind_frozen_gate_assignments",
+            "artifact_role": "temporal_holdout_gt_blind_frozen_gate_assignments",
             "source_candidate_artifact": str(artifact_path),
             "source_candidate_revision": str(candidate["revision"]),
+            "validation_scope": run.validation_scope,
+            **temporal_protocol,
             "branches": BRANCHES,
             "candidate_generation_raw_pointmap_fields": 0,
             "candidate_generation_gt_fields": 0,
             "positive_depth_source": "inferred_from_t0_acceptance_contract",
-            "gate_thresholds_selected_with_new_sequence_gt": 0,
+            "gate_thresholds_selected_with_holdout_gt": 0,
             "gate": asdict(run.gate),
             "protocol_gate_signature": protocol_signature,
             "assignment_signature": assignment_signature,
@@ -108,8 +117,12 @@ def main() -> None:
     manifest = {
         "schema": 1,
         "revision": REVISION,
-        "artifact_role": "new_sequence_gt_blind_gate_freeze_manifest",
+        "artifact_role": "temporal_holdout_gt_blind_gate_freeze_manifest",
         "discovery_clip": run.discovery_clip,
+        "discovery_scene_id": run.discovery_scene_id,
+        "discovery_last_frame": run.discovery_last_frame,
+        "validation_scope": run.validation_scope,
+        **temporal_protocol,
         "source_candidate_artifact": str(artifact_path),
         "source_candidate_revision": str(candidate["revision"]),
         "branches": BRANCHES,
@@ -120,18 +133,18 @@ def main() -> None:
         "candidate_generation_raw_pointmap_fields": 0,
         "candidate_generation_gt_fields": 0,
         "positive_depth_source": "inferred_from_t0_acceptance_contract",
-        "gate_thresholds_selected_with_new_sequence_gt": 0,
+        "gate_thresholds_selected_with_holdout_gt": 0,
         "gate": asdict(run.gate),
         "protocol_gate_signature": protocol_signature,
         "assignment_signature": assignment_signature,
         "frozen_gate_artifact": str(frozen_path),
     }
     _write_json(manifest_path, manifest)
-    print("T0.2 NEW-SEQUENCE MULTI-VIEW TRIANGULATION CONFIRMATION")
+    print("T0.2 SAME-SCENE UNSEEN-TIME MULTI-VIEW CONFIRMATION")
     print("  branches=correct ID, foreground union, shuffled ID")
     print("  fixed gate=positive depth & condition<100 & views>=4")
     print(
-        "  gates frozen before new-sequence GT-derived scores are opened "
+        "  gates frozen before temporal-holdout GT-derived scores are opened "
         f"signature={protocol_signature[:12]}"
     )
 
@@ -140,14 +153,13 @@ def main() -> None:
     t0_summary = _load_t0_summary(
         run.source_t0_output_dir / "summary.json", BRANCHES[0]
     )
-    confirmation_clip = str(t0_summary["clip"])
-    if confirmation_clip == run.discovery_clip:
-        raise ValueError(
-            "T0.2 refuses the discovery clip; provide a genuinely new sequence."
-        )
+    _validate_scored_source_metadata(
+        t0_summary,
+        temporal_protocol=temporal_protocol,
+    )
     for branch in BRANCHES:
         if branch not in t0_summary.get("branch_lookup", {}):
-            raise ValueError(f"New-sequence T0 summary lacks branch {branch!r}.")
+            raise ValueError(f"Temporal-holdout T0 summary lacks branch {branch!r}.")
     attempted = {
         int(t0_summary["branch_lookup"][branch]["attempted_query_count"])
         for branch in BRANCHES
@@ -175,6 +187,7 @@ def main() -> None:
         manifest_path=manifest_path,
         protocol_signature=protocol_signature,
         assignment_signature=assignment_signature,
+        temporal_protocol=temporal_protocol,
         scored_by_branch=scored_by_branch,
     )
     _write_outputs(
@@ -207,6 +220,7 @@ def _score_confirmation(
     manifest_path: Path,
     protocol_signature: str,
     assignment_signature: str,
+    temporal_protocol: dict[str, Any],
     scored_by_branch: dict[str, list[dict[str, Any]]],
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     branch_rows = []
@@ -256,8 +270,13 @@ def _score_confirmation(
         "correct_id_confirmation_pass": int(correct_pass),
         "sam_geometry_interpretation": sam_interpretation,
         "same_frozen_gate_all_branches": 1,
-        "new_sequence_differs_from_discovery_clip": 1,
-        "gate_thresholds_selected_with_new_sequence_gt": 0,
+        "same_scene_unseen_temporal_holdout": 1,
+        "same_scene_as_discovery": temporal_protocol["same_scene_as_discovery"],
+        "frame_overlap_with_discovery": temporal_protocol["frame_overlap_with_discovery"],
+        "all_confirmation_frames_after_discovery": temporal_protocol[
+            "all_confirmation_frames_after_discovery"
+        ],
+        "gate_thresholds_selected_with_holdout_gt": 0,
         "formal_v0_pose_modified": 0,
         "formal_v0_pointmap_modified": 0,
         "formal_v0_semantic_map_modified": 0,
@@ -270,13 +289,24 @@ def _score_confirmation(
     summary = {
         "schema": 1,
         "revision": REVISION,
-        "experiment": "new_sequence_reliable_multiview_triangulation_confirmation",
+        "experiment": "same_scene_unseen_temporal_holdout_multiview_confirmation",
         "baseline_version": "v0",
         "baseline_status": "frozen_unchanged",
+        "validation_scope": run.validation_scope,
         "discovery_clip": run.discovery_clip,
+        "discovery_scene_id": run.discovery_scene_id,
+        "discovery_last_frame": run.discovery_last_frame,
         "confirmation_clip": t0_summary["clip"],
+        "confirmation_scene_id": temporal_protocol["confirmation_scene_id"],
         "frames": t0_summary["frames"],
-        "new_sequence_confirmation": 1,
+        "same_scene_unseen_temporal_holdout": 1,
+        "same_scene_as_discovery": temporal_protocol["same_scene_as_discovery"],
+        "frame_overlap_with_discovery": temporal_protocol["frame_overlap_with_discovery"],
+        "all_confirmation_frames_after_discovery": temporal_protocol[
+            "all_confirmation_frames_after_discovery"
+        ],
+        "cross_scene_generalization_claimed": 0,
+        "holdout_frame_selection_gt_fields": 0,
         "source_t0_revision": candidate["revision"],
         "source_t0_decision": t0_summary["decision"]["t0_decision"],
         "branches": branch_rows,
@@ -297,7 +327,7 @@ def _score_confirmation(
         },
         "candidate_generation_raw_pointmap_fields": 0,
         "candidate_generation_gt_fields": 0,
-        "source_new_sequence_gt_scores_read_after_gate_freeze": 1,
+        "source_temporal_holdout_gt_scores_read_after_gate_freeze": 1,
         "model_loaded_or_run": 0,
         "model_trained": 0,
         "pose_modified": 0,
@@ -309,9 +339,9 @@ def _score_confirmation(
         "frozen_gate_manifest": str(manifest_path),
         "decision": decision,
         "claim": (
-            "fixed_reliable_multiview_triangulation_generalizes_to_new_sequence"
+            "fixed_reliable_multiview_triangulation_confirmed_on_same_scene_unseen_time"
             if correct_pass
-            else "fixed_reliable_multiview_triangulation_not_confirmed_on_new_sequence"
+            else "fixed_reliable_multiview_triangulation_not_confirmed_on_same_scene_unseen_time"
         ),
     }
     return summary, branch_rows, anchor_rows
@@ -348,6 +378,67 @@ def t02_gate_mask(
     if gate.require_positive_depth:
         accepted &= positive
     return accepted
+
+
+def validate_temporal_holdout_source(
+    run: T02Run,
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate holdout identity using candidate-only, non-GT metadata."""
+
+    confirmation_clip = str(candidate.get("clip_name", "")).strip()
+    confirmation_scene_id = str(candidate.get("scene_id", "")).strip()
+    frames = tuple(int(value) for value in candidate.get("frame_indices", ()))
+    if not confirmation_clip or not confirmation_scene_id or not frames:
+        raise ValueError(
+            "T0.2 candidate artifact lacks clip_name, scene_id or frame_indices."
+        )
+    if confirmation_clip == run.discovery_clip:
+        raise ValueError("T0.2 confirmation clip must differ from discovery clip.")
+    if confirmation_clip != run.confirmation_clip:
+        raise ValueError("T0.2 candidate clip differs from the frozen holdout clip.")
+    if confirmation_scene_id != run.discovery_scene_id:
+        raise ValueError(
+            "T0.2 is a same-scene temporal holdout; confirmation scene differs "
+            "from discovery_scene_id."
+        )
+    if len(frames) != len(set(frames)):
+        raise ValueError("T0.2 confirmation frames contain duplicates.")
+    if tuple(sorted(frames)) != frames:
+        raise ValueError("T0.2 confirmation frames must be time ordered.")
+    if frames != run.confirmation_frames:
+        raise ValueError("T0.2 candidate frames differ from the frozen holdout frames.")
+    if min(frames) <= run.discovery_last_frame:
+        raise ValueError(
+            "T0.2 requires every confirmation frame to occur after the "
+            "discovery interval."
+        )
+    return {
+        "confirmation_clip": confirmation_clip,
+        "confirmation_scene_id": confirmation_scene_id,
+        "confirmation_frames": frames,
+        "same_scene_as_discovery": 1,
+        "frame_overlap_with_discovery": 0,
+        "all_confirmation_frames_after_discovery": 1,
+    }
+
+
+def _validate_scored_source_metadata(
+    summary: dict[str, Any],
+    *,
+    temporal_protocol: dict[str, Any],
+) -> None:
+    """Ensure the post-freeze score files describe the frozen candidate."""
+
+    if str(summary.get("clip", "")) != temporal_protocol["confirmation_clip"]:
+        raise ValueError("T0 summary clip differs from the frozen candidate artifact.")
+    if str(summary.get("scene_id", "")) != temporal_protocol[
+        "confirmation_scene_id"
+    ]:
+        raise ValueError("T0 summary scene differs from the frozen candidate artifact.")
+    frames = tuple(int(value) for value in summary.get("frames", ()))
+    if frames != tuple(temporal_protocol["confirmation_frames"]):
+        raise ValueError("T0 summary frames differ from the frozen candidate artifact.")
 
 
 def interpret_sam_geometry(
@@ -403,14 +494,22 @@ def _write_copyable(path: Path, summary: dict[str, Any]) -> None:
     lines = [
         "===== COPYABLE_T02_MULTIVIEW_CONFIRMATION_BEGIN =====",
         f"revision={summary['revision']}",
+        f"validation_scope={summary['validation_scope']}",
         f"discovery_clip={summary['discovery_clip']}",
+        f"discovery_scene_id={summary['discovery_scene_id']}",
+        f"discovery_last_frame={summary['discovery_last_frame']}",
         f"confirmation_clip={summary['confirmation_clip']}",
+        f"confirmation_scene_id={summary['confirmation_scene_id']}",
         f"frames={len(summary['frames'])}",
         "branches=" + ",".join(row["branch"] for row in summary["branches"]),
         f"gate={summary['gate_rule']}",
         f"protocol_gate_signature={summary['protocol_gate_signature']}",
-        "new_sequence_confirmation=1",
-        "gate_thresholds_selected_with_new_sequence_gt=0",
+        "same_scene_as_discovery=1",
+        "frame_overlap_with_discovery=0",
+        "all_confirmation_frames_after_discovery=1",
+        "cross_scene_generalization_claimed=0",
+        "holdout_frame_selection_gt_fields=0",
+        "gate_thresholds_selected_with_holdout_gt=0",
         "candidate_generation_raw_pointmap_fields=0",
         "candidate_generation_gt_fields=0",
         "model_loaded_or_run=0",
@@ -471,10 +570,26 @@ def _load_run(path: str | Path) -> T02Run:
         discovery_clip=str(
             raw.get("discovery_clip", "00a231a370_90_525_step15_37_68_54")
         ),
+        discovery_scene_id=str(raw.get("discovery_scene_id", "00a231a370")),
+        discovery_last_frame=int(raw.get("discovery_last_frame", 525)),
+        validation_scope=str(raw.get("validation_scope", VALIDATION_SCOPE)),
+        confirmation_clip=str(
+            raw.get(
+                "confirmation_clip",
+                "00a231a370_533_591_step2_t02_holdout",
+            )
+        ),
+        confirmation_frames=tuple(
+            int(value)
+            for value in raw.get(
+                "confirmation_frame_indices",
+                tuple(range(533, 592, 2)),
+            )
+        ),
         source_t0_output_dir=_resolve(
             raw.get(
                 "source_t0_output_dir",
-                "outputs/streaming_couping_t02_new_sequence_anchor_probe",
+                "outputs/streaming_couping_t02_temporal_holdout_anchor_probe",
             )
         ),
         output_dir=_resolve(
@@ -501,8 +616,26 @@ def _load_run(path: str | Path) -> T02Run:
 def _validate_run(run: T02Run) -> None:
     if not run.discovery_clip.strip():
         raise ValueError("T0.2 discovery clip cannot be empty.")
+    if not run.discovery_scene_id.strip():
+        raise ValueError("T0.2 discovery scene cannot be empty.")
+    if run.discovery_last_frame < 0:
+        raise ValueError("T0.2 discovery_last_frame cannot be negative.")
+    if run.validation_scope != VALIDATION_SCOPE:
+        raise ValueError(
+            f"T0.2 validation_scope is frozen at {VALIDATION_SCOPE!r}."
+        )
+    if not run.confirmation_clip.strip():
+        raise ValueError("T0.2 confirmation clip cannot be empty.")
+    if run.confirmation_clip == run.discovery_clip:
+        raise ValueError("T0.2 confirmation and discovery clips must differ.")
+    if len(run.confirmation_frames) != 30:
+        raise ValueError("T0.2 confirmation holdout is frozen at 30 frames.")
+    if tuple(sorted(set(run.confirmation_frames))) != run.confirmation_frames:
+        raise ValueError("T0.2 confirmation frames must be unique and ordered.")
+    if min(run.confirmation_frames) <= run.discovery_last_frame:
+        raise ValueError("T0.2 confirmation frames must all follow discovery.")
     if run.output_dir == run.source_t0_output_dir:
-        raise ValueError("T0.2 cannot overwrite its new-sequence T0 source.")
+        raise ValueError("T0.2 cannot overwrite its temporal-holdout T0 source.")
     # Hard rejection prevents changing the post-T0.1 confirmation hypothesis.
     if (
         run.gate.maximum_condition_number_exclusive
@@ -522,7 +655,12 @@ def _validate_run(run: T02Run) -> None:
 def _protocol_signature(run: T02Run) -> str:
     payload = {
         "revision": REVISION,
+        "validation_scope": run.validation_scope,
         "discovery_clip": run.discovery_clip,
+        "discovery_scene_id": run.discovery_scene_id,
+        "discovery_last_frame": run.discovery_last_frame,
+        "confirmation_clip": run.confirmation_clip,
+        "confirmation_frames": run.confirmation_frames,
         "branches": BRANCHES,
         "gate_rule": "positive_depth AND condition_number < 100 AND num_views >= 4",
         "condition_threshold": FIXED_MAXIMUM_CONDITION_NUMBER,

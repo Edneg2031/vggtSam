@@ -11,15 +11,16 @@ cd "$ROOT"
 [[ -s "$MANIFEST" ]] || { echo "missing manifest: $MANIFEST" >&2; exit 1; }
 
 rm -rf "$OUTPUT"
-echo "T0.2 independent confirmation sequence planning"
+echo "T0.2 same-scene unseen-time holdout planning"
 echo "Reads manifest metadata/file existence only; no mask, pointmap, model or GPU"
 PYTHONPATH=. "$PYTHON_BIN" \
   -m streaming_couping.scripts.plan_t02_confirmation_sequence \
   --manifest "$MANIFEST" \
   --discovery-scene-id 00a231a370 \
+  --discovery-last-frame 525 \
   --frame-count 30 \
-  --frame-stride 15 \
-  --maximum-candidates 20 \
+  --frame-stride 2 \
+  --maximum-candidates 1 \
   --output-dir "$OUTPUT"
 
 [[ -s "$OUTPUT/summary.json" ]] || { echo "missing T0.2 planner summary" >&2; exit 1; }
@@ -32,18 +33,23 @@ summary = json.loads(Path(
     "outputs/streaming_couping_t02_sequence_planner/summary.json"
 ).read_text())
 assert summary["schema"] == 1
-assert summary["revision"] == "t02_manifest_only_confirmation_sequence_planner_r2"
-assert summary["role"] == "t02_new_sequence_planning_only"
-assert summary["discovery_scene_excluded"] == 1
+assert summary["revision"] == "t02_manifest_only_temporal_holdout_planner_r3"
+assert summary["role"] == "t02_same_scene_temporal_holdout_planning_only"
+assert summary["validation_scope"] == "same_scene_unseen_temporal_holdout"
+assert summary["same_scene_required"] == 1
+assert summary["discovery_last_frame"] == 525
 assert summary["gt_geometry_values_read"] == 0
 assert summary["pointmap_file_content_read"] == 0
 assert summary["instance_mask_file_content_read"] == 0
+assert summary["holdout_selection_gt_fields"] == 0
 assert summary["model_loaded_or_run"] == 0
 assert summary["planner_ready"] in {0, 1}
 if summary["planner_ready"]:
-    assert summary["reported_candidate_count"] > 0
-    assert summary["recommended_scene_id"] != "00a231a370"
-eligible = summary["eligible_scene_count"]
+    assert summary["reported_candidate_count"] == 1
+    assert summary["recommended_scene_id"] == "00a231a370"
+    assert summary["recommended_clip_name"] == "00a231a370_533_591_step2_t02_holdout"
+    assert summary["recommended_frame_indices"] == list(range(533, 592, 2))
+eligible = summary["eligible_holdout_count"]
 recommended = summary["recommended_scene_id"]
 ready = summary["planner_ready"]
 print(

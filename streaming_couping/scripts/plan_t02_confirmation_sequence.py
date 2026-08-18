@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan deterministic T0.2 confirmation clips from manifest metadata only."""
+"""Plan a same-scene unseen-time T0.2 holdout from manifest metadata only."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-REVISION = "t02_manifest_only_confirmation_sequence_planner_r2"
+REVISION = "t02_manifest_only_temporal_holdout_planner_r3"
 PATH_FIELDS = ("image_path", "instance_mask", "pointmap")
 MATRIX_FIELDS = ("world_to_camera", "intrinsics")
 REQUIRED_FIELDS = PATH_FIELDS + MATRIX_FIELDS
@@ -24,6 +24,7 @@ def main() -> None:
         manifest,
         manifest_path=manifest_path,
         discovery_scene_id=args.discovery_scene_id,
+        discovery_last_frame=args.discovery_last_frame,
         frame_count=args.frame_count,
         frame_stride=args.frame_stride,
     )
@@ -40,16 +41,17 @@ def main() -> None:
         output_dir,
         manifest_path=manifest_path,
         discovery_scene_id=args.discovery_scene_id,
+        discovery_last_frame=args.discovery_last_frame,
         frame_count=args.frame_count,
         frame_stride=args.frame_stride,
-        eligible_scene_count=len(eligible),
-        rejected_scene_count=rejected,
+        eligible_holdout_count=len(eligible),
+        rejected_holdout_count=rejected,
         candidates=selected,
         diagnostics=candidates,
     )
-    print("T0.2 MANIFEST-ONLY CONFIRMATION SEQUENCE PLANNER")
+    print("T0.2 MANIFEST-ONLY SAME-SCENE TEMPORAL HOLDOUT PLANNER")
     print(
-        f"  eligible_scenes={len(eligible)} "
+        f"  eligible_holdouts={len(eligible)} "
         f"reported={len(selected)} rejected={rejected}"
     )
     if selected:
@@ -68,98 +70,128 @@ def plan_confirmation_sequences(
     *,
     manifest_path: Path,
     discovery_scene_id: str,
+    discovery_last_frame: int,
     frame_count: int,
     frame_stride: int,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Return lexicographically ordered, metadata-complete independent clips."""
+    """Return one centered, metadata-complete post-discovery holdout clip."""
 
     count = int(frame_count)
     maximum_stride = int(frame_stride)
     if count < 2 or maximum_stride < 1:
         raise ValueError("T0.2 frame count/stride are invalid.")
-    rows = []
-    for scene in manifest.get("scenes", ()):
-        scene_id = str(scene.get("scene_id", "")).strip()
-        if not scene_id or scene_id == str(discovery_scene_id):
-            continue
-        frames = scene.get("frames", ())
-        if len(frames) < count:
-            rows.append(
-                {
-                    "scene_id": scene_id,
-                    "scene_frame_count": len(frames),
-                    "clip_name": "",
-                    "frame_count": count,
-                    "frame_stride": 0,
-                    "first_frame": "",
-                    "last_frame": "",
-                    "frame_indices": "",
-                    "required_manifest_fields_complete": 0,
-                    "required_files_exist": 0,
-                    "eligible": 0,
-                    "rejection_reason": "insufficient_frames",
-                }
-            )
-            continue
-        stride = min(maximum_stride, (len(frames) - 1) // (count - 1))
-        span = (count - 1) * stride
-        start = (len(frames) - 1 - span) // 2
-        indices = tuple(start + offset * stride for offset in range(count))
-        selected = [frames[index] for index in indices]
-        field_counts = {
-            field: sum(int(frame.get(field) is not None) for frame in selected)
-            for field in REQUIRED_FIELDS
-        }
-        fields_complete = all(value == count for value in field_counts.values())
-        existing_counts = {
-            field: sum(
-                int(_resolve_manifest_path(frame[field], manifest_path).is_file())
-                for frame in selected
-                if frame.get(field)
-            )
-            for field in PATH_FIELDS
-        }
-        files_complete = all(value == count for value in existing_counts.values())
-        eligible = int(fields_complete and files_complete)
-        clip_name = f"{scene_id}_{indices[0]}_{indices[-1]}_step{stride}_t02"
-        missing_fields = [
-            field for field, value in field_counts.items() if value != count
-        ]
-        missing_files = [
-            field for field, value in existing_counts.items() if value != count
-        ]
-        rejection_reason = ""
-        if missing_fields:
-            rejection_reason = "missing_fields:" + " ".join(missing_fields)
-        elif missing_files:
-            rejection_reason = "missing_files:" + " ".join(missing_files)
-        rows.append(
-            {
-                "scene_id": scene_id,
-                "scene_frame_count": len(frames),
-                "clip_name": clip_name,
-                "frame_count": count,
-                "frame_stride": stride,
-                "first_frame": indices[0],
-                "last_frame": indices[-1],
-                "frame_indices": " ".join(str(value) for value in indices),
-                **{
-                    f"{field}_field_count": field_counts[field]
-                    for field in REQUIRED_FIELDS
-                },
-                **{
-                    f"{field}_existing_file_count": existing_counts[field]
-                    for field in PATH_FIELDS
-                },
-                "required_manifest_fields_complete": int(fields_complete),
-                "required_files_exist": int(files_complete),
-                "eligible": eligible,
-                "rejection_reason": rejection_reason,
-            }
+    scene_id = str(discovery_scene_id).strip()
+    scene = next(
+        (
+            value
+            for value in manifest.get("scenes", ())
+            if str(value.get("scene_id", "")).strip() == scene_id
+        ),
+        None,
+    )
+    if scene is None:
+        return [_rejected_row(scene_id, count, "discovery_scene_missing")], 1
+    frames = scene.get("frames", ())
+    first_allowed = int(discovery_last_frame) + 1
+    span = (count - 1) * maximum_stride
+    maximum_start = len(frames) - 1 - span
+    if maximum_start < first_allowed:
+        reason = (
+            "insufficient_post_discovery_frames:"
+            f"need_last_at_most_{len(frames) - 1}"
         )
-    rows.sort(key=lambda row: (not int(row["eligible"]), str(row["scene_id"])))
-    rejected = sum(int(not int(row["eligible"])) for row in rows)
-    return rows, rejected
+        return [
+            _rejected_row(
+                scene_id,
+                count,
+                reason,
+                scene_frame_count=len(frames),
+            )
+        ], 1
+    start = first_allowed + (maximum_start - first_allowed) // 2
+    indices = tuple(start + offset * maximum_stride for offset in range(count))
+    selected = [frames[index] for index in indices]
+    field_counts = {
+        field: sum(int(frame.get(field) is not None) for frame in selected)
+        for field in REQUIRED_FIELDS
+    }
+    fields_complete = all(value == count for value in field_counts.values())
+    existing_counts = {
+        field: sum(
+            int(_resolve_manifest_path(frame[field], manifest_path).is_file())
+            for frame in selected
+            if frame.get(field)
+        )
+        for field in PATH_FIELDS
+    }
+    files_complete = all(value == count for value in existing_counts.values())
+    eligible = int(fields_complete and files_complete)
+    missing_fields = [
+        field for field, value in field_counts.items() if value != count
+    ]
+    missing_files = [
+        field for field, value in existing_counts.items() if value != count
+    ]
+    rejection_reason = ""
+    if missing_fields:
+        rejection_reason = "missing_fields:" + " ".join(missing_fields)
+    elif missing_files:
+        rejection_reason = "missing_files:" + " ".join(missing_files)
+    row = {
+        "scene_id": scene_id,
+        "scene_frame_count": len(frames),
+        "clip_name": (
+            f"{scene_id}_{indices[0]}_{indices[-1]}_step"
+            f"{maximum_stride}_t02_holdout"
+        ),
+        "frame_count": count,
+        "frame_stride": maximum_stride,
+        "first_frame": indices[0],
+        "last_frame": indices[-1],
+        "frame_indices": " ".join(str(value) for value in indices),
+        "same_scene_as_discovery": 1,
+        "frame_overlap_with_discovery": 0,
+        "all_frames_after_discovery": 1,
+        **{
+            f"{field}_field_count": field_counts[field]
+            for field in REQUIRED_FIELDS
+        },
+        **{
+            f"{field}_existing_file_count": existing_counts[field]
+            for field in PATH_FIELDS
+        },
+        "required_manifest_fields_complete": int(fields_complete),
+        "required_files_exist": int(files_complete),
+        "eligible": eligible,
+        "rejection_reason": rejection_reason,
+    }
+    return [row], int(not eligible)
+
+
+def _rejected_row(
+    scene_id: str,
+    frame_count: int,
+    reason: str,
+    *,
+    scene_frame_count: int = 0,
+) -> dict[str, Any]:
+    return {
+        "scene_id": scene_id,
+        "scene_frame_count": scene_frame_count,
+        "clip_name": "",
+        "frame_count": frame_count,
+        "frame_stride": 0,
+        "first_frame": "",
+        "last_frame": "",
+        "frame_indices": "",
+        "same_scene_as_discovery": 1,
+        "frame_overlap_with_discovery": 0,
+        "all_frames_after_discovery": 0,
+        "required_manifest_fields_complete": 0,
+        "required_files_exist": 0,
+        "eligible": 0,
+        "rejection_reason": reason,
+    }
 
 
 def _write_outputs(
@@ -167,10 +199,11 @@ def _write_outputs(
     *,
     manifest_path: Path,
     discovery_scene_id: str,
+    discovery_last_frame: int,
     frame_count: int,
     frame_stride: int,
-    eligible_scene_count: int,
-    rejected_scene_count: int,
+    eligible_holdout_count: int,
+    rejected_holdout_count: int,
     candidates: list[dict[str, Any]],
     diagnostics: list[dict[str, Any]],
 ) -> Path:
@@ -183,22 +216,25 @@ def _write_outputs(
     summary = {
         "schema": 1,
         "revision": REVISION,
-        "role": "t02_new_sequence_planning_only",
+        "role": "t02_same_scene_temporal_holdout_planning_only",
         "source": "manifest_metadata_and_file_existence_only",
         "manifest": str(manifest_path),
         "discovery_scene_id": str(discovery_scene_id),
-        "discovery_scene_excluded": 1,
+        "discovery_last_frame": int(discovery_last_frame),
+        "validation_scope": "same_scene_unseen_temporal_holdout",
+        "same_scene_required": 1,
         "frame_count": int(frame_count),
         "frame_stride": int(frame_stride),
-        "selection_rule": "centered_adaptive_stride_capped_then_scene_id_lexicographic",
+        "selection_rule": "post_discovery_centered_fixed_stride",
         "required_frame_fields": REQUIRED_FIELDS,
         "gt_geometry_values_read": 0,
         "pointmap_file_content_read": 0,
         "instance_mask_file_content_read": 0,
+        "holdout_selection_gt_fields": 0,
         "model_loaded_or_run": 0,
-        "eligible_scene_count": int(eligible_scene_count),
+        "eligible_holdout_count": int(eligible_holdout_count),
         "reported_candidate_count": len(candidates),
-        "rejected_scene_count": int(rejected_scene_count),
+        "rejected_holdout_count": int(rejected_holdout_count),
         "planner_ready": int(primary is not None),
         "recommended_scene_id": (
             str(primary["scene_id"]) if primary is not None else None
@@ -231,7 +267,9 @@ def _write_copyable(path: Path, summary: dict[str, Any]) -> None:
     lines = [
         "===== COPYABLE_T02_SEQUENCE_PLANNER_BEGIN =====",
         f"revision={summary['revision']}",
+        f"validation_scope={summary['validation_scope']}",
         f"discovery_scene_id={summary['discovery_scene_id']}",
+        f"discovery_last_frame={summary['discovery_last_frame']}",
         f"frame_count={summary['frame_count']}",
         f"frame_stride={summary['frame_stride']}",
         f"selection_rule={summary['selection_rule']}",
@@ -239,8 +277,9 @@ def _write_copyable(path: Path, summary: dict[str, Any]) -> None:
         "gt_geometry_values_read=0",
         "pointmap_file_content_read=0",
         "instance_mask_file_content_read=0",
+        "holdout_selection_gt_fields=0",
         "model_loaded_or_run=0",
-        f"eligible_scene_count={summary['eligible_scene_count']}",
+        f"eligible_holdout_count={summary['eligible_holdout_count']}",
         f"reported_candidate_count={summary['reported_candidate_count']}",
         f"planner_ready={summary['planner_ready']}",
         f"recommended_scene_id={summary['recommended_scene_id']}",
@@ -318,8 +357,9 @@ def _parse_args() -> argparse.Namespace:
         default="data/processed/scannetpp_pinhole_2d/manifest.json",
     )
     parser.add_argument("--discovery-scene-id", default="00a231a370")
+    parser.add_argument("--discovery-last-frame", type=int, default=525)
     parser.add_argument("--frame-count", type=int, default=30)
-    parser.add_argument("--frame-stride", type=int, default=15)
+    parser.add_argument("--frame-stride", type=int, default=2)
     parser.add_argument("--maximum-candidates", type=int, default=20)
     parser.add_argument(
         "--output-dir",

@@ -1,6 +1,11 @@
-# Confirm the post-T0.1 hypothesis on a genuinely new sequence.
+# Confirm the post-T0.1 gate on an unseen later interval of the same scene.
 discovery_clip: 00a231a370_90_525_step15_37_68_54
-source_t0_output_dir: outputs/streaming_couping_t02_new_sequence_anchor_probe
+discovery_scene_id: 00a231a370
+discovery_last_frame: 525
+validation_scope: same_scene_unseen_temporal_holdout
+confirmation_clip: 00a231a370_533_591_step2_t02_holdout
+confirmation_frame_indices: [533, 535, 537, 539, 541, 543, 545, 547, 549, 551, 553, 555, 557, 559, 561, 563, 565, 567, 569, 571, 573, 575, 577, 579, 581, 583, 585, 587, 589, 591]
+source_t0_output_dir: outputs/streaming_couping_t02_temporal_holdout_anchor_probe
 output_dir: outputs/streaming_couping_t02_multiview_confirmation
 
 # Frozen protocol: changing either value is rejected by the runner.
