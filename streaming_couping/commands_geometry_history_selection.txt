@@ -1,0 +1,75 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+GPU0="${GEOMETRY_HISTORY_GPU0:-1}"
+GPU1="${GEOMETRY_HISTORY_GPU1:-2}"
+CONFIG=streaming_couping/configs/geometry_history_selection.yaml
+OUTPUT=outputs/streaming_couping_geometry_history_selection
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+[[ -s outputs/streaming_couping_v0/cache/00a231a370_90_525_step15_37_68_54.pt ]] || {
+  echo "missing frozen V0 cache; run commands_v0_baseline.txt first" >&2
+  exit 1
+}
+[[ -s outputs/streaming_couping_v0/qk_pose_retrieval/qk_pose_output.pt ]] || {
+  echo "missing frozen V0 QK pose artifact; run commands_v0_baseline.txt first" >&2
+  exit 1
+}
+
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+echo "Geometry history smoke: QK overlap pool, view complementarity and causality"
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_geometry_history_selection
+
+rm -rf "$OUTPUT"
+echo "Training-free geometry-specific point-head history selection"
+echo "physical GPUs=$GPU0,$GPU1 logical StreamVGGT=cuda:0,cuda:1"
+echo "V0 pose/pointmap/semantic artifacts are read-only and never overwritten"
+CUDA_VISIBLE_DEVICES="$GPU0,$GPU1" PYTHONUNBUFFERED=1 PYTHONPATH=. \
+  "$PYTHON_BIN" -m streaming_couping.scripts.run_geometry_history_selection \
+  --config "$CONFIG" \
+  --streamvggt-devices cuda:0,cuda:1
+
+[[ -s "$OUTPUT/summary.json" ]] || { echo "missing experiment summary" >&2; exit 1; }
+[[ -s "$OUTPUT/candidate_pointmaps_native.pt" ]] || { echo "missing candidate pointmaps" >&2; exit 1; }
+PYTHONPATH=. "$PYTHON_BIN" -c '
+import json
+from pathlib import Path
+path = Path("outputs/streaming_couping_geometry_history_selection/summary.json")
+summary = json.loads(path.read_text())
+assert summary["schema"] == 1
+assert summary["revision"] == "geometry_specific_history_selection_r1"
+assert summary["baseline_version"] == "v0"
+assert summary["baseline_status"] == "frozen_unchanged"
+assert summary["candidate_generation_gt_fields"] == 0
+assert summary["sam_candidate_inputs"] == 0
+assert summary["model_trained"] == 0
+assert summary["camera_head_run"] == 0
+assert summary["depth_head_run"] == 0
+assert summary["point_head_run"] == 1
+assert [row["branch"] for row in summary["branches"]] == [
+    "full_history", "qk_top4", "geometry_top4"
+]
+decision = summary["decision"]
+assert decision["formal_v0_pose_modified"] == 0
+assert decision["formal_v0_pointmap_modified"] == 0
+assert decision["formal_v0_semantic_map_modified"] == 0
+geometry = summary["branch_lookup"]["geometry_top4"]
+paired = geometry["paired_gain_vs_full_percent"]
+symmetric = geometry["symmetric_gain_vs_full_percent"]
+passed = decision["geometry_history_pass"]
+print(
+    "Geometry history result accepted "
+    f"paired_gain={paired:.4f}% "
+    f"symmetric_gain={symmetric:.4f}% "
+    f"pass={passed}"
+)
+'
+
+echo ""
+sed -n '1,180p' "$OUTPUT/copyable_result.txt"
