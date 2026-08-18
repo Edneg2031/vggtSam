@@ -26,7 +26,7 @@ from streaming_couping.scripts.run_t01_triangulation_reliability import (
 )
 
 
-REVISION = "t02_same_scene_temporal_holdout_confirmation_r2"
+REVISION = "t02_same_scene_temporal_holdout_confirmation_r3"
 VALIDATION_SCOPE = "same_scene_unseen_temporal_holdout"
 BRANCHES = (
     "correct_persistent_id",
@@ -72,7 +72,11 @@ def main() -> None:
     metrics_by_branch: dict[str, dict[str, torch.Tensor]] = {}
     masks_by_branch: dict[str, torch.Tensor] = {}
     for branch in BRANCHES:
-        anchors = _validate_and_select_candidates(candidate, branch)
+        anchors = _validate_and_select_candidates(
+            candidate,
+            branch,
+            allow_empty=(branch != "correct_persistent_id"),
+        )
         metrics = _candidate_metrics(anchors)
         anchors_by_branch[branch] = anchors
         metrics_by_branch[branch] = metrics
@@ -175,6 +179,7 @@ def main() -> None:
             anchors=anchors_by_branch[branch],
             metrics=metrics_by_branch[branch],
             gate_masks={"frozen_gate": masks_by_branch[branch]},
+            allow_empty=(branch != "correct_persistent_id"),
         )
         for branch in BRANCHES
     }

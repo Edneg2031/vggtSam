@@ -162,7 +162,10 @@ def main() -> None:
 
 
 def _validate_and_select_candidates(
-    payload: dict[str, Any], branch: str
+    payload: dict[str, Any],
+    branch: str,
+    *,
+    allow_empty: bool = False,
 ) -> dict[str, torch.Tensor]:
     if int(payload.get("schema", -1)) != 1:
         raise ValueError("T0 candidate artifact schema is not supported.")
@@ -195,7 +198,7 @@ def _validate_and_select_candidates(
     if missing:
         raise ValueError(f"T0 candidate branch is missing {sorted(missing)}.")
     count = int(torch.as_tensor(anchors["point_world"]).shape[0])
-    if count < 1:
+    if count < 1 and not allow_empty:
         raise ValueError("T0 candidate branch contains no anchors.")
     for name in required:
         if int(torch.as_tensor(anchors[name]).shape[0]) != count:
@@ -245,6 +248,7 @@ def _load_and_validate_scores(
     anchors: dict[str, torch.Tensor],
     metrics: dict[str, torch.Tensor],
     gate_masks: dict[str, torch.Tensor],
+    allow_empty: bool = False,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with path.open(newline="", encoding="utf8") as handle:
@@ -300,7 +304,7 @@ def _load_and_validate_scores(
                     },
                 }
             )
-    if not rows:
+    if not rows and not allow_empty:
         raise ValueError("T0 score table has no rows for the configured branch.")
     indices = [int(row["anchor_index"]) for row in rows]
     if len(indices) != len(set(indices)):

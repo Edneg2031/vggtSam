@@ -38,7 +38,7 @@ from pathlib import Path
 path = Path("outputs/streaming_couping_t02_multiview_confirmation/summary.json")
 summary = json.loads(path.read_text())
 assert summary["schema"] == 1
-assert summary["revision"] == "t02_same_scene_temporal_holdout_confirmation_r2"
+assert summary["revision"] == "t02_same_scene_temporal_holdout_confirmation_r3"
 assert summary["baseline_version"] == "v0"
 assert summary["baseline_status"] == "frozen_unchanged"
 assert summary["validation_scope"] == "same_scene_unseen_temporal_holdout"

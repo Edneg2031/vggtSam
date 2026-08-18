@@ -32,6 +32,8 @@ shuffled_persistent_id
 ```
 
 gate assignment 会在读取 holdout 的 GT-derived anchor score 之前冻结并签名。
+若 control 分支没有产生有效 anchor，会记录为 0 anchors，并把 SAM 对照解释为
+`insufficient_control_anchor_support`；它不会让 correct-ID 的几何确认整体崩溃。
 正式 V0 始终不变：
 
 ```text
