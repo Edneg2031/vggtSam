@@ -14,7 +14,7 @@ from .qk_pose_retrieval import rank_qk_history
 class GeometryHistoryPolicy:
     total_frame_budget: int = 5
     anchor_frames: int = 1
-    overlap_pool_size: int = 8
+    overlap_pool_size: int = 12
 
     def validate(self) -> None:
         if int(self.total_frame_budget) < 2:
@@ -40,12 +40,13 @@ def select_geometry_history(
     *,
     policy: GeometryHistoryPolicy,
 ) -> GeometryHistorySelection:
-    """Select overlap first, then favor complementary camera viewpoints.
+    """Select QK overlap first, then greedily diversify camera viewpoints.
 
-    The first-stage QK pool is an RGB-only overlap proxy.  Within that pool,
-    camera-center distance and relative rotation are ranked independently and
-    combined with equal weight.  Only ranks are used, so native pose scale does
-    not introduce a tuned metric threshold.
+    The first-stage QK pool is an RGB-only overlap gate.  The best-QK candidate
+    seeds the set.  Each later candidate maximizes its mean camera-center and
+    rotation distance from the already selected set.  Distances are converted
+    to ranks at every greedy step, avoiding a tuned translation/rotation unit
+    conversion.
     """
 
     policy.validate()
@@ -71,38 +72,102 @@ def select_geometry_history(
 
     qk_ranked = rank_qk_history(qk_scores, indices=available)
     pool = tuple(qk_ranked[: min(int(policy.overlap_pool_size), len(qk_ranked))])
-    baselines, rotations = _view_complementarity(
-        poses,
-        current_index=frame,
-        history_indices=pool,
+    pose_rotations, pose_centers = _camera_geometry(poses)
+    current_baselines, current_rotations = _mean_pose_distances(
+        pose_rotations,
+        pose_centers,
+        candidate_indices=pool,
+        reference_indices=(frame,),
     )
-    baseline_ranks = _normalized_ranks(baselines, pool)
-    rotation_ranks = _normalized_ranks(rotations, pool)
-    geometry_scores = 0.5 * (baseline_ranks + rotation_ranks)
-    pool_positions = {history: position for position, history in enumerate(pool)}
-    geometry_ranked = tuple(
-        sorted(
-            pool,
-            key=lambda history: (
-                -float(geometry_scores[pool_positions[history]]),
-                -float(qk_scores[history]),
-                history,
-            ),
+    chosen = [pool[0]]
+    selection_details: dict[int, dict[str, Any]] = {
+        pool[0]: {
+            "greedy_selection_step": 1,
+            "selection_mean_baseline_to_prior_native": 0.0,
+            "selection_mean_rotation_to_prior_degrees": 0.0,
+            "selection_baseline_rank_normalized": 0.0,
+            "selection_rotation_rank_normalized": 0.0,
+            "selection_diversity_score": 0.0,
+        }
+    }
+    while len(chosen) < remaining:
+        candidates = tuple(history for history in pool if history not in chosen)
+        baselines, rotations = _mean_pose_distances(
+            pose_rotations,
+            pose_centers,
+            candidate_indices=candidates,
+            reference_indices=tuple(chosen),
         )
-    )
-    chosen = tuple(geometry_ranked[:remaining])
-    selected = tuple(sorted((*anchors, *chosen)))
-    chosen_set = set(chosen)
+        baseline_ranks = _normalized_ranks(baselines, candidates)
+        rotation_ranks = _normalized_ranks(rotations, candidates)
+        diversity_scores = 0.5 * (baseline_ranks + rotation_ranks)
+        winner_position = sorted(
+            range(len(candidates)),
+            key=lambda position: (
+                -float(diversity_scores[position]),
+                -float(qk_scores[candidates[position]]),
+                int(candidates[position]),
+            ),
+        )[0]
+        winner = candidates[winner_position]
+        chosen.append(winner)
+        selection_details[winner] = {
+            "greedy_selection_step": len(chosen),
+            "selection_mean_baseline_to_prior_native": float(
+                baselines[winner_position]
+            ),
+            "selection_mean_rotation_to_prior_degrees": float(
+                rotations[winner_position]
+            ),
+            "selection_baseline_rank_normalized": float(
+                baseline_ranks[winner_position]
+            ),
+            "selection_rotation_rank_normalized": float(
+                rotation_ranks[winner_position]
+            ),
+            "selection_diversity_score": float(diversity_scores[winner_position]),
+        }
+    chosen_tuple = tuple(chosen)
+    final_baselines = []
+    final_rotations = []
+    for history in pool:
+        references = tuple(value for value in chosen_tuple if value != history)
+        if not references:
+            references = chosen_tuple
+        baseline, rotation = _mean_pose_distances(
+            pose_rotations,
+            pose_centers,
+            candidate_indices=(history,),
+            reference_indices=references,
+        )
+        final_baselines.append(float(baseline[0]))
+        final_rotations.append(float(rotation[0]))
+    selected = tuple(sorted((*anchors, *chosen_tuple)))
+    chosen_set = set(chosen_tuple)
     diagnostics = tuple(
         {
             "history_sequence_index": int(history),
             "qk_pool_rank": int(position),
             "qk_score": float(qk_scores[history]),
-            "camera_center_baseline_native": float(baselines[position]),
-            "relative_rotation_degrees": float(rotations[position]),
-            "baseline_rank_normalized": float(baseline_ranks[position]),
-            "rotation_rank_normalized": float(rotation_ranks[position]),
-            "geometry_score": float(geometry_scores[position]),
+            "camera_center_baseline_to_current_native": float(
+                current_baselines[position]
+            ),
+            "relative_rotation_to_current_degrees": float(
+                current_rotations[position]
+            ),
+            "mean_baseline_to_final_selected_native": final_baselines[position],
+            "mean_rotation_to_final_selected_degrees": final_rotations[position],
+            **selection_details.get(
+                history,
+                {
+                    "greedy_selection_step": -1,
+                    "selection_mean_baseline_to_prior_native": None,
+                    "selection_mean_rotation_to_prior_degrees": None,
+                    "selection_baseline_rank_normalized": None,
+                    "selection_rotation_rank_normalized": None,
+                    "selection_diversity_score": None,
+                },
+            ),
             "selected": int(history in chosen_set),
         }
         for position, history in enumerate(pool)
@@ -110,15 +175,7 @@ def select_geometry_history(
     return GeometryHistorySelection(selected, pool, diagnostics)
 
 
-def _view_complementarity(
-    poses: torch.Tensor,
-    *,
-    current_index: int,
-    history_indices: tuple[int, ...],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if not history_indices:
-        empty = torch.empty(0, dtype=torch.float32)
-        return empty, empty
+def _camera_geometry(poses: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     rotations = torch.stack(
         [_project_rotation(matrix[:3, :3]) for matrix in poses]
     )
@@ -126,19 +183,60 @@ def _view_complementarity(
     centers = -torch.einsum(
         "sij,sj->si", rotations.transpose(-1, -2), translations
     )
-    indices = torch.tensor(history_indices, dtype=torch.long)
+    return rotations, centers
+
+
+def _mean_pose_distances(
+    rotations: torch.Tensor,
+    centers: torch.Tensor,
+    *,
+    candidate_indices: tuple[int, ...],
+    reference_indices: tuple[int, ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not candidate_indices:
+        empty = torch.empty(0, dtype=torch.float32)
+        return empty, empty
+    if not reference_indices:
+        raise ValueError("Pose diversity needs at least one reference view.")
+    candidates = torch.tensor(candidate_indices, dtype=torch.long)
+    references = torch.tensor(reference_indices, dtype=torch.long)
+    candidate_centers = centers.index_select(0, candidates)
+    reference_centers = centers.index_select(0, references)
     baselines = torch.linalg.vector_norm(
-        centers.index_select(0, indices) - centers[int(current_index)],
+        candidate_centers[:, None, :] - reference_centers[None, :, :],
         dim=-1,
-    )
-    current_rotation = rotations[int(current_index)]
-    history_rotations = rotations.index_select(0, indices)
-    relative = history_rotations @ current_rotation.T
+    ).mean(dim=1)
+    candidate_rotations = rotations.index_select(0, candidates)
+    reference_rotations = rotations.index_select(0, references)
+    relative = candidate_rotations[:, None] @ reference_rotations.transpose(-1, -2)[
+        None
+    ]
     cosine = ((relative.diagonal(dim1=-2, dim2=-1).sum(dim=-1) - 1.0) / 2.0).clamp(
         -1.0, 1.0
     )
-    angles = torch.rad2deg(torch.acos(cosine))
+    angles = torch.rad2deg(torch.acos(cosine)).mean(dim=1)
     return baselines.float(), angles.float()
+
+
+def select_recent_history(
+    frame_index: int,
+    *,
+    total_frame_budget: int,
+    anchor_frames: int,
+) -> tuple[int, ...]:
+    """Keep fixed anchors and fill the remaining budget with recent history."""
+
+    frame = int(frame_index)
+    total = int(total_frame_budget)
+    anchors_count = int(anchor_frames)
+    if total < 2 or not 1 <= anchors_count < total:
+        raise ValueError("Invalid recent-history budget.")
+    if frame <= total:
+        return tuple(range(frame))
+    anchors = tuple(range(min(anchors_count, frame)))
+    available = tuple(index for index in range(frame) if index not in anchors)
+    remaining = total - len(anchors)
+    return tuple(sorted((*anchors, *available[-remaining:])))
 
 
 def _normalized_ranks(
@@ -149,17 +247,18 @@ def _normalized_ranks(
         raise ValueError("Rank values and history indices are inconsistent.")
     if values.numel() <= 1:
         return torch.ones_like(values, dtype=torch.float32)
-    order = sorted(
-        range(values.numel()),
-        key=lambda position: (
-            float(values[position]),
-            int(history_indices[position]),
-        ),
-    )
     ranks = torch.empty(values.numel(), dtype=torch.float32)
     denominator = float(values.numel() - 1)
-    for rank, position in enumerate(order):
-        ranks[position] = float(rank) / denominator
+    for position in range(values.numel()):
+        tied = torch.isclose(
+            values,
+            values[position],
+            rtol=1e-5,
+            atol=1e-7,
+        )
+        strictly_lower = (values < values[position]) & ~tied
+        average_rank = float(strictly_lower.sum()) + 0.5 * float(tied.sum() - 1)
+        ranks[position] = average_rank / denominator
     return ranks
 
 

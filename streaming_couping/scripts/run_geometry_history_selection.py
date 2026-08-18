@@ -27,6 +27,7 @@ from streaming_couping.src.external_repos import maybe_add_repo_to_path
 from streaming_couping.src.geometry_history_selection import (
     GeometryHistoryPolicy,
     select_geometry_history,
+    select_recent_history,
 )
 from streaming_couping.src.learned_pose.baseline_runtime import (
     load_baseline_run_config,
@@ -48,7 +49,13 @@ from streaming_couping.src.qk_pose_retrieval import (
 from streaming_couping.src.semantic_map import normalize_confidence
 
 
-REVISION = "geometry_specific_history_selection_r1"
+REVISION = "geometry_diverse_history_selection_r2"
+BRANCHES = (
+    "full_history",
+    "qk_top4",
+    "recent_top4",
+    "geometry_diverse_top4",
+)
 
 
 @dataclass(frozen=True)
@@ -110,7 +117,7 @@ def main() -> None:
 
     run.output_dir.mkdir(parents=True, exist_ok=True)
     candidate_payload = _candidate_generation_payload(payload, qk_artifact)
-    print("GEOMETRY-SPECIFIC HISTORY POINT-HEAD REPLAY")
+    print("GEOMETRY-DIVERSE HISTORY POINT-HEAD REPLAY")
     print("  candidate fields=RGB,frame_indices,frozen_QK_pose")
     print("  SAM=0 GT=0 training=0 camera_head=0 depth_head=0")
     candidates = _generate_candidates(
@@ -150,9 +157,9 @@ def main() -> None:
     )
     _write_outputs(run, summary, frame_rows, candidates)
     print(
-        "  geometry_top4 "
-        f"paired_gain={summary['branch_lookup']['geometry_top4']['paired_gain_vs_full_percent']:.4f}% "
-        f"symmetric_gain={summary['branch_lookup']['geometry_top4']['symmetric_gain_vs_full_percent']:.4f}% "
+        "  geometry_diverse_top4 "
+        f"paired_gain={summary['branch_lookup']['geometry_diverse_top4']['paired_gain_vs_full_percent']:.4f}% "
+        f"symmetric_gain={summary['branch_lookup']['geometry_diverse_top4']['symmetric_gain_vs_full_percent']:.4f}% "
         f"pass={summary['decision']['geometry_history_pass']}"
     )
     print(f"  result={run.output_dir / 'summary.json'}")
@@ -173,7 +180,7 @@ def _generate_candidates(
         anchor_frames=run.geometry_policy.anchor_frames,
     )
     output = {}
-    for branch in ("qk_top4", "geometry_top4"):
+    for branch in BRANCHES[1:]:
         print(f"  replay branch={branch} frames={len(frames)}")
         runner.reset()
         points = []
@@ -190,6 +197,13 @@ def _generate_candidates(
                     policy=qk_policy,
                 )
                 pool = tuple(ranked)
+            elif branch == "recent_top4":
+                selected = select_recent_history(
+                    frame_index,
+                    total_frame_budget=run.geometry_policy.total_frame_budget,
+                    anchor_frames=run.geometry_policy.anchor_frames,
+                )
+                pool = ()
             else:
                 selection = select_geometry_history(
                     frame_index,
@@ -322,7 +336,7 @@ def _score_candidates(
     branch_rows = []
     frame_rows: list[dict[str, Any]] = []
     metric_lookup = {}
-    for name in ("full_history", "qk_top4", "geometry_top4"):
+    for name in BRANCHES:
         metrics, per_frame = _pointmap_metrics(
             aligned[name],
             target,
@@ -387,6 +401,18 @@ def _score_candidates(
             and float(item["paired_rmse"])
             > float(full_frame[int(item["sequence_index"])]["paired_rmse"])
         )
+        row["improved_nonreference_frames_vs_full"] = sum(
+            1
+            for item in frame_rows
+            if item["branch"] == name
+            and int(item["sequence_index"]) != reference
+            and float(item["paired_rmse"])
+            < float(full_frame[int(item["sequence_index"])]["paired_rmse"])
+        )
+        row["improved_nonreference_frame_ratio_vs_full"] = (
+            float(row["improved_nonreference_frames_vs_full"])
+            / max(len(frames) - 1, 1)
+        )
         row.update(
             {
                 f"compatibility_{key}": value
@@ -401,8 +427,9 @@ def _score_candidates(
         )
 
     lookup = {row["branch"]: row for row in branch_rows}
-    geometry = lookup["geometry_top4"]
+    geometry = lookup["geometry_diverse_top4"]
     qk = lookup["qk_top4"]
+    recent = lookup["recent_top4"]
     full = lookup["full_history"]
     reference_pass = int(
         float(geometry["reference_rmse_native"])
@@ -434,19 +461,25 @@ def _score_candidates(
         "geometry_beats_qk_symmetric": int(
             float(geometry["symmetric_mean"]) < float(qk["symmetric_mean"])
         ),
+        "geometry_beats_recent_paired": int(
+            float(geometry["paired_rmse"]) < float(recent["paired_rmse"])
+        ),
+        "geometry_beats_recent_symmetric": int(
+            float(geometry["symmetric_mean"]) < float(recent["symmetric_mean"])
+        ),
         "formal_v0_pose_modified": 0,
         "formal_v0_pointmap_modified": 0,
         "formal_v0_semantic_map_modified": 0,
         "next_gate": (
-            "sam_covisibility_overlap_pool_probe"
+            "geometry_specific_memory_supported_then_sam_covisibility_probe"
             if geometry_pass
-            else "keep_full_history_pointmap"
+            else "independent_sparse_3d_anchor_probe"
         ),
     }
     summary = {
         "schema": 1,
         "revision": REVISION,
-        "experiment": "geometry_specific_history_selection",
+        "experiment": "geometry_diverse_history_selection",
         "baseline_version": "v0",
         "baseline_status": "frozen_unchanged",
         "clip": payload["clip_name"],
@@ -459,7 +492,8 @@ def _score_candidates(
             "total_frame_budget": run.geometry_policy.total_frame_budget,
             "anchor_frames": run.geometry_policy.anchor_frames,
             "qk_overlap_pool_size": run.geometry_policy.overlap_pool_size,
-            "geometry_rank": "equal_rank_sum_camera_center_baseline_and_relative_rotation",
+            "selection": "highest_qk_seed_then_greedy_pairwise_view_diversity",
+            "diversity_score": "equal_rank_sum_mean_camera_center_baseline_and_mean_relative_rotation",
         },
         "pose_branch": "frozen_v0_retrieve_qk_unchanged",
         "point_head_intermediate_layers": tuple(payload["dpt_layer_indices"]),
@@ -481,11 +515,7 @@ def _score_candidates(
         "qk_pose_artifact": str(qk_path),
         "candidate_artifact": str(artifact_path),
         "decision": decision,
-        "claim": (
-            "geometry_specific_history_improves_pointmap_on_single_sequence"
-            if geometry_pass
-            else "geometry_specific_history_improvement_not_established"
-        ),
+        "claim": _geometry_claim(geometry_pass, geometry, qk),
     }
     return summary, frame_rows
 
@@ -723,7 +753,7 @@ def _write_copyable(path: Path, summary: dict[str, Any]) -> None:
         f"revision={summary['revision']}",
         f"clip={summary['clip']}",
         f"frames={len(summary['frames'])}",
-        "branches=full_history,qk_top4,geometry_top4",
+        "branches=" + ",".join(row["branch"] for row in summary["branches"]),
         f"pose_branch={summary['pose_branch']}",
         f"point_head_intermediate_layers={_space(summary['point_head_intermediate_layers'])}",
         f"total_frame_budget={summary['history_policy']['total_frame_budget']}",
@@ -734,7 +764,7 @@ def _write_copyable(path: Path, summary: dict[str, Any]) -> None:
         "candidate_generation_gt_fields=0",
         "formal_v0_modified=0",
         "",
-        "branch,supported_points,paired_rmse,paired_median,paired_p90,symmetric_mean,paired_gain_vs_full_percent,symmetric_gain_vs_full_percent,worse_nonreference_frames_vs_full,compatibility_reprojection_median_px,compatibility_reprojection_p90_px,compatibility_positive_z_rate,compatibility_in_bounds_rate,reference_rmse_native",
+        "branch,supported_points,paired_rmse,paired_median,paired_p90,symmetric_mean,paired_gain_vs_full_percent,symmetric_gain_vs_full_percent,improved_nonreference_frames_vs_full,improved_nonreference_frame_ratio_vs_full,worse_nonreference_frames_vs_full,compatibility_reprojection_median_px,compatibility_reprojection_p90_px,compatibility_positive_z_rate,compatibility_in_bounds_rate,reference_rmse_native",
     ]
     fields = (
         "branch",
@@ -745,6 +775,8 @@ def _write_copyable(path: Path, summary: dict[str, Any]) -> None:
         "symmetric_mean",
         "paired_gain_vs_full_percent",
         "symmetric_gain_vs_full_percent",
+        "improved_nonreference_frames_vs_full",
+        "improved_nonreference_frame_ratio_vs_full",
         "worse_nonreference_frames_vs_full",
         "compatibility_reprojection_median_px",
         "compatibility_reprojection_p90_px",
@@ -837,7 +869,7 @@ def _load_run(path: str | Path) -> ExperimentRun:
         geometry_policy=GeometryHistoryPolicy(
             total_frame_budget=int(history.get("total_frame_budget", 5)),
             anchor_frames=int(history.get("anchor_frames", 1)),
-            overlap_pool_size=int(history.get("qk_overlap_pool_size", 8)),
+            overlap_pool_size=int(history.get("qk_overlap_pool_size", 12)),
         ),
         confidence_threshold=float(evaluation.get("confidence_threshold", 0.30)),
         alignment_max_points=int(evaluation.get("alignment_max_points", 30000)),
@@ -902,6 +934,21 @@ def _rmse(values: torch.Tensor) -> float:
 
 def _gain(baseline: float, candidate: float) -> float:
     return 100.0 * (float(baseline) - float(candidate)) / max(abs(float(baseline)), 1e-12)
+
+
+def _geometry_claim(
+    geometry_pass: int,
+    geometry: dict[str, Any],
+    qk: dict[str, Any],
+) -> str:
+    if int(geometry_pass):
+        return "geometry_diverse_history_improves_pointmap_on_single_sequence"
+    if (
+        float(geometry["paired_rmse"]) < float(qk["paired_rmse"])
+        and float(geometry["symmetric_mean"]) < float(qk["symmetric_mean"])
+    ):
+        return "geometry_diversity_helps_vs_qk_but_not_full_history"
+    return "geometry_diverse_history_improvement_not_established"
 
 
 def _space(values) -> str:

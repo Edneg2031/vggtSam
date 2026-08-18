@@ -23,11 +23,11 @@ export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-echo "Geometry history smoke: QK overlap pool, view complementarity and causality"
+echo "Geometry history smoke: QK Top-12, greedy pairwise diversity and causality"
 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_geometry_history_selection
 
 rm -rf "$OUTPUT"
-echo "Training-free geometry-specific point-head history selection"
+echo "Training-free geometry-diverse point-head history selection"
 echo "physical GPUs=$GPU0,$GPU1 logical StreamVGGT=cuda:0,cuda:1"
 echo "V0 pose/pointmap/semantic artifacts are read-only and never overwritten"
 CUDA_VISIBLE_DEVICES="$GPU0,$GPU1" PYTHONUNBUFFERED=1 PYTHONPATH=. \
@@ -43,7 +43,7 @@ from pathlib import Path
 path = Path("outputs/streaming_couping_geometry_history_selection/summary.json")
 summary = json.loads(path.read_text())
 assert summary["schema"] == 1
-assert summary["revision"] == "geometry_specific_history_selection_r1"
+assert summary["revision"] == "geometry_diverse_history_selection_r2"
 assert summary["baseline_version"] == "v0"
 assert summary["baseline_status"] == "frozen_unchanged"
 assert summary["candidate_generation_gt_fields"] == 0
@@ -52,19 +52,23 @@ assert summary["model_trained"] == 0
 assert summary["camera_head_run"] == 0
 assert summary["depth_head_run"] == 0
 assert summary["point_head_run"] == 1
+assert summary["history_policy"]["qk_overlap_pool_size"] == 12
+assert summary["history_policy"]["selection"] == (
+    "highest_qk_seed_then_greedy_pairwise_view_diversity"
+)
 assert [row["branch"] for row in summary["branches"]] == [
-    "full_history", "qk_top4", "geometry_top4"
+    "full_history", "qk_top4", "recent_top4", "geometry_diverse_top4"
 ]
 decision = summary["decision"]
 assert decision["formal_v0_pose_modified"] == 0
 assert decision["formal_v0_pointmap_modified"] == 0
 assert decision["formal_v0_semantic_map_modified"] == 0
-geometry = summary["branch_lookup"]["geometry_top4"]
+geometry = summary["branch_lookup"]["geometry_diverse_top4"]
 paired = geometry["paired_gain_vs_full_percent"]
 symmetric = geometry["symmetric_gain_vs_full_percent"]
 passed = decision["geometry_history_pass"]
 print(
-    "Geometry history result accepted "
+    "Geometry-diverse history output schema accepted "
     f"paired_gain={paired:.4f}% "
     f"symmetric_gain={symmetric:.4f}% "
     f"pass={passed}"

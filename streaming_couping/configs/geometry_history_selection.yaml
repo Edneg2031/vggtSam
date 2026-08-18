@@ -6,7 +6,7 @@ output_dir: outputs/streaming_couping_geometry_history_selection
 history:
   total_frame_budget: 5
   anchor_frames: 1
-  qk_overlap_pool_size: 8
+  qk_overlap_pool_size: 12
 
 evaluation:
   confidence_threshold: 0.30
