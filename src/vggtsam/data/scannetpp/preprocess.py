@@ -341,14 +341,14 @@ def _process_frame(
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     height, width = image_rgb.shape[:2]
     manifest_image_path = image_path
+    image_storage = "source_reference"
     if config.cache_images:
-        _materialize_cached_image(
+        manifest_image_path, image_storage = _materialize_cached_image(
             image_path,
             cached_image_path,
             mode=config.image_cache_mode,
             overwrite=not config.skip_existing,
         )
-        manifest_image_path = cached_image_path
 
     colmap_image = image_by_name.get(frame_name) or image_by_name.get(
         Path(frame_name).name
@@ -370,6 +370,7 @@ def _process_frame(
             "image_name": frame_name,
             "image_path": str(manifest_image_path),
             "image_source_path": str(image_path),
+            "image_storage": image_storage,
             "semantic_mask": str(semantic_path),
             "instance_mask": str(instance_path),
             "pointmap": str(pointmap_path) if pointmap_path.exists() else None,
@@ -441,6 +442,7 @@ def _process_frame(
         "image_name": frame_name,
         "image_path": str(manifest_image_path),
         "image_source_path": str(image_path),
+        "image_storage": image_storage,
         "semantic_mask": str(semantic_path),
         "instance_mask": str(instance_path),
         "pointmap": str(pointmap_path) if config.save_pointmaps else None,
@@ -461,29 +463,51 @@ def _materialize_cached_image(
     *,
     mode: str,
     overwrite: bool,
-) -> None:
-    """Create a generated image entry as a copy or absolute symlink."""
+) -> Tuple[Path, str]:
+    """Create a copy/link, falling back to a zero-copy source reference."""
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     present = destination.exists() or destination.is_symlink()
     if present and not overwrite:
         if mode == "copy":
-            return
+            return destination, "copy"
         if (
             mode == "symlink"
             and destination.is_symlink()
             and destination.resolve() == source.resolve()
         ):
-            return
+            return destination, "symlink"
     if present:
         destination.unlink()
     if mode == "symlink":
-        destination.symlink_to(source.resolve())
-        return
+        try:
+            destination.symlink_to(source.resolve())
+            return destination, "symlink"
+        except OSError:
+            pass
+        # Many SMB/CIFS mounts reject symlinks but may still support hardlinks.
+        try:
+            os.link(source.resolve(), destination)
+            return destination, "hardlink"
+        except OSError:
+            pass
+        marker = destination.parent / "SOURCE_REFERENCE_ONLY.txt"
+        if not marker.exists():
+            try:
+                marker.write_text(
+                    "This mounted filesystem supports neither symbolic nor hard "
+                    "links. manifest.json references the original RGB files "
+                    "directly; masks and pointmaps remain in this processed scene.\n",
+                    encoding="utf8",
+                )
+            except OSError:
+                pass
+        return source.resolve(), "source_reference"
     if mode != "copy":
         raise ValueError(f"Unsupported image_cache_mode: {mode}")
     shutil.copyfile(source, destination)
     destination.chmod(0o644)
+    return destination, "copy"
 
 
 def _camera_record(colmap_image: Any, camera: Any) -> Dict[str, Any]:

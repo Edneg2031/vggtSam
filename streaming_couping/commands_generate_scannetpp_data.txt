@@ -12,7 +12,8 @@ export SCANNETPP_PREPROCESS_MODE=full
 export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
 
 cd "$ROOT"
-echo "Generate ScanNet++ RGB symlinks, semantic/instance masks and GT pointmaps"
+echo "Generate ScanNet++ semantic/instance masks and GT pointmaps"
+echo "RGB is read directly from the historical source path; no copy/link is made"
 echo "scenes=$SCANNETPP_SCENES"
 zsh streaming_couping/commands_prepare_scannetpp_nas.txt
 
@@ -34,7 +35,7 @@ for scene_id in os.environ["SCANNETPP_SCENES"].split():
     if not frames:
         raise RuntimeError(f"generated scene has no frames: {scene_id}")
     missing = []
-    non_symlink_images = []
+    invalid_source_images = []
     for index, frame in enumerate(frames):
         image = Path(frame["image_path"])
         semantic = Path(frame["semantic_mask"])
@@ -42,20 +43,26 @@ for scene_id in os.environ["SCANNETPP_SCENES"].split():
         pointmap = Path(frame["pointmap"])
         if not all(path.is_file() for path in (image, semantic, instance, pointmap)):
             missing.append(index)
-        if not image.is_symlink():
-            non_symlink_images.append(index)
+        source_image = Path(frame["image_source_path"])
+        if (
+            str(frame.get("image_storage", "")) != "source_reference"
+            or image != source_image
+            or not source_image.is_file()
+        ):
+            invalid_source_images.append(index)
     if missing:
         raise RuntimeError(
             f"scene {scene_id} has incomplete generated frames: {missing[:20]}"
         )
-    if non_symlink_images:
+    if invalid_source_images:
         raise RuntimeError(
-            f"scene {scene_id} image entries are not symlinks: "
-            f"{non_symlink_images[:20]}"
+            f"scene {scene_id} does not reference source RGB directly: "
+            f"{invalid_source_images[:20]}"
         )
     print(
         f"generated scene accepted scene={scene_id} frames={len(frames)} "
-        "rgb_symlinks=1 semantic_masks=1 instance_masks=1 pointmaps=1"
+        "rgb_source_reference=1 semantic_masks=1 "
+        "instance_masks=1 pointmaps=1"
     )
 print(f"manifest={manifest_path}")
 PY

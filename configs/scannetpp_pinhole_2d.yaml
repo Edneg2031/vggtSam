@@ -25,8 +25,8 @@ semantic_ignore_label: 65535
 save_visualizations: false
 save_raster: false
 save_pointmaps: true
-# Put an image entry beside generated masks/pointmaps without duplicating RGB.
-cache_images: true
-image_cache_mode: symlink
+# RGB stays in the historical read-only dataset. manifest.json points to the
+# original image path; only masks and pointmaps are generated on process_data.
+cache_images: false
 skip_existing: true
 dry_run: false

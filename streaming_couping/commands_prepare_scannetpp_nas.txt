@@ -55,12 +55,18 @@ import cv2
 import numpy
 import plyfile
 import yaml
-try:
-    import numba
-    print("preprocess dependencies passed; numba=1")
-except ImportError:
-    print("preprocess dependencies passed; numba=0 (processing will be slow)")
+print("preprocess base dependencies passed")
 '
+  if PYTHONPATH="$ROOT/src" "$PYTHON_BIN" -c 'import numba' 2>/dev/null; then
+    echo "numba rasterizer available"
+  elif [[ "$MODE" == "full" && "${SCANNETPP_ALLOW_SLOW_RASTERIZER:-0}" != "1" ]]; then
+    echo "numba is required for full-scene rasterization (795 frames in 00a231a370)" >&2
+    echo "install with: $PYTHON_BIN -m pip install numba" >&2
+    echo "or explicitly set SCANNETPP_ALLOW_SLOW_RASTERIZER=1 to use the very slow fallback" >&2
+    exit 1
+  else
+    echo "numba=0; using the slow Python rasterizer"
+  fi
 fi
 
 SCENE_ARGS=()
