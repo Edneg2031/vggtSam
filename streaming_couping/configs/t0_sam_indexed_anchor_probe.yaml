@@ -1,0 +1,34 @@
+# Read-only T0 probe. V0 artifacts are inputs and are never overwritten.
+v0_config: streaming_couping/configs/v0_baseline.yaml
+output_dir: outputs/streaming_couping_t0_anchor_probe
+
+matching:
+  # First cached DPT level, frame-attention half only. No point/depth output is
+  # used to form correspondences.
+  descriptor_level_position: 0
+  descriptor_token_half: frame
+  track_score_threshold: 0.50
+  mask_erosion_pixels: 3
+  minimum_patch_coverage: 0.25
+  excluded_prompts: [wardrobe]
+  qk_history_pool_size: 8
+  maximum_queries_per_instance_frame: 64
+  maximum_history_views: 4
+  minimum_match_similarity: 0.60
+  minimum_match_margin: 0.01
+
+triangulation:
+  minimum_views: 2
+  minimum_ray_angle_degrees: 1.5
+  maximum_condition_number: 10000.0
+  # Pixel gates scale with the cached patch size and are fixed before GT.
+  maximum_mean_reprojection_patch_fraction: 0.75
+  maximum_reprojection_patch_fraction: 1.50
+
+controls:
+  # Cyclic patch-grid shift preserves mask area exactly.
+  shifted_mask_fraction_y: 0.25
+  shifted_mask_fraction_x: 0.20
+
+evaluation:
+  minimum_equal_count: 32

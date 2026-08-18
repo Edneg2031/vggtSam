@@ -1,0 +1,71 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+GPU="${T0_ANCHOR_GPU:-1}"
+CONFIG=streaming_couping/configs/t0_sam_indexed_anchor_probe.yaml
+OUTPUT=outputs/streaming_couping_t0_anchor_probe
+V0_CACHE=outputs/streaming_couping_v0/cache/00a231a370_90_525_step15_37_68_54.pt
+QK_DIR=outputs/streaming_couping_v0/qk_pose_retrieval
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+[[ -s "$V0_CACHE" ]] || { echo "missing frozen V0 cache; run commands_v0_baseline.txt first" >&2; exit 1; }
+[[ -s "$QK_DIR/qk_pose_output.pt" ]] || { echo "missing frozen V0 QK pose artifact" >&2; exit 1; }
+[[ -s "$QK_DIR/retrieval_diagnostics.csv" ]] || { echo "missing frozen QK ranking diagnostics" >&2; exit 1; }
+
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+
+echo "T0 smoke: cached 2D descriptors, MNN and calibrated ray triangulation"
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_t0_sam_indexed_anchor_probe
+
+rm -rf "$OUTPUT"
+echo "T0 read-only SAM-indexed independent 3D anchor probe"
+echo "physical GPU=$GPU logical matching device=cuda:0"
+echo "No model is loaded; raw pointmap and GT enter only after anchors are frozen"
+CUDA_VISIBLE_DEVICES="$GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. \
+  "$PYTHON_BIN" -m streaming_couping.scripts.run_t0_sam_indexed_anchor_probe \
+  --config "$CONFIG" \
+  --device cuda:0
+
+[[ -s "$OUTPUT/summary.json" ]] || { echo "missing T0 summary" >&2; exit 1; }
+[[ -s "$OUTPUT/anchors_candidate.pt" ]] || { echo "missing frozen T0 anchor artifact" >&2; exit 1; }
+PYTHONPATH=. "$PYTHON_BIN" -c '
+import json
+from pathlib import Path
+path = Path("outputs/streaming_couping_t0_anchor_probe/summary.json")
+summary = json.loads(path.read_text())
+assert summary["schema"] == 1
+assert summary["revision"] == "t0_sam_indexed_independent_3d_anchor_probe_r1"
+assert summary["baseline_version"] == "v0"
+assert summary["baseline_status"] == "frozen_unchanged"
+assert summary["candidate_generation_raw_pointmap_fields"] == 0
+assert summary["candidate_generation_gt_fields"] == 0
+assert summary["model_loaded_or_run"] == 0
+assert summary["model_trained"] == 0
+assert summary["pose_modified"] == 0
+assert summary["pointmap_modified"] == 0
+assert [row["branch"] for row in summary["branches"]] == [
+    "foreground_union",
+    "correct_persistent_id",
+    "shuffled_persistent_id",
+    "shifted_mask_control",
+]
+assert summary["decision"]["t0_decision"] in {"GO", "PARTIAL_GO", "NO_GO"}
+assert summary["decision"]["formal_v0_pose_modified"] == 0
+assert summary["decision"]["formal_v0_pointmap_modified"] == 0
+assert summary["decision"]["formal_v0_semantic_map_modified"] == 0
+assert summary["decision"]["equal_attempted_query_protocol"] == 1
+primary = summary["branch_lookup"]["correct_persistent_id"]
+print(
+    "T0 output schema accepted "
+    f"anchors={primary['evaluated_anchor_count']} "
+    f"tri_gain={primary['tri_gain_vs_raw_percent']:.4f}% "
+    f"decision={summary['decision']['t0_decision']}"
+)
+'
+
+echo ""
+sed -n '1,220p' "$OUTPUT/copyable_result.txt"
