@@ -24,6 +24,7 @@ class CoordinateBundle:
     calibrated_intrinsics: torch.Tensor
     predicted_intrinsics: torch.Tensor
     raw_depth_metric: torch.Tensor
+    raw_depth_pointmap_scale_metric: torch.Tensor
     target_depth_metric: torch.Tensor
     raw_world_points_metric: torch.Tensor
     target_world_points_metric: torch.Tensor
@@ -31,6 +32,9 @@ class CoordinateBundle:
     native_to_metric_scale: float
     native_to_metric_rotation: torch.Tensor
     native_to_metric_translation: torch.Tensor
+    depth_reference_affine_scale: float
+    depth_reference_affine_shift: float
+    depth_reference_affine_fit_rmse: float
 
 
 def intrinsics_from_pose_encoding(
@@ -145,6 +149,10 @@ def prepare_coordinate_bundle(payload: dict, qk_artifact: dict) -> CoordinateBun
     confidence = _squeeze_scalar(
         payload["baseline_world_confidence"], "baseline_world_confidence"
     )
+    reference_index = int(payload.get("reference_sequence_index", 0))
+    depth_scale, depth_shift, depth_fit_rmse = _robust_affine_depth_alignment(
+        raw_depth[reference_index], target_depth[reference_index]
+    )
     raw_pose_native = as_homogeneous_world_to_camera(raw_pose)
     qk_pose_native = as_homogeneous_world_to_camera(qk_pose)
     bundle = CoordinateBundle(
@@ -165,7 +173,8 @@ def prepare_coordinate_bundle(payload: dict, qk_artifact: dict) -> CoordinateBun
         predicted_intrinsics=intrinsics_from_pose_encoding(
             payload["baseline_pose_encoding"], image_size
         ),
-        raw_depth_metric=raw_depth * scale,
+        raw_depth_metric=raw_depth * depth_scale + depth_shift,
+        raw_depth_pointmap_scale_metric=raw_depth * scale,
         target_depth_metric=target_depth,
         raw_world_points_metric=align_native_points(
             payload["baseline_world_points"],
@@ -178,6 +187,9 @@ def prepare_coordinate_bundle(payload: dict, qk_artifact: dict) -> CoordinateBun
         native_to_metric_scale=scale,
         native_to_metric_rotation=rotation.detach().float().cpu(),
         native_to_metric_translation=translation.detach().float().cpu(),
+        depth_reference_affine_scale=depth_scale,
+        depth_reference_affine_shift=depth_shift,
+        depth_reference_affine_fit_rmse=depth_fit_rmse,
     )
     _validate_bundle_shapes(bundle)
     return bundle
@@ -227,7 +239,10 @@ def unproject_z_depth(
 def d0_branches(bundle: CoordinateBundle) -> dict[str, torch.Tensor]:
     """Generate the six primary calibrated-K cells and direct point baseline."""
 
-    depths = {"raw_depth": bundle.raw_depth_metric, "gt_depth": bundle.target_depth_metric}
+    depths = {
+        "raw_depth_ref_affine": bundle.raw_depth_metric,
+        "gt_depth": bundle.target_depth_metric,
+    }
     poses = {
         "raw_pose": bundle.raw_world_to_camera_metric,
         "qk_pose": bundle.qk_world_to_camera_metric,
@@ -245,7 +260,10 @@ def d0_branches(bundle: CoordinateBundle) -> dict[str, torch.Tensor]:
 
 
 def d0_predicted_k_supplement(bundle: CoordinateBundle) -> dict[str, torch.Tensor]:
-    depths = {"raw_depth": bundle.raw_depth_metric, "gt_depth": bundle.target_depth_metric}
+    depths = {
+        "raw_depth_ref_affine": bundle.raw_depth_metric,
+        "gt_depth": bundle.target_depth_metric,
+    }
     poses = {
         "raw_pose": bundle.raw_world_to_camera_metric,
         "qk_pose": bundle.qk_world_to_camera_metric,
@@ -258,6 +276,30 @@ def d0_predicted_k_supplement(bundle: CoordinateBundle) -> dict[str, torch.Tenso
         for depth_name, depth in depths.items()
         for pose_name, pose in poses.items()
     }
+
+
+def d0_uncalibrated_depth_supplement(
+    bundle: CoordinateBundle,
+) -> dict[str, torch.Tensor]:
+    """Expose the invalid old point-head-scale assumption as report-only."""
+
+    poses = {
+        "raw_pose": bundle.raw_world_to_camera_metric,
+        "qk_pose": bundle.qk_world_to_camera_metric,
+        "gt_pose": bundle.target_world_to_camera_metric,
+    }
+    output = {}
+    for intrinsics_name, intrinsics in (
+        ("calibrated_k", bundle.calibrated_intrinsics),
+        ("predicted_k", bundle.predicted_intrinsics),
+    ):
+        for pose_name, pose in poses.items():
+            output[
+                f"raw_depth_pointmap_scale__{pose_name}__{intrinsics_name}"
+            ] = unproject_z_depth(
+                bundle.raw_depth_pointmap_scale_metric, intrinsics, pose
+            )
+    return output
 
 
 def common_support(
@@ -494,6 +536,7 @@ def _validate_bundle_shapes(bundle: CoordinateBundle) -> None:
             raise ValueError(f"{name} is not aligned to target pointmap.")
     for name, value in (
         ("raw_depth_metric", bundle.raw_depth_metric),
+        ("raw_depth_pointmap_scale_metric", bundle.raw_depth_pointmap_scale_metric),
         ("target_depth_metric", bundle.target_depth_metric),
         ("confidence", bundle.confidence),
     ):
@@ -517,6 +560,61 @@ def _squeeze_scalar(value: torch.Tensor, name: str) -> torch.Tensor:
     if output.ndim != 3:
         raise ValueError(f"{name} must have shape [S,H,W] or [S,H,W,1].")
     return output
+
+
+def _robust_affine_depth_alignment(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    trim_fraction: float = 0.8,
+    iterations: int = 4,
+) -> tuple[float, float, float]:
+    """Fit one reference-frame depth affine and freeze it for the sequence."""
+
+    valid = (
+        torch.isfinite(source)
+        & torch.isfinite(target)
+        & (source > 0.0)
+        & (target > 0.0)
+    )
+    source_values = source[valid].float().cpu()
+    target_values = target[valid].float().cpu()
+    if source_values.numel() < 1024:
+        raise ValueError("Reference depth affine needs at least 1024 valid pixels.")
+    if source_values.numel() > 100_000:
+        index = torch.linspace(
+            0, source_values.numel() - 1, steps=100_000
+        ).long()
+        source_values = source_values.index_select(0, index)
+        target_values = target_values.index_select(0, index)
+    keep = torch.ones(source_values.numel(), dtype=torch.bool)
+    for _ in range(int(iterations)):
+        scale, shift = _least_squares_affine(
+            source_values[keep], target_values[keep]
+        )
+        residual = (scale * source_values + shift - target_values).abs()
+        next_keep = residual <= torch.quantile(residual, float(trim_fraction))
+        if int(next_keep.sum()) < 1024 or torch.equal(next_keep, keep):
+            break
+        keep = next_keep
+    scale, shift = _least_squares_affine(
+        source_values[keep], target_values[keep]
+    )
+    if not torch.isfinite(scale) or not torch.isfinite(shift) or scale <= 0.0:
+        raise ValueError("Reference depth affine fit is invalid.")
+    residual = scale * source_values[keep] + shift - target_values[keep]
+    return float(scale), float(shift), float(torch.sqrt(residual.square().mean()))
+
+
+def _least_squares_affine(
+    source: torch.Tensor, target: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    source_mean = source.mean()
+    target_mean = target.mean()
+    centered = source - source_mean
+    scale = (centered * (target - target_mean)).sum() / centered.square().sum().clamp_min(1e-12)
+    shift = target_mean - scale * source_mean
+    return scale, shift
 
 
 def _even_limit(indices: torch.Tensor, limit: int) -> torch.Tensor:

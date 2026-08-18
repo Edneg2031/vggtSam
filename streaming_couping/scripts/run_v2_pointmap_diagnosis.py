@@ -23,6 +23,7 @@ from streaming_couping.src.pointmap_diagnosis import (
     confidence_diagnostics,
     d0_branches,
     d0_predicted_k_supplement,
+    d0_uncalibrated_depth_supplement,
     distribution_row,
     align_native_points,
     as_homogeneous_world_to_camera,
@@ -44,7 +45,7 @@ from streaming_couping.src.triangulation_probe import (
 )
 
 
-REVISION = "v2_pointmap_diagnosis_d0_d1_t0_r1"
+REVISION = "v2_pointmap_diagnosis_d0_d1_t0_r2"
 
 
 @dataclass(frozen=True)
@@ -155,6 +156,10 @@ def _run_d0(run: V2Run, payload: dict, bundle: CoordinateBundle) -> dict[str, An
     for role, branches in (
         ("primary_calibrated_k", primary),
         ("report_only_predicted_k", d0_predicted_k_supplement(bundle)),
+        (
+            "report_only_invalid_pointmap_scale_assumption",
+            d0_uncalibrated_depth_supplement(bundle),
+        ),
     ):
         for name, points in branches.items():
             metrics, frames = pointmap_metrics(
@@ -193,6 +198,20 @@ def _run_d0(run: V2Run, payload: dict, bundle: CoordinateBundle) -> dict[str, An
         "primary_intrinsics": "processed_dataset_calibration",
         "predicted_intrinsics_role": "report_only",
         "depth_representation": "camera_space_z_depth",
+        "raw_depth_scale_semantics": "independent_scale_shift_invariant_head",
+        "raw_depth_alignment": "single_reference_frame_robust_affine_frozen_for_sequence",
+        "raw_depth_reference_affine": {
+            "scale": bundle.depth_reference_affine_scale,
+            "shift": bundle.depth_reference_affine_shift,
+            "fit_rmse": bundle.depth_reference_affine_fit_rmse,
+            "reference_sequence_index": int(payload.get("reference_sequence_index", 0)),
+            "reference_frame": int(
+                payload["frame_indices"][
+                    int(payload.get("reference_sequence_index", 0))
+                ]
+            ),
+            "gt_role": "d0_oracle_gauge_calibration_only",
+        },
         "pose_convention": "world_to_camera_opencv",
         "gt_role": "oracle_generation_and_scoring",
         "candidate_generation_gt_fields": "oracle_stage_not_applicable",
@@ -404,12 +423,24 @@ def _run_t0(
     equal_support = int(
         correct.get("candidate_matches", 0) == shuffled.get("candidate_matches", -1)
     )
-    correct_beats_shuffled = int(
-        int(correct.get("valid_anchors", 0)) > 0
+    correct_valid = int(correct.get("valid_anchors", 0))
+    shuffled_valid = int(shuffled.get("valid_anchors", 0))
+    identity_validity_advantage = int(
+        correct_valid > 0
         and float(correct.get("valid_rate", 0.0))
         > float(shuffled.get("valid_rate", 0.0))
+    )
+    identity_error_comparison_available = int(
+        correct_valid > 0 and shuffled_valid > 0
+    )
+    identity_error_advantage = int(
+        identity_error_comparison_available
         and float(correct.get("triangulation_rmse", float("inf")))
         < float(shuffled.get("triangulation_rmse", float("inf")))
+    )
+    correct_beats_shuffled = int(
+        identity_validity_advantage
+        and (shuffled_valid == 0 or identity_error_advantage)
     )
     high_quality_gain = float(correct.get("high_quality_mean_delta", float("nan")))
     enough_high_quality = int(
@@ -456,6 +487,9 @@ def _run_t0(
         "branches": branch_rows,
         "branch_lookup": lookup,
         "correct_id_beats_shuffled": correct_beats_shuffled,
+        "correct_id_validity_advantage": identity_validity_advantage,
+        "correct_id_error_comparison_available": identity_error_comparison_available,
+        "correct_id_error_advantage": identity_error_advantage,
         "enough_high_quality_anchors": enough_high_quality,
         "go_t1": go_t1,
         "claim": (
@@ -664,6 +698,8 @@ def _generate_oracle_candidates(
             "history_target_world": bundle.target_world_points_metric[unit.history_index],
             "history_intrinsics": bundle.calibrated_intrinsics[unit.history_index],
             "history_world_to_camera": bundle.target_world_to_camera_metric[unit.history_index],
+            "current_intrinsics": bundle.calibrated_intrinsics[unit.current_index],
+            "current_world_to_camera": bundle.target_world_to_camera_metric[unit.current_index],
             "depth_tolerance": float(config["oracle_depth_tolerance_metric"]),
         }
         correct = project_oracle_correspondence(
@@ -724,7 +760,12 @@ def _score_match_branch(
             & (result.condition <= float(config["high_quality_max_condition"]))
             & (result.reprojection_max_px <= float(config["high_quality_max_reprojection_px"]))
         )
-        integer = matches.current_xy.round().long()
+        evaluation_xy = (
+            matches.current_xy
+            if matches.evaluation_xy is None
+            else matches.evaluation_xy
+        )
+        integer = evaluation_xy.round().long()
         target = bundle.target_world_points_metric[
             unit.current_index, integer[:, 1], integer[:, 0]
         ]
@@ -788,6 +829,7 @@ def _score_match_branch(
                 "history_sequence_index": unit.history_index,
                 "slot": unit.slot,
                 "current_xy": matches.current_xy,
+                "evaluation_xy": evaluation_xy,
                 "history_xy": matches.history_xy,
                 "triangulated_points_metric": evaluated_points,
                 "triangulated_points_native": (
@@ -1007,6 +1049,9 @@ def _write_copyable(path: Path, summary: dict[str, Any]) -> None:
         "d0_sanity_metrics=" + json.dumps(
             d0["sanity_metrics_on_independent_gt_support"], sort_keys=True
         ),
+        "d0_raw_depth_reference_affine=" + json.dumps(
+            d0["raw_depth_reference_affine"], sort_keys=True
+        ),
         "",
         "D0_BRANCHES",
         "branch,table_role,supported_points,valid_ratio,paired_rmse,paired_median,paired_p90,symmetric_mean",
@@ -1059,6 +1104,9 @@ def _write_copyable(path: Path, summary: dict[str, Any]) -> None:
                 f"t0_pair_units={t0['pair_units']}",
                 f"t0_equal_support={t0['equal_current_query_support_correct_vs_shuffled']}",
                 f"t0_correct_id_beats_shuffled={t0['correct_id_beats_shuffled']}",
+                f"t0_correct_id_validity_advantage={t0['correct_id_validity_advantage']}",
+                f"t0_correct_id_error_comparison_available={t0['correct_id_error_comparison_available']}",
+                f"t0_correct_id_error_advantage={t0['correct_id_error_advantage']}",
                 f"t0_go_t1={t0['go_t1']}",
                 f"trackhead_status={t0['trackhead_preflight']['status']}",
                 "",
@@ -1096,7 +1144,9 @@ def _write_results_markdown(path: Path, summary: dict[str, Any]) -> None:
     if summary.get("t0"):
         lines.extend((
             f"- Pair units: {summary['t0']['pair_units']}",
-            f"- Correct ID beats shuffled: {summary['t0']['correct_id_beats_shuffled']}",
+            f"- Correct ID validity advantage: {summary['t0']['correct_id_validity_advantage']}",
+            f"- Correct/shuffled error comparison available: {summary['t0']['correct_id_error_comparison_available']}",
+            f"- Correct ID error advantage: {summary['t0']['correct_id_error_advantage']}",
             f"- TrackHead preflight: `{summary['t0']['trackhead_preflight']['status']}`", "",
         ))
     else:

@@ -10,7 +10,7 @@ OUTPUT=outputs/streaming_couping_v0/pointmap_diagnosis_v2
 cd "$ROOT"
 [[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
 
-echo "V2 smoke: Sim(3), z-depth closure, region partition and DLT"
+echo "V2 smoke: Sim(3), depth affine, oracle projection, region partition and DLT"
 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_v2_pointmap_diagnosis
 
 [[ -s outputs/streaming_couping_v0/cache/00a231a370_90_525_step15_37_68_54.pt ]] || {
@@ -36,13 +36,15 @@ import json
 from pathlib import Path
 summary = json.loads(Path("outputs/streaming_couping_v0/pointmap_diagnosis_v2/summary.json").read_text())
 assert summary["schema"] == 1
-assert summary["revision"] == "v2_pointmap_diagnosis_d0_d1_t0_r1"
+assert summary["revision"] == "v2_pointmap_diagnosis_d0_d1_t0_r2"
 assert summary["baseline_version"] == "v0"
 assert summary["baseline_status"] == "frozen_unchanged"
 assert summary["model_trained"] == 0
 assert summary["formal_v0_pose_modified"] == 0
 assert summary["formal_v0_pointmap_modified"] == 0
 assert summary["formal_v0_semantic_map_modified"] == 0
+assert summary["d0"]["raw_depth_alignment"] == "single_reference_frame_robust_affine_frozen_for_sequence"
+assert summary["d0"]["raw_depth_reference_affine"]["gt_role"] == "d0_oracle_gauge_calibration_only"
 decision = summary["decision"]
 if summary["d0"]["sanity_pass"]:
     assert summary["d1"] is not None
@@ -50,6 +52,9 @@ if summary["d0"]["sanity_pass"]:
     assert summary["t0"]["candidate_frozen_before_gt_access"] == 1
     assert summary["t0"]["candidate_generation_gt_fields"] == 0
     assert summary["t0"]["formal_v0_pointmap_modified"] == 0
+    assert "correct_id_validity_advantage" in summary["t0"]
+    assert "correct_id_error_comparison_available" in summary["t0"]
+    assert "correct_id_error_advantage" in summary["t0"]
     pair_units = summary["t0"]["pair_units"]
     trackhead = summary["t0"]["trackhead_preflight"]["status"]
     print(

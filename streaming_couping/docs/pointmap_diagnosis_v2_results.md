@@ -4,7 +4,7 @@
 
 - 正式 V0 不变：QK pose、full-history raw world pointmap、SAM persistent semantic lifting。
 - V2 只读 V0 cache 和 QK pose artifact，不训练，不更新 pose，不更新 pointmap，也不写回 semantic map。
-- 旧 V1 pointwise surfel/correspondence update 已删除，因为 correct-ID support 虽然更相干，但实际点更新使 correct-support RMSE 下降（变差）。
+- 旧 V1 pointwise surfel/correspondence update 已删除，因为 correct-ID support 虽然更相干，但实际点更新使 correct-support 几何性能下降（RMSE 上升）。
 
 ## 实验顺序
 
@@ -14,6 +14,8 @@
 4. **TrackHead preflight**：按真实 API 输入 cached DPT token levels，visibility/confidence 使用 head 内部 sigmoid 后的固定 0.5 阈值。若仍无有效观测，记录 `TRACKHEAD_UNUSABLE`，不放宽阈值。
 
 T0 只输出稀疏诊断 anchors，不写回 V0。只有 high-quality triangulation 优于同像素 raw point，并且 correct-ID 优于 shuffled-ID，才允许下一阶段讨论 T1。
+
+D0 中 depth head 按其训练目标作为独立 scale/shift-invariant 输出处理：只在 reference frame 用 GT depth 拟合一次 robust affine，然后冻结到整个序列。直接套用 point-head Sim(3) scale 的旧假设仅作为 report-only 对照。T0 oracle 的两端坐标均由同一个 GT world point 投影，原始整数像素仅用于取得同位置 raw/GT 评分点。
 
 ## 运行
 

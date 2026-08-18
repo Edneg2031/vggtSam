@@ -16,6 +16,7 @@ class PairMatches:
     history_xy: torch.Tensor
     query_indices: torch.Tensor
     confidence: torch.Tensor
+    evaluation_xy: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,7 @@ def match_patch_descriptors(
         history_xy=torch.empty(0, 2),
         query_indices=torch.empty(0, dtype=torch.long),
         confidence=torch.empty(0),
+        evaluation_xy=torch.empty(0, 2),
     )
     if current_xy.shape[0] == 0 or history_xy.shape[0] < 2:
         return empty
@@ -138,6 +140,7 @@ def match_patch_descriptors(
         ),
         query_indices=selected,
         confidence=(1.0 - ratio.index_select(0, selected)).clamp(0.0, 1.0),
+        evaluation_xy=current_xy.index_select(0, selected),
     )
 
 
@@ -156,6 +159,7 @@ def equalize_query_support(
             history_xy=torch.empty(0, 2),
             query_indices=torch.empty(0, dtype=torch.long),
             confidence=torch.empty(0),
+            evaluation_xy=torch.empty(0, 2),
         )
         return empty, empty
     return _select_query_ids(correct, common), _select_query_ids(control, common)
@@ -300,6 +304,8 @@ def project_oracle_correspondence(
     history_mask: torch.Tensor,
     history_intrinsics: torch.Tensor,
     history_world_to_camera: torch.Tensor,
+    current_intrinsics: torch.Tensor,
+    current_world_to_camera: torch.Tensor,
     *,
     depth_tolerance: float,
 ) -> PairMatches:
@@ -311,17 +317,28 @@ def project_oracle_correspondence(
             history_xy=torch.empty(0, 2),
             query_indices=torch.empty(0, dtype=torch.long),
             confidence=torch.empty(0),
+            evaluation_xy=torch.empty(0, 2),
         )
     query_index = torch.arange(current_xy.shape[0])
     integer = current_xy.round().long()
     world = current_target_world[integer[:, 1], integer[:, 0]]
+    current_projected, current_z = project_world_points(
+        world, current_intrinsics, current_world_to_camera
+    )
     projected, projected_z = project_world_points(
         world, history_intrinsics, history_world_to_camera
     )
     rounded = projected.round().long()
     height, width = history_mask.shape
+    current_height, current_width = current_target_world.shape[:2]
     in_bounds = (
         torch.isfinite(projected).all(dim=-1)
+        & torch.isfinite(current_projected).all(dim=-1)
+        & (current_z > 0.0)
+        & (current_projected[:, 0] >= 0.0)
+        & (current_projected[:, 0] <= float(current_width - 1))
+        & (current_projected[:, 1] >= 0.0)
+        & (current_projected[:, 1] <= float(current_height - 1))
         & (rounded[:, 0] >= 0)
         & (rounded[:, 0] < width)
         & (rounded[:, 1] >= 0)
@@ -344,10 +361,11 @@ def project_oracle_correspondence(
     )
     selected = torch.nonzero(visible, as_tuple=False)[:, 0]
     return PairMatches(
-        current_xy=current_xy.index_select(0, selected),
+        current_xy=current_projected.index_select(0, selected),
         history_xy=projected.index_select(0, selected),
         query_indices=query_index.index_select(0, selected),
         confidence=torch.ones(selected.numel()),
+        evaluation_xy=current_xy.index_select(0, selected),
     )
 
 
@@ -369,4 +387,9 @@ def _select_query_ids(matches: PairMatches, query_ids: list[int]) -> PairMatches
         history_xy=matches.history_xy.index_select(0, index),
         query_indices=matches.query_indices.index_select(0, index),
         confidence=matches.confidence.index_select(0, index),
+        evaluation_xy=(
+            None
+            if matches.evaluation_xy is None
+            else matches.evaluation_xy.index_select(0, index)
+        ),
     )
