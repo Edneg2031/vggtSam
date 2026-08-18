@@ -1,0 +1,74 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+CONFIG=streaming_couping/configs/t01_triangulation_reliability.yaml
+T0_OUTPUT=outputs/streaming_couping_t0_anchor_probe
+OUTPUT=outputs/streaming_couping_t01_triangulation_reliability
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+[[ -s "$T0_OUTPUT/anchors_candidate.pt" ]] || { echo "missing frozen T0 candidates" >&2; exit 1; }
+[[ -s "$T0_OUTPUT/anchor_scores.csv" ]] || { echo "missing frozen T0 scores" >&2; exit 1; }
+[[ -s "$T0_OUTPUT/summary.json" ]] || { echo "missing frozen T0 summary" >&2; exit 1; }
+
+export PYTHONHASHSEED=0
+
+echo "T0.1 smoke: fixed GT-blind reliability gates and paired scoring"
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_t01_triangulation_reliability
+
+rm -rf "$OUTPUT"
+echo "T0.1 read-only triangulation long-tail reliability diagnostic"
+echo "Reads frozen T0 candidates; no model, matching, pose or pointmap update"
+PYTHONUNBUFFERED=1 PYTHONPATH=. \
+  "$PYTHON_BIN" -m streaming_couping.scripts.run_t01_triangulation_reliability \
+  --config "$CONFIG"
+
+[[ -s "$OUTPUT/summary.json" ]] || { echo "missing T0.1 summary" >&2; exit 1; }
+[[ -s "$OUTPUT/frozen_gate_assignments.pt" ]] || { echo "missing frozen T0.1 gate artifact" >&2; exit 1; }
+[[ -s "$OUTPUT/frozen_gate_manifest.json" ]] || { echo "missing frozen T0.1 gate manifest" >&2; exit 1; }
+PYTHONPATH=. "$PYTHON_BIN" -c '
+import json
+from pathlib import Path
+
+path = Path("outputs/streaming_couping_t01_triangulation_reliability/summary.json")
+summary = json.loads(path.read_text())
+assert summary["schema"] == 1
+assert summary["revision"] == "t01_triangulation_long_tail_reliability_diagnostic_r1"
+assert summary["baseline_version"] == "v0"
+assert summary["baseline_status"] == "frozen_unchanged"
+assert summary["source_branch"] == "correct_persistent_id"
+assert summary["candidate_generation_raw_pointmap_fields"] == 0
+assert summary["candidate_generation_gt_fields"] == 0
+assert summary["source_t0_gt_scores_read_after_gate_freeze"] == 1
+assert summary["model_loaded_or_run"] == 0
+assert summary["model_trained"] == 0
+assert summary["pose_modified"] == 0
+assert summary["pointmap_modified"] == 0
+assert [row["gate"] for row in summary["gates"]] == [
+    "before_gate",
+    "primary_gate",
+    "primary_gate_views_ge_3",
+]
+assert summary["decision"]["t01_decision"] in {"GO", "NO_GO"}
+assert summary["decision"]["gate_frozen_before_gt_scoring"] == 1
+assert summary["decision"]["gate_thresholds_selected_with_gt"] == 0
+assert summary["decision"]["formal_v0_pose_modified"] == 0
+assert summary["decision"]["formal_v0_pointmap_modified"] == 0
+assert summary["decision"]["formal_v0_semantic_map_modified"] == 0
+primary = summary["gate_lookup"]["primary_gate"]
+strict = summary["gate_lookup"]["primary_gate_views_ge_3"]
+decision = summary["decision"]["t01_decision"]
+primary_count = primary["anchor_count"]
+strict_count = strict["anchor_count"]
+print(
+    "T0.1 output schema accepted "
+    f"primary={primary_count} "
+    f"strict={strict_count} "
+    f"decision={decision}"
+)
+'
+
+echo ""
+sed -n '1,260p' "$OUTPUT/copyable_result.txt"
