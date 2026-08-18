@@ -1,0 +1,61 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/home/bod/184Nas/process_data/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+
+# Direct invocation generates the retained V0 scene. Override this environment
+# variable with a space-separated scene list for cross-scene preparation.
+export SCANNETPP_SCENES="${SCANNETPP_SCENES:-00a231a370}"
+export SCANNETPP_PREPROCESS_MODE=full
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+
+cd "$ROOT"
+echo "Generate ScanNet++ RGB symlinks, semantic/instance masks and GT pointmaps"
+echo "scenes=$SCANNETPP_SCENES"
+zsh streaming_couping/commands_prepare_scannetpp_nas.txt
+
+MANIFEST="$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json"
+export MANIFEST
+PYTHONPATH=. "$PYTHON_BIN" - <<'PY'
+import json
+import os
+from pathlib import Path
+
+manifest_path = Path(os.environ["MANIFEST"])
+manifest = json.loads(manifest_path.read_text(encoding="utf8"))
+lookup = {str(scene["scene_id"]): scene for scene in manifest.get("scenes", ())}
+for scene_id in os.environ["SCANNETPP_SCENES"].split():
+    scene = lookup.get(scene_id)
+    if scene is None:
+        raise RuntimeError(f"generated manifest is missing scene {scene_id}")
+    frames = list(scene.get("frames", ()))
+    if not frames:
+        raise RuntimeError(f"generated scene has no frames: {scene_id}")
+    missing = []
+    non_symlink_images = []
+    for index, frame in enumerate(frames):
+        image = Path(frame["image_path"])
+        semantic = Path(frame["semantic_mask"])
+        instance = Path(frame["instance_mask"])
+        pointmap = Path(frame["pointmap"])
+        if not all(path.is_file() for path in (image, semantic, instance, pointmap)):
+            missing.append(index)
+        if not image.is_symlink():
+            non_symlink_images.append(index)
+    if missing:
+        raise RuntimeError(
+            f"scene {scene_id} has incomplete generated frames: {missing[:20]}"
+        )
+    if non_symlink_images:
+        raise RuntimeError(
+            f"scene {scene_id} image entries are not symlinks: "
+            f"{non_symlink_images[:20]}"
+        )
+    print(
+        f"generated scene accepted scene={scene_id} frames={len(frames)} "
+        "rgb_symlinks=1 semantic_masks=1 instance_masks=1 pointmaps=1"
+    )
+print(f"manifest={manifest_path}")
+PY

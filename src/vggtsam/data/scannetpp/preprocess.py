@@ -55,6 +55,7 @@ class ScanNetPP2DConfig:
     save_raster: bool = True
     save_pointmaps: bool = True
     cache_images: bool = True
+    image_cache_mode: str = "copy"
     skip_existing: bool = True
     dry_run: bool = False
 
@@ -63,6 +64,9 @@ def prepare_scannetpp_2d(config: ScanNetPP2DConfig) -> Dict[str, Any]:
     config.data_root = Path(config.data_root)
     config.output_root = Path(config.output_root)
     config.output_root.mkdir(parents=True, exist_ok=True)
+    config.image_cache_mode = str(config.image_cache_mode).strip().lower()
+    if config.image_cache_mode not in {"copy", "symlink"}:
+        raise ValueError("image_cache_mode must be copy or symlink.")
 
     scene_ids = _resolve_scene_ids(config)
     print(f"scannetpp_preprocess scenes={len(scene_ids)} root={config.data_root}")
@@ -338,9 +342,12 @@ def _process_frame(
     height, width = image_rgb.shape[:2]
     manifest_image_path = image_path
     if config.cache_images:
-        if not cached_image_path.exists() or not config.skip_existing:
-            shutil.copyfile(image_path, cached_image_path)
-            cached_image_path.chmod(0o644)
+        _materialize_cached_image(
+            image_path,
+            cached_image_path,
+            mode=config.image_cache_mode,
+            overwrite=not config.skip_existing,
+        )
         manifest_image_path = cached_image_path
 
     colmap_image = image_by_name.get(frame_name) or image_by_name.get(
@@ -446,6 +453,37 @@ def _process_frame(
         "pointmap_pixels": int(valid_pointmap.sum()),
         "visible_instance_ids": visible_instances,
     }
+
+
+def _materialize_cached_image(
+    source: Path,
+    destination: Path,
+    *,
+    mode: str,
+    overwrite: bool,
+) -> None:
+    """Create a generated image entry as a copy or absolute symlink."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    present = destination.exists() or destination.is_symlink()
+    if present and not overwrite:
+        if mode == "copy":
+            return
+        if (
+            mode == "symlink"
+            and destination.is_symlink()
+            and destination.resolve() == source.resolve()
+        ):
+            return
+    if present:
+        destination.unlink()
+    if mode == "symlink":
+        destination.symlink_to(source.resolve())
+        return
+    if mode != "copy":
+        raise ValueError(f"Unsupported image_cache_mode: {mode}")
+    shutil.copyfile(source, destination)
+    destination.chmod(0o644)
 
 
 def _camera_record(colmap_image: Any, camera: Any) -> Dict[str, Any]:

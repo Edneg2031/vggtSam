@@ -25,8 +25,8 @@ semantic_ignore_label: 65535
 save_visualizations: false
 save_raster: false
 save_pointmaps: true
-# RGB source and processed outputs share the same mounted root, so avoid a
-# second image copy. Manifest image paths remain absolute and stable.
-cache_images: false
+# Put an image entry beside generated masks/pointmaps without duplicating RGB.
+cache_images: true
+image_cache_mode: symlink
 skip_existing: true
 dry_run: false

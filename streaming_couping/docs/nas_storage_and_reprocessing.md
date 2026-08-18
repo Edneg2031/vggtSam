@@ -24,6 +24,7 @@
 ├── data/processed/scannetpp_pinhole_2d/
 │   ├── manifest.json
 │   └── <scene_id>/
+│       ├── images/             # 指向旧 RGB 的软链接
 │       ├── semantic_masks/
 │       ├── instance_masks/
 │       └── pointmaps/
@@ -51,6 +52,22 @@ ScanNet++ 预处理配置都会展开该变量。
 
 不需要复制原始场景。命令会直接读取旧的 `open_source` 路径，只把生成结果
 写到新的 `process_data/vggtSam`。
+
+如果要直接生成正式数据，运行：
+
+```bash
+zsh streaming_couping/commands_generate_scannetpp_data.txt
+```
+
+它默认完整处理 `00a231a370`。指定多个场景时使用：
+
+```bash
+SCANNETPP_SCENES="00a231a370 1d34f56de8" \
+zsh streaming_couping/commands_generate_scannetpp_data.txt
+```
+
+该命令会为 RGB 创建软链接，生成缺失的 semantic mask、instance mask 和
+world pointmap，最后逐帧验证四类文件是否完整。
 
 如果服务器环境缺少预处理依赖，先运行一次：
 
@@ -89,8 +106,8 @@ ${VGGT_SAM_STORAGE_ROOT}/outputs/processed_dataset_audit/summary.json
 ```
 
 该审计不读取 GT pointmap 数值，只看 manifest、文件存在性和文件大小。
-默认不重复复制 RGB，也不保存后续实验不需要的 z-buffer/raster 中间文件，
-以减少 NAS 占用。
+RGB 使用软链接，也不保存后续实验不需要的 z-buffer/raster 中间文件，以
+减少 NAS 占用。
 
 ## 重新生成 V0
 
