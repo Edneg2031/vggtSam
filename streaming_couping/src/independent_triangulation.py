@@ -45,17 +45,21 @@ def extract_frame_patch_descriptors(
     """
 
     value = token_levels.detach().float().cpu()
-    if value.ndim != 5 or value.shape[1] != 1:
+    if value.ndim == 5 and value.shape[1] == 1:
+        level_axis = value[:, 0]
+    elif value.ndim == 4:
+        level_axis = value
+    else:
         raise ValueError(
-            "token_levels must have shape [L,1,S,T,C], got "
+            "token_levels must have shape [L,S,T,C] or [L,1,S,T,C], got "
             f"{tuple(value.shape)}."
         )
     level = int(level_position)
     if level < 0:
-        level += int(value.shape[0])
-    if not 0 <= level < int(value.shape[0]):
+        level += int(level_axis.shape[0])
+    if not 0 <= level < int(level_axis.shape[0]):
         raise ValueError("Descriptor level_position is outside token_levels.")
-    tokens = value[level, 0]
+    tokens = level_axis[level]
     grid_height, grid_width = map(int, patch_shape)
     patch_count = grid_height * grid_width
     start = int(patch_start_idx)

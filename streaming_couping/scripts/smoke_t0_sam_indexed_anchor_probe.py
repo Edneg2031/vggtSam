@@ -41,8 +41,16 @@ def test_cached_frame_half_descriptor_extraction() -> None:
         patch_shape=(2, 2),
         token_half="global",
     )
+    batchless = extract_frame_patch_descriptors(
+        tokens[:, 0],
+        level_position=0,
+        patch_start_idx=2,
+        patch_shape=(2, 2),
+        token_half="frame",
+    )
     torch.testing.assert_close(frame[0, 0], torch.tensor([1.0, 0.0]))
     torch.testing.assert_close(global_descriptor[0, 0], torch.tensor([0.0, 1.0]))
+    torch.testing.assert_close(batchless, frame)
 
 
 def test_mask_support_and_area_exact_shift() -> None:
