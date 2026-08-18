@@ -5,16 +5,18 @@ ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
 GPU0="${T1_FEATURE_TTA_GPU0:-1}"
 GPU1="${T1_FEATURE_TTA_GPU1:-2}"
+SAM_GPU="${T1_FEATURE_TTA_SAM_GPU:-3}"
 KEEP_CLEAN="${T1_KEEP_CLEAN_ARTIFACT:-0}"
+KEEP_REBUILT_V0_CACHE="${T1_KEEP_REBUILT_V0_CACHE:-0}"
 CONFIG=streaming_couping/configs/t1_feature_tta.yaml
+V0_CONFIG=streaming_couping/configs/v0_baseline.yaml
 V0_CACHE=outputs/streaming_couping_v0/cache/00a231a370_90_525_step15_37_68_54.pt
 QK_POSE=outputs/streaming_couping_v0/qk_pose_retrieval/qk_pose_output.pt
+QK_SUMMARY=outputs/streaming_couping_v0/qk_pose_retrieval/qk_pose_summary.json
 OUTPUT=outputs/streaming_couping_t1_feature_tta
 
 cd "$ROOT"
 [[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
-[[ -s "$V0_CACHE" ]] || { echo "missing frozen V0 cache; run commands_v0_baseline.txt first" >&2; exit 1; }
-[[ -s "$QK_POSE" ]] || { echo "missing frozen V0 QK pose artifact; run commands_v0_baseline.txt first" >&2; exit 1; }
 
 export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
@@ -22,6 +24,32 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 echo "T1 smoke: zero-output LoRA, deterministic history dropout and shuffled teacher"
 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_t1_feature_tta
+
+REBUILT_V0_CACHE=0
+if [[ ! -s "$V0_CACHE" ]]; then
+  REBUILT_V0_CACHE=1
+  echo "Frozen V0 cache is absent; rebuilding only the required cache stage"
+  echo "physical GPUs=$GPU0,$GPU1,$SAM_GPU logical StreamVGGT=cuda:0,cuda:1 SAM3.1=cuda:2"
+  CUDA_VISIBLE_DEVICES="$GPU0,$GPU1,$SAM_GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. \
+    "$PYTHON_BIN" -m streaming_couping.scripts.run_dynamic_instance_baseline \
+    --config "$V0_CONFIG" \
+    --stage cache \
+    --streamvggt-devices cuda:0,cuda:1 \
+    --sam3-device cuda:2 \
+    --geometry-device cuda:0 \
+    --rebuild-cache
+fi
+[[ -s "$V0_CACHE" ]] || { echo "failed to rebuild frozen V0 cache" >&2; exit 1; }
+
+if [[ ! -s "$QK_POSE" || ! -s "$QK_SUMMARY" ]]; then
+  rm -rf outputs/streaming_couping_v0/qk_pose_retrieval
+  echo "Frozen QK pose artifact is absent; rebuilding the RGB/QK pose branch only"
+  CUDA_VISIBLE_DEVICES="$GPU0,$GPU1" PYTHONUNBUFFERED=1 PYTHONPATH=. \
+    "$PYTHON_BIN" -m streaming_couping.scripts.run_v0_qk_pose_retrieval \
+    --config "$V0_CONFIG" \
+    --streamvggt-devices cuda:0,cuda:1
+fi
+[[ -s "$QK_POSE" ]] || { echo "failed to rebuild frozen V0 QK pose artifact" >&2; exit 1; }
 
 rm -rf "$OUTPUT"
 mkdir -p "$OUTPUT"
@@ -102,6 +130,10 @@ print(
 if [[ "$KEEP_CLEAN" != "1" ]]; then
   rm -f "$OUTPUT/clean_tta_input.pt"
   echo "Removed temporary clean TTA artifact to save storage (set T1_KEEP_CLEAN_ARTIFACT=1 to retain it)"
+fi
+if [[ "$REBUILT_V0_CACHE" == "1" && "$KEEP_REBUILT_V0_CACHE" != "1" ]]; then
+  rm -f "$V0_CACHE"
+  echo "Removed the V0 cache rebuilt by this command (set T1_KEEP_REBUILT_V0_CACHE=1 to retain it)"
 fi
 
 echo ""

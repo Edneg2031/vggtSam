@@ -43,6 +43,8 @@ D. zero_update_lora
 zsh streaming_couping/commands_t1_feature_tta.txt
 ```
 
+如果 V0 cache 已删除，这条命令会自动只重建 T1 所需的 V0 cache；如果 QK pose artifact 也不存在，则只额外重建 QK 分支，不会运行 V0 audit 和语义地图导出。实验成功后，命令会自动删除本次临时重建的大 cache。
+
 默认使用物理 GPU 1、2。可覆盖：
 
 ```bash
@@ -54,6 +56,13 @@ clean artifact 体积较大，评分完成后默认删除；如需保留：
 
 ```bash
 T1_KEEP_CLEAN_ARTIFACT=1 \
+zsh streaming_couping/commands_t1_feature_tta.txt
+```
+
+如果希望同时保留自动重建的 V0 cache：
+
+```bash
+T1_KEEP_REBUILT_V0_CACHE=1 \
 zsh streaming_couping/commands_t1_feature_tta.txt
 ```
 
