@@ -8,6 +8,8 @@ from typing import Any
 
 import yaml
 
+from ..storage import expand_storage_path
+
 
 @dataclass(frozen=True)
 class ClipConfig:
@@ -720,15 +722,7 @@ def _validate(config: LearnedPoseConfig) -> None:
 def _path(value: Any, base: Path) -> Path:
     if value is None or str(value).strip() == "":
         raise ValueError("A required path is missing from the learned-pose config.")
-    path = Path(value).expanduser()
-    if path.is_absolute():
-        return path
-    # Repository commands are run from the repository root. Prefer that
-    # interpretation, then fall back to YAML-relative paths.
-    cwd_path = (Path.cwd() / path).resolve()
-    if cwd_path.exists() or not (base / path).exists():
-        return cwd_path
-    return (base / path).resolve()
+    return expand_storage_path(value, base=base, prefer_cwd=True)
 
 
 def _pair(value: Any, field: str) -> tuple[int, int]:

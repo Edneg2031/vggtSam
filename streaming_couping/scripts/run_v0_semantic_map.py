@@ -28,6 +28,7 @@ from streaming_couping.src.semantic_map import (
     SemanticPointMap,
     build_semantic_pointmap,
 )
+from streaming_couping.src.storage import expand_storage_path
 
 
 REVISION = "v0_frozen_semantic_map_export_r2"
@@ -537,9 +538,9 @@ def _load_run(path: str | Path) -> SemanticMapRun:
     section = raw.get("semantic_map", {})
     run = SemanticMapRun(
         source_path=source,
-        output_dir=Path(
+        output_dir=expand_storage_path(
             section.get("output_dir", "outputs/streaming_couping_v0/semantic_map")
-        ).expanduser().resolve(),
+        ),
         confidence_threshold=float(section.get("confidence_threshold", 0.30)),
         track_score_threshold=float(section.get("track_score_threshold", 0.50)),
         max_map_points=int(section.get("max_map_points", 400000)),

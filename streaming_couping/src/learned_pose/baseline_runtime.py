@@ -8,6 +8,8 @@ from pathlib import Path
 import torch
 import yaml
 
+from ..storage import expand_storage_path
+
 
 @dataclass(frozen=True)
 class BaselineRunConfig:
@@ -248,7 +250,7 @@ def _int_tuple(value) -> tuple[int, ...]:
 
 
 def _path(value: str | Path) -> Path:
-    return Path(value).expanduser().resolve()
+    return expand_storage_path(value)
 
 
 def _validate_config(config: BaselineRunConfig) -> None:

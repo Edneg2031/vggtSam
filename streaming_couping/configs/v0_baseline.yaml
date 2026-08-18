@@ -1,10 +1,10 @@
 # Frozen V0: QK-retrieved pose, raw full-history world pointmap and SAM3.1
 # persistent semantic lifting. SAM mask/ID never enters pose generation.
 recovery_config: streaming_couping/configs/recovery_dynamic_instance.yaml
-output_dir: outputs/streaming_couping_v0/data_stage
+output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/data_stage
 
 dataset:
-  manifest: data/processed/scannetpp_pinhole_2d/manifest.json
+  manifest: ${VGGT_SAM_STORAGE_ROOT}/data/processed/scannetpp_pinhole_2d/manifest.json
   clips:
     - name: 00a231a370_90_525_step15_37_68_54
       scene_id: 00a231a370
@@ -43,7 +43,7 @@ runtime:
 
 features:
   # Stable V0-owned cache. Rebuild explicitly when it is absent or stale.
-  cache_dir: outputs/streaming_couping_v0/cache
+  cache_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/cache
   rebuild: false
   cache_sam_appearance: false
   sam_source: disabled_geometry_only_baseline
@@ -70,7 +70,7 @@ fusion:
 baseline:
   version: v0
   status: frozen
-  output_dir: outputs/streaming_couping_v0
+  output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0
   clip_name: 00a231a370_90_525_step15_37_68_54
   audit_device: "cuda:0"
   frames:
@@ -79,20 +79,20 @@ baseline:
     # The selection is fixed before GT scoring. It consumes the RGB/QK-only
     # artifact below; raw StreamVGGT remains an explicit runtime fallback.
     selected_branch: retrieve_qk
-    qk_pose_output: outputs/streaming_couping_v0/qk_pose_retrieval/qk_pose_output.pt
+    qk_pose_output: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/qk_pose_retrieval/qk_pose_output.pt
     allow_raw_fallback: true
 
 # Training-free pose candidate. RGB/native QK selects history and the frozen
 # camera head emits pose. Depth/point heads and SAM are not run here.
 qk_pose_retrieval:
-  output_dir: outputs/streaming_couping_v0/qk_pose_retrieval
+  output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/qk_pose_retrieval
   total_frame_budget: 5
   anchor_frames: 1
 
 # Deployable semantic map: raw full-history world pointmap plus SAM persistent
 # slot/ID labels. The selected QK pose trajectory is stored alongside the map.
 semantic_map:
-  output_dir: outputs/streaming_couping_v0/semantic_map
+  output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/semantic_map
   confidence_threshold: 0.30
   track_score_threshold: 0.50
   max_map_points: 400000

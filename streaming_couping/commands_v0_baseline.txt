@@ -2,15 +2,19 @@
 set -euo pipefail
 
 ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/home/bod/184Nas/process_data/vggtSam}"
 PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
 STREAM_GPU0="${BASELINE_STREAM_GPU0:-1}"
 STREAM_GPU1="${BASELINE_STREAM_GPU1:-2}"
 SAM_GPU="${BASELINE_SAM_GPU:-3}"
 VISIBLE_GPUS="$STREAM_GPU0,$STREAM_GPU1,$SAM_GPU"
 CONFIG=streaming_couping/configs/v0_baseline.yaml
+V0_OUTPUT="$STORAGE_ROOT/outputs/streaming_couping_v0"
 
 cd "$ROOT"
 [[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+mkdir -p "$STORAGE_ROOT/data/processed" "$STORAGE_ROOT/outputs"
 
 export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
@@ -35,7 +39,7 @@ CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" PYTHONUNBUFFERED=1 PYTHONPATH=. \
   --geometry-device cuda:0 \
   "${ARGS[@]}"
 
-QK_OUTPUT=outputs/streaming_couping_v0/qk_pose_retrieval
+QK_OUTPUT="$V0_OUTPUT/qk_pose_retrieval"
 QK_POSE="$QK_OUTPUT/qk_pose_output.pt"
 QK_SUMMARY="$QK_OUTPUT/qk_pose_summary.json"
 if [[ "${BASELINE_REBUILD_QK:-0}" == "1" || ! -s "$QK_POSE" || ! -s "$QK_SUMMARY" ]]; then
@@ -57,14 +61,17 @@ CUDA_VISIBLE_DEVICES="$VISIBLE_GPUS" PYTHONUNBUFFERED=1 PYTHONPATH=. \
   --stage audit \
   --audit-device cuda:0
 
-[[ -s outputs/streaming_couping_v0/baseline_summary.json ]] || {
+BASELINE_SUMMARY="$V0_OUTPUT/baseline_summary.json"
+export BASELINE_SUMMARY
+[[ -s "$BASELINE_SUMMARY" ]] || {
   echo "missing baseline_summary.json" >&2
   exit 1
 }
 PYTHONPATH=. "$PYTHON_BIN" -c '
 import json
+import os
 from pathlib import Path
-summary = json.loads(Path("outputs/streaming_couping_v0/baseline_summary.json").read_text())
+summary = json.loads(Path(os.environ["BASELINE_SUMMARY"]).read_text())
 assert summary["baseline_version"] == "v0"
 assert summary["schema"] == 6
 assert summary["baseline_status"] == "frozen"
@@ -112,7 +119,8 @@ print(
 )
 '
 
-SEMANTIC_OUTPUT=outputs/streaming_couping_v0/semantic_map
+SEMANTIC_OUTPUT="$V0_OUTPUT/semantic_map"
+export SEMANTIC_OUTPUT
 rm -rf "$SEMANTIC_OUTPUT"
 echo "stage 4/4: lift SAM persistent instances onto the raw world pointmap"
 echo "No GT is read; QK pose is stored alongside the unchanged raw pointmap"
@@ -138,10 +146,11 @@ PYTHONUNBUFFERED=1 PYTHONPATH=. "$PYTHON_BIN" \
 }
 PYTHONPATH=. "$PYTHON_BIN" -c '
 import json
+import os
 from pathlib import Path
-summary = json.loads(Path(
-    "outputs/streaming_couping_v0/semantic_map/semantic_map_summary.json"
-).read_text())
+summary = json.loads(
+    Path(os.environ["SEMANTIC_OUTPUT"], "semantic_map_summary.json").read_text()
+)
 assert summary["schema"] == 2
 assert summary["revision"] == "v0_frozen_semantic_map_export_r2"
 assert summary["baseline_revision"] == "v0_frozen_semantic_mapping_pipeline_r1"

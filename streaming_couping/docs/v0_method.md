@@ -67,14 +67,14 @@ box / guitar case`。它们来自独立的 annotation-only 场景盘点；盘点
 
 一次命令生成：
 
-- `outputs/streaming_couping_v0/baseline_summary.json`：tracking 与 pose 结果；
-- `outputs/streaming_couping_v0/poses.pt`：raw/QK 相机轨迹；
-- `outputs/streaming_couping_v0/semantic_map/semantic_map.pt`：完整结构化语义地图；
-- `outputs/streaming_couping_v0/semantic_map/semantic_map.ply`：按persistent slot着色的语义点云；
-- `outputs/streaming_couping_v0/semantic_map/rgb_map.ply`：保留原始图像颜色的点云；
-- `outputs/streaming_couping_v0/semantic_map/tracks.csv`：实例元数据；
-- `outputs/streaming_couping_v0/semantic_map/prompt_discovery.csv`：逐提示词的原始发现、出生门控、最终保留和 mask 支持统计；
-- `outputs/streaming_couping_v0/semantic_map/semantic_map_summary.json`：pipeline 审计。
+- `${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/baseline_summary.json`：tracking 与 pose 结果；
+- `${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/poses.pt`：raw/QK 相机轨迹；
+- `${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/semantic_map/semantic_map.pt`：完整结构化语义地图；
+- `${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/semantic_map/semantic_map.ply`：按persistent slot着色的语义点云；
+- `${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/semantic_map/rgb_map.ply`：保留原始图像颜色的点云；
+- `${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/semantic_map/tracks.csv`：实例元数据；
+- `${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/semantic_map/prompt_discovery.csv`：逐提示词的原始发现、出生门控、最终保留和 mask 支持统计；
+- `${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/semantic_map/semantic_map_summary.json`：pipeline 审计。
 
 `semantic_map.pt`保存 world point、原始RGB、语义RGB、固定slot调色板、confidence、frame index、
 semantic slot、SAM track ID、track metadata，以及raw/QK两条相机轨迹。

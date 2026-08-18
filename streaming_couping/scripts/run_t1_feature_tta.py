@@ -54,6 +54,7 @@ from streaming_couping.src.learned_pose.cache import cache_path, load_feature_ca
 from streaming_couping.src.learned_pose.config import ClipConfig, load_learned_pose_config
 from streaming_couping.src.pointmap_alignment import _paired_limit, _robust_similarity
 from streaming_couping.src.semantic_map import normalize_confidence
+from streaming_couping.src.storage import expand_storage_path
 
 
 REVISION = "t1_full_history_teacher_masked_history_lora_tta_r1"
@@ -1280,8 +1281,7 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def _resolve(value: str | Path) -> Path:
-    path = Path(value).expanduser()
-    return path.resolve() if path.is_absolute() else (Path.cwd() / path).resolve()
+    return expand_storage_path(value)
 
 
 def _parse_args() -> argparse.Namespace:

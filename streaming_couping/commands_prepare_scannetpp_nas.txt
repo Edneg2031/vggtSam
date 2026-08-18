@@ -1,0 +1,100 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/home/bod/184Nas/process_data/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+MODE="${SCANNETPP_PREPROCESS_MODE:-preflight}"
+CONFIG=configs/scannetpp_pinhole_2d.yaml
+PROCESSED_ROOT="$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d"
+MANIFEST="$PROCESSED_ROOT/manifest.json"
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+
+mkdir -p \
+  "$STORAGE_ROOT/source/scannetpp_pinhole/data" \
+  "$STORAGE_ROOT/source/scannetpp_pinhole/metadata" \
+  "$STORAGE_ROOT/source/scannetpp/data" \
+  "$STORAGE_ROOT/data/processed" \
+  "$STORAGE_ROOT/outputs"
+
+echo "ScanNet++ NAS preprocessing mode=$MODE"
+echo "storage=$STORAGE_ROOT"
+echo "pinhole scenes=$STORAGE_ROOT/source/scannetpp_pinhole/data/<scene_id>"
+echo "annotations=$STORAGE_ROOT/source/scannetpp/data/<scene_id>/scans"
+echo "processed=$PROCESSED_ROOT"
+df -h "$STORAGE_ROOT" | tail -n 1
+
+if [[ "$MODE" == "preflight" ]]; then
+  PYTHONPATH=src "$PYTHON_BIN" -c '
+import numpy
+import yaml
+print("preflight dependencies passed")
+'
+else
+  PYTHONPATH=src "$PYTHON_BIN" -c '
+import cv2
+import numpy
+import plyfile
+import yaml
+try:
+    import numba
+    print("preprocess dependencies passed; numba=1")
+except ImportError:
+    print("preprocess dependencies passed; numba=0 (processing will be slow)")
+'
+fi
+
+SCENE_ARGS=()
+if [[ -n "${SCANNETPP_SCENES:-}" ]]; then
+  SCENE_ARGS+=(--scene-ids ${=SCANNETPP_SCENES})
+fi
+
+case "$MODE" in
+  preflight)
+    echo "Read-only asset preflight; no masks or pointmaps are generated"
+    PYTHONPATH=src "$PYTHON_BIN" scripts/prepare_scannetpp_2d.py \
+      --config "$CONFIG" \
+      "${SCENE_ARGS[@]}" \
+      --max-frames "${SCANNETPP_DEBUG_FRAMES:-5}" \
+      --dry-run
+    ;;
+  debug)
+    if (( ${#SCENE_ARGS[@]} == 0 )); then
+      SCENE_ARGS=(--scene-ids 00a231a370)
+    fi
+    echo "Generate a five-frame visual/debug slice on NAS"
+    PYTHONPATH=src "$PYTHON_BIN" scripts/prepare_scannetpp_2d.py \
+      --config "$CONFIG" \
+      "${SCENE_ARGS[@]}" \
+      --max-frames "${SCANNETPP_DEBUG_FRAMES:-5}" \
+      --overwrite \
+      --save-visualizations
+    ;;
+  full)
+    echo "Generate/resume full selected scenes; existing complete frames are kept"
+    PYTHONPATH=src "$PYTHON_BIN" scripts/prepare_scannetpp_2d.py \
+      --config "$CONFIG" \
+      "${SCENE_ARGS[@]}" \
+      --skip-existing \
+      --no-visualizations
+    ;;
+  audit)
+    [[ -s "$MANIFEST" ]] || { echo "missing manifest: $MANIFEST" >&2; exit 1; }
+    ;;
+  *)
+    echo "SCANNETPP_PREPROCESS_MODE must be preflight, debug, full or audit" >&2
+    exit 2
+    ;;
+esac
+
+if [[ "$MODE" != "preflight" ]]; then
+  [[ -s "$MANIFEST" ]] || { echo "missing manifest after preprocessing" >&2; exit 1; }
+  PYTHONPATH=. "$PYTHON_BIN" \
+    -m streaming_couping.scripts.audit_processed_dataset \
+    --manifest "$MANIFEST" \
+    --output-dir "$STORAGE_ROOT/outputs/processed_dataset_audit" \
+    --minimum-frames "${SCANNETPP_MINIMUM_FRAMES:-30}"
+fi

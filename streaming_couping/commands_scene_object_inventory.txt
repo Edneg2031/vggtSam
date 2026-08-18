@@ -2,12 +2,15 @@
 set -euo pipefail
 
 ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/home/bod/184Nas/process_data/vggtSam}"
 PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
 CONFIG=streaming_couping/configs/v0_baseline.yaml
-OUTPUT=outputs/streaming_couping_v0/scene_object_inventory
+OUTPUT="$STORAGE_ROOT/outputs/streaming_couping_v0/scene_object_inventory"
 
 cd "$ROOT"
 [[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+export OUTPUT
 
 echo "Scene object inventory for manual SAM prompt planning"
 echo "Reads dataset annotations/masks only; no model, checkpoint or GPU is used"
@@ -27,10 +30,11 @@ PYTHONPATH=. "$PYTHON_BIN" \
 }
 PYTHONPATH=. "$PYTHON_BIN" -c '
 import json
+import os
 from pathlib import Path
-summary = json.loads(Path(
-    "outputs/streaming_couping_v0/scene_object_inventory/scene_object_inventory.json"
-).read_text())
+summary = json.loads(
+    Path(os.environ["OUTPUT"], "scene_object_inventory.json").read_text()
+)
 assert summary["schema"] == 1
 assert summary["revision"] == "scene_annotation_object_inventory_r1"
 assert summary["role"] == "manual_prompt_planning_only"

@@ -39,6 +39,7 @@ from streaming_couping.src.qk_pose_retrieval import (
     rank_qk_history,
     select_qk_history,
 )
+from streaming_couping.src.storage import expand_storage_path
 
 
 REVISION = "v0_streamvggt_qk_pose_retrieval_r1"
@@ -460,12 +461,12 @@ def _load_run(path: str | Path) -> QKRun:
     policy.validate()
     return QKRun(
         source_path=source,
-        output_dir=Path(
+        output_dir=expand_storage_path(
             section.get(
                 "output_dir",
                 "outputs/streaming_couping_v0/qk_pose_retrieval",
             )
-        ).expanduser().resolve(),
+        ),
         policy=policy,
     )
 

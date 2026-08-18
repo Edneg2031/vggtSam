@@ -1,0 +1,32 @@
+# ScanNet++ pinhole RGB/annotation/pointmap preprocessing on mounted storage.
+# Override VGGT_SAM_STORAGE_ROOT if the mount point changes.
+data_root: ${VGGT_SAM_STORAGE_ROOT}/source/scannetpp_pinhole/data
+annotation_root: ${VGGT_SAM_STORAGE_ROOT}/source/scannetpp/data
+metadata_root: ${VGGT_SAM_STORAGE_ROOT}/source/scannetpp_pinhole/metadata
+scene_list: ${VGGT_SAM_STORAGE_ROOT}/source/scannetpp_pinhole/scannetpp_part_valid_scenes.txt
+output_root: ${VGGT_SAM_STORAGE_ROOT}/data/processed/scannetpp_pinhole_2d
+
+# Empty means: use scene_list when present, otherwise discover data_root.
+scene_ids: []
+limit_scenes:
+
+mesh_filename: mesh_aligned_0.05.ply
+annotation_scan_subdir: scans
+semantic_mesh_filename: mesh_aligned_0.05_semantic.ply
+segments_filename: segments.json
+annotations_filename: segments_anno.json
+semantic_classes_file:
+
+frame_step: 1
+max_frames:
+near: 0.001
+semantic_ignore_label: 65535
+
+save_visualizations: false
+save_raster: false
+save_pointmaps: true
+# RGB source and processed outputs share the same mounted root, so avoid a
+# second image copy. Manifest image paths remain absolute and stable.
+cache_images: false
+skip_existing: true
+dry_run: false
