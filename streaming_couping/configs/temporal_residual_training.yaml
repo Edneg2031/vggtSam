@@ -1,7 +1,8 @@
 # Single-scene development protocol only.  Formal V0 artifacts are read-only.
+# r2 changes checkpoint selection only: minimum val RMSE, then minimum val P90.
 # This fixed 18/6/6 temporal split cannot establish cross-scene generalization.
 v0_config: streaming_couping/configs/v0_baseline.yaml
-output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_phase1_temporal_residual
+output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_phase1_temporal_residual_r2
 device: cuda:0
 seed: 2026
 

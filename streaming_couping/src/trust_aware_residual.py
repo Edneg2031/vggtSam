@@ -22,6 +22,17 @@ class ResidualOutput:
     log_variance: torch.Tensor | None
 
 
+def validation_checkpoint_is_better(
+    rmse: float,
+    p90: float,
+    best: tuple[float, float] | None,
+) -> bool:
+    """Apply the frozen r2 model-selection rule without reading test metrics."""
+
+    score = (float(rmse), float(p90))
+    return best is None or score < best
+
+
 def point_head_patch_features(
     token_levels: torch.Tensor,
     *,

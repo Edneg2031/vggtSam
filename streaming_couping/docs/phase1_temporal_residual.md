@@ -55,6 +55,20 @@ reference-frame Sim(3) 将 GT 逆变换到 native gauge，再监督 residual；�
 GT 只用于 train label、validation 监控和最终 test 评价。Epoch 数和所有阈值在运行前固定，test 的 6 帧
 不参与参数更新或模型选择。
 
+### r2 checkpoint selection
+
+r1 直接评价第 30 epoch，得到所有 test RMSE/P90 均恶化；但 train loss 持续下降时 validation RMSE 很早
+达到最低并随后上升，说明 final checkpoint 已经过拟合。r2 不改变模型、loss、学习率、正则、epoch 数或
+任何数据划分，只补标准的 validation model selection：
+
+```text
+primary:   minimum validation RMSE
+tie-break: minimum validation P90
+```
+
+三个学习分支各自保存 best-validation checkpoint。30 epochs 全部结束后才加载所选权重，每个分支只运行
+一次 test 评价。不能根据 r1 中观察到的结果把训练轮数事后改成 1。
+
 ## 运行
 
 要求下列两个只读 artifact 已存在：
@@ -79,7 +93,7 @@ TEMPORAL_RESIDUAL_GPU=2 zsh streaming_couping/commands_temporal_residual_trainin
 输出目录：
 
 ```text
-/data184/open_source/vggtSam/outputs/streaming_couping_phase1_temporal_residual
+/data184/open_source/vggtSam/outputs/streaming_couping_phase1_temporal_residual_r2
 ```
 
 其中包括 `summary.json`、`branch_summary.csv`、`frame_metrics.csv`、`training_curve.csv`、
@@ -87,9 +101,11 @@ TEMPORAL_RESIDUAL_GPU=2 zsh streaming_couping/commands_temporal_residual_trainin
 
 ## 判断边界
 
-只有 D 分支在 test 上同时满足 RMSE 降低、P90 不恶化、至少 4/6 帧改善，且 uncertainty-error Spearman
-不低于 0.20、低 uncertainty 的 50% coverage 风险更低，才记为 temporal development `GO`。
+三个预先声明的学习分支中，只要有一个 best-validation checkpoint 在 test 上同时满足 RMSE 低于 raw、
+P90 不高于 raw，才记为 temporal development `GO`。Improved-frame ratio、UQ Spearman 和 risk-coverage
+继续输出，但不额外改变 r2 GO/NO-GO。
 
 即使得到 `GO`，下一步也只能是在存储恢复后用完全冻结的 protocol 做 held-out scene 验证；不能据此加入
-SAM 或宣称跨场景 pointmap 已提升。若为 `NO_GO`，先检查 residual 学习信号，不继续堆 SAM、ICP、BA、
-triangulation 或 Gaussian。
+SAM 或宣称跨场景 pointmap 已提升。若 r2 为 `NO_GO`，正式停止当前 geometry-only residual 路线，不再调
+epoch、学习率、正则、gate/UQ loss 或 hidden dimension；SAM/geometry joint training 只能作为另一条新假设
+重新立项，不能用于挽救本轮结论。

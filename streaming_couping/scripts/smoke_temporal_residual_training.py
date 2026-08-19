@@ -12,12 +12,14 @@ from streaming_couping.src.trust_aware_residual import (
     invert_similarity,
     point_head_patch_features,
     robust_point_loss,
+    validation_checkpoint_is_better,
 )
 
 
 def main() -> None:
     _test_cached_feature_layout()
     _test_similarity_round_trip()
+    _test_validation_checkpoint_selection()
     _test_protected_fallback_and_gradient()
     print("Phase 1 temporal trust-aware residual smoke passed")
 
@@ -51,6 +53,14 @@ def _test_similarity_round_trip() -> None:
         metric, scale=1.7, rotation=rotation, translation=translation
     )
     torch.testing.assert_close(recovered, native, rtol=1e-5, atol=1e-5)
+
+
+def _test_validation_checkpoint_selection() -> None:
+    assert validation_checkpoint_is_better(0.12, 0.20, None)
+    assert validation_checkpoint_is_better(0.11, 0.30, (0.12, 0.20))
+    assert validation_checkpoint_is_better(0.12, 0.19, (0.12, 0.20))
+    assert not validation_checkpoint_is_better(0.12, 0.21, (0.12, 0.20))
+    assert not validation_checkpoint_is_better(0.13, 0.10, (0.12, 0.20))
 
 
 def _test_protected_fallback_and_gradient() -> None:

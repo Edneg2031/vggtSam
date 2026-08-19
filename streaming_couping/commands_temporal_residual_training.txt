@@ -8,7 +8,7 @@ GPU="${TEMPORAL_RESIDUAL_GPU:-1}"
 CONFIG=streaming_couping/configs/temporal_residual_training.yaml
 V0_CACHE="$STORAGE_ROOT/outputs/streaming_couping_v0/cache/00a231a370_90_525_step15_37_68_54.pt"
 QK_POSE="$STORAGE_ROOT/outputs/streaming_couping_v0/qk_pose_retrieval/qk_pose_output.pt"
-OUTPUT="$STORAGE_ROOT/outputs/streaming_couping_phase1_temporal_residual"
+OUTPUT="$STORAGE_ROOT/outputs/streaming_couping_phase1_temporal_residual_r2"
 
 cd "$ROOT"
 [[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
@@ -29,14 +29,15 @@ export PYTHONHASHSEED=2026
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-echo "Phase 1 smoke: cached DPT layout, Sim(3) gauge and protected raw fallback"
+echo "Phase 1 r2 smoke: DPT layout, Sim(3), raw fallback and validation selection"
 PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_temporal_residual_training
 
 rm -rf "$OUTPUT"
 mkdir -p "$OUTPUT"
-echo "Phase 1 geometry-only temporal residual training"
+echo "Phase 1 r2 geometry-only temporal residual training"
 echo "physical GPU=$GPU logical training device=cuda:0"
 echo "split=train 0-17, validation 18-23, test 24-29"
+echo "Each branch loads its best validation checkpoint before one-pass test scoring"
 echo "Formal V0 is read-only; StreamVGGT/SAM models are not loaded"
 CUDA_VISIBLE_DEVICES="$GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. \
   "$PYTHON_BIN" -m streaming_couping.scripts.run_temporal_residual_training \
@@ -61,7 +62,7 @@ from pathlib import Path
 
 summary = json.loads(Path(os.environ["OUTPUT"], "summary.json").read_text())
 assert summary["schema"] == 1
-assert summary["revision"] == "phase1_temporal_trust_aware_pointmap_residual_r1"
+assert summary["revision"] == "phase1_temporal_trust_aware_pointmap_residual_r2"
 assert summary["scope"] == "single_scene_temporal_split_pipeline_and_proof_of_learning"
 assert summary["sam_inputs"] == 0
 assert summary["backbone_parameters_updated"] == 0
@@ -69,6 +70,7 @@ assert summary["point_head_parameters_updated"] == 0
 assert summary["camera_head_parameters_updated"] == 0
 assert summary["external_residual_head_parameters_updated"] == 1
 assert summary["test_frames_used_for_optimization"] == 0
+assert summary["test_evaluation_policy"] == "one_pass_after_best_validation_checkpoint_loaded"
 assert summary["formal_v0_modified"] == 0
 assert len(summary["split"]["train_sequence_indices"]) == 18
 assert len(summary["split"]["validation_sequence_indices"]) == 6
@@ -80,10 +82,26 @@ for split in ("validation", "test"):
         "gated_residual",
         "gated_residual_uncertainty",
     }
+for branch in ("residual_no_gate", "gated_residual", "gated_residual_uncertainty"):
+    selection = summary["selected_checkpoints"][branch]
+    assert selection["rule"] == "minimum_validation_rmse_then_minimum_validation_p90"
+    assert 0 <= selection["best_epoch"] < 30
+    assert selection["test_metrics_read_during_selection"] == 0
+    assert selection["reloaded_validation_equivalence_pass"] == 1
 decision = summary["decision"]
 assert decision["scope"] == "single_scene_temporal_development_only"
 assert decision["temporal_development_decision"] in {"GO", "NO_GO"}
 assert decision["cross_scene_generalization_claim"] == 0
+assert decision["go_rule"] == "any_predeclared_learned_branch_test_rmse_below_raw_and_p90_not_above_raw"
+assert set(decision["branch_test_decisions"]) == {
+    "residual_no_gate",
+    "gated_residual",
+    "gated_residual_uncertainty",
+}
+expected_go = any(
+    value["test_go"] == 1 for value in decision["branch_test_decisions"].values()
+)
+assert (decision["temporal_development_decision"] == "GO") == expected_go
 assert decision["formal_v0_pose_modified"] == 0
 assert decision["formal_v0_pointmap_modified"] == 0
 assert decision["formal_v0_semantic_map_modified"] == 0
@@ -93,12 +111,14 @@ p90_gain = test["p90_gain_vs_raw_percent"]
 improved = test["improved_frames_vs_raw"]
 spearman = test["uncertainty_error_spearman"]
 result = decision["temporal_development_decision"]
+passing = ",".join(decision["passing_branches"]) or "none"
 print(
     "Phase 1 output schema accepted "
     f"rmse_gain={rmse_gain:.4f}% "
     f"p90_gain={p90_gain:.4f}% "
     f"frames={improved}/6 "
     f"uq_spearman={spearman:.4f} "
+    f"passing={passing} "
     f"decision={result}"
 )
 '

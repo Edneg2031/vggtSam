@@ -35,10 +35,11 @@ from streaming_couping.src.trust_aware_residual import (
     invert_similarity,
     point_head_patch_features,
     robust_point_loss,
+    validation_checkpoint_is_better,
 )
 
 
-REVISION = "phase1_temporal_trust_aware_pointmap_residual_r1"
+REVISION = "phase1_temporal_trust_aware_pointmap_residual_r2"
 LEARNED_BRANCHES = (
     "residual_no_gate",
     "gated_residual",
@@ -115,7 +116,7 @@ def main() -> None:
     data, qk_path, qk_sha_before = _load_experiment_data(run)
     _validate_split(run, len(data.frame_indices))
     device = _resolve_device(run.device)
-    print("PHASE 1 TEMPORAL TRUST-AWARE POINTMAP RESIDUAL TRAINING")
+    print("PHASE 1 R2 BEST-VALIDATION POINTMAP RESIDUAL TRAINING")
     print(
         f"  clip={data.clip} frames={len(data.frame_indices)} "
         f"split={len(run.train_indices)}/{len(run.validation_indices)}/{len(run.test_indices)}"
@@ -127,18 +128,10 @@ def main() -> None:
     print("  frozen=StreamVGGT backbone, PointHead, CameraHead; SAM=0")
     print("  GT role=supervised train labels, validation monitoring, sealed test scoring")
 
-    raw_rows, raw_frames = _score_raw(data, run)
-    branch_rows = list(raw_rows)
-    frame_rows = list(raw_frames)
     training_rows: list[dict[str, Any]] = []
     risk_rows: list[dict[str, Any]] = []
     states: dict[str, Any] = {}
-    branch_lookup: dict[str, dict[str, dict[str, Any]]] = {
-        "validation": {
-            row["branch"]: row for row in branch_rows if row["split"] == "validation"
-        },
-        "test": {row["branch"]: row for row in branch_rows if row["split"] == "test"},
-    }
+    selection_summaries: dict[str, dict[str, Any]] = {}
 
     for branch in LEARNED_BRANCHES:
         spec = BRANCH_SPECS[branch]
@@ -162,15 +155,51 @@ def main() -> None:
             f"  training {branch} gate={int(spec.use_gate)} "
             f"uncertainty={int(spec.use_uncertainty)}"
         )
-        curve = _train_branch(model, branch, data, run, device)
+        curve, best_state, selection = _train_branch(
+            model, branch, data, run, device
+        )
         training_rows.extend(curve)
+        selection_summaries[branch] = selection
         states[branch] = {
             "spec": asdict(spec),
-            "state_dict": {
-                key: value.detach().cpu() for key, value in model.state_dict().items()
-            },
+            "state_dict": best_state,
             "zero_update_native_maximum": zero_error,
+            "checkpoint_selection": selection,
         }
+        print(
+            f"    selected best-validation epoch={selection['best_epoch'] + 1} "
+            f"RMSE={selection['best_validation_rmse']:.6f} "
+            f"P90={selection['best_validation_p90']:.6f}"
+        )
+        model.to("cpu")
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    print("  all best-validation checkpoints frozen; opening one-pass test scoring")
+    raw_rows, raw_frames = _score_raw(data, run)
+    branch_rows = list(raw_rows)
+    frame_rows = list(raw_frames)
+    branch_lookup: dict[str, dict[str, dict[str, Any]]] = {
+        "validation": {
+            row["branch"]: row for row in branch_rows if row["split"] == "validation"
+        },
+        "test": {row["branch"]: row for row in branch_rows if row["split"] == "test"},
+    }
+    for branch in LEARNED_BRANCHES:
+        spec = BRANCH_SPECS[branch]
+        selection = selection_summaries[branch]
+        model = TrustAwareResidualHead(
+            feature_channels=int(data.features.shape[-1]),
+            level_count=int(data.features.shape[1]),
+            patch_shape=data.patch_shape,
+            projection_channels=run.projection_channels,
+            hidden_channels=run.hidden_channels,
+            use_gate=spec.use_gate,
+            use_uncertainty=spec.use_uncertainty,
+            gate_bias=run.gate_bias,
+        ).to(device)
+        model.load_state_dict(states[branch]["state_dict"], strict=True)
         for split, indices in (
             ("validation", run.validation_indices),
             ("test", run.test_indices),
@@ -191,6 +220,34 @@ def main() -> None:
                 raw["median"], row["median"]
             )
             row["p90_gain_vs_raw_percent"] = _gain(raw["p90"], row["p90"])
+            row["selected_checkpoint_epoch"] = selection["best_epoch"]
+            row["selected_checkpoint_epoch_one_based"] = selection["best_epoch"] + 1
+            if split == "validation":
+                equivalent = int(
+                    math.isclose(
+                        row["rmse"],
+                        selection["best_validation_rmse"],
+                        rel_tol=0.0,
+                        abs_tol=1e-6,
+                    )
+                    and math.isclose(
+                        row["median"],
+                        selection["best_validation_median"],
+                        rel_tol=0.0,
+                        abs_tol=1e-6,
+                    )
+                    and math.isclose(
+                        row["p90"],
+                        selection["best_validation_p90"],
+                        rel_tol=0.0,
+                        abs_tol=1e-6,
+                    )
+                )
+                if not equivalent:
+                    raise RuntimeError(
+                        f"Reloaded best-validation metrics changed for {branch}."
+                    )
+                selection["reloaded_validation_equivalence_pass"] = equivalent
             branch_rows.append(row)
             frame_rows.extend(rows)
             branch_lookup[split][branch] = row
@@ -212,7 +269,8 @@ def main() -> None:
                 )
         test = branch_lookup["test"][branch]
         print(
-            f"    test RMSE gain={test['rmse_gain_vs_raw_percent']:.4f}% "
+            f"  {branch} best-epoch={selection['best_epoch'] + 1} "
+            f"test RMSE gain={test['rmse_gain_vs_raw_percent']:.4f}% "
             f"P90 gain={test['p90_gain_vs_raw_percent']:.4f}% "
             f"frames={test['improved_frames_vs_raw']}/{len(run.test_indices)}"
         )
@@ -231,33 +289,40 @@ def main() -> None:
         >= run.uncertainty_minimum_spearman
         and int(test_final.get("half_coverage_risk_below_full", 0)) == 1
     )
-    temporal_go = int(
-        test_final["rmse"] < test_raw["rmse"]
-        and test_final["p90"] <= test_raw["p90"]
-        and test_final["improved_frames_vs_raw"]
-        >= run.minimum_improved_test_frames
-        and uncertainty_pass
+    branch_test_decisions = {
+        branch: {
+            "test_rmse_beats_raw": int(
+                branch_lookup["test"][branch]["rmse"] < test_raw["rmse"]
+            ),
+            "test_p90_not_worse_than_raw": int(
+                branch_lookup["test"][branch]["p90"] <= test_raw["p90"]
+            ),
+            "test_go": int(
+                branch_lookup["test"][branch]["rmse"] < test_raw["rmse"]
+                and branch_lookup["test"][branch]["p90"] <= test_raw["p90"]
+            ),
+        }
+        for branch in LEARNED_BRANCHES
+    }
+    passing_branches = tuple(
+        branch for branch in LEARNED_BRANCHES if branch_test_decisions[branch]["test_go"]
     )
+    temporal_go = int(bool(passing_branches))
     decision = {
         "scope": "single_scene_temporal_development_only",
         "temporal_development_decision": "GO" if temporal_go else "NO_GO",
         "cross_scene_generalization_claim": 0,
-        "gated_uq_test_rmse_beats_raw": int(test_final["rmse"] < test_raw["rmse"]),
-        "gated_uq_test_p90_not_worse_than_raw": int(
-            test_final["p90"] <= test_raw["p90"]
-        ),
-        "gated_uq_test_frame_majority_pass": int(
-            test_final["improved_frames_vs_raw"]
-            >= run.minimum_improved_test_frames
-        ),
-        "uncertainty_reliability_pass": uncertainty_pass,
+        "go_rule": "any_predeclared_learned_branch_test_rmse_below_raw_and_p90_not_above_raw",
+        "branch_test_decisions": branch_test_decisions,
+        "passing_branches": passing_branches,
+        "uncertainty_reliability_diagnostic": uncertainty_pass,
         "formal_v0_pose_modified": 0,
         "formal_v0_pointmap_modified": 0,
         "formal_v0_semantic_map_modified": 0,
         "next_gate": (
             "repeat_fixed_protocol_on_heldout_scenes_when_storage_returns"
             if temporal_go
-            else "do_not_add_sam_review_residual_learning_signal"
+            else "stop_geometry_only_residual_then_reassess_joint_training_as_new_hypothesis"
         ),
     }
     summary = {
@@ -292,6 +357,11 @@ def main() -> None:
         "camera_head_parameters_updated": 0,
         "external_residual_head_parameters_updated": 1,
         "test_frames_used_for_optimization": 0,
+        "checkpoint_selection": (
+            "independent_per_branch_minimum_validation_rmse_then_minimum_validation_p90"
+        ),
+        "selected_checkpoints": selection_summaries,
+        "test_evaluation_policy": "one_pass_after_best_validation_checkpoint_loaded",
         "pose_branch": "formal_v0_retrieve_qk_frozen_unchanged",
         "qk_pose_artifact": str(qk_path),
         "qk_pose_sha256_before": qk_sha_before,
@@ -412,7 +482,7 @@ def _load_experiment_data(
             f"{layer_indices}."
         )
     if int(clip.reference_sequence_index) != 0:
-        raise ValueError("Phase 1 r1 requires the formal first-frame reference gauge.")
+        raise ValueError("Phase 1 r2 requires the formal first-frame reference gauge.")
     del payload
     gc.collect()
     qk_path = _qk_artifact_path(run.v0_config)
@@ -454,7 +524,7 @@ def _train_branch(
     data: ExperimentData,
     run: RunConfig,
     device: torch.device,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, torch.Tensor], dict[str, Any]]:
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=run.learning_rate,
@@ -462,6 +532,9 @@ def _train_branch(
         foreach=False,
     )
     rows = []
+    best_state: dict[str, torch.Tensor] | None = None
+    best_score: tuple[float, float] | None = None
+    best_epoch = -1
     generator = torch.Generator(device="cpu")
     for epoch in range(run.epochs):
         generator.manual_seed(run.seed + epoch * 1009)
@@ -514,9 +587,22 @@ def _train_branch(
             total += float(loss.detach().cpu())
             gradient_maximum = max(gradient_maximum, gradient_value)
             batches += 1
-        validation_rmse, validation_p90 = _quick_metrics(
+        validation_rmse, validation_median, validation_p90 = _quick_metrics(
             model, run.validation_indices, data, run, device
         )
+        score = (validation_rmse, validation_p90)
+        selected_as_best = int(
+            validation_checkpoint_is_better(
+                validation_rmse, validation_p90, best_score
+            )
+        )
+        if selected_as_best:
+            best_score = score
+            best_epoch = epoch
+            best_state = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
+            }
         row = {
             "branch": branch,
             "epoch": epoch,
@@ -527,7 +613,9 @@ def _train_branch(
             "mean_uncertainty_loss": uncertainty_total / batches,
             "maximum_gradient_norm_before_clip": gradient_maximum,
             "validation_rmse": validation_rmse,
+            "validation_median": validation_median,
             "validation_p90": validation_p90,
+            "selected_as_best_validation_checkpoint": selected_as_best,
         }
         rows.append(row)
         if epoch in {0, run.epochs - 1} or (epoch + 1) % 10 == 0:
@@ -535,7 +623,28 @@ def _train_branch(
                 f"    epoch={epoch + 1}/{run.epochs} "
                 f"loss={row['mean_loss']:.6f} val_rmse={validation_rmse:.6f}"
             )
-    return rows
+    if best_state is None or best_score is None or best_epoch < 0:
+        raise RuntimeError(f"No validation checkpoint was selected for {branch}.")
+    selected_rows = [
+        row for row in rows if row["selected_as_best_validation_checkpoint"] == 1
+    ]
+    if not selected_rows or int(selected_rows[-1]["epoch"]) != best_epoch:
+        raise RuntimeError(f"Validation checkpoint audit failed for {branch}.")
+    for row in rows:
+        row["is_final_selected_checkpoint"] = int(int(row["epoch"]) == best_epoch)
+    return (
+        rows,
+        best_state,
+        {
+            "rule": "minimum_validation_rmse_then_minimum_validation_p90",
+            "best_epoch": best_epoch,
+            "best_validation_rmse": best_score[0],
+            "best_validation_median": float(selected_rows[-1]["validation_median"]),
+            "best_validation_p90": best_score[1],
+            "epochs_evaluated": run.epochs,
+            "test_metrics_read_during_selection": 0,
+        },
+    )
 
 
 @torch.inference_mode()
@@ -545,7 +654,7 @@ def _quick_metrics(
     data: ExperimentData,
     run: RunConfig,
     device: torch.device,
-) -> tuple[float, float]:
+) -> tuple[float, float, float]:
     model.eval()
     errors = []
     for index in indices:
@@ -566,7 +675,11 @@ def _quick_metrics(
             )
         )
     joined = torch.cat(errors)
-    return _rmse(joined), float(torch.quantile(joined, 0.90))
+    return (
+        _rmse(joined),
+        float(joined.median()),
+        float(torch.quantile(joined, 0.90)),
+    )
 
 
 def _score_raw(
@@ -866,7 +979,7 @@ def _validate_split(run: RunConfig, frame_count: int) -> None:
     }
     if frame_count != 30 or actual != expected:
         raise ValueError(
-            f"Phase 1 r1 requires the fixed 30-frame 18/6/6 split; got "
+            f"Phase 1 r2 requires the fixed 30-frame 18/6/6 split; got "
             f"frames={frame_count}, split={actual}."
         )
     joined = (*run.train_indices, *run.validation_indices, *run.test_indices)
@@ -889,7 +1002,7 @@ def _load_run(path: str | Path, *, device_override: str | None) -> RunConfig:
         output_dir=expand_storage_path(
             raw.get(
                 "output_dir",
-                "${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_phase1_temporal_residual",
+                "${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_phase1_temporal_residual_r2",
             )
         ),
         device=str(device_override or raw.get("device", "cuda:0")),
@@ -949,7 +1062,7 @@ def _load_run(path: str | Path, *, device_override: str | None) -> RunConfig:
     }
     changed = {name: value for name, (value, expected) in fixed.items() if value != expected}
     if changed:
-        raise ValueError(f"Phase 1 r1 fixed protocol was changed: {changed}.")
+        raise ValueError(f"Phase 1 r2 fixed protocol was changed: {changed}.")
     return run
 
 
@@ -1043,16 +1156,41 @@ def _write_copyable(path: Path, summary: Mapping[str, Any]) -> None:
         "point_head_parameters_updated=0",
         "camera_head_parameters_updated=0",
         "test_frames_used_for_optimization=0",
+        "checkpoint_selection=minimum_validation_rmse_then_minimum_validation_p90",
+        "test_evaluation_policy=one_pass_after_best_validation_checkpoint_loaded",
         "formal_v0_modified=0",
         "cross_scene_generalization_claim=0",
         "",
         (
-            "split,branch,evaluated_points,rmse,median,p90,"
-            "rmse_gain_vs_raw_percent,p90_gain_vs_raw_percent,"
-            "improved_frames_vs_raw,improved_frame_ratio_vs_raw,"
-            "uncertainty_error_spearman"
+            "branch,best_epoch_one_based,best_validation_rmse,"
+            "best_validation_median,best_validation_p90"
         ),
     ]
+    for branch in LEARNED_BRANCHES:
+        selected = summary["selected_checkpoints"][branch]
+        lines.append(
+            ",".join(
+                str(value)
+                for value in (
+                    branch,
+                    int(selected["best_epoch"]) + 1,
+                    selected["best_validation_rmse"],
+                    selected["best_validation_median"],
+                    selected["best_validation_p90"],
+                )
+            )
+        )
+    lines.extend(
+        (
+            "",
+            (
+                "split,branch,evaluated_points,rmse,median,p90,"
+                "rmse_gain_vs_raw_percent,p90_gain_vs_raw_percent,"
+                "improved_frames_vs_raw,improved_frame_ratio_vs_raw,"
+                "uncertainty_error_spearman"
+            ),
+        )
+    )
     fields = (
         "split",
         "branch",
