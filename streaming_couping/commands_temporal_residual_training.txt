@@ -1,0 +1,107 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+GPU="${TEMPORAL_RESIDUAL_GPU:-1}"
+CONFIG=streaming_couping/configs/temporal_residual_training.yaml
+V0_CACHE="$STORAGE_ROOT/outputs/streaming_couping_v0/cache/00a231a370_90_525_step15_37_68_54.pt"
+QK_POSE="$STORAGE_ROOT/outputs/streaming_couping_v0/qk_pose_retrieval/qk_pose_output.pt"
+OUTPUT="$STORAGE_ROOT/outputs/streaming_couping_phase1_temporal_residual"
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+[[ -s "$V0_CACHE" ]] || {
+  echo "missing frozen V0 cache: $V0_CACHE" >&2
+  echo "Run first: zsh streaming_couping/commands_v0_baseline.txt" >&2
+  exit 1
+}
+[[ -s "$QK_POSE" ]] || {
+  echo "missing frozen V0 QK pose artifact: $QK_POSE" >&2
+  echo "Run first: zsh streaming_couping/commands_v0_baseline.txt" >&2
+  exit 1
+}
+
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+export OUTPUT
+export PYTHONHASHSEED=2026
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+echo "Phase 1 smoke: cached DPT layout, Sim(3) gauge and protected raw fallback"
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.smoke_temporal_residual_training
+
+rm -rf "$OUTPUT"
+mkdir -p "$OUTPUT"
+echo "Phase 1 geometry-only temporal residual training"
+echo "physical GPU=$GPU logical training device=cuda:0"
+echo "split=train 0-17, validation 18-23, test 24-29"
+echo "Formal V0 is read-only; StreamVGGT/SAM models are not loaded"
+CUDA_VISIBLE_DEVICES="$GPU" PYTHONUNBUFFERED=1 PYTHONPATH=. \
+  "$PYTHON_BIN" -m streaming_couping.scripts.run_temporal_residual_training \
+  --config "$CONFIG" --device cuda:0
+
+for artifact in \
+  summary.json \
+  branch_summary.csv \
+  frame_metrics.csv \
+  training_curve.csv \
+  risk_coverage.csv \
+  models.pt \
+  copyable_result.txt
+do
+  [[ -s "$OUTPUT/$artifact" ]] || { echo "missing output: $OUTPUT/$artifact" >&2; exit 1; }
+done
+
+PYTHONPATH=. "$PYTHON_BIN" -c '
+import json
+import os
+from pathlib import Path
+
+summary = json.loads(Path(os.environ["OUTPUT"], "summary.json").read_text())
+assert summary["schema"] == 1
+assert summary["revision"] == "phase1_temporal_trust_aware_pointmap_residual_r1"
+assert summary["scope"] == "single_scene_temporal_split_pipeline_and_proof_of_learning"
+assert summary["sam_inputs"] == 0
+assert summary["backbone_parameters_updated"] == 0
+assert summary["point_head_parameters_updated"] == 0
+assert summary["camera_head_parameters_updated"] == 0
+assert summary["external_residual_head_parameters_updated"] == 1
+assert summary["test_frames_used_for_optimization"] == 0
+assert summary["formal_v0_modified"] == 0
+assert len(summary["split"]["train_sequence_indices"]) == 18
+assert len(summary["split"]["validation_sequence_indices"]) == 6
+assert len(summary["split"]["test_sequence_indices"]) == 6
+for split in ("validation", "test"):
+    assert set(summary["branch_lookup"][split]) == {
+        "raw_full_history",
+        "residual_no_gate",
+        "gated_residual",
+        "gated_residual_uncertainty",
+    }
+decision = summary["decision"]
+assert decision["scope"] == "single_scene_temporal_development_only"
+assert decision["temporal_development_decision"] in {"GO", "NO_GO"}
+assert decision["cross_scene_generalization_claim"] == 0
+assert decision["formal_v0_pose_modified"] == 0
+assert decision["formal_v0_pointmap_modified"] == 0
+assert decision["formal_v0_semantic_map_modified"] == 0
+test = summary["branch_lookup"]["test"]["gated_residual_uncertainty"]
+rmse_gain = test["rmse_gain_vs_raw_percent"]
+p90_gain = test["p90_gain_vs_raw_percent"]
+improved = test["improved_frames_vs_raw"]
+spearman = test["uncertainty_error_spearman"]
+result = decision["temporal_development_decision"]
+print(
+    "Phase 1 output schema accepted "
+    f"rmse_gain={rmse_gain:.4f}% "
+    f"p90_gain={p90_gain:.4f}% "
+    f"frames={improved}/6 "
+    f"uq_spearman={spearman:.4f} "
+    f"decision={result}"
+)
+'
+
+echo ""
+sed -n '1,220p' "$OUTPUT/copyable_result.txt"
