@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_STORAGE_ROOT = Path("/home/bod/184Nas/process_data/vggtSam")
+DEFAULT_STORAGE_ROOT = Path("/data184/open_source/vggtSam")
 
 
 def storage_root() -> Path:

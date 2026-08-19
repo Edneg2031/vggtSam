@@ -1,0 +1,28 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PINHOLE_ROOT="${SCANNETPP_PINHOLE_ROOT:-/data184/open_source/scannet_pp_pinhole}"
+ANNOTATION_ROOT="${SCANNETPP_ANNOTATION_ROOT:-/data184/open_source/scannet_pp}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+PROCESSED_ROOT="$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d"
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+[[ -d "$PROCESSED_ROOT" ]] || { echo "missing processed root: $PROCESSED_ROOT" >&2; exit 1; }
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+
+echo "Relocate copied ScanNet++ manifests to $PROCESSED_ROOT"
+echo "No image, mask or pointmap array is read or regenerated"
+PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.relocate_processed_dataset \
+  --processed-root "$PROCESSED_ROOT" \
+  --pinhole-root "$PINHOLE_ROOT" \
+  --annotation-root "$ANNOTATION_ROOT"
+
+PYTHONPATH=. "$PYTHON_BIN" \
+  -m streaming_couping.scripts.audit_processed_dataset \
+  --manifest "$PROCESSED_ROOT/manifest.json" \
+  --output-dir "$STORAGE_ROOT/outputs/processed_dataset_audit" \
+  --minimum-frames "${SCANNETPP_MINIMUM_FRAMES:-30}"

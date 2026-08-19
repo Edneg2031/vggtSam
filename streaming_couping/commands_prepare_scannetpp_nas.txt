@@ -2,9 +2,9 @@
 set -euo pipefail
 
 ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
-STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/home/bod/184Nas/process_data/vggtSam}"
-PINHOLE_ROOT="${SCANNETPP_PINHOLE_ROOT:-/home/bod/184Nas/open_source/scannet_pp_pinhole}"
-ANNOTATION_ROOT="${SCANNETPP_ANNOTATION_ROOT:-/home/bod/184Nas/open_source/scannet_pp}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PINHOLE_ROOT="${SCANNETPP_PINHOLE_ROOT:-/data184/open_source/scannet_pp_pinhole}"
+ANNOTATION_ROOT="${SCANNETPP_ANNOTATION_ROOT:-/data184/open_source/scannet_pp}"
 PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
 MODE="${SCANNETPP_PREPROCESS_MODE:-preflight}"
 CONFIG=configs/scannetpp_pinhole_2d.yaml

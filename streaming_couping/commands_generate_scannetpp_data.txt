@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
-STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/home/bod/184Nas/process_data/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
 
 # Direct invocation generates the retained V0 scene. Override this environment

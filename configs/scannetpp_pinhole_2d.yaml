@@ -1,9 +1,9 @@
 # Read the existing ScanNet++ release in place. Only newly processed artifacts
 # are written below VGGT_SAM_STORAGE_ROOT.
-data_root: /home/bod/184Nas/open_source/scannet_pp_pinhole/data
-annotation_root: /home/bod/184Nas/open_source/scannet_pp/data
-metadata_root: /home/bod/184Nas/open_source/scannet_pp_pinhole/metadata
-scene_list: /home/bod/184Nas/open_source/scannet_pp_pinhole/scannetpp_part_valid_scenes.txt
+data_root: /data184/open_source/scannet_pp_pinhole/data
+annotation_root: /data184/open_source/scannet_pp/data
+metadata_root: /data184/open_source/scannet_pp_pinhole/metadata
+scene_list: /data184/open_source/scannet_pp_pinhole/scannetpp_part_valid_scenes.txt
 output_root: ${VGGT_SAM_STORAGE_ROOT}/data/processed/scannetpp_pinhole_2d
 
 # Empty means: use scene_list when present, otherwise discover data_root.

@@ -876,7 +876,7 @@ def _build_config(args: argparse.Namespace) -> ScanNetPP2DConfig:
 def _expand_path(value: Any) -> Path:
     root = os.environ.get(
         "VGGT_SAM_STORAGE_ROOT",
-        "/home/bod/184Nas/process_data/vggtSam",
+        "/data184/open_source/vggtSam",
     )
     raw = str(value).replace("${VGGT_SAM_STORAGE_ROOT}", root)
     raw = raw.replace("$VGGT_SAM_STORAGE_ROOT", root)

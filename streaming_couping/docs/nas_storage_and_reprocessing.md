@@ -3,7 +3,7 @@
 原始 ScanNet++ 不搬动，继续从已有只读位置读取：
 
 ```text
-/home/bod/184Nas/open_source/scannet_pp_pinhole/
+/data184/open_source/scannet_pp_pinhole/
 ├── data/<scene_id>/
 │   ├── images/
 │   ├── colmap/
@@ -11,7 +11,7 @@
 ├── metadata/semantic_classes.txt
 └── scannetpp_part_valid_scenes.txt
 
-/home/bod/184Nas/open_source/scannet_pp/data/<scene_id>/scans/
+/data184/open_source/scannet_pp/data/<scene_id>/scans/
 ├── mesh_aligned_0.05_semantic.ply
 ├── segments.json
 └── segments_anno.json
@@ -20,7 +20,7 @@
 新生成的大体积数据统一写到：
 
 ```text
-/home/bod/184Nas/process_data/vggtSam/
+/data184/open_source/vggtSam/
 ├── data/processed/scannetpp_pinhole_2d/
 │   ├── manifest.json
 │   └── <scene_id>/
@@ -41,7 +41,7 @@
 服务器命令默认使用：
 
 ```bash
-export VGGT_SAM_STORAGE_ROOT=/home/bod/184Nas/process_data/vggtSam
+export VGGT_SAM_STORAGE_ROOT=/data184/open_source/vggtSam
 ```
 
 如果以后挂载点变化，只需要覆盖这个变量。V0 配置、恢复配置、T1 配置和
@@ -50,7 +50,17 @@ ScanNet++ 预处理配置都会展开该变量。
 ## 推荐处理顺序
 
 不需要复制原始场景。命令会直接读取旧的 `open_source` 路径，只把生成结果
-写到新的 `process_data/vggtSam`。
+写到新的 `/data184/open_source/vggtSam`。
+
+如果 processed 数据已经复制到新路径，先只修复 JSON 中可能残留的旧绝对
+路径并检查完整性：
+
+```bash
+zsh streaming_couping/commands_relocate_processed_dataset.txt
+```
+
+该命令不读取或重算 RGB、mask、pointmap 数值；原 JSON 会保留一个
+`.before_relocation` 备份。
 
 如果要直接生成正式数据，运行：
 
