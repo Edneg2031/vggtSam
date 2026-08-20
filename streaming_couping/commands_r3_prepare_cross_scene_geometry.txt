@@ -3,11 +3,23 @@ set -euo pipefail
 
 ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
-SOURCE_ROOT="${R3_SCANNETPP_SOURCE_ROOT:-$STORAGE_ROOT/source/scanet_pp_pinhole}"
+if [[ -n "${R3_SCANNETPP_SOURCE_ROOT:-}" ]]; then
+  SOURCE_ROOT="$R3_SCANNETPP_SOURCE_ROOT"
+else
+  SOURCE_ROOT="$STORAGE_ROOT/source/scanet_pp_pinhole"
+fi
 SCENE_ID="${R3_SCENE_ID:-0a184cf634}"
 PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
-OUTPUT="${R3_GEOMETRY_OUTPUT:-$STORAGE_ROOT/data/processed/residual_cross_scene_r3}"
-STANDARD_ROOT="${SCANNETPP_PROCESSED_ROOT:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d}"
+if [[ -n "${R3_GEOMETRY_OUTPUT:-}" ]]; then
+  OUTPUT="$R3_GEOMETRY_OUTPUT"
+else
+  OUTPUT="$STORAGE_ROOT/data/processed/residual_cross_scene_r3"
+fi
+if [[ -n "${SCANNETPP_PROCESSED_ROOT:-}" ]]; then
+  STANDARD_ROOT="$SCANNETPP_PROCESSED_ROOT"
+else
+  STANDARD_ROOT="$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d"
+fi
 REPORT="$OUTPUT/copyable_result.txt"
 LOG="$OUTPUT/run.log"
 

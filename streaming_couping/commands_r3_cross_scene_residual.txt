@@ -6,9 +6,21 @@ STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
 GPUS="${R3_RESIDUAL_GPUS:-1,2}"
 SCENE_ID="${R3_SCENE_ID:-0a184cf634}"
-R3_GEOMETRY="${R3_GEOMETRY_OUTPUT:-$STORAGE_ROOT/data/processed/residual_cross_scene_r3}"
-R2_OUTPUT="${R2_RESIDUAL_OUTPUT:-$STORAGE_ROOT/outputs/streaming_couping_phase1_temporal_residual_r2}"
-OUTPUT="${R3_RESIDUAL_OUTPUT:-$STORAGE_ROOT/outputs/streaming_couping_phase1_cross_scene_r3}"
+if [[ -n "${R3_GEOMETRY_OUTPUT:-}" ]]; then
+  R3_GEOMETRY="$R3_GEOMETRY_OUTPUT"
+else
+  R3_GEOMETRY="$STORAGE_ROOT/data/processed/residual_cross_scene_r3"
+fi
+if [[ -n "${R2_RESIDUAL_OUTPUT:-}" ]]; then
+  R2_OUTPUT="$R2_RESIDUAL_OUTPUT"
+else
+  R2_OUTPUT="$STORAGE_ROOT/outputs/streaming_couping_phase1_temporal_residual_r2"
+fi
+if [[ -n "${R3_RESIDUAL_OUTPUT:-}" ]]; then
+  OUTPUT="$R3_RESIDUAL_OUTPUT"
+else
+  OUTPUT="$STORAGE_ROOT/outputs/streaming_couping_phase1_cross_scene_r3"
+fi
 LOG="$OUTPUT/run.log"
 REPORT="$OUTPUT/copyable_result.txt"
 

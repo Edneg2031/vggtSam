@@ -3,9 +3,21 @@ set -euo pipefail
 
 ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
-AUDIT_ROOT="${R3_MULTI_OUTPUT:-$STORAGE_ROOT/data/processed/residual_cross_scene_r3}"
-CHECKPOINT="${R2_RESIDUAL_OUTPUT:-$STORAGE_ROOT/outputs/streaming_couping_phase1_temporal_residual_r2}/models.pt"
-OUTPUT_ROOT="${R3_MULTI_RESIDUAL_OUTPUT:-$STORAGE_ROOT/outputs/streaming_couping_phase1_cross_scene}"
+if [[ -n "${R3_MULTI_OUTPUT:-}" ]]; then
+  AUDIT_ROOT="$R3_MULTI_OUTPUT"
+else
+  AUDIT_ROOT="$STORAGE_ROOT/data/processed/residual_cross_scene_r3"
+fi
+if [[ -n "${R2_RESIDUAL_OUTPUT:-}" ]]; then
+  CHECKPOINT="$R2_RESIDUAL_OUTPUT/models.pt"
+else
+  CHECKPOINT="$STORAGE_ROOT/outputs/streaming_couping_phase1_temporal_residual_r2/models.pt"
+fi
+if [[ -n "${R3_MULTI_RESIDUAL_OUTPUT:-}" ]]; then
+  OUTPUT_ROOT="$R3_MULTI_RESIDUAL_OUTPUT"
+else
+  OUTPUT_ROOT="$STORAGE_ROOT/outputs/streaming_couping_phase1_cross_scene"
+fi
 PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
 GPUS="${R3_RESIDUAL_GPUS:-1,2}"
 

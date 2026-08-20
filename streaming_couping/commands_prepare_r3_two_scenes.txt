@@ -3,9 +3,21 @@ set -euo pipefail
 
 ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
-SOURCE_ROOT="${R3_SCANNETPP_SOURCE_ROOT:-$STORAGE_ROOT/source/scanet_pp_pinhole}"
-STANDARD_ROOT="${SCANNETPP_PROCESSED_ROOT:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d}"
-AUDIT_ROOT="${R3_MULTI_OUTPUT:-$STORAGE_ROOT/data/processed/residual_cross_scene_r3}"
+if [[ -n "${R3_SCANNETPP_SOURCE_ROOT:-}" ]]; then
+  SOURCE_ROOT="$R3_SCANNETPP_SOURCE_ROOT"
+else
+  SOURCE_ROOT="$STORAGE_ROOT/source/scanet_pp_pinhole"
+fi
+if [[ -n "${SCANNETPP_PROCESSED_ROOT:-}" ]]; then
+  STANDARD_ROOT="$SCANNETPP_PROCESSED_ROOT"
+else
+  STANDARD_ROOT="$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d"
+fi
+if [[ -n "${R3_MULTI_OUTPUT:-}" ]]; then
+  AUDIT_ROOT="$R3_MULTI_OUTPUT"
+else
+  AUDIT_ROOT="$STORAGE_ROOT/data/processed/residual_cross_scene_r3"
+fi
 PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
 
 if [[ -n "${R3_SCENES:-}" ]]; then
