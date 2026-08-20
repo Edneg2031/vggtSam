@@ -7,6 +7,7 @@ SOURCE_ROOT="${R3_SCANNETPP_SOURCE_ROOT:-$STORAGE_ROOT/source/scanet_pp_pinhole}
 SCENE_ID="${R3_SCENE_ID:-0a184cf634}"
 PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
 OUTPUT="${R3_GEOMETRY_OUTPUT:-$STORAGE_ROOT/data/processed/residual_cross_scene_r3}"
+STANDARD_ROOT="${SCANNETPP_PROCESSED_ROOT:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d}"
 REPORT="$OUTPUT/copyable_result.txt"
 LOG="$OUTPUT/run.log"
 
@@ -114,5 +115,38 @@ for index, frame in enumerate(scene["frames"]):
 print("r3 geometry-only artifact validation passed")
 PY
 
+# Expose the exact same clip under the normal ScanNet++ processed layout.
+# This is deliberately a separate compatibility materialization: the isolated
+# R3 manifest remains untouched and remains the evaluator's audit artifact.
+LAYOUT_ARGS=()
+if [[ "${R3_GEOMETRY_OVERWRITE:-0}" == "1" ]]; then
+  LAYOUT_ARGS+=(--overwrite)
+fi
+set +e
+PYTHONPATH="$ROOT:$ROOT/src" "$PYTHON_BIN" \
+  -m streaming_couping.scripts.materialize_standard_scannetpp_scene \
+  --r3-manifest "$OUTPUT/manifest.json" \
+  --processed-root "$STANDARD_ROOT" \
+  --scene-id "$SCENE_ID" \
+  "${LAYOUT_ARGS[@]}" \
+  >> "$LOG" 2>&1
+LAYOUT_STATUS=$?
+set -e
+if (( LAYOUT_STATUS != 0 )); then
+  echo "standard layout materialization failed; inspect $LOG" >&2
+  tail -80 "$LOG" >&2
+  exit "$LAYOUT_STATUS"
+fi
+
+[[ -s "$STANDARD_ROOT/$SCENE_ID/scene_manifest.json" ]] || {
+  write_shell_failure "missing standardized scene manifest: $STANDARD_ROOT/$SCENE_ID/scene_manifest.json"
+  exit 1
+}
+[[ -s "$STANDARD_ROOT/manifest.json" ]] || {
+  write_shell_failure "missing standardized global manifest: $STANDARD_ROOT/manifest.json"
+  exit 1
+}
+
 echo ""
 sed -n '1,220p' "$REPORT"
+echo "standard_processed_scene=$STANDARD_ROOT/$SCENE_ID"

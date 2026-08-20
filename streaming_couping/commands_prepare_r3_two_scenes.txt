@@ -1,0 +1,115 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+SOURCE_ROOT="${R3_SCANNETPP_SOURCE_ROOT:-$STORAGE_ROOT/source/scanet_pp_pinhole}"
+STANDARD_ROOT="${SCANNETPP_PROCESSED_ROOT:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d}"
+AUDIT_ROOT="${R3_MULTI_OUTPUT:-$STORAGE_ROOT/data/processed/residual_cross_scene_r3}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+
+if [[ -n "${R3_SCENES:-}" ]]; then
+  SCENES=(${=R3_SCENES})
+else
+  SCENES=(0a184cf634 1a8e0d78c0)
+fi
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+mkdir -p "$AUDIT_ROOT" "$STANDARD_ROOT"
+
+echo "R3 multi-scene geometry preparation"
+echo "source_root=$SOURCE_ROOT"
+echo "standard_root=$STANDARD_ROOT"
+echo "audit_root=$AUDIT_ROOT"
+echo "scenes=${SCENES[*]}"
+
+for scene in "${SCENES[@]}"; do
+  [[ -d "$SOURCE_ROOT/data/$scene/images" ]] || {
+    echo "missing source images for scene=$scene: $SOURCE_ROOT/data/$scene/images" >&2
+    exit 1
+  }
+  [[ -d "$SOURCE_ROOT/data/$scene/colmap" ]] || {
+    echo "missing source COLMAP for scene=$scene: $SOURCE_ROOT/data/$scene/colmap" >&2
+    exit 1
+  }
+  [[ -f "$SOURCE_ROOT/data/$scene/mesh_aligned_0.05.ply" ]] || {
+    echo "missing source mesh for scene=$scene" >&2
+    exit 1
+  }
+done
+
+for scene in "${SCENES[@]}"; do
+  # Reuse an already materialized 30-frame scene. This avoids regenerating the
+  # existing 0a184cf634 pointmaps when this batch command is run after the
+  # single-scene experiment.
+  if [[ "${R3_GEOMETRY_OVERWRITE:-0}" != "1" && -s "$STANDARD_ROOT/$scene/scene_manifest.json" ]]; then
+    if SCENE_DIR="$STANDARD_ROOT/$scene" "$PYTHON_BIN" - <<'PY'
+import json
+import os
+from pathlib import Path
+
+scene_dir = Path(os.environ["SCENE_DIR"])
+payload = json.loads((scene_dir / "scene_manifest.json").read_text(encoding="utf8"))
+frames = payload.get("frames", [])
+if len(frames) != 30:
+    raise SystemExit(1)
+for frame in frames:
+    if not Path(frame["image_path"]).is_file():
+        raise SystemExit(1)
+    if not Path(frame["pointmap"]).is_file():
+        raise SystemExit(1)
+PY
+    then
+      echo "reuse standardized scene=$scene"
+      continue
+    fi
+  fi
+  echo ""
+  echo "===== prepare scene=$scene ====="
+  scene_audit="$AUDIT_ROOT/$scene"
+  R3_SCENE_ID="$scene" \
+  R3_GEOMETRY_OUTPUT="$scene_audit" \
+  R3_SCANNETPP_SOURCE_ROOT="$SOURCE_ROOT" \
+  SCANNETPP_PROCESSED_ROOT="$STANDARD_ROOT" \
+  zsh "$ROOT/streaming_couping/commands_r3_prepare_cross_scene_geometry.txt"
+done
+
+export STANDARD_ROOT SCENES_TEXT="${SCENES[*]}"
+PYTHONPATH="$ROOT:$ROOT/src" "$PYTHON_BIN" - <<'PY'
+import json
+import os
+from pathlib import Path
+
+root = Path(os.environ["STANDARD_ROOT"])
+manifest_path = root / "manifest.json"
+payload = json.loads(manifest_path.read_text(encoding="utf8"))
+lookup = {str(scene.get("scene_id")): scene for scene in payload.get("scenes", ())}
+requested = os.environ["SCENES_TEXT"].split()
+missing = [scene for scene in requested if scene not in lookup]
+if missing:
+    raise RuntimeError(f"standard manifest is missing scenes: {missing}")
+for scene_id in requested:
+    scene_dir = root / scene_id
+    scene_manifest = scene_dir / "scene_manifest.json"
+    if not scene_manifest.is_file():
+        raise RuntimeError(f"missing standardized scene manifest: {scene_manifest}")
+    frames = lookup[scene_id].get("frames", [])
+    if len(frames) != 30:
+        raise RuntimeError(f"scene {scene_id} has {len(frames)} frames, expected 30")
+    for frame in frames:
+        for field in ("image_path", "pointmap"):
+            path = Path(frame[field])
+            if not path.is_file():
+                raise RuntimeError(f"scene {scene_id} missing {field}: {path}")
+print(
+    "R3 multi-scene standard layout accepted "
+    + " ".join(f"{scene}={len(lookup[scene]['frames'])}" for scene in requested)
+)
+print(f"global_manifest={manifest_path}")
+PY
+
+echo ""
+echo "completed scenes=${SCENES[*]}"
+echo "standard_root=$STANDARD_ROOT"
+echo "audit_root=$AUDIT_ROOT/<scene_id>"
