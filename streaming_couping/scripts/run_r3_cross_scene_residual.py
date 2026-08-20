@@ -27,6 +27,7 @@ from streaming_couping.src.backbones.streamvggt_parallel import (
     LayerShardedStreamVGGT,
     assert_processed_key_cache_equivalence,
 )
+from streaming_couping.src.external_repos import maybe_add_repo_to_path
 from streaming_couping.src.pointmap_alignment import (
     _load_gt_pointmaps,
     _paired_limit,
@@ -64,6 +65,11 @@ def main() -> None:
 
     devices = tuple(value.strip() for value in args.devices.split(",") if value.strip())
     if devices:
+        # The equivalence audit imports the external StreamVGGT package
+        # directly, so register its repo before running the audit.  The model
+        # loader performs the same registration later, but that is too late
+        # for this preflight check.
+        maybe_add_repo_to_path(run_cfg["streamvggt_repo"])
         assert_processed_key_cache_equivalence()
     print("R3 CROSS-SCENE FROZEN RESIDUAL EVALUATION")
     print(
