@@ -25,7 +25,7 @@ from vggtsam.data.scannetpp.rasterize import (
 )
 
 
-REVISION = "r3_frozen_cross_scene_geometry_preprocess_r1"
+REVISION = "r3_frozen_cross_scene_geometry_preprocess_r2"
 DEVELOPMENT_SCENE = "00a231a370"
 DEFAULT_SCENE = "0a184cf634"
 DEFAULT_START = 90
@@ -78,11 +78,6 @@ def prepare_geometry_scene(
     scene = str(scene_id).strip()
     if not scene or scene == DEVELOPMENT_SCENE:
         raise ValueError("r3 requires a non-empty scene different from development.")
-    source_indices = fixed_source_indices(
-        start=start,
-        stride=stride,
-        frame_count=frame_count,
-    )
     if near <= 0.0:
         raise ValueError("near must be positive.")
     if not has_numba():
@@ -108,6 +103,12 @@ def prepare_geometry_scene(
     available = available_colmap_images(
         ordered_images(image_lookup),
         image_dir=image_dir,
+    )
+    source_indices = adaptive_source_indices(
+        available_count=len(available),
+        requested_start=start,
+        requested_stride=stride,
+        frame_count=frame_count,
     )
     selected = select_fixed_clip(available, source_indices=source_indices)
     mesh = load_ply_mesh(mesh_path)
@@ -218,11 +219,23 @@ def prepare_geometry_scene(
         "development_scene_id": DEVELOPMENT_SCENE,
         "heldout_scene_overlap": 0,
         "frame_count": len(frame_rows),
-        "source_frame_start": start,
-        "source_frame_stride": stride,
+        "source_frame_start": int(source_indices[0]),
+        "source_frame_stride": int(stride) if len(set(np.diff(source_indices))) == 1 else None,
         "source_frame_indices": source_indices,
         "manifest_frame_indices": tuple(range(len(frame_rows))),
-        "selection_rule": "fixed_colmap_order_indices_matching_development_clip",
+        "selection_rule": (
+            "development_start_and_stride_when_available_else_full_scene_"
+            "even_sampling_without_gt"
+        ),
+        "requested_source_frame_start": start,
+        "requested_source_frame_stride": stride,
+        "effective_source_frame_start": int(source_indices[0]),
+        "effective_source_frame_stride_min": int(
+            min(np.diff(source_indices)) if len(source_indices) > 1 else 0
+        ),
+        "effective_source_frame_stride_max": int(
+            max(np.diff(source_indices)) if len(source_indices) > 1 else 0
+        ),
         "source_available_frame_count": len(available),
         "source_total_colmap_image_count": len(image_lookup),
         "mesh_path": str(mesh_path),
@@ -268,6 +281,41 @@ def fixed_source_indices(
     if start < 0 or stride < 1 or frame_count < 2:
         raise ValueError("Invalid fixed source-frame protocol.")
     return tuple(start + offset * stride for offset in range(frame_count))
+
+
+def adaptive_source_indices(
+    *,
+    available_count: int,
+    requested_start: int = DEFAULT_START,
+    requested_stride: int = DEFAULT_STRIDE,
+    frame_count: int = DEFAULT_FRAME_COUNT,
+) -> tuple[int, ...]:
+    """Choose a deterministic clip that fits shorter held-out scenes."""
+
+    if available_count < 1 or requested_start < 0 or requested_stride < 1:
+        raise ValueError("Invalid available-frame adaptive protocol.")
+    if frame_count < 2:
+        raise ValueError("Adaptive protocol requires at least two frames.")
+    requested_last = requested_start + (frame_count - 1) * requested_stride
+    if requested_last < available_count:
+        return fixed_source_indices(
+            start=requested_start,
+            stride=requested_stride,
+            frame_count=frame_count,
+        )
+    if available_count < frame_count:
+        raise ValueError(
+            f"Adaptive r3 protocol needs {frame_count} available frames, got "
+            f"{available_count}."
+        )
+    values = np.rint(
+        np.linspace(0, available_count - 1, num=frame_count)
+    ).astype(np.int64)
+    values[0] = 0
+    values[-1] = available_count - 1
+    if np.any(np.diff(values) < 1):
+        raise ValueError("Adaptive r3 source indices are not strictly increasing.")
+    return tuple(int(value) for value in values.tolist())
 
 
 def available_colmap_images(
@@ -408,8 +456,11 @@ def _write_copyable(path: Path, summary: dict[str, Any]) -> None:
         f"development_scene_id={summary['development_scene_id']}",
         "heldout_scene_overlap=0",
         f"frame_count={summary['frame_count']}",
-        f"source_frame_start={summary['source_frame_start']}",
-        f"source_frame_stride={summary['source_frame_stride']}",
+        f"requested_source_frame_start={summary['requested_source_frame_start']}",
+        f"requested_source_frame_stride={summary['requested_source_frame_stride']}",
+        f"effective_source_frame_start={summary['effective_source_frame_start']}",
+        f"effective_source_frame_stride_min={summary['effective_source_frame_stride_min']}",
+        f"effective_source_frame_stride_max={summary['effective_source_frame_stride_max']}",
         "source_frame_indices="
         + " ".join(str(value) for value in summary["source_frame_indices"]),
         "manifest_frame_indices="

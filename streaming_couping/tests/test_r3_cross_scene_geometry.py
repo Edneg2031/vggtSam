@@ -5,6 +5,7 @@ import pytest
 
 from streaming_couping.scripts.prepare_r3_cross_scene_geometry import (
     available_colmap_images,
+    adaptive_source_indices,
     camera_intrinsics,
     fixed_source_indices,
     select_fixed_clip,
@@ -25,6 +26,19 @@ def _image(identifier: int, name: str) -> Image:
 def test_r3_protocol_matches_development_source_indices() -> None:
     assert fixed_source_indices() == tuple(range(90, 526, 15))
     assert len(fixed_source_indices()) == 30
+
+
+def test_r3_short_scene_uses_adaptive_sampling() -> None:
+    indices = adaptive_source_indices(available_count=332)
+    assert len(indices) == 30
+    assert indices[0] == 0
+    assert indices[-1] == 331
+    assert min(np.diff(indices)) >= 1
+    assert max(np.diff(indices)) <= 12
+
+
+def test_r3_long_scene_preserves_development_protocol() -> None:
+    assert adaptive_source_indices(available_count=795) == tuple(range(90, 526, 15))
 
 
 def test_available_colmap_images_filters_before_sequence_indexing(

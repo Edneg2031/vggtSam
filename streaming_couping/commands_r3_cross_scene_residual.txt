@@ -1,0 +1,84 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+GPUS="${R3_RESIDUAL_GPUS:-1,2}"
+SCENE_ID="${R3_SCENE_ID:-0a184cf634}"
+R3_GEOMETRY="${R3_GEOMETRY_OUTPUT:-$STORAGE_ROOT/data/processed/residual_cross_scene_r3}"
+R2_OUTPUT="${R2_RESIDUAL_OUTPUT:-$STORAGE_ROOT/outputs/streaming_couping_phase1_temporal_residual_r2}"
+OUTPUT="${R3_RESIDUAL_OUTPUT:-$STORAGE_ROOT/outputs/streaming_couping_phase1_cross_scene_r3}"
+LOG="$OUTPUT/run.log"
+REPORT="$OUTPUT/copyable_result.txt"
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+[[ -s "$R3_GEOMETRY/manifest.json" ]] || {
+  echo "missing r3 geometry manifest: $R3_GEOMETRY/manifest.json" >&2
+  echo "Run first: zsh streaming_couping/commands_r3_prepare_cross_scene_geometry.txt" >&2
+  exit 1
+}
+[[ -s "$R2_OUTPUT/models.pt" ]] || {
+  echo "missing r2 best-validation checkpoint: $R2_OUTPUT/models.pt" >&2
+  echo "Run first: zsh streaming_couping/commands_temporal_residual_training.txt" >&2
+  exit 1
+}
+
+rm -rf "$OUTPUT"
+mkdir -p "$OUTPUT"
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+export PYTHONHASHSEED=2026
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+echo "R3 held-out-scene residual inference"
+echo "scene=$SCENE_ID physical GPUs=$GPUS logical devices=cuda:0,cuda:1"
+echo "Loads r2 residual_no_gate best-validation checkpoint; no training or SAM"
+echo "GT pointmaps enter only after frozen candidate generation"
+
+set +e
+CUDA_VISIBLE_DEVICES="$GPUS" PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT:$ROOT/src" \
+  "$PYTHON_BIN" -m streaming_couping.scripts.run_r3_cross_scene_residual \
+  --r3-manifest "$R3_GEOMETRY/manifest.json" \
+  --checkpoint "$R2_OUTPUT/models.pt" \
+  --v0-config streaming_couping/configs/v0_baseline.yaml \
+  --scene-id "$SCENE_ID" \
+  --devices cuda:0,cuda:1 \
+  --output-dir "$OUTPUT" \
+  > "$LOG" 2>&1
+STATUS=$?
+set -e
+
+if (( STATUS != 0 )); then
+  sed -n '1,240p' "$LOG"
+  exit "$STATUS"
+fi
+
+for artifact in summary.json branch_summary.csv frame_metrics.csv copyable_result.txt run.log; do
+  [[ -s "$OUTPUT/$artifact" ]] || { echo "missing r3 output: $OUTPUT/$artifact" >&2; exit 1; }
+done
+
+export OUTPUT SCENE_ID
+PYTHONPATH="$ROOT:$ROOT/src" "$PYTHON_BIN" - <<'PY' >> "$LOG" 2>&1
+import json
+import os
+from pathlib import Path
+
+output = Path(os.environ["OUTPUT"])
+summary = json.loads((output / "summary.json").read_text(encoding="utf8"))
+assert summary["revision"] == "r3_cross_scene_residual_inference_r1"
+assert summary["scene_id"] == os.environ["SCENE_ID"]
+assert summary["frame_count"] == 30
+assert summary["sam_inputs"] == 0
+assert summary["model_trained"] == 0
+assert summary["gt_values_used_for_candidate_generation"] == 0
+assert summary["formal_v0_modified"] == 0
+assert set(summary["branch_lookup"]) == {"raw_full_history", "residual_no_gate"}
+assert summary["decision"]["cross_scene_decision"] in {"GO", "NO_GO"}
+print("r3 cross-scene residual schema accepted")
+PY
+
+sed -n '1,240p' "$LOG"
+echo ""
+sed -n '1,160p' "$REPORT"
