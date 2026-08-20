@@ -1,0 +1,98 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+AUDIT_ROOT="${R3_MULTI_OUTPUT:-$STORAGE_ROOT/data/processed/residual_cross_scene_r3}"
+CHECKPOINT="${R2_RESIDUAL_OUTPUT:-$STORAGE_ROOT/outputs/streaming_couping_phase1_temporal_residual_r2}/models.pt"
+OUTPUT_ROOT="${R3_MULTI_RESIDUAL_OUTPUT:-$STORAGE_ROOT/outputs/streaming_couping_phase1_cross_scene}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+GPUS="${R3_RESIDUAL_GPUS:-1,2}"
+
+if [[ -n "${R3_SCENES:-}" ]]; then
+  SCENES=(${=R3_SCENES})
+else
+  SCENES=(0a184cf634 1a8e0d78c0)
+fi
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+[[ -s "$CHECKPOINT" ]] || { echo "missing frozen r2 checkpoint: $CHECKPOINT" >&2; exit 1; }
+mkdir -p "$OUTPUT_ROOT"
+
+echo "R3 frozen residual evaluation for multiple held-out scenes"
+echo "checkpoint=$CHECKPOINT"
+echo "scenes=${SCENES[*]}"
+
+for scene in "${SCENES[@]}"; do
+  # The first scene may still use the original single-scene R3 audit location;
+  # the multi-scene preparation command stores newly generated scenes below
+  # residual_cross_scene_r3/<scene_id>.
+  if [[ "$scene" == "0a184cf634" && -s "$AUDIT_ROOT/manifest.json" ]]; then
+    geometry="$AUDIT_ROOT"
+  else
+    geometry="$AUDIT_ROOT/$scene"
+  fi
+  [[ -s "$geometry/manifest.json" ]] || {
+    echo "missing R3 manifest for scene=$scene: $geometry/manifest.json" >&2
+    exit 1
+  }
+
+  scene_output="$OUTPUT_ROOT/$scene"
+  echo ""
+  echo "===== evaluate scene=$scene ====="
+  R3_SCENE_ID="$scene" \
+  R3_GEOMETRY_OUTPUT="$geometry" \
+  R2_RESIDUAL_OUTPUT="$(dirname "$CHECKPOINT")" \
+  R3_RESIDUAL_OUTPUT="$scene_output" \
+  R3_RESIDUAL_GPUS="$GPUS" \
+  zsh "$ROOT/streaming_couping/commands_r3_cross_scene_residual.txt"
+done
+
+export OUTPUT_ROOT SCENES_TEXT="${SCENES[*]}"
+PYTHONPATH="$ROOT:$ROOT/src" "$PYTHON_BIN" - <<'PY'
+import json
+import os
+from pathlib import Path
+
+root = Path(os.environ["OUTPUT_ROOT"])
+rows = []
+for scene_id in os.environ["SCENES_TEXT"].split():
+    path = root / scene_id / "summary.json"
+    payload = json.loads(path.read_text(encoding="utf8"))
+    raw = payload["branch_lookup"]["raw_full_history"]
+    residual = payload["branch_lookup"]["residual_no_gate"]
+    decision = payload["decision"]
+    rows.append(
+        {
+            "scene_id": scene_id,
+            "raw_rmse": raw["rmse"],
+            "residual_rmse": residual["rmse"],
+            "raw_p90": raw["p90"],
+            "residual_p90": residual["p90"],
+            "improved_frame_ratio": decision["improved_frame_ratio"],
+            "scene_decision": decision["cross_scene_decision"],
+        }
+    )
+summary = {
+    "schema": 1,
+    "revision": "r3_cross_scene_residual_multi_scene_summary_r1",
+    "scenes": rows,
+    "all_scenes_go": int(all(row["scene_decision"] == "GO" for row in rows)),
+    "generalization_claim": 0,
+}
+(root / "summary.json").write_text(
+    json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf8"
+)
+print("R3 multi-scene residual summary")
+for row in rows:
+    print(
+        f"  {row['scene_id']}: raw_rmse={row['raw_rmse']:.6f} "
+        f"residual_rmse={row['residual_rmse']:.6f} "
+        f"raw_p90={row['raw_p90']:.6f} "
+        f"residual_p90={row['residual_p90']:.6f} "
+        f"improved_ratio={row['improved_frame_ratio']:.4f} "
+        f"decision={row['scene_decision']}"
+    )
+print(f"summary={root / 'summary.json'}")
+PY

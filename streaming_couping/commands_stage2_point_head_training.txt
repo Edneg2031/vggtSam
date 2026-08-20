@@ -1,0 +1,62 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+GPUS="${STAGE2_GPUS:-1,2}"
+CONFIG="${STAGE2_CONFIG:-streaming_couping/configs/stage2_point_head_training.yaml}"
+OUTPUT="${STAGE2_OUTPUT:-/data184/open_source/vggtSam/outputs/streaming_couping_stage2_point_head}"
+LOG="$OUTPUT/run.log"
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+mkdir -p "$OUTPUT"
+
+echo "Stage 2 trainable original PointHead baseline"
+echo "physical GPUs=$GPUS logical devices=cuda:0,cuda:1"
+echo "backbone/aggregator/camera frozen; SAM=0; QK unchanged"
+echo "output=$OUTPUT"
+
+set +e
+CUDA_VISIBLE_DEVICES="$GPUS" PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT:$ROOT/src" \
+  "$PYTHON_BIN" -m streaming_couping.scripts.run_stage2_point_head_training \
+  --config "$CONFIG" \
+  > "$LOG" 2>&1
+STATUS=$?
+set -e
+
+if (( STATUS != 0 )); then
+  sed -n '1,240p' "$LOG"
+  exit "$STATUS"
+fi
+
+for artifact in summary.json point_head_only.pt training_curve.csv heldout_frame_metrics.csv copyable_result.txt; do
+  [[ -s "$OUTPUT/$artifact" ]] || {
+    echo "missing Stage 2 artifact: $OUTPUT/$artifact" >&2
+    exit 1
+  }
+done
+
+export OUTPUT
+PYTHONPATH="$ROOT:$ROOT/src" "$PYTHON_BIN" - <<'PY' >> "$LOG" 2>&1
+import json
+import os
+from pathlib import Path
+
+output = Path(os.environ["OUTPUT"])
+summary = json.loads((output / "summary.json").read_text(encoding="utf8"))
+assert summary["revision"] == "stage2_trainable_point_head_geometry_only_r1"
+assert summary["sam_inputs"] == 0
+assert summary["qk_pose_modified"] == 0
+assert summary["backbone_parameters_updated"] == 0
+assert summary["camera_head_parameters_updated"] == 0
+assert summary["point_head_parameters_updated"] == 1
+assert summary["formal_v0_modified"] == 0
+assert len(summary["heldout_scenes"]) >= 1
+assert summary["decision"]["stage2_point_head_decision"] in {"GO", "NO_GO"}
+print("Stage 2 PointHead schema accepted")
+PY
+
+sed -n '1,260p' "$LOG"
+echo ""
+sed -n '1,180p' "$OUTPUT/copyable_result.txt"

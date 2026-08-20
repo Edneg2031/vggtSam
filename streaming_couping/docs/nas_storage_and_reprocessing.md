@@ -29,7 +29,8 @@
 │       └── pointmaps/
 └── outputs/
     ├── streaming_couping_v0/
-    ├── streaming_couping_t1_feature_tta/
+    ├── streaming_couping_phase1_temporal_residual_r2/
+    ├── streaming_couping_phase1_cross_scene_r3/
     └── processed_dataset_audit/
 ```
 
