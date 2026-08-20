@@ -220,7 +220,14 @@ def _load_v0_runtime(path: Path) -> dict[str, Any]:
 
 def _run_candidate_head(output: Any, checkpoint: dict[str, Any]) -> dict[str, Any]:
     aux = output.geometry.aux
-    expected_image_size = tuple(int(v) for v in aux["image_shape"])
+    # ``image_shape`` is returned in the adapter-level auxiliary payload;
+    # geometry.aux contains the feature/head tensors but not that metadata.
+    image_shape = output.aux.get("image_shape")
+    if image_shape is None:
+        image_shape = aux.get("image_shape")
+    if image_shape is None:
+        raise ValueError("StreamVGGT output lacks processed image_shape metadata")
+    expected_image_size = tuple(int(v) for v in image_shape)
     dpt = aux.get("stream_dpt_tokens")
     if not isinstance(dpt, list) or len(dpt) != 4:
         raise ValueError("StreamVGGT output lacks four DPT feature levels")
