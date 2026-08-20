@@ -24,6 +24,7 @@ training:
 evaluation:
   confidence_threshold: 0.30
   maximum_points_per_frame: 8192
+  minimum_improved_frame_ratio: 0.50
 
 heldout_scenes:
   - scene_id: 0a184cf634

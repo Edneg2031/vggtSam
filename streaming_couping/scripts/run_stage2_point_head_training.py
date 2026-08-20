@@ -52,8 +52,9 @@ from streaming_couping.src.trust_aware_residual import (
 )
 
 
-REVISION = "stage2_trainable_point_head_geometry_only_r1"
+REVISION = "stage2_trainable_point_head_geometry_only_r2"
 EXPECTED_DPT_LAYERS = (4, 11, 17, 23)
+MINIMUM_IMPROVED_FRAME_RATIO = 0.5
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,7 @@ class RunConfig:
     point_beta: float
     confidence_threshold: float
     maximum_points: int
+    minimum_improved_frame_ratio: float
     heldout_scenes: tuple[tuple[str, Path], ...]
 
 
@@ -224,6 +226,13 @@ def main() -> None:
             "all_heldout_p90_not_above_raw": int(
                 all(row["point_head_p90"] <= row["raw_p90"] for row in heldout_summaries)
             ),
+            "all_heldout_strict_majority_frames_improved": int(
+                all(
+                    row["improved_frame_ratio"] > run.minimum_improved_frame_ratio
+                    for row in heldout_summaries
+                )
+            ),
+            "minimum_improved_frame_ratio": run.minimum_improved_frame_ratio,
             "stage2_point_head_decision": (
                 "GO"
                 if heldout_summaries
@@ -660,7 +669,13 @@ def _evaluate_heldout(
         "decision": "GO"
         if point_metrics["rmse"] < raw_metrics["rmse"]
         and point_metrics["p90"] <= raw_metrics["p90"]
+        and improved / len(raw_by_frame) > MINIMUM_IMPROVED_FRAME_RATIO
         else "NO_GO",
+        "go_rule": (
+            "point_head_rmse_below_raw_and_p90_not_above_raw_and_"
+            "strict_majority_frames_improved"
+        ),
+        "minimum_improved_frame_ratio": run.minimum_improved_frame_ratio,
     }
     return summary, raw_frames + point_frames
 
@@ -845,6 +860,11 @@ def _load_run(path: str | Path, *, device_override: str | None) -> RunConfig:
         point_beta=float(training.get("point_beta", 0.05)),
         confidence_threshold=float(evaluation.get("confidence_threshold", 0.30)),
         maximum_points=int(evaluation.get("maximum_points_per_frame", 8192)),
+        minimum_improved_frame_ratio=float(
+            evaluation.get(
+                "minimum_improved_frame_ratio", MINIMUM_IMPROVED_FRAME_RATIO
+            )
+        ),
         heldout_scenes=heldout,
     )
 
@@ -856,6 +876,13 @@ def _validate_split(run: RunConfig, frame_count: int) -> None:
         raise ValueError("Stage 2 fixed split must be train=0..17 and validation=18..23")
     if run.epochs != 30 or run.batch_size != 2 or run.learning_rate != 2e-4:
         raise ValueError("Stage 2 fixed protocol changed; keep 30 epochs, batch 2, lr 2e-4")
+    if run.minimum_improved_frame_ratio != MINIMUM_IMPROVED_FRAME_RATIO:
+        raise ValueError("Stage 2 fixed protocol requires a strict majority frame gate")
+    if len(run.heldout_scenes) < 2:
+        raise ValueError("Stage 2 requires at least two independent held-out scenes")
+    scene_ids = [scene_id for scene_id, _ in run.heldout_scenes]
+    if len(scene_ids) != len(set(scene_ids)):
+        raise ValueError("Stage 2 held-out scenes must be unique")
 
 
 def _resolve_device(value: str) -> torch.device:

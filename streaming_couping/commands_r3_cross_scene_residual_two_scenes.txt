@@ -70,15 +70,20 @@ for scene_id in os.environ["SCENES_TEXT"].split():
             "residual_rmse": residual["rmse"],
             "raw_p90": raw["p90"],
             "residual_p90": residual["p90"],
+            "improved_frames": decision["improved_frames"],
+            "frame_count": payload["frame_count"],
             "improved_frame_ratio": decision["improved_frame_ratio"],
             "scene_decision": decision["cross_scene_decision"],
         }
     )
 summary = {
     "schema": 1,
-    "revision": "r3_cross_scene_residual_multi_scene_summary_r1",
+    "revision": "r3_cross_scene_residual_multi_scene_summary_r2",
     "scenes": rows,
     "all_scenes_go": int(all(row["scene_decision"] == "GO" for row in rows)),
+    "all_scenes_strict_majority_frames_improved": int(
+        all(row["improved_frame_ratio"] > 0.5 for row in rows)
+    ),
     "generalization_claim": 0,
 }
 (root / "summary.json").write_text(
@@ -91,6 +96,7 @@ for row in rows:
         f"residual_rmse={row['residual_rmse']:.6f} "
         f"raw_p90={row['raw_p90']:.6f} "
         f"residual_p90={row['residual_p90']:.6f} "
+        f"improved_frames={row['improved_frames']}/{row['frame_count']} "
         f"improved_ratio={row['improved_frame_ratio']:.4f} "
         f"decision={row['scene_decision']}"
     )

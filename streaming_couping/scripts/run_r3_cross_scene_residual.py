@@ -42,9 +42,10 @@ from streaming_couping.src.trust_aware_residual import (
 )
 
 
-REVISION = "r3_cross_scene_residual_inference_r1"
+REVISION = "r3_cross_scene_residual_inference_r2"
 BRANCH = "residual_no_gate"
 EXPECTED_DPT_LAYERS = (4, 11, 17, 23)
+MINIMUM_IMPROVED_FRAME_RATIO = 0.5
 
 
 def main() -> None:
@@ -393,8 +394,20 @@ def _score(
     raw_frames = {row["sequence_index"]: row for row in frame_rows if row["branch"] == "raw_full_history"}
     improved = sum(residual_frames[i]["rmse"] < raw_frames[i]["rmse"] for i in raw_frames)
     decision = {
-        "cross_scene_decision": "GO" if residual_row["rmse"] < raw_row["rmse"] and residual_row["p90"] <= raw_row["p90"] else "NO_GO",
-        "go_rule": "residual_rmse_below_raw_and_p90_not_above_raw",
+        "cross_scene_decision": (
+            "GO"
+            if (
+                residual_row["rmse"] < raw_row["rmse"]
+                and residual_row["p90"] <= raw_row["p90"]
+                and improved / len(raw_frames) > MINIMUM_IMPROVED_FRAME_RATIO
+            )
+            else "NO_GO"
+        ),
+        "go_rule": (
+            "residual_rmse_below_raw_and_p90_not_above_raw_and_"
+            "strict_majority_frames_improved"
+        ),
+        "minimum_improved_frame_ratio": MINIMUM_IMPROVED_FRAME_RATIO,
         "improved_frames": int(improved),
         "improved_frame_ratio": float(improved / len(raw_frames)),
         "cross_scene_generalization_claim": 0,

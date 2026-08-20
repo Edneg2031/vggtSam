@@ -67,7 +67,7 @@ from pathlib import Path
 
 output = Path(os.environ["OUTPUT"])
 summary = json.loads((output / "summary.json").read_text(encoding="utf8"))
-assert summary["revision"] == "r3_cross_scene_residual_inference_r1"
+assert summary["revision"] == "r3_cross_scene_residual_inference_r2"
 assert summary["scene_id"] == os.environ["SCENE_ID"]
 assert summary["frame_count"] == 30
 assert summary["sam_inputs"] == 0
@@ -76,6 +76,7 @@ assert summary["gt_values_used_for_candidate_generation"] == 0
 assert summary["formal_v0_modified"] == 0
 assert set(summary["branch_lookup"]) == {"raw_full_history", "residual_no_gate"}
 assert summary["decision"]["cross_scene_decision"] in {"GO", "NO_GO"}
+assert summary["decision"]["minimum_improved_frame_ratio"] == 0.5
 print("r3 cross-scene residual schema accepted")
 PY
 
