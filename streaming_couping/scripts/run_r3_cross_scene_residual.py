@@ -23,6 +23,7 @@ from streaming_couping.src.backbones.streamvggt_latent import (
     StreamVGGTLatentAdapter,
     load_streamvggt_latent_model,
 )
+from streaming_couping.src.backbones.streamvggt_wrapper import StreamVGGTWrapper
 from streaming_couping.src.backbones.streamvggt_parallel import (
     LayerShardedStreamVGGT,
     assert_processed_key_cache_equivalence,
@@ -33,7 +34,6 @@ from streaming_couping.src.pointmap_alignment import (
     _paired_limit,
     _robust_similarity,
 )
-from streaming_couping.src.semantic_map import normalize_confidence
 from streaming_couping.src.storage import expand_storage_path
 from streaming_couping.src.trust_aware_residual import (
     TrustAwareResidualHead,
@@ -107,7 +107,11 @@ def main() -> None:
             return_pointmap=True,
             streaming_cache=True,
         )
-    candidate = _run_candidate_head(output, model_payload)
+    candidate = _run_candidate_head(
+        output,
+        model_payload,
+        image_paths=image_paths,
+    )
     del adapter, runner, model, output
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -218,16 +222,18 @@ def _load_v0_runtime(path: Path) -> dict[str, Any]:
     }
 
 
-def _run_candidate_head(output: Any, checkpoint: dict[str, Any]) -> dict[str, Any]:
+def _run_candidate_head(
+    output: Any,
+    checkpoint: dict[str, Any],
+    *,
+    image_paths: Sequence[Path],
+) -> dict[str, Any]:
     aux = output.geometry.aux
-    # ``image_shape`` is returned in the adapter-level auxiliary payload;
-    # geometry.aux contains the feature/head tensors but not that metadata.
-    image_shape = output.aux.get("image_shape")
-    if image_shape is None:
-        image_shape = aux.get("image_shape")
-    if image_shape is None:
-        raise ValueError("StreamVGGT output lacks processed image_shape metadata")
-    expected_image_size = tuple(int(v) for v in image_shape)
+    # Reuse the exact conversion used while building the first scene's V0
+    # cache.  This keeps pointmap/confidence/layout semantics identical across
+    # development and held-out scenes.
+    geometry = StreamVGGTWrapper._geometry_from_output(output, image_paths)
+    expected_image_size = tuple(int(v) for v in geometry.processed_size)
     dpt = aux.get("stream_dpt_tokens")
     if not isinstance(dpt, list) or len(dpt) != 4:
         raise ValueError("StreamVGGT output lacks four DPT feature levels")
@@ -242,17 +248,14 @@ def _run_candidate_head(output: Any, checkpoint: dict[str, Any]) -> dict[str, An
     confidence = aux.get("confidence_dense")
     if pointmap is None or confidence is None:
         raise ValueError("StreamVGGT output lacks raw pointmap/confidence")
-    raw = _normalize_dense_layout(
-        pointmap.detach().float().cpu(),
-        expected_image_size,
-        channels=3,
-    )
-    confidence = normalize_confidence(confidence.detach().float().cpu())
-    confidence = _normalize_dense_layout(
-        confidence,
-        expected_image_size,
-        channels=None,
-    )
+    raw = geometry.world_points.detach().float().cpu()
+    confidence = geometry.confidence.detach().float().cpu()
+    if tuple(int(v) for v in raw.shape[1:3]) != expected_image_size:
+        raise ValueError(
+            "StreamVGGT geometry conversion produced a pointmap whose spatial "
+            f"shape differs from processed_size: points={tuple(raw.shape)} "
+            f"processed_size={expected_image_size}"
+        )
     model_cfg = checkpoint["model"]
     training_patch_shape = tuple(int(v) for v in model_cfg["patch_shape"])
     model = TrustAwareResidualHead(
@@ -329,6 +332,7 @@ def _score(
     target = target.float()
     if raw.shape != target.shape or prediction.shape != target.shape:
         raise ValueError(f"Candidate/GT shape mismatch: raw={raw.shape}, gt={target.shape}")
+    confidence = _align_confidence_to_points(confidence, raw)
     valid = (
         torch.isfinite(raw).all(dim=-1)
         & torch.isfinite(prediction).all(dim=-1)
@@ -396,6 +400,29 @@ def _score(
         "cross_scene_generalization_claim": 0,
     }
     return {"branches": branch_rows, "branch_lookup": lookup, "decision": decision}, branch_rows, frame_rows
+
+
+def _align_confidence_to_points(
+    confidence: torch.Tensor,
+    points: torch.Tensor,
+) -> torch.Tensor:
+    """Match confidence's spatial axes to the already-canonical pointmap."""
+
+    if confidence.ndim == 4 and confidence.shape[-1] == 1:
+        confidence = confidence[..., 0]
+    expected = tuple(int(v) for v in points.shape[:-1])
+    if tuple(int(v) for v in confidence.shape) == expected:
+        return confidence.contiguous()
+    if confidence.ndim == 3 and tuple(int(v) for v in confidence.shape) == (
+        expected[0],
+        expected[2],
+        expected[1],
+    ):
+        return confidence.transpose(1, 2).contiguous()
+    raise ValueError(
+        "StreamVGGT confidence layout does not match pointmap: "
+        f"confidence={tuple(confidence.shape)} points={tuple(points.shape)}"
+    )
 
 
 def _limited_indices(mask: torch.Tensor, maximum: int) -> torch.Tensor:
