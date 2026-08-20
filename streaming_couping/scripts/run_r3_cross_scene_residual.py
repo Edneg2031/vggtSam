@@ -120,6 +120,11 @@ def main() -> None:
         processed_size=candidate["image_size"],
         image_mode=run_cfg["image_mode"],
     )
+    target = _normalize_dense_layout(
+        target,
+        candidate["image_size"],
+        channels=3,
+    )
     summary, branch_rows, frame_rows = _score(
         candidate,
         target,
@@ -215,6 +220,7 @@ def _load_v0_runtime(path: Path) -> dict[str, Any]:
 
 def _run_candidate_head(output: Any, checkpoint: dict[str, Any]) -> dict[str, Any]:
     aux = output.geometry.aux
+    expected_image_size = tuple(int(v) for v in aux["image_shape"])
     dpt = aux.get("stream_dpt_tokens")
     if not isinstance(dpt, list) or len(dpt) != 4:
         raise ValueError("StreamVGGT output lacks four DPT feature levels")
@@ -229,12 +235,17 @@ def _run_candidate_head(output: Any, checkpoint: dict[str, Any]) -> dict[str, An
     confidence = aux.get("confidence_dense")
     if pointmap is None or confidence is None:
         raise ValueError("StreamVGGT output lacks raw pointmap/confidence")
-    raw = pointmap.detach().float().cpu()
+    raw = _normalize_dense_layout(
+        pointmap.detach().float().cpu(),
+        expected_image_size,
+        channels=3,
+    )
     confidence = normalize_confidence(confidence.detach().float().cpu())
-    if raw.ndim == 4 and raw.shape[0] == 1:
-        raw = raw[0]
-    if confidence.ndim == 4 and confidence.shape[0] == 1:
-        confidence = confidence[0]
+    confidence = _normalize_dense_layout(
+        confidence,
+        expected_image_size,
+        channels=None,
+    )
     model_cfg = checkpoint["model"]
     training_patch_shape = tuple(int(v) for v in model_cfg["patch_shape"])
     model = TrustAwareResidualHead(
@@ -257,12 +268,45 @@ def _run_candidate_head(output: Any, checkpoint: dict[str, Any]) -> dict[str, An
         "raw": raw,
         "prediction": prediction,
         "confidence": confidence,
-        "image_size": tuple(int(v) for v in raw.shape[1:3]),
+        "image_size": expected_image_size,
         "feature_shape": tuple(int(v) for v in features.shape),
         "source_patch_shape": patch_shape,
         "training_patch_shape": training_patch_shape,
         "fully_convolutional_patch_shape_transfer": 1,
     }
+
+
+def _normalize_dense_layout(
+    values: torch.Tensor,
+    expected_hw: tuple[int, int],
+    *,
+    channels: int | None,
+) -> torch.Tensor:
+    """Return dense predictions in the canonical ``[T,H,W,C]`` layout.
+
+    Some StreamVGGT point-head builds expose the spatial axes in the reverse
+    order for non-square crops.  The adapter's ``image_shape`` is the source
+    of truth for the processed image, so transpose only when the returned
+    tensor is exactly ``[T,W,H,...]``.  This keeps the original scene behavior
+    unchanged while making the cross-scene aspect-ratio case explicit.
+    """
+
+    tensor = values
+    if tensor.ndim == 5 and tensor.shape[0] == 1:
+        tensor = tensor[0]
+    if tensor.ndim == 4 and channels is not None and tensor.shape[-1] != channels:
+        raise ValueError(f"Expected dense channels={channels}, got {tuple(tensor.shape)}")
+    if tensor.ndim not in (3, 4):
+        raise ValueError(f"Expected dense [T,H,W,(C)], got {tuple(tensor.shape)}")
+    height, width = expected_hw
+    if tuple(int(v) for v in tensor.shape[1:3]) == (height, width):
+        return tensor.contiguous()
+    if tuple(int(v) for v in tensor.shape[1:3]) == (width, height):
+        return tensor.transpose(1, 2).contiguous()
+    raise ValueError(
+        "StreamVGGT dense output does not match processed image shape: "
+        f"output={tuple(tensor.shape)} expected_hw={expected_hw}"
+    )
 
 
 def _score(
