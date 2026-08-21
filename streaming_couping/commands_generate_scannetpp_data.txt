@@ -5,9 +5,9 @@ ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
 
-# Direct invocation generates the retained V0 scene. Override this environment
-# variable with a space-separated scene list for cross-scene preparation.
-export SCANNETPP_SCENES="${SCANNETPP_SCENES:-00a231a370}"
+# Direct invocation generates the current five-scene pilot set. Override this
+# environment variable with a space-separated scene list when needed.
+export SCANNETPP_SCENES="${SCANNETPP_SCENES:-00a231a370 0a184cf634 1a8e0d78c0 1be2c31cac 1eacc65607}"
 export SCANNETPP_PREPROCESS_MODE=full
 export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
 
