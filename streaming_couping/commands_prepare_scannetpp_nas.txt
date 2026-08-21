@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PINHOLE_ROOT="${SCANNETPP_PINHOLE_ROOT:-/data184/open_source/vggtSam/source/scanet_pp_pinhole}"
-ANNOTATION_ROOT="${SCANNETPP_ANNOTATION_ROOT:-/data184/open_source/scannet_pp}"
+ANNOTATION_ROOT="${SCANNETPP_ANNOTATION_ROOT:-/home/bod/184Nas/open_source/scannet_pp}"
 PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
 MODE="${SCANNETPP_PREPROCESS_MODE:-preflight}"
 CONFIG=configs/scannetpp_pinhole_2d.yaml
@@ -12,6 +12,34 @@ PROCESSED_ROOT="$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d"
 MANIFEST="$PROCESSED_ROOT/manifest.json"
 SCENE_ROOT="$PINHOLE_ROOT/data"
 SCENE_LIST="$PINHOLE_ROOT/scannetpp_part_valid_scenes.txt"
+
+# The annotation release is mounted differently on some 3am machines. If the
+# default 184Nas mount is unavailable, resolve the root by checking for
+# data/<scene_id>/scans instead of assuming one mount.
+if [[ ! -d "$ANNOTATION_ROOT/data" ]]; then
+  ANNOTATION_SCENES=(${=SCANNETPP_SCENES:-00a231a370})
+  for candidate in \
+    /home/bod/184Nas/open_source/scannet_pp \
+    /data184/open_source/scannet_pp \
+    /data184/open_source/vggtSam/source/scannet_pp \
+    /data184/open_source/vggtSam/source/scanet_pp \
+    /data184/open_source/vggtSam/source/*(N-/)
+  do
+    [[ -d "$candidate/data" ]] || continue
+    candidate_ok=1
+    for scene_id in "${ANNOTATION_SCENES[@]}"; do
+      if [[ ! -d "$candidate/data/$scene_id/scans" ]]; then
+        candidate_ok=0
+        break
+      fi
+    done
+    if (( candidate_ok )); then
+      ANNOTATION_ROOT="$candidate"
+      break
+    fi
+  done
+fi
+
 ANNOTATION_DATA_ROOT="$ANNOTATION_ROOT/data"
 
 cd "$ROOT"
@@ -39,7 +67,12 @@ df -h "$STORAGE_ROOT" | tail -n 1
   exit 1
 }
 [[ -d "$ANNOTATION_DATA_ROOT" ]] || {
-  echo "missing historical annotation source: $ANNOTATION_DATA_ROOT" >&2
+  echo "missing historical annotation source for scenes ${SCANNETPP_SCENES:-00a231a370}" >&2
+  echo "Set SCANNETPP_ANNOTATION_ROOT to the directory containing data/<scene_id>/scans" >&2
+  echo "Checked: /home/bod/184Nas/open_source/scannet_pp" >&2
+  echo "        /data184/open_source/scannet_pp" >&2
+  echo "        /data184/open_source/vggtSam/source/scannet_pp" >&2
+  echo "        /data184/open_source/vggtSam/source/scanet_pp" >&2
   exit 1
 }
 
