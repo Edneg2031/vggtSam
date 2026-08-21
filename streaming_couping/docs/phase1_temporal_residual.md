@@ -69,7 +69,10 @@ tie-break: minimum validation P90
 三个学习分支各自保存 best-validation checkpoint。30 epochs 全部结束后才加载所选权重，每个分支只运行
 一次 test 评价。不能根据 r1 中观察到的结果把训练轮数事后改成 1。
 
-## 运行
+## 运行（历史归档）
+
+这份 Phase 1 记录对应旧的单场景 `18/6/6` temporal protocol。其命令入口已移除，
+不属于当前多场景实验流程；当前流程请参考 `docs/current_method.md`。
 
 要求下列两个只读 artifact 已存在：
 
@@ -78,19 +81,7 @@ tie-break: minimum validation P90
 /data184/open_source/vggtSam/outputs/streaming_couping_v0/qk_pose_retrieval/qk_pose_output.pt
 ```
 
-运行：
-
-```bash
-zsh streaming_couping/commands_temporal_residual_training.txt
-```
-
-默认只用物理 GPU 1。可改为：
-
-```bash
-TEMPORAL_RESIDUAL_GPU=2 zsh streaming_couping/commands_temporal_residual_training.txt
-```
-
-输出目录：
+历史输出目录：
 
 ```text
 /data184/open_source/vggtSam/outputs/streaming_couping_phase1_temporal_residual_r2
