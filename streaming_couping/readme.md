@@ -37,6 +37,18 @@ outputs/streaming_couping_v0/
     └── tracks.csv
 ```
 
+绘制 V0 raw pose 与 QK pose 的相机轨迹、GT 对比和逐帧误差：
+
+```bash
+zsh streaming_couping/commands_plot_v0_poses.txt
+```
+
+结果写入 `outputs/streaming_couping_v0/pose_plots/`：
+`pose_trajectory.png`、`pose_trajectory.svg`、`pose_metrics.csv` 和
+`pose_plot_summary.json`。图中的 GT 会使用 V0 cache 的
+`point_alignment_scale` 转换到 StreamVGGT native gauge；这只用于可视化，
+不会修改 V0 的 pose artifact。
+
 当前单序列证据只支持QK pose改善（center `10.93%`、rotation `6.15%`）。V0不声明SAM改善
 pose或几何；SAM的正式作用是实例发现、跨帧persistent identity和语义投影。完整方法见
 [V0方法说明](docs/v0_method.md)。

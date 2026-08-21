@@ -1,0 +1,15 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+CONFIG="${V0_CONFIG:-streaming_couping/configs/v0_baseline.yaml}"
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+
+echo "Plotting frozen V0 raw/QK camera poses"
+echo "config=$CONFIG"
+
+PYTHONPATH=. "$PYTHON_BIN" -m streaming_couping.scripts.plot_v0_poses \
+  --config "$CONFIG"

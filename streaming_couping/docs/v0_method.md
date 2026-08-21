@@ -76,6 +76,15 @@ box / guitar case`。它们来自独立的 annotation-only 场景盘点；盘点
 - `${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/semantic_map/prompt_discovery.csv`：逐提示词的原始发现、出生门控、最终保留和 mask 支持统计；
 - `${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/semantic_map/semantic_map_summary.json`：pipeline 审计。
 
+位姿诊断图可单独生成：
+
+```bash
+zsh streaming_couping/commands_plot_v0_poses.txt
+```
+
+它只读取已有的 `poses.pt`、manifest 和 cache，输出 raw/QK/GT 轨迹、逐帧
+center/rotation error 以及 CSV；不会重新运行模型，也不会修改 V0 结果。
+
 `semantic_map.pt`保存 world point、原始RGB、语义RGB、固定slot调色板、confidence、frame index、
 semantic slot、SAM track ID、track metadata，以及raw/QK两条相机轨迹。
 
