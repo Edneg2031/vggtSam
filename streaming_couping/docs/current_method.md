@@ -61,24 +61,29 @@ StreamVGGT 和 SAM backbone 都冻结，只训练 geometry decoder，并使用 G
 
 ## 4. 数据与验证协议
 
-当前共有 5 个场景：
+当前有 4 个完整可用场景：
 
 - `00a231a370`：从 `/home/bod/184Nas/open_source/scannet_pp_pinhole` 读取 pinhole 数据。
-- 其他四个场景：从 `/data184/open_source/vggtSam/source/scanet_pp_pinhole` 读取。
+- 其他三个场景：从 `/data184/open_source/vggtSam/source/scanet_pp_pinhole` 读取。
 - semantic/instance annotations：从 `/home/bod/184Nas/open_source/scannet_pp/data` 读取。
 - 生成结果：写入 `/data184/open_source/vggtSam/data/processed/scannetpp_pinhole_2d`。
 
+`1be2c31cac` 的 pinhole/annotation 资产不完整，已排除，不参与当前实验。
+
 原始 RGB 只读引用，不复制图片。
 
-推荐使用 scene-disjoint protocol：
+当前 4 场景 pilot 使用 scene-disjoint protocol：
 
 ```text
-Train: 3 scenes
+Train: 2 scenes
 Val:   1 unseen scene
 Test:  1 completely unseen scene
 ```
 
-模型选择和 checkpoint 选择只能使用 validation scene。最终 test scene 只评价一次。条件允许时，轮换 scene split 以减少偶然性。
+当前固定 split 为：`Train={00a231a370, 0a184cf634}`、
+`Val={1a8e0d78c0}`、`Test={1eacc65607}`。模型选择和 checkpoint 选择只能使用
+validation scene。最终 test scene 只评价一次。条件允许时，进行 4-fold scene rotation；
+要恢复 `3/1/1`，还需要新增一个完整场景。
 
 ## 5. 实验顺序
 
@@ -100,7 +105,15 @@ zsh streaming_couping/commands_generate_scannetpp_data.txt
 2. 冻结 StreamVGGT + trainable residual decoder。
 3. 冻结 StreamVGGT backbone + trainable geometry PointHead/decoder。
 
-先确认 geometry-only 方法能在 scene-disjoint split 上稳定超过 raw baseline。
+当前入口：
+
+```bash
+zsh streaming_couping/commands_prepare_multiscene_geometry_cache.txt
+zsh streaming_couping/commands_train_multiscene_geometry.txt
+```
+
+第一版只训练 `residual_no_gate`，确认 geometry-only 方法能在 scene-disjoint split
+上稳定超过 raw baseline 后，再增加 trainable PointHead 对比。
 
 ### Stage 2：object-aware geometry
 
