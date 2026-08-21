@@ -60,9 +60,12 @@ echo "current_pinhole_root=$CURRENT_PINHOLE_ROOT"
 echo "processed_output=$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d"
 
 failed=0
-check_scene "${SCENES[1]}" "$LEGACY_PINHOLE_ROOT" || failed=1
-for scene_id in "${SCENES[@]:2}"; do
-  check_scene "$scene_id" "$CURRENT_PINHOLE_ROOT" || failed=1
+for scene_id in "${SCENES[@]}"; do
+  if [[ "$scene_id" == "00a231a370" ]]; then
+    check_scene "$scene_id" "$LEGACY_PINHOLE_ROOT" || failed=1
+  else
+    check_scene "$scene_id" "$CURRENT_PINHOLE_ROOT" || failed=1
+  fi
 done
 
 if (( failed )); then
