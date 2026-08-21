@@ -1,0 +1,72 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+ANNOTATION_ROOT="${SCANNETPP_ANNOTATION_ROOT:-/home/bod/184Nas/open_source/scannet_pp}"
+LEGACY_PINHOLE_ROOT="${SCANNETPP_LEGACY_PINHOLE_ROOT:-/home/bod/184Nas/open_source/scannet_pp_pinhole}"
+CURRENT_PINHOLE_ROOT="${SCANNETPP_PINHOLE_ROOT:-/data184/open_source/vggtSam/source/scanet_pp_pinhole}"
+
+SCENES=(
+  00a231a370
+  0a184cf634
+  1a8e0d78c0
+  1be2c31cac
+  1eacc65607
+)
+
+has_colmap_text() {
+  local scene_root="$1"
+  local candidate
+  for candidate in \
+    "$scene_root/colmap" \
+    "$scene_root/colmap/0" \
+    "$scene_root/colmap/sparse/0"
+  do
+    if [[ -f "$candidate/cameras.txt" && -f "$candidate/images.txt" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+check_scene() {
+  local scene_id="$1"
+  local pinhole_root="$2"
+  local scene_root="$pinhole_root/data/$scene_id"
+  local annotation_scan="$ANNOTATION_ROOT/data/$scene_id/scans"
+  local missing=()
+
+  [[ -d "$scene_root/images" ]] || missing+=("images")
+  has_colmap_text "$scene_root" || missing+=("colmap_text")
+  [[ -f "$scene_root/mesh_aligned_0.05.ply" ]] || missing+=("pinhole_mesh")
+  [[ -f "$annotation_scan/mesh_aligned_0.05_semantic.ply" ]] || missing+=("semantic_mesh")
+  [[ -f "$annotation_scan/segments.json" ]] || missing+=("segments.json")
+  [[ -f "$annotation_scan/segments_anno.json" ]] || missing+=("segments_anno.json")
+
+  if (( ${#missing[@]} == 0 )); then
+    echo "READY scene=$scene_id pinhole_root=$pinhole_root"
+    return 0
+  fi
+
+  echo "INCOMPLETE scene=$scene_id pinhole_root=$pinhole_root missing=${(j:,:)missing}"
+  return 1
+}
+
+echo "ScanNet++ read-only preflight"
+echo "annotation_root=$ANNOTATION_ROOT"
+echo "legacy_pinhole_root=$LEGACY_PINHOLE_ROOT"
+echo "current_pinhole_root=$CURRENT_PINHOLE_ROOT"
+echo "processed_output=$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d"
+
+failed=0
+check_scene "${SCENES[1]}" "$LEGACY_PINHOLE_ROOT" || failed=1
+for scene_id in "${SCENES[@]:2}"; do
+  check_scene "$scene_id" "$CURRENT_PINHOLE_ROOT" || failed=1
+done
+
+if (( failed )); then
+  echo "preflight_result=INCOMPLETE"
+  exit 1
+fi
+echo "preflight_result=READY"
