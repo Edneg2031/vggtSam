@@ -4,6 +4,10 @@ manifest: ${VGGT_SAM_STORAGE_ROOT}/data/processed/scannetpp_pinhole_2d/manifest.
 v0_config: streaming_couping/configs/v0_baseline.yaml
 output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_multiscene_geometry_r1/cache
 
+# Keep every scene on one dense/patch grid.  The default V0 crop mode preserves
+# aspect ratio, so different scenes can otherwise produce different heights.
+image_mode: pad
+
 scene_splits:
   train:
     - 00a231a370

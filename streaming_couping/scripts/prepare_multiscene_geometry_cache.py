@@ -86,12 +86,18 @@ def main() -> None:
         selected_layer_indices=EXPECTED_DPT_LAYERS,
         amp_dtype=runtime["amp_dtype"],
     )
+    image_mode = str(config.get("image_mode", runtime["image_mode"]))
+    if image_mode not in {"crop", "pad"}:
+        raise ValueError(
+            f"Multi-scene geometry image_mode must be 'crop' or 'pad', got {image_mode!r}."
+        )
+    print(f"image_mode={image_mode}")
     for line in runner.layout_summary():
         print(f"  {line}")
     adapter = StreamVGGTLatentAdapter(
         model,
         device=devices[0],
-        image_mode=runtime["image_mode"],
+        image_mode=image_mode,
         dpt_layer_indices=EXPECTED_DPT_LAYERS,
         parallel_runner=runner,
     )
@@ -109,7 +115,7 @@ def main() -> None:
             manifest_path=manifest_path,
             adapter=adapter,
             runner=runner,
-            image_mode=runtime["image_mode"],
+            image_mode=image_mode,
             confidence_threshold=float(config.get("confidence_threshold", 0.30)),
             max_alignment_points=int(config.get("max_alignment_points", 30000)),
         )
@@ -124,7 +130,7 @@ def main() -> None:
         "manifest": str(manifest_path),
         "output_dir": str(output_dir),
         "dpt_layer_indices": list(EXPECTED_DPT_LAYERS),
-        "image_mode": runtime["image_mode"],
+        "image_mode": image_mode,
         "confidence_threshold": float(config.get("confidence_threshold", 0.30)),
         "episode_length": int(config["episode_length"]),
         "splits": splits,
