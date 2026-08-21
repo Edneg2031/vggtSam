@@ -110,10 +110,15 @@ zsh streaming_couping/commands_generate_scannetpp_data.txt
 ```bash
 zsh streaming_couping/commands_prepare_multiscene_geometry_cache.txt
 zsh streaming_couping/commands_train_multiscene_geometry.txt
+zsh streaming_couping/commands_train_multiscene_geometry_direct.txt
 ```
 
-第一版只训练 `residual_no_gate`，确认 geometry-only 方法能在 scene-disjoint split
-上稳定超过 raw baseline 后，再增加 trainable PointHead 对比。
+Stage 1 的 C 分支是预先登记的 Direct Geometry Decoder：冻结
+StreamVGGT aggregator/backbone 和 CameraHead，只训练 released original
+PointHead。它使用同一个 multi-scene cache、validation-only checkpoint selection
+和一次性 test scoring；不能因为 residual 的 test 结果而修改 residual 或 Direct
+分支的固定训练协议。当前 pilot 是 `2 train / 1 validation / 1 test`，不是最终的
+`3 / 1 / 1` 五场景 protocol。
 
 ### Stage 2：object-aware geometry
 

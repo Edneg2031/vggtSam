@@ -1,0 +1,19 @@
+# Stage 1 Fold1 branch C: Direct Geometry Decoder.
+# StreamVGGT aggregator/backbone and CameraHead stay frozen; only the released
+# original PointHead is trained from the frozen multi-scene feature cache.
+cache_index: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_multiscene_geometry_r1/cache/index.json
+output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_multiscene_geometry_r1/direct_training
+v0_config: streaming_couping/configs/v0_baseline.yaml
+device: cuda:0
+seed: 2026
+
+# Pre-registered Stage 1 C protocol.  The runner rejects changes to these.
+epochs: 30
+batch_size: 2
+learning_rate: 0.0002
+weight_decay: 0.0001
+grad_clip_norm: 1.0
+point_beta: 0.05
+
+maximum_points_per_frame: 8192
+raw_fallback_tolerance: 0.01

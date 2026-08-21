@@ -68,6 +68,9 @@ def main() -> None:
         if tuple(item["patch_shape"]) != patch_shape or tuple(item["image_size"]) != image_size:
             raise ValueError(f"Spatial layout mismatch in {item['episode_id']}")
 
+    coverage = _frame_coverage(episodes)
+    raw_val, raw_val_frames = _score_raw(validation, "validation", maximum_points)
+
     print("MULTI-SCENE GEOMETRY-ONLY TRAINING")
     print(f"cache_index={index_path}")
     print(
@@ -77,10 +80,17 @@ def main() -> None:
     )
     print(
         f"episodes=train={len(train)} validation={len(validation)} test={len(test)} "
-        f"frames={sum(item['features'].shape[0] for item in episodes)}"
+        f"total_frame_occurrences={sum(item['features'].shape[0] for item in episodes)} "
+        f"train_frame_occurrences={sum(item['features'].shape[0] for item in train)}"
     )
     print("frozen=StreamVGGT backbone and original PointHead; SAM=0")
     print("checkpoint selection=validation scene only; test=one-pass sealed scoring")
+    _print_frame_coverage(coverage)
+    print(
+        f"  raw_val_rmse={raw_val['rmse']:.6f} "
+        f"raw_val_median={raw_val['median']:.6f} "
+        f"raw_val_p90={raw_val['p90']:.6f}"
+    )
 
     model = TrustAwareResidualHead(
         feature_channels=channels,
@@ -134,7 +144,15 @@ def main() -> None:
             point_loss_total += float(point_loss.detach().cpu())
             batches += 1
 
-        validation_row, _ = _score_split(model, validation, "validation", device, maximum_points, image_size)
+        validation_row, _ = _score_split(
+            model,
+            validation,
+            "validation",
+            device,
+            maximum_points,
+            image_size,
+        )
+        validation_row = _annotate_comparison(validation_row, raw_val)
         score = (validation_row["rmse"], validation_row["p90"])
         selected = int(validation_checkpoint_is_better(*score, best_score))
         if selected:
@@ -147,7 +165,17 @@ def main() -> None:
                 "mean_loss": total_loss / max(batches, 1),
                 "mean_point_loss": point_loss_total / max(batches, 1),
                 "validation_rmse": validation_row["rmse"],
+                "validation_median": validation_row["median"],
                 "validation_p90": validation_row["p90"],
+                "raw_validation_rmse": raw_val["rmse"],
+                "raw_validation_median": raw_val["median"],
+                "raw_validation_p90": raw_val["p90"],
+                "validation_rmse_gain_vs_raw_percent": validation_row[
+                    "rmse_gain_vs_raw_percent"
+                ],
+                "validation_improved_frame_ratio_vs_raw": validation_row[
+                    "improved_frame_ratio_vs_raw"
+                ],
                 "selected_as_best": selected,
             }
         )
@@ -160,13 +188,26 @@ def main() -> None:
     if best_state is None or best_epoch < 0:
         raise RuntimeError("No validation checkpoint was selected.")
     model.load_state_dict(best_state, strict=True)
-    val_row, val_frames = _score_split(model, validation, "validation", device, maximum_points, image_size)
-    raw_val, raw_val_frames = _score_raw(validation, "validation", maximum_points)
-    test_row, test_frames = _score_split(model, test, "test", device, maximum_points, image_size)
+    val_row, val_frames = _score_split(
+        model,
+        validation,
+        "validation",
+        device,
+        maximum_points,
+        image_size,
+    )
+    val_row = _annotate_comparison(val_row, raw_val)
+    test_row, test_frames = _score_split(
+        model,
+        test,
+        "test",
+        device,
+        maximum_points,
+        image_size,
+    )
     raw_test, raw_test_frames = _score_raw(test, "test", maximum_points)
-    test_row["rmse_gain_vs_raw_percent"] = _gain(raw_test["rmse"], test_row["rmse"])
-    test_row["p90_gain_vs_raw_percent"] = _gain(raw_test["p90"], test_row["p90"])
-    test_row["improved_frame_ratio_vs_raw"] = test_row["improved_frames_vs_raw"] / max(len(test_frames), 1)
+    test_row = _annotate_comparison(test_row, raw_test)
+    validation_beats_raw = _beats_raw(val_row, raw_val)
     decision = {
         "cross_scene_pilot_decision": "GO"
         if (
@@ -178,6 +219,22 @@ def main() -> None:
         "rule": "test_rmse_below_raw_and_p90_not_above_raw_and_strict_majority_frames_improved",
         "test_scene_ids": splits["test"],
         "cross_scene_generalization_claim": 0,
+        "validation_comparison": {
+            "residual_beats_raw": int(validation_beats_raw),
+            "rule": "validation_rmse_below_raw_and_p90_not_above_raw_and_strict_majority_frames_improved",
+        },
+        "interpretation_case": (
+            "A_validation_beats_raw_test_fails"
+            if validation_beats_raw
+            and not (
+                test_row["rmse"] < raw_test["rmse"]
+                and test_row["p90"] <= raw_test["p90"]
+                and test_row["improved_frame_ratio_vs_raw"] > 0.5
+            )
+            else "B_residual_does_not_beat_validation_raw"
+            if not validation_beats_raw
+            else "validation_and_test_pass"
+        ),
     }
     summary = {
         "schema": 1,
@@ -185,6 +242,12 @@ def main() -> None:
         "experiment": "frozen_streamvggt_multiscene_residual_no_gate",
         "cache_index": str(index_path),
         "scene_splits": splits,
+        "scene_disjoint_protocol": {
+            "name": "fold1_2_train_1_validation_1_test",
+            "train_scene_count": len(splits["train"]),
+            "validation_scene_count": len(splits["validation"]),
+            "test_scene_count": len(splits["test"]),
+        },
         "episodes": {split: [item["episode_id"] for item in episodes if item["split"] == split] for split in ("train", "validation", "test")},
         "model": {
             "streamvggt_frozen": 1,
@@ -200,8 +263,13 @@ def main() -> None:
             "best_epoch": best_epoch,
             "test_metrics_read_during_selection": 0,
         },
-        "validation": {"raw": raw_val, "residual_no_gate": val_row},
+        "validation": {
+            "raw": raw_val,
+            "residual_no_gate": val_row,
+            "residual_beats_raw": int(validation_beats_raw),
+        },
         "test": {"raw": raw_test, "residual_no_gate": test_row},
+        "data_coverage": coverage,
         "frame_metrics": raw_val_frames + val_frames + raw_test_frames + test_frames,
         "decision": decision,
         "formal_v0_modified": 0,
@@ -222,6 +290,14 @@ def main() -> None:
     _write_json(output_dir / "summary.json", summary)
     _write_csv(output_dir / "training_curve.csv", curve)
     _write_csv(output_dir / "frame_metrics.csv", summary["frame_metrics"])
+    print(
+        f"  val_raw=(rmse={raw_val['rmse']:.6f}, median={raw_val['median']:.6f}, "
+        f"p90={raw_val['p90']:.6f}) "
+        f"val_residual=(rmse={val_row['rmse']:.6f}, median={val_row['median']:.6f}, "
+        f"p90={val_row['p90']:.6f}) "
+        f"gain={val_row['rmse_gain_vs_raw_percent']:.4f}% "
+        f"improved_frame_ratio={val_row['improved_frame_ratio_vs_raw']:.4f}"
+    )
     print(
         f"  raw_test_rmse={raw_test['rmse']:.6f} "
         f"residual_test_rmse={test_row['rmse']:.6f} "
@@ -254,6 +330,104 @@ def _validate_splits(episodes: list[dict[str, Any]], splits: dict[str, Any]) -> 
         actual = {item["scene_id"] for item in episodes if item["split"] == split}
         if expected != actual:
             raise ValueError(f"Split mismatch for {split}: expected={expected} actual={actual}")
+
+
+def _frame_coverage(episodes: list[dict[str, Any]]) -> dict[str, Any]:
+    """Describe episode occurrences and duplicate frame coverage per scene."""
+
+    coverage: dict[str, Any] = {}
+    totals: dict[str, Any] = {}
+    for split in ("train", "validation", "test"):
+        scene_rows: dict[str, Any] = {}
+        split_episodes = [item for item in episodes if item["split"] == split]
+        for scene_id in sorted({str(item["scene_id"]) for item in split_episodes}):
+            scene_episodes = sorted(
+                (item for item in split_episodes if str(item["scene_id"]) == scene_id),
+                key=lambda item: str(item["episode_id"]),
+            )
+            episode_rows = []
+            occurrences: list[int] = []
+            for item in scene_episodes:
+                indices = [int(value) for value in item["frame_indices"]]
+                occurrences.extend(indices)
+                episode_rows.append(
+                    {
+                        "episode_id": str(item["episode_id"]),
+                        "frame_indices": indices,
+                        "frame_count": len(indices),
+                    }
+                )
+            unique_indices = sorted(set(occurrences))
+            total_occurrences = len(occurrences)
+            duplicate_occurrences = total_occurrences - len(unique_indices)
+            scene_rows[scene_id] = {
+                "episode_count": len(episode_rows),
+                "episodes": episode_rows,
+                "total_frame_occurrences": total_occurrences,
+                "unique_frame_count": len(unique_indices),
+                "duplicate_frame_occurrences": duplicate_occurrences,
+                "overlap_ratio": duplicate_occurrences / max(total_occurrences, 1),
+                "unique_frame_indices": unique_indices,
+            }
+        coverage[split] = scene_rows
+        total_occurrences = sum(
+            int(row["total_frame_occurrences"]) for row in scene_rows.values()
+        )
+        total_unique = sum(int(row["unique_frame_count"]) for row in scene_rows.values())
+        totals[split] = {
+            "scene_count": len(scene_rows),
+            "total_frame_occurrences": total_occurrences,
+            "unique_frame_count": total_unique,
+            "duplicate_frame_occurrences": total_occurrences - total_unique,
+            "overlap_ratio": (total_occurrences - total_unique)
+            / max(total_occurrences, 1),
+        }
+    coverage["totals"] = totals
+    return coverage
+
+
+def _print_frame_coverage(coverage: dict[str, Any]) -> None:
+    print("FRAME COVERAGE (overlap_ratio=1-unique_frames/total_occurrences)")
+    for split in ("train", "validation", "test"):
+        total = coverage.get("totals", {}).get(split)
+        if total is not None:
+            print(
+                f"  split={split} total_occurrences={total['total_frame_occurrences']} "
+                f"unique_frames={total['unique_frame_count']} "
+                f"overlap_ratio={total['overlap_ratio']:.4f}"
+            )
+        for scene_id, row in coverage.get(split, {}).items():
+            print(
+                f"  split={split} scene={scene_id} "
+                f"episodes={row['episode_count']} "
+                f"total_occurrences={row['total_frame_occurrences']} "
+                f"unique_frames={row['unique_frame_count']} "
+                f"overlap_ratio={row['overlap_ratio']:.4f}"
+            )
+            for episode in row["episodes"]:
+                print(
+                    f"    episode={episode['episode_id']} "
+                    f"frame_indices={episode['frame_indices']}"
+                )
+
+
+def _annotate_comparison(candidate: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
+    row = dict(candidate)
+    row["rmse_gain_vs_raw_percent"] = _gain(raw["rmse"], row["rmse"])
+    row["median_gain_vs_raw_percent"] = _gain(raw["median"], row["median"])
+    row["p90_gain_vs_raw_percent"] = _gain(raw["p90"], row["p90"])
+    row["improved_frame_ratio_vs_raw"] = row["improved_frames_vs_raw"] / max(
+        row["frame_count"], 1
+    )
+    return row
+
+
+def _beats_raw(candidate: dict[str, Any], raw: dict[str, Any]) -> bool:
+    return bool(
+        candidate["rmse"] < raw["rmse"]
+        and candidate["p90"] <= raw["p90"]
+        and candidate["improved_frame_ratio_vs_raw"] > 0.5
+    )
 
 
 def _batch(episodes: list[dict[str, Any]], selected: list[tuple[int, int]], device: torch.device):
