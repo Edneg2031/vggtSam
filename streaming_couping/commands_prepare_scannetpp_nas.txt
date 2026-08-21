@@ -17,7 +17,7 @@ SCENE_LIST="$PINHOLE_ROOT/scannetpp_part_valid_scenes.txt"
 # default 184Nas mount is unavailable, resolve the root by checking for
 # data/<scene_id>/scans instead of assuming one mount.
 if [[ ! -d "$ANNOTATION_ROOT/data" ]]; then
-  ANNOTATION_SCENES=(${=SCANNETPP_SCENES:-00a231a370})
+  ANNOTATION_SCENES=(${=SCANNETPP_SCENES:-0a184cf634})
   for candidate in \
     /home/bod/184Nas/open_source/scannet_pp \
     /data184/open_source/scannet_pp \
@@ -67,7 +67,7 @@ df -h "$STORAGE_ROOT" | tail -n 1
   exit 1
 }
 [[ -d "$ANNOTATION_DATA_ROOT" ]] || {
-  echo "missing historical annotation source for scenes ${SCANNETPP_SCENES:-00a231a370}" >&2
+  echo "missing historical annotation source for scenes ${SCANNETPP_SCENES:-0a184cf634}" >&2
   echo "Set SCANNETPP_ANNOTATION_ROOT to the directory containing data/<scene_id>/scans" >&2
   echo "Checked: /home/bod/184Nas/open_source/scannet_pp" >&2
   echo "        /data184/open_source/scannet_pp" >&2
@@ -106,7 +106,7 @@ SCENE_ARGS=()
 if [[ -n "${SCANNETPP_SCENES:-}" ]]; then
   SCENE_ARGS+=(--scene-ids ${=SCANNETPP_SCENES})
 elif [[ "$MODE" == "preflight" || "$MODE" == "debug" ]]; then
-  SCENE_ARGS=(--scene-ids "${SCANNETPP_DEFAULT_SCENE:-00a231a370}")
+      SCENE_ARGS=(--scene-ids "${SCANNETPP_DEFAULT_SCENE:-0a184cf634}")
 fi
 
 SOURCE_ARGS=(
@@ -128,7 +128,7 @@ case "$MODE" in
     ;;
   debug)
     if (( ${#SCENE_ARGS[@]} == 0 )); then
-      SCENE_ARGS=(--scene-ids 00a231a370)
+      SCENE_ARGS=(--scene-ids 0a184cf634)
     fi
     echo "Generate a five-frame visual/debug slice on NAS"
     PYTHONPATH="$ROOT/src" "$PYTHON_BIN" scripts/prepare_scannetpp_2d.py \

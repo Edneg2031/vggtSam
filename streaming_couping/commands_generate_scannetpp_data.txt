@@ -5,17 +5,51 @@ ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
 
-# Direct invocation generates the current five-scene pilot set. Override this
-# environment variable with a space-separated scene list when needed.
-export SCANNETPP_SCENES="${SCANNETPP_SCENES:-00a231a370 0a184cf634 1a8e0d78c0 1be2c31cac 1eacc65607}"
+# 00a231a370 is retained on the old 184Nas pinhole mount; the other four
+# scenes are on the current source mount. Override this variable with a
+# space-separated scene list when processing a subset.
+REQUESTED_SCENES=(${=SCANNETPP_SCENES:-00a231a370 0a184cf634 1a8e0d78c0 1be2c31cac 1eacc65607})
+export SCANNETPP_SCENES="${(j: :)REQUESTED_SCENES}"
 export SCANNETPP_PREPROCESS_MODE=full
 export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+export VGGT_SAM_ROOT="$ROOT"
+
+LEGACY_SCENE=00a231a370
+LEGACY_PINHOLE_ROOT=/home/bod/184Nas/open_source/scannet_pp_pinhole
+CURRENT_PINHOLE_ROOT=/data184/open_source/vggtSam/source/scanet_pp_pinhole
+LEGACY_REQUESTED=0
+CURRENT_SCENES=()
+for scene_id in "${REQUESTED_SCENES[@]}"; do
+  if [[ "$scene_id" == "$LEGACY_SCENE" ]]; then
+    LEGACY_REQUESTED=1
+  else
+    CURRENT_SCENES+=("$scene_id")
+  fi
+done
 
 cd "$ROOT"
 echo "Generate ScanNet++ semantic/instance masks and GT pointmaps"
 echo "RGB is read directly from the historical source path; no copy/link is made"
 echo "scenes=$SCANNETPP_SCENES"
-zsh streaming_couping/commands_prepare_scannetpp_nas.txt
+
+if (( LEGACY_REQUESTED )); then
+  [[ -d "$LEGACY_PINHOLE_ROOT/data/$LEGACY_SCENE" ]] || {
+    echo "missing 184Nas pinhole source: $LEGACY_PINHOLE_ROOT/data/$LEGACY_SCENE" >&2
+    exit 1
+  }
+  echo "prepare legacy scene=$LEGACY_SCENE pinhole_root=$LEGACY_PINHOLE_ROOT"
+  SCANNETPP_SCENES="$LEGACY_SCENE" \
+  SCANNETPP_PINHOLE_ROOT="$LEGACY_PINHOLE_ROOT" \
+    zsh streaming_couping/commands_prepare_scannetpp_nas.txt
+fi
+
+if (( ${#CURRENT_SCENES[@]} )); then
+  CURRENT_SCENE_TEXT="${(j: :)CURRENT_SCENES}"
+  echo "prepare current scenes=$CURRENT_SCENE_TEXT pinhole_root=$CURRENT_PINHOLE_ROOT"
+  SCANNETPP_SCENES="$CURRENT_SCENE_TEXT" \
+  SCANNETPP_PINHOLE_ROOT="$CURRENT_PINHOLE_ROOT" \
+    zsh streaming_couping/commands_prepare_scannetpp_nas.txt
+fi
 
 MANIFEST="$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json"
 export MANIFEST
