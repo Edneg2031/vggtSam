@@ -62,9 +62,11 @@ ratio = float(stats["normal_frame_unchanged_ratio"])
 assert ratio == ratio and ratio >= 1.0 - 1e-12
 print(
     "V2 conditional recovery export accepted "
-    f"triggers={stats['recovery_trigger_count']} "
-    f"applied={stats['recovery_success_count']} "
-    f"normal_unchanged={ratio:.4f}"
+    "triggers={} applied={} normal_unchanged={:.4f}".format(
+        stats["recovery_trigger_count"],
+        stats["recovery_success_count"],
+        ratio,
+    )
 )
 '
 
