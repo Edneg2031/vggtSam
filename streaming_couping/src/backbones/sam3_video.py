@@ -199,6 +199,7 @@ class SAM3VideoTrackerAdapter:
         output_size: tuple[int, int],
         prompt_frame_idx: int = 0,
         reference_mask: torch.Tensor | np.ndarray | None = None,
+        propagation_direction: str = "both",
         quiet: bool = True,
     ) -> SAM3TrackOutput:
         if not image_paths:
@@ -208,6 +209,11 @@ class SAM3VideoTrackerAdapter:
             raise ValueError(
                 f"prompt_frame_idx={prompt_frame_idx} is out of range for "
                 f"{len(image_paths)} frames."
+            )
+        propagation_direction = str(propagation_direction).strip().lower()
+        if propagation_direction not in {"forward", "both"}:
+            raise ValueError(
+                "propagation_direction must be 'forward' or 'both'."
             )
 
         with tempfile.TemporaryDirectory(prefix="sam3_track_") as tmp:
@@ -241,9 +247,13 @@ class SAM3VideoTrackerAdapter:
                     propagated = list(
                         self.predictor.propagate_in_video(
                             session_id=session_id,
-                            propagation_direction="both",
+                            propagation_direction=propagation_direction,
                             start_frame_idx=prompt_frame_idx,
-                            max_frame_num_to_track=len(image_paths),
+                            max_frame_num_to_track=(
+                                len(image_paths) - prompt_frame_idx
+                                if propagation_direction == "forward"
+                                else len(image_paths)
+                            ),
                             output_prob_thresh=self.output_prob_thresh,
                         )
                     )
@@ -281,6 +291,7 @@ class SAM3VideoTrackerAdapter:
             aux={
                 "prompt": prompt,
                 "num_frames": len(image_paths),
+                "propagation_direction": propagation_direction,
                 "frame_object_counts": {
                     int(frame_idx): len(objects)
                     for frame_idx, objects in frame_objects.items()

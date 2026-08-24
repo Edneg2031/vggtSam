@@ -50,6 +50,16 @@ class FeatureConfig:
     sam_local_sampling: str = "farthest_uv"
     sam_local_storage_dtype: str = "float16"
     geometry_prompt_point_confidence_threshold: float = 0.30
+    # ``per_object_retrack`` is a decoupled-session ablation: multiplex SAM3.1
+    # discovers births, then each retained object gets an independent causal
+    # forward session. It is not a claim of hidden-memory SAM3-DMS parity.
+    sam_memory_policy: str = "coupled"
+    geometry_prompt_variants: tuple[str, ...] = (
+        "sam31_online_geometry_compete",
+    )
+    geometry_control_shift_xy: tuple[float, float] = (0.20, 0.0)
+    geometry_control_stale_lag: int = 3
+    geometry_control_seed: int = 2026
     point_confidence_threshold: float = 0.30
     min_instance_points: int = 128
     sampled_instance_points: int = 128
@@ -235,6 +245,37 @@ def load_learned_pose_config(path: str | Path) -> LearnedPoseConfig:
                     "geometry_prompt_point_confidence_threshold",
                     0.30,
                 )
+            ),
+            sam_memory_policy=str(
+                features.get("sam_memory_policy", "coupled")
+            ).strip().lower(),
+            geometry_prompt_variants=tuple(
+                str(value).strip()
+                for value in features.get(
+                    "geometry_prompt_variants",
+                    (
+                        ["sam31_online_geometry_compete"]
+                        if str(
+                            features.get(
+                                "sam_segmentation_variant",
+                                "legacy_recovery",
+                            )
+                        )
+                        == "sam31_online_geometry_compete"
+                        else []
+                    ),
+                )
+                if str(value).strip()
+            ),
+            geometry_control_shift_xy=_float_pair(
+                features.get("geometry_control_shift_xy", [0.20, 0.0]),
+                "features.geometry_control_shift_xy",
+            ),
+            geometry_control_stale_lag=int(
+                features.get("geometry_control_stale_lag", 3)
+            ),
+            geometry_control_seed=int(
+                features.get("geometry_control_seed", 2026)
             ),
             point_confidence_threshold=float(features.get("point_confidence_threshold", 0.30)),
             min_instance_points=int(features.get("min_instance_points", 128)),
@@ -459,6 +500,14 @@ def _validate(config: LearnedPoseConfig) -> None:
         "sam31_online_forward",
         "sam31_online_geometry_compete",
     }
+    allowed_geometry_prompt_variants = {
+        "sam31_online_geometry_compete",
+        "sam31_online_geometry_box_only",
+        "sam31_online_geometry_points_only",
+        "control_shifted_geometry",
+        "control_random_positive",
+        "control_stale_geometry",
+    }
     if (
         config.features.sam_segmentation_variant
         not in allowed_segmentation_variants
@@ -467,6 +516,65 @@ def _validate(config: LearnedPoseConfig) -> None:
             "features.sam_segmentation_variant must be legacy_recovery, "
             "v6_sam31_adaptive_positive_compete_010, or "
             "a sam31_online variant."
+        )
+    if config.features.sam_memory_policy not in {
+        "coupled",
+        "per_object_retrack",
+    }:
+        raise ValueError(
+            "features.sam_memory_policy must be coupled or "
+            "per_object_retrack."
+        )
+    unknown_geometry_variants = sorted(
+        set(config.features.geometry_prompt_variants)
+        - allowed_geometry_prompt_variants
+    )
+    if unknown_geometry_variants:
+        raise ValueError(
+            "Unknown features.geometry_prompt_variants: "
+            f"{unknown_geometry_variants}."
+        )
+    if len(set(config.features.geometry_prompt_variants)) != len(
+        config.features.geometry_prompt_variants
+    ):
+        raise ValueError(
+            "features.geometry_prompt_variants must not contain duplicates."
+        )
+    if (
+        config.features.sam_segmentation_variant
+        == "sam31_online_geometry_compete"
+        and "sam31_online_geometry_compete"
+        not in config.features.geometry_prompt_variants
+    ):
+        raise ValueError(
+            "The selected online geometry variant must be included in "
+            "features.geometry_prompt_variants."
+        )
+    if any(
+        abs(float(value)) > 1.0
+        for value in config.features.geometry_control_shift_xy
+    ):
+        raise ValueError(
+            "features.geometry_control_shift_xy fractions must be in [-1,1]."
+        )
+    if (
+        "control_shifted_geometry"
+        in config.features.geometry_prompt_variants
+        and all(
+            float(value) == 0.0
+            for value in config.features.geometry_control_shift_xy
+        )
+    ):
+        raise ValueError(
+            "control_shifted_geometry requires a non-zero shift."
+        )
+    if config.features.geometry_control_stale_lag < 1:
+        raise ValueError(
+            "features.geometry_control_stale_lag must be positive."
+        )
+    if config.features.geometry_control_seed < 0:
+        raise ValueError(
+            "features.geometry_control_seed must be non-negative."
         )
     if not (
         0.0
@@ -729,6 +837,13 @@ def _pair(value: Any, field: str) -> tuple[int, int]:
     values = tuple(int(v) for v in value)
     if len(values) != 2 or min(values) <= 0:
         raise ValueError(f"{field} must contain two positive integers.")
+    return values
+
+
+def _float_pair(value: Any, field: str) -> tuple[float, float]:
+    values = tuple(float(v) for v in value)
+    if len(values) != 2:
+        raise ValueError(f"{field} must contain exactly two numbers.")
     return values
 
 

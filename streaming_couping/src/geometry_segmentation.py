@@ -20,6 +20,25 @@ from .types import SAM3MaskCandidate, TrackingSequence
 
 RAW_SAM31_VARIANT = "raw_sam31"
 V6_DEPLOYED_VARIANT = "v6_sam31_adaptive_positive_compete_010"
+ONLINE_GEOMETRY_VARIANT = "sam31_online_geometry_compete"
+ONLINE_GEOMETRY_BOX_ONLY_VARIANT = "sam31_online_geometry_box_only"
+ONLINE_GEOMETRY_POINTS_ONLY_VARIANT = "sam31_online_geometry_points_only"
+CONTROL_SHIFTED_GEOMETRY_VARIANT = "control_shifted_geometry"
+CONTROL_RANDOM_POSITIVE_VARIANT = "control_random_positive"
+CONTROL_STALE_GEOMETRY_VARIANT = "control_stale_geometry"
+SEMANTIC_MAPPING_GEOMETRY_VARIANTS = (
+    ONLINE_GEOMETRY_VARIANT,
+    ONLINE_GEOMETRY_BOX_ONLY_VARIANT,
+    ONLINE_GEOMETRY_POINTS_ONLY_VARIANT,
+    CONTROL_SHIFTED_GEOMETRY_VARIANT,
+    CONTROL_RANDOM_POSITIVE_VARIANT,
+    CONTROL_STALE_GEOMETRY_VARIANT,
+)
+GEOMETRY_PROMPT_MODES = {
+    "box_points": (True, True),
+    "box_only": (True, False),
+    "points_only": (False, True),
+}
 V6_SEGMENTATION_VARIANTS = (
     RAW_SAM31_VARIANT,
     V6_DEPLOYED_VARIANT,
@@ -40,6 +59,122 @@ def causal_prompts_after_birth(
         None if frame <= birth else prompt
         for frame, prompt in enumerate(prompts)
     )
+
+
+def shifted_geometry_prompts(
+    prompts: Sequence[GeometrySegmentationPrompt | None],
+    *,
+    shift_xy: tuple[float, float],
+) -> tuple[GeometrySegmentationPrompt | None, ...]:
+    """Translate every prompt with zero fill, never circular wrap-around.
+
+    ``shift_xy`` is expressed as fractions of output width and height.  This
+    keeps the negative control comparable when SAM's output resolution changes.
+    """
+
+    if len(shift_xy) != 2:
+        raise ValueError("shift_xy must contain (x_fraction, y_fraction).")
+    output: list[GeometrySegmentationPrompt | None] = []
+    for prompt in prompts:
+        if prompt is None:
+            output.append(None)
+            continue
+        normalized = _normalize_prompt(prompt)
+        height, width = normalized.box_mask.shape
+        dx = int(round(float(shift_xy[0]) * width))
+        dy = int(round(float(shift_xy[1]) * height))
+        output.append(
+            GeometrySegmentationPrompt(
+                box_mask=zero_fill_shift_mask(
+                    normalized.box_mask,
+                    shift_xy=(dx, dy),
+                ),
+                positive_mask=zero_fill_shift_mask(
+                    normalized.positive_mask,
+                    shift_xy=(dx, dy),
+                ),
+            )
+        )
+    return tuple(output)
+
+
+def randomized_positive_prompts(
+    prompts: Sequence[GeometrySegmentationPrompt | None],
+    *,
+    seed: int,
+) -> tuple[GeometrySegmentationPrompt | None, ...]:
+    """Keep each geometry box and positive-pixel count but randomize location."""
+
+    output: list[GeometrySegmentationPrompt | None] = []
+    for frame, prompt in enumerate(prompts):
+        if prompt is None:
+            output.append(None)
+            continue
+        normalized = _normalize_prompt(prompt)
+        positive = normalized.positive_mask
+        count = int(positive.sum())
+        random_mask = torch.zeros_like(positive)
+        if count:
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(int(seed) + 1_000_003 * int(frame))
+            selected = torch.randperm(
+                positive.numel(),
+                generator=generator,
+            )[:count]
+            random_mask.reshape(-1)[selected] = True
+        output.append(
+            GeometrySegmentationPrompt(
+                box_mask=normalized.box_mask,
+                positive_mask=random_mask,
+            )
+        )
+    return tuple(output)
+
+
+def stale_geometry_prompts(
+    prompts: Sequence[GeometrySegmentationPrompt | None],
+    *,
+    lag: int,
+) -> tuple[GeometrySegmentationPrompt | None, ...]:
+    """Use only an earlier frame's image-space prompt as a causal control."""
+
+    lag = int(lag)
+    if lag < 1:
+        raise ValueError("stale geometry lag must be positive.")
+    return tuple(
+        None if frame < lag else prompts[frame - lag]
+        for frame in range(len(prompts))
+    )
+
+
+def zero_fill_shift_mask(
+    mask: torch.Tensor,
+    *,
+    shift_xy: tuple[int, int],
+) -> torch.Tensor:
+    """Shift a 2-D mask by integer pixels without leaking across boundaries."""
+
+    source = mask.detach().cpu().bool()
+    if source.ndim != 2:
+        raise ValueError("zero_fill_shift_mask expects a 2-D mask.")
+    dx, dy = (int(value) for value in shift_xy)
+    height, width = source.shape
+    output = torch.zeros_like(source)
+    destination_x0 = max(0, dx)
+    destination_x1 = min(width, width + dx)
+    destination_y0 = max(0, dy)
+    destination_y1 = min(height, height + dy)
+    if destination_x1 <= destination_x0 or destination_y1 <= destination_y0:
+        return output
+    source_x0 = max(0, -dx)
+    source_y0 = max(0, -dy)
+    source_x1 = source_x0 + (destination_x1 - destination_x0)
+    source_y1 = source_y0 + (destination_y1 - destination_y0)
+    output[
+        destination_y0:destination_y1,
+        destination_x0:destination_x1,
+    ] = source[source_y0:source_y1, source_x0:source_x1]
+    return output
 
 
 @dataclass(frozen=True)
@@ -75,11 +210,21 @@ def segment_instance_with_geometry_prompts(
     output_size: tuple[int, int],
     sam3: SAM3Wrapper,
     config: V6GeometrySegmentationConfig,
+    corrected_variant: str = V6_DEPLOYED_VARIANT,
+    prompt_mode: str = "box_points",
 ) -> dict[str, object]:
-    """Return raw SAM3.1 and the single selected V6 correction."""
+    """Return raw SAM3.1 and one controlled geometry-prompt correction."""
 
     sequence_length = len(sequence.frame_indices)
     output_size = tuple(int(value) for value in output_size)
+    corrected_variant = str(corrected_variant).strip()
+    prompt_mode = str(prompt_mode).strip().lower()
+    if not corrected_variant or corrected_variant == RAW_SAM31_VARIANT:
+        raise ValueError("corrected_variant must be a distinct non-empty name.")
+    if prompt_mode not in GEOMETRY_PROMPT_MODES:
+        raise ValueError(
+            "prompt_mode must be box_points, box_only, or points_only."
+        )
     _validate_inputs(
         sequence_length=sequence_length,
         output_size=output_size,
@@ -106,6 +251,8 @@ def segment_instance_with_geometry_prompts(
                     frame=frame,
                     frame_index=int(frame_index),
                     reference_pixels=int(reference_mask.sum()),
+                    corrected_variant=corrected_variant,
+                    prompt_mode=prompt_mode,
                 )
             )
             continue
@@ -116,6 +263,8 @@ def segment_instance_with_geometry_prompts(
                     frame=frame,
                     frame_index=int(frame_index),
                     raw_pixels=int(raw_masks[frame].sum()),
+                    corrected_variant=corrected_variant,
+                    prompt_mode=prompt_mode,
                 )
             )
             continue
@@ -137,6 +286,7 @@ def segment_instance_with_geometry_prompts(
                 output_size=output_size,
                 prompt=prompt,
                 config=config,
+                prompt_mode=prompt_mode,
             ),
             config=config,
         )
@@ -158,17 +308,19 @@ def segment_instance_with_geometry_prompts(
                 prompted_row=prompted_row,
                 correction_applied=selected is not None,
                 correction_reason=reason,
+                corrected_variant=corrected_variant,
+                prompt_mode=prompt_mode,
             )
         )
 
     return {
         "masks": {
             RAW_SAM31_VARIANT: raw_masks,
-            V6_DEPLOYED_VARIANT: corrected_masks,
+            corrected_variant: corrected_masks,
         },
         "scores": {
             RAW_SAM31_VARIANT: raw_scores,
-            V6_DEPLOYED_VARIANT: corrected_scores,
+            corrected_variant: corrected_scores,
         },
         "diagnostics": diagnostics,
     }
@@ -300,14 +452,18 @@ def _run_positive_point_prompt(
     output_size: tuple[int, int],
     prompt: GeometrySegmentationPrompt,
     config: V6GeometrySegmentationConfig,
+    prompt_mode: str,
 ) -> list[dict[str, object]]:
-    candidates = sam3.propose_geometry_point_refined_masks(
+    use_box, use_points = GEOMETRY_PROMPT_MODES[prompt_mode]
+    candidates = sam3.propose_geometry_prompted_masks(
         image_path,
         prompt=label,
         output_size=output_size,
         geometry_prompt=prompt.box_mask,
         positive_prompt=prompt.positive_mask,
         max_positive_points=int(config.point_positive_samples),
+        use_box=use_box,
+        use_points=use_points,
     )
     return [
         evaluate_mask_against_geometry(
@@ -355,6 +511,8 @@ def _reference_diagnostic(
     frame: int,
     frame_index: int,
     reference_pixels: int,
+    corrected_variant: str,
+    prompt_mode: str,
 ) -> dict[str, object]:
     return {
         "sequence_index": frame,
@@ -366,6 +524,8 @@ def _reference_diagnostic(
         "prompted_mask_pixels": reference_pixels,
         "correction_applied": 0,
         "correction_reason": "reference_mask",
+        "corrected_variant": corrected_variant,
+        "prompt_mode": prompt_mode,
     }
 
 
@@ -374,6 +534,8 @@ def _fallback_diagnostic(
     frame: int,
     frame_index: int,
     raw_pixels: int,
+    corrected_variant: str,
+    prompt_mode: str,
 ) -> dict[str, object]:
     return {
         "sequence_index": frame,
@@ -385,6 +547,8 @@ def _fallback_diagnostic(
         "prompted_mask_pixels": 0,
         "correction_applied": 0,
         "correction_reason": "keep_raw:geometry_prompt_unavailable",
+        "corrected_variant": corrected_variant,
+        "prompt_mode": prompt_mode,
     }
 
 
@@ -397,6 +561,8 @@ def _frame_diagnostic(
     prompted_row: dict[str, object] | None,
     correction_applied: bool,
     correction_reason: str,
+    corrected_variant: str,
+    prompt_mode: str,
 ) -> dict[str, object]:
     return {
         "sequence_index": frame,
@@ -426,6 +592,8 @@ def _frame_diagnostic(
         ),
         "correction_applied": int(correction_applied),
         "correction_reason": correction_reason,
+        "corrected_variant": corrected_variant,
+        "prompt_mode": prompt_mode,
     }
 
 

@@ -52,10 +52,12 @@ echo "current_pinhole_root=$CURRENT_PINHOLE_ROOT"
 echo "processed_output=$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d"
 
 failed=0
+# These are the four scenes in the retained V0/development protocol.
+# 1be2c31cac is intentionally excluded because its pinhole/annotation assets
+# are incomplete.
 check_scene "00a231a370" "$LEGACY_PINHOLE_ROOT" || failed=1
 check_scene "0a184cf634" "$CURRENT_PINHOLE_ROOT" || failed=1
 check_scene "1a8e0d78c0" "$CURRENT_PINHOLE_ROOT" || failed=1
-check_scene "1be2c31cac" "$CURRENT_PINHOLE_ROOT" || failed=1
 check_scene "1eacc65607" "$CURRENT_PINHOLE_ROOT" || failed=1
 
 if (( failed )); then

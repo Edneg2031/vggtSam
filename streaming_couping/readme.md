@@ -7,7 +7,7 @@ V0 是冻结、免训练的 StreamVGGT + SAM3.1 语义地图 pipeline：
 - SAM3.1 persistent mask/slot/track ID作为点云语义；
 - SAM不参与pose，QK分支不运行depth/point heads，点云不做后处理优化。
 
-唯一运行入口：
+模型主运行入口：
 
 ```bash
 zsh streaming_couping/commands_v0_baseline.txt
@@ -19,6 +19,18 @@ zsh streaming_couping/commands_v0_baseline.txt
 2. 使用first-frame anchor + native QK Top-4运行pose-only camera replay；
 3. 固定QK pose并完成tracking/pose审计；
 4. 将SAM persistent实例标签投影到未修改的raw world pointmap并导出语义地图。
+
+辅助入口：
+
+```bash
+zsh streaming_couping/commands_plot_v0_poses.txt
+zsh streaming_couping/commands_semantic_mapping.txt
+zsh streaming_couping/commands_check_scannetpp_data.txt
+zsh streaming_couping/commands_audit_scannetpp_processed.txt
+```
+
+其中 `commands_semantic_mapping.txt` 只读取已经完成的 V0/V6 cache，离线比较 raw SAM、V6、
+GT-mask oracle 和 object-memory map-write gate，不重新运行模型。
 
 主要输出：
 
@@ -50,5 +62,12 @@ zsh streaming_couping/commands_plot_v0_poses.txt
 不会修改 V0 的 pose artifact。
 
 当前单序列证据只支持QK pose改善（center `10.93%`、rotation `6.15%`）。V0不声明SAM改善
-pose或几何；SAM的正式作用是实例发现、跨帧persistent identity和语义投影。完整方法见
-[V0方法说明](docs/v0_method.md)。
+pose或几何；SAM的正式作用是实例发现、跨帧persistent identity和语义投影。
+
+当前系统与实验路线：
+
+- [系统 pipeline](docs/system_pipeline.md)
+- [语义地图实验路线](docs/experiment_route.md)
+
+仓库只保留当前主线和必要的只读数据检查入口。已停止的 residual、Direct PointHead、R3、
+temporal residual、Stage2 训练及其命令/配置已经移除，不应再从旧输出目录继续启动。

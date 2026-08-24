@@ -96,3 +96,38 @@ semantic_map:
   confidence_threshold: 0.30
   track_score_threshold: 0.50
   max_map_points: 400000
+
+# Offline Stage 0 evaluation. This section is ignored by the V0 model/cache
+# loader and is consumed only after the frozen cache has been generated.
+semantic_evaluation:
+  output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_semantic_map_stage0
+  raw_cache_variant: sam31_online_forward
+  v6_cache_variant: sam31_online_geometry_compete
+  tracking:
+    assignment_min_iou: 0.01
+    identity_iou_threshold: 0.50
+    reentry_iou_threshold: 0.25
+    reentry_min_gap: 2
+    reentry_window: 3
+    improvement_epsilon: 0.000001
+  map:
+    confidence_threshold: 0.30
+    track_score_threshold: 0.50
+    max_points_per_object: 4096
+    distance_chunk_size: 512
+    fscore_thresholds_m: [0.05, 0.10]
+    voxel_size_m: 0.05
+    ghost_distance_m: 0.10
+    duplicate_voxel_iou: 0.25
+  object_memory:
+    short_term_capacity: 5
+    long_term_capacity: 4
+    min_track_score: 0.50
+    min_geometry_confidence: 0.30
+    min_mask_pixels: 32
+    min_area_ratio: 0.35
+    max_area_ratio: 2.85
+    long_term_min_track_score: 0.75
+    long_term_min_geometry_confidence: 0.50
+    reentry_gap: 3
+  prompt_label_aliases: {}
