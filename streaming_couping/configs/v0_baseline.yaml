@@ -160,6 +160,38 @@ semantic_map:
       absolute_center_scale: 0.02
       category_hard_gate: true
 
+  # V2 does not merge SAM tracks.  It keeps the V0 slot identity and invokes
+  # geometry only for low-confidence, lost, area-outlier, or re-entry frames.
+  # The final mask always comes from a frozen SAM3.1 refinement call; the
+  # geometry proposal is never written directly into the pointmap.
+  v2_geometry_recovery:
+    output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v2/semantic_map
+    raw_cache_variant: sam31_online_forward
+    recovery:
+      low_score_threshold: 0.50
+      min_mask_pixels: 32
+      min_area_ratio: 0.35
+      max_area_ratio: 2.85
+      reentry_gap: 3
+      min_history_points: 16
+      max_points_per_object: 4096
+      min_memory_update_score: 0.50
+      min_geometry_confidence: 0.30
+      max_positive_points: 6
+      min_candidate_score: 0.50
+      min_candidate_support_recall: 0.15
+      min_candidate_iou: 0.02
+      min_candidate_area_ratio: 0.20
+      max_candidate_area_ratio: 5.00
+      proposal_box_quantile: 0.02
+      proposal_box_padding_ratio: 0.12
+      min_projected_points: 8
+      min_projected_fraction: 0.005
+      min_supported_points: 8
+      min_support_ratio: 0.02
+      support_abs_distance: 0.15
+      support_relative_distance: 0.10
+
 # Offline Stage 0 evaluation. This section is ignored by the V0 model/cache
 # loader and is consumed only after the frozen cache has been generated.
 semantic_evaluation:
