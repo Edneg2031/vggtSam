@@ -92,10 +92,37 @@ qk_pose_retrieval:
 # Deployable semantic map: raw full-history world pointmap plus SAM persistent
 # slot/ID labels. The selected QK pose trajectory is stored alongside the map.
 semantic_map:
+  # v0_slot preserves the original SAM-slot exporter.  The V1 command uses
+  # the same config with --identity-mode v1_object_memory.
+  identity_mode: v0_slot
   output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/semantic_map
   confidence_threshold: 0.30
   track_score_threshold: 0.50
   max_map_points: 400000
+  v1_object_memory:
+    output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v1/semantic_map
+    min_observation_points: 16
+    min_mask_pixels: 32
+    min_track_score: 0.50
+    min_geometry_confidence: 0.30
+    max_points_per_object: 4096
+    center_ema_alpha: 0.25
+    same_frame_merge_score: 0.78
+    association:
+      center_weight: 0.40
+      voxel_weight: 0.25
+      chamfer_weight: 0.20
+      appearance_weight: 0.10
+      category_weight: 0.05
+      min_match_score: 0.50
+      max_center_distance_ratio: 0.35
+      center_scale_ratio: 0.12
+      chamfer_scale_ratio: 0.12
+      voxel_size_ratio: 0.02
+      absolute_voxel_size: 0.02
+      max_points_per_comparison: 256
+      category_hard_gate: true
+    use_cached_appearance: false
 
 # Offline Stage 0 evaluation. This section is ignored by the V0 model/cache
 # loader and is consumed only after the frozen cache has been generated.
@@ -110,6 +137,7 @@ semantic_evaluation:
     reentry_min_gap: 2
     reentry_window: 3
     improvement_epsilon: 0.000001
+    fragmentation_iou_threshold: 0.05
   map:
     confidence_threshold: 0.30
     track_score_threshold: 0.50
@@ -130,4 +158,27 @@ semantic_evaluation:
     long_term_min_track_score: 0.75
     long_term_min_geometry_confidence: 0.50
     reentry_gap: 3
+  persistent_object_memory:
+    min_observation_points: 16
+    min_mask_pixels: 32
+    min_track_score: 0.50
+    min_geometry_confidence: 0.30
+    max_points_per_object: 4096
+    center_ema_alpha: 0.25
+    same_frame_merge_score: 0.78
+    association:
+      center_weight: 0.40
+      voxel_weight: 0.25
+      chamfer_weight: 0.20
+      appearance_weight: 0.10
+      category_weight: 0.05
+      min_match_score: 0.50
+      max_center_distance_ratio: 0.35
+      center_scale_ratio: 0.12
+      chamfer_scale_ratio: 0.12
+      voxel_size_ratio: 0.02
+      absolute_voxel_size: 0.02
+      max_points_per_comparison: 256
+      category_hard_gate: true
+    use_cached_appearance: false
   prompt_label_aliases: {}

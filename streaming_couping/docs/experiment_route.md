@@ -175,6 +175,27 @@ CLIP 不能单独被当作可靠的 instance tracker，尤其是场景中存在�
 
 ## 6. Stage 3：object-level memory 和 map fusion
 
+V1 persistent 3-D instance memory 已按下面的 geometry-only 版本实现，作为 Stage 3 的第一轮
+可运行基线：
+
+    SAM observation
+        ↓ active SAM track 直接复用，birth/re-entry 才 association
+    persistent object ID
+        ↓ center / voxel overlap / Chamfer / category (+ optional appearance)
+    accumulated world points
+
+实现入口：
+
+    zsh streaming_couping/commands_semantic_mapping_v1.txt
+    zsh streaming_couping/commands_semantic_mapping_v1_evaluation.txt
+
+V0 仍由 `semantic_map.identity_mode: v0_slot` 控制；V1 命令显式使用
+`v1_object_memory`，所以两条路线可以在同一个 frozen cache 上复现。V1 输出
+`object_memory.json/csv`、`association_events.csv` 和带 `persistent_object_id` 的 PLY。
+
+第一轮默认关闭 appearance，先验证 geometry-only identity memory；只有 V1 的 fragmentation/
+re-entry 结果明确显示 identity 仍是瓶颈时，才打开 cached appearance。
+
 先实现显式、可审计的 map memory，不修改 SAM hidden memory：
 
     short-term memory:
@@ -313,4 +334,3 @@ RetrieveVGGT / FrameVGGT 风格的 memory 是另一条支线，不要和 SAM tok
             → object-level semantic map
 
 并用 GT-mask oracle、wrong geometry 和 appearance shuffle controls 说明提升究竟来自哪里。
-

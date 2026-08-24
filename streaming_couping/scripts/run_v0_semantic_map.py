@@ -39,6 +39,7 @@ BASELINE_REVISION = "v0_frozen_semantic_mapping_pipeline_r1"
 class SemanticMapRun:
     source_path: Path
     output_dir: Path
+    identity_mode: str
     confidence_threshold: float
     track_score_threshold: float
     max_map_points: int
@@ -51,6 +52,11 @@ def main() -> None:
     run = _load_run(args.config)
     if args.output_dir:
         run = replace(run, output_dir=Path(args.output_dir).expanduser().resolve())
+    if run.identity_mode != "v0_slot":
+        raise ValueError(
+            "V0 exporter requires semantic_map.identity_mode=v0_slot; "
+            "use commands_semantic_mapping_v1.txt for V1."
+        )
     clip = _find_clip(data.clips, baseline.clip_name)
     cache_path_value = cache_path(data, clip)
     payload = load_feature_cache(cache_path_value)
@@ -541,6 +547,7 @@ def _load_run(path: str | Path) -> SemanticMapRun:
         output_dir=expand_storage_path(
             section.get("output_dir", "outputs/streaming_couping_v0/semantic_map")
         ),
+        identity_mode=str(section.get("identity_mode", "v0_slot")),
         confidence_threshold=float(section.get("confidence_threshold", 0.30)),
         track_score_threshold=float(section.get("track_score_threshold", 0.50)),
         max_map_points=int(section.get("max_map_points", 400000)),

@@ -208,13 +208,16 @@ GT instance mask、GT pointmap 和 Sim(3) 只在候选生成完成之后打开�
 zsh streaming_couping/commands_v0_baseline.txt
 zsh streaming_couping/commands_plot_v0_poses.txt
 zsh streaming_couping/commands_semantic_mapping.txt
+zsh streaming_couping/commands_semantic_mapping_v1.txt
+zsh streaming_couping/commands_semantic_mapping_v1_evaluation.txt
 zsh streaming_couping/commands_check_scannetpp_data.txt
 zsh streaming_couping/commands_audit_scannetpp_processed.txt
 ```
 
-前三个命令分别用于运行 V0、可视化 pose、以及离线比较 raw/V6/GT-oracle/object-memory 四个
-semantic-map 分支；后两个命令只读检查服务器上的 ScanNet++ 源数据和已处理 manifest。数据生成、
-迁移和手工 prompt inventory 属于一次性准备工具，不再作为后续实验入口保留。
+前五个命令分别用于运行 V0、可视化 pose、离线比较 Stage 0 分支、导出 V1 persistent object
+memory 地图、以及比较 V0/V1 identity；后两个命令只读检查服务器上的 ScanNet++ 源数据和已处理
+manifest。V1 只在 SAM observation 到 object memory 的身份层工作，不修改 StreamVGGT、SAM3 或
+SAM hidden memory。
 
 ## 5. 系统定位
 

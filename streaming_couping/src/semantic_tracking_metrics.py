@@ -28,6 +28,7 @@ class TrackingMetricConfig:
     reentry_min_gap: int = 2
     reentry_window: int = 3
     improvement_epsilon: float = 1e-6
+    fragmentation_iou_threshold: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -473,6 +474,21 @@ def _evaluate_one_variant(
             pixels = int(masks[:, slot].sum())
             pixel_idfp += pixels
             frame_idfp += int(masks[:, slot].flatten(1).any(dim=1).sum())
+    global_scores = global_iou_matrix(masks, gt)
+    fragmentation_count = 0
+    for target in range(objects):
+        compatible_scores = global_scores[:, target][compatibility[:, target]]
+        count = int(
+            (compatible_scores >= float(config.fragmentation_iou_threshold)).sum()
+        )
+        fragmentation_count += max(0, count - 1)
+    merge_error_count = 0
+    for slot in range(tracks):
+        compatible_scores = global_scores[slot][compatibility[slot]]
+        count = int(
+            (compatible_scores >= float(config.fragmentation_iou_threshold)).sum()
+        )
+        merge_error_count += max(0, count - 1)
     denominator = improvements + worsened + unchanged
     summary = {
         "scene_id": scene_id,
@@ -499,6 +515,8 @@ def _evaluate_one_variant(
         "pixel_idfp": int(pixel_idfp),
         "pixel_idfn": int(pixel_idfn),
         "id_switches": int(total_switches),
+        "fragmentation_count": int(fragmentation_count),
+        "merge_error_count": int(merge_error_count),
         "reentry_events": int(total_reentries),
         "reentry_successes": int(successful_reentries),
         "reentry_success_rate": (

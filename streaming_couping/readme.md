@@ -25,12 +25,19 @@ zsh streaming_couping/commands_v0_baseline.txt
 ```bash
 zsh streaming_couping/commands_plot_v0_poses.txt
 zsh streaming_couping/commands_semantic_mapping.txt
+zsh streaming_couping/commands_semantic_mapping_v1.txt
+zsh streaming_couping/commands_semantic_mapping_v1_evaluation.txt
 zsh streaming_couping/commands_check_scannetpp_data.txt
 zsh streaming_couping/commands_audit_scannetpp_processed.txt
 ```
 
 其中 `commands_semantic_mapping.txt` 只读取已经完成的 V0/V6 cache，离线比较 raw SAM、V6、
 GT-mask oracle 和 object-memory map-write gate，不重新运行模型。
+
+`commands_semantic_mapping_v1.txt` 在同一 frozen cache 上导出 V1 persistent 3-D instance memory
+语义地图；`commands_semantic_mapping_v1_evaluation.txt` 比较 V0 track identity 与 V1 object
+identity，并输出 fragmentation、merge error、re-entry 和 object-level map 指标。两条 V1 命令都
+不重新运行 StreamVGGT/SAM3。
 
 主要输出：
 
@@ -47,6 +54,10 @@ outputs/streaming_couping_v0/
     ├── rgb_map.ply       # 原始RGB外观
     ├── semantic_map_summary.json
     └── tracks.csv
+
+V1 导出写入 `outputs/streaming_couping_v1/semantic_map/`，额外包含
+`object_memory.json`、`object_memory.csv`、`association_events.csv`，并在
+`semantic_map.pt` 中同时保存 `sam_track_ids` 和 `persistent_object_ids`。
 ```
 
 绘制 V0 raw pose 与 QK pose 的相机轨迹、GT 对比和逐帧误差：

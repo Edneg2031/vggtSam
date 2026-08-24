@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 from pathlib import Path
@@ -45,14 +45,19 @@ from streaming_couping.src.learned_pose.config import (
 )
 from streaming_couping.src.object_memory import (
     ObjectMemoryConfig,
+    PersistentObjectMemory,
+    PersistentObjectMemoryConfig,
     build_object_memory_write_policy,
+    collapse_persistent_tracks,
 )
+from streaming_couping.src.instance_association import InstanceAssociationConfig
 from streaming_couping.src.semantic_map_metrics import (
     SemanticMapMetricConfig,
     apply_similarity,
     evaluate_semantic_object_map,
     load_ground_truth_stream_masks,
 )
+from streaming_couping.src.semantic_map import normalize_confidence
 from streaming_couping.src.semantic_tracking_metrics import (
     TrackingMetricConfig,
     evaluate_tracking_variants,
@@ -75,6 +80,9 @@ class EvaluationRunConfig:
     tracking: TrackingMetricConfig
     map_metrics: SemanticMapMetricConfig
     memory: ObjectMemoryConfig
+    persistent_memory: PersistentObjectMemoryConfig
+    use_cached_appearance: bool
+    include_v1_memory: bool
     prompt_label_aliases: dict[str, tuple[str, ...]]
 
 
@@ -82,17 +90,15 @@ def main() -> None:
     args = _parse_args()
     data = load_learned_pose_config(args.config)
     run = _load_run(args.config)
-    if args.output_dir:
-        run = EvaluationRunConfig(
-            source_path=run.source_path,
-            output_dir=Path(args.output_dir).expanduser().resolve(),
-            raw_cache_variant=run.raw_cache_variant,
-            v6_cache_variant=run.v6_cache_variant,
-            tracking=run.tracking,
-            map_metrics=run.map_metrics,
-            memory=run.memory,
-            prompt_label_aliases=run.prompt_label_aliases,
-        )
+    run = replace(
+        run,
+        output_dir=(
+            Path(args.output_dir).expanduser().resolve()
+            if args.output_dir
+            else run.output_dir
+        ),
+        include_v1_memory=bool(args.include_v1_memory),
+    )
 
     clips = _select_clips(data.clips, args.clip)
     run.output_dir.mkdir(parents=True, exist_ok=True)
@@ -104,13 +110,22 @@ def main() -> None:
     map_object_rows: list[dict[str, object]] = []
     map_duplicate_rows: list[dict[str, object]] = []
     memory_rows: list[dict[str, object]] = []
+    persistent_memory_rows: list[dict[str, object]] = []
+    persistent_object_rows: list[dict[str, object]] = []
+    include_v1 = bool(run.include_v1_memory)
 
-    print("STAGE 0 SEMANTIC-MAP OFFLINE EVALUATION")
+    print(
+        "STAGE 1 V1 + STAGE 0 SEMANTIC-MAP OFFLINE EVALUATION"
+        if include_v1
+        else "STAGE 0 SEMANTIC-MAP OFFLINE EVALUATION"
+    )
     print(f"config={run.source_path}")
     print(f"output={run.output_dir}")
     print(
-        "GT is opened only for evaluation; raw assignment is frozen for all "
-        "variants"
+        "GT is opened only for evaluation; Stage 0 raw assignment is frozen; "
+        "V1 receives a separate evaluation-only object assignment"
+        if include_v1
+        else "GT is opened only for evaluation; raw assignment is frozen for all variants"
     )
     for clip in clips:
         result = _evaluate_clip(data, clip, run)
@@ -122,6 +137,25 @@ def main() -> None:
         map_object_rows.extend(result["map"]["object_rows"])
         map_duplicate_rows.extend(result["map"]["duplicate_rows"])
         memory_rows.extend(result["memory"]["rows"])
+        if include_v1:
+            persistent_memory_rows.extend(result["persistent_memory"]["events"])
+            persistent_object_rows.extend(result["persistent_memory"]["objects"])
+            tracking_rows.extend(
+                result["persistent_memory"]["tracking"]["summary_rows"]
+            )
+            tracking_object_rows.extend(
+                result["persistent_memory"]["tracking"]["object_rows"]
+            )
+            tracking_frame_rows.extend(
+                result["persistent_memory"]["tracking"]["frame_rows"]
+            )
+            map_rows.extend(result["persistent_memory"]["map"]["summary_rows"])
+            map_object_rows.extend(
+                result["persistent_memory"]["map"]["object_rows"]
+            )
+            map_duplicate_rows.extend(
+                result["persistent_memory"]["map"]["duplicate_rows"]
+            )
         _print_clip_result(result)
 
     tracking_aggregate = _aggregate_rows(
@@ -134,7 +168,9 @@ def main() -> None:
     )
     summary = {
         "schema": 1,
-        "revision": REVISION,
+        "revision": (
+            REVISION + "_with_v1_memory" if include_v1 else REVISION
+        ),
         "config": str(run.source_path),
         "output_dir": str(run.output_dir),
         "clips": clip_results,
@@ -142,6 +178,7 @@ def main() -> None:
         "candidate_generation_gt_fields": 0,
         "evaluation_gt_fields": 1,
         "raw_assignment_frozen": 1,
+        "v1_assignment_evaluation_only": int(include_v1),
         "pointmap_modified": 0,
         "streamvggt_pose_modified": 0,
         "streamvggt_pointmap_source": "raw_full_history_world_pointmap",
@@ -158,6 +195,13 @@ def main() -> None:
             "scope": "post_tracking_object_map_write_only",
             "sam_hidden_memory_modified": 0,
             "event_count": len(memory_rows),
+        },
+        "persistent_memory": {
+            "enabled": int(include_v1),
+            "scope": "causal_sam_observation_to_persistent_object_id",
+            "sam_hidden_memory_modified": 0,
+            "event_count": len(persistent_memory_rows),
+            "object_count_rows": len(persistent_object_rows),
         },
         "decision": _decision_summary(
             tracking_rows=tracking_rows,
@@ -201,6 +245,15 @@ def main() -> None:
             memory_rows,
         ),
     }
+    if include_v1:
+        output_paths["persistent_memory_events"] = _write_csv(
+            run.output_dir / "persistent_memory_events.csv",
+            persistent_memory_rows,
+        )
+        output_paths["persistent_objects"] = _write_csv(
+            run.output_dir / "persistent_objects.csv",
+            persistent_object_rows,
+        )
     summary["outputs"] = {name: str(path) for name, path in output_paths.items()}
     summary_path.write_text(
         json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n",
@@ -367,6 +420,132 @@ def _evaluate_clip(
         map_object_rows.extend(result["object_rows"])
         map_duplicate_rows.extend(result["duplicate_rows"])
 
+    persistent_memory_result: dict[str, object] = {
+        "events": [],
+        "objects": [],
+        "tracking": {
+            "summary_rows": [],
+            "object_rows": [],
+            "frame_rows": [],
+        },
+        "map": {
+            "summary_rows": [],
+            "object_rows": [],
+            "duplicate_rows": [],
+        },
+    }
+    if run.include_v1_memory:
+        persistent_confidence = normalize_confidence(confidence)
+        appearance = None
+        if run.use_cached_appearance and "appearance" in payload:
+            candidate = payload["appearance"]
+            if torch.is_tensor(candidate):
+                candidate = candidate.detach().float().cpu()
+                if candidate.ndim == 3 and tuple(candidate.shape[:2]) == tuple(
+                    raw_stream.shape[:2]
+                ):
+                    appearance = candidate
+        persistent_memory_model = PersistentObjectMemory(run.persistent_memory)
+        persistent_result = persistent_memory_model.process_sequence(
+            world_points=payload["baseline_world_points"],
+            confidence=persistent_confidence,
+            masks=raw_stream,
+            track_scores=raw_stream_scores,
+            frame_indices=frames,
+            track_ids=track_ids,
+            track_prompts=track_prompts,
+            appearance=appearance,
+        )
+        object_ids = tuple(int(value) for value in persistent_result["object_ids"])
+        object_prompts = {
+            int(row["object_id"]): str(row["category"])
+            for row in persistent_result["objects"]
+        }
+        persistent_output = collapse_persistent_tracks(
+            masks=raw_output,
+            scores=raw_scores,
+            persistent_object_ids=persistent_result["persistent_object_ids"],
+            object_ids=object_ids,
+            object_prompts=object_prompts,
+        )
+        persistent_stream = collapse_persistent_tracks(
+            masks=raw_stream,
+            scores=raw_stream_scores,
+            persistent_object_ids=persistent_result["persistent_object_ids"],
+            object_ids=object_ids,
+            object_prompts=object_prompts,
+        )
+        persistent_tracking = evaluate_tracking_variants(
+            scene_id=str(payload["scene_id"]),
+            clip_name=str(payload["clip_name"]),
+            frame_indices=frames,
+            variant_masks={"v1_object_memory": persistent_output["masks"]},
+            variant_scores={"v1_object_memory": persistent_output["scores"]},
+            raw_variant="v1_object_memory",
+            track_ids=object_ids,
+            track_prompts=tuple(str(value) for value in persistent_output["prompts"]),
+            ground_truth=ground_truth,
+            config=run.tracking,
+            prompt_label_aliases=run.prompt_label_aliases,
+        )
+        persistent_write_mask = _collapse_object_write_mask(
+            persistent_result["map_write_mask"],
+            persistent_result["persistent_object_ids"],
+            object_ids,
+        )
+        persistent_map = evaluate_semantic_object_map(
+            scene_id=str(payload["scene_id"]),
+            clip_name=str(payload["clip_name"]),
+            variant="v1_object_memory",
+            map_policy="persistent_object_memory",
+            aligned_world_points=aligned_points,
+            target_world_points=target_points,
+            confidence=confidence,
+            predicted_masks=persistent_stream["masks"],
+            track_scores=persistent_stream["scores"],
+            gt_masks=gt_stream,
+            gt_instance_ids=ground_truth.instance_ids,
+            gt_labels=ground_truth.labels,
+            assignments=persistent_tracking["assignments"],
+            map_write_mask=persistent_write_mask,
+            track_ids=object_ids,
+            config=run.map_metrics,
+        )
+        persistent_objects = []
+        for row in persistent_result["objects"]:
+            current = dict(row)
+            current.update(
+                {
+                    "scene_id": str(payload["scene_id"]),
+                    "clip": str(payload["clip_name"]),
+                    "variant": "v1_object_memory",
+                }
+            )
+            persistent_objects.append(current)
+        persistent_events = []
+        for row in persistent_result["events"]:
+            current = dict(row)
+            current.update(
+                {
+                    "scene_id": str(payload["scene_id"]),
+                    "clip": str(payload["clip_name"]),
+                    "variant": "v1_object_memory",
+                }
+            )
+            persistent_events.append(current)
+        persistent_memory_result = {
+            "events": persistent_events,
+            "objects": persistent_objects,
+            "tracking": persistent_tracking,
+            "map": {
+                "summary_rows": [persistent_map["summary"]],
+                "object_rows": persistent_map["object_rows"],
+                "duplicate_rows": persistent_map["duplicate_rows"],
+            },
+            "object_count": int(persistent_result["persistent_object_count"]),
+            "track_to_object": persistent_result["track_to_object"],
+        }
+
     return {
         "clip": {
             "scene_id": str(payload["scene_id"]),
@@ -385,7 +564,23 @@ def _evaluate_clip(
             "duplicate_rows": map_duplicate_rows,
         },
         "memory": memory,
+        "persistent_memory": persistent_memory_result,
     }
+
+
+def _collapse_object_write_mask(
+    write_mask: torch.Tensor,
+    persistent_object_ids: torch.Tensor,
+    object_ids: Sequence[int],
+) -> torch.Tensor:
+    writes = write_mask.detach().bool().cpu()
+    ids = persistent_object_ids.detach().long().cpu()
+    if tuple(writes.shape) != tuple(ids.shape):
+        raise ValueError("Persistent write mask and IDs have different shapes.")
+    output = torch.zeros(writes.shape[0], len(object_ids), dtype=torch.bool)
+    for index, object_id in enumerate(object_ids):
+        output[:, index] = (writes & (ids == int(object_id))).any(dim=1)
+    return output
 
 
 def _build_oracle_variant(
@@ -491,6 +686,8 @@ def _load_run(path: str | Path) -> EvaluationRunConfig:
     tracking_raw = section.get("tracking", {}) or {}
     map_raw = section.get("map", {}) or {}
     memory_raw = section.get("object_memory", {}) or {}
+    persistent_raw = section.get("persistent_object_memory", {}) or {}
+    persistent_association_raw = persistent_raw.get("association", {}) or {}
     aliases = {
         str(key): tuple(str(value) for value in values)
         for key, values in (section.get("prompt_label_aliases", {}) or {}).items()
@@ -507,6 +704,9 @@ def _load_run(path: str | Path) -> EvaluationRunConfig:
         reentry_window=int(tracking_raw.get("reentry_window", 3)),
         improvement_epsilon=float(
             tracking_raw.get("improvement_epsilon", 1e-6)
+        ),
+        fragmentation_iou_threshold=float(
+            tracking_raw.get("fragmentation_iou_threshold", 0.05)
         ),
     )
     map_metrics = SemanticMapMetricConfig(
@@ -539,6 +739,61 @@ def _load_run(path: str | Path) -> EvaluationRunConfig:
         ),
         reentry_gap=int(memory_raw.get("reentry_gap", 3)),
     )
+    persistent_association = InstanceAssociationConfig(
+        center_weight=float(persistent_association_raw.get("center_weight", 0.40)),
+        voxel_weight=float(persistent_association_raw.get("voxel_weight", 0.25)),
+        chamfer_weight=float(
+            persistent_association_raw.get("chamfer_weight", 0.20)
+        ),
+        appearance_weight=float(
+            persistent_association_raw.get("appearance_weight", 0.10)
+        ),
+        category_weight=float(
+            persistent_association_raw.get("category_weight", 0.05)
+        ),
+        min_match_score=float(
+            persistent_association_raw.get("min_match_score", 0.50)
+        ),
+        max_center_distance_ratio=float(
+            persistent_association_raw.get("max_center_distance_ratio", 0.35)
+        ),
+        center_scale_ratio=float(
+            persistent_association_raw.get("center_scale_ratio", 0.12)
+        ),
+        chamfer_scale_ratio=float(
+            persistent_association_raw.get("chamfer_scale_ratio", 0.12)
+        ),
+        voxel_size_ratio=float(
+            persistent_association_raw.get("voxel_size_ratio", 0.02)
+        ),
+        absolute_voxel_size=float(
+            persistent_association_raw.get("absolute_voxel_size", 0.02)
+        ),
+        max_points_per_comparison=int(
+            persistent_association_raw.get("max_points_per_comparison", 256)
+        ),
+        category_hard_gate=bool(
+            persistent_association_raw.get("category_hard_gate", True)
+        ),
+    )
+    persistent_memory = PersistentObjectMemoryConfig(
+        max_points_per_object=int(
+            persistent_raw.get("max_points_per_object", 4096)
+        ),
+        min_observation_points=int(
+            persistent_raw.get("min_observation_points", 16)
+        ),
+        min_mask_pixels=int(persistent_raw.get("min_mask_pixels", 32)),
+        min_track_score=float(persistent_raw.get("min_track_score", 0.50)),
+        min_geometry_confidence=float(
+            persistent_raw.get("min_geometry_confidence", 0.30)
+        ),
+        center_ema_alpha=float(persistent_raw.get("center_ema_alpha", 0.25)),
+        same_frame_merge_score=float(
+            persistent_raw.get("same_frame_merge_score", 0.78)
+        ),
+        association=persistent_association,
+    )
     run = EvaluationRunConfig(
         source_path=source,
         output_dir=expand_storage_path(
@@ -557,6 +812,11 @@ def _load_run(path: str | Path) -> EvaluationRunConfig:
         tracking=tracking,
         map_metrics=map_metrics,
         memory=memory,
+        persistent_memory=persistent_memory,
+        use_cached_appearance=bool(
+            persistent_raw.get("use_cached_appearance", False)
+        ),
+        include_v1_memory=False,
         prompt_label_aliases=aliases,
     )
     _validate_run(run)
@@ -574,6 +834,8 @@ def _validate_run(run: EvaluationRunConfig) -> None:
         raise ValueError("tracking.identity_iou_threshold must be in [0,1].")
     if not 0.0 <= run.tracking.reentry_iou_threshold <= 1.0:
         raise ValueError("tracking.reentry_iou_threshold must be in [0,1].")
+    if not 0.0 <= run.tracking.fragmentation_iou_threshold <= 1.0:
+        raise ValueError("tracking.fragmentation_iou_threshold must be in [0,1].")
 
 
 def _select_clips(
@@ -617,6 +879,28 @@ def _print_clip_result(result: Mapping[str, object]) -> None:
         f"{memory['visible_observations']} "
         f"ratio={_format_metric(memory['write_ratio_of_visible'])}"
     )
+    persistent = result.get("persistent_memory", {})
+    if persistent.get("tracking", {}).get("summary_rows"):
+        for row in persistent["tracking"]["summary_rows"]:
+            print(
+                f"  tracking variant={row['variant']} "
+                f"IoU={_format_metric(row['mean_frame_iou'])} "
+                f"frame_IDF1={_format_metric(row['frame_idf1'])} "
+                f"pixel_IDF1={_format_metric(row['pixel_idf1'])} "
+                f"fragmentation={row.get('fragmentation_count', 0)} "
+                f"merge_errors={row.get('merge_error_count', 0)}"
+            )
+        for row in persistent["map"]["summary_rows"]:
+            print(
+                f"  map variant={row['variant']} "
+                f"voxelIoU5cm={_format_metric(row['voxel_iou_5cm'])} "
+                f"F5cm={_format_metric(row['fscore_5cm'])} "
+                f"ghost={_format_metric(row['ghost_point_ratio'])}"
+            )
+        print(
+            f"  persistent_objects={persistent.get('object_count', 0)} "
+            f"events={len(persistent.get('events', ())) }"
+        )
 
 
 def _aggregate_rows(
@@ -642,6 +926,8 @@ def _aggregate_rows(
         "pixel_idfp",
         "pixel_idfn",
         "id_switches",
+        "fragmentation_count",
+        "merge_error_count",
         "reentry_events",
         "reentry_successes",
         "duplicate_objects",
@@ -711,6 +997,8 @@ def _decision_summary(
     raw_map = maps.get("raw_sam", {})
     v6_map = maps.get("v6_geometry", {})
     gate_map = maps.get("v6_memory_gate", {})
+    v1 = tracking.get("v1_object_memory", {})
+    v1_map = maps.get("v1_object_memory", {})
     return {
         "tracking_v6_mean_iou_delta_vs_raw": _delta(
             v6.get("mean_frame_iou"), raw.get("mean_frame_iou")
@@ -723,6 +1011,24 @@ def _decision_summary(
         ),
         "map_v6_memory_ghost_delta_vs_v6": _delta(
             gate_map.get("ghost_point_ratio"), v6_map.get("ghost_point_ratio")
+        ),
+        "tracking_v1_frame_idf1_delta_vs_raw": _delta(
+            v1.get("frame_idf1"), raw.get("frame_idf1")
+        ),
+        "tracking_v1_pixel_idf1_delta_vs_raw": _delta(
+            v1.get("pixel_idf1"), raw.get("pixel_idf1")
+        ),
+        "tracking_v1_fragmentation_count": v1.get(
+            "fragmentation_count", float("nan")
+        ),
+        "tracking_v1_merge_error_count": v1.get(
+            "merge_error_count", float("nan")
+        ),
+        "map_v1_voxel_iou_delta_vs_raw": _delta(
+            v1_map.get("voxel_iou_5cm"), raw_map.get("voxel_iou_5cm")
+        ),
+        "map_v1_ghost_delta_vs_raw": _delta(
+            v1_map.get("ghost_point_ratio"), raw_map.get("ghost_point_ratio")
         ),
         "interpretation": (
             "Use GT oracle to separate geometry from tracking; use V6 memory "
@@ -777,8 +1083,19 @@ def _csv_value(value: object) -> object:
 
 def _write_copyable(path: Path, summary: Mapping[str, object]) -> None:
     decision = summary["decision"]
+    include_v1 = bool(summary.get("persistent_memory", {}).get("enabled", 0))
+    begin = (
+        "===== SEMANTIC_MAP_STAGE0_WITH_V1_BEGIN ====="
+        if include_v1
+        else "===== SEMANTIC_MAP_STAGE0_BEGIN ====="
+    )
+    end = (
+        "===== SEMANTIC_MAP_STAGE0_WITH_V1_END ====="
+        if include_v1
+        else "===== SEMANTIC_MAP_STAGE0_END ====="
+    )
     lines = [
-        "===== SEMANTIC_MAP_STAGE0_BEGIN =====",
+        begin,
         f"revision={summary['revision']}",
         f"clips={summary['clip_count']}",
         "pointmap=raw_full_history_world_pointmap",
@@ -790,8 +1107,13 @@ def _write_copyable(path: Path, summary: Mapping[str, object]) -> None:
         f"tracking_v6_frame_idf1_delta_vs_raw={decision['tracking_v6_frame_idf1_delta_vs_raw']}",
         f"map_v6_voxel_iou_delta_vs_raw={decision['map_v6_voxel_iou_delta_vs_raw']}",
         f"map_v6_memory_ghost_delta_vs_v6={decision['map_v6_memory_ghost_delta_vs_v6']}",
+        f"tracking_v1_frame_idf1_delta_vs_raw={decision['tracking_v1_frame_idf1_delta_vs_raw']}",
+        f"tracking_v1_fragmentation_count={decision['tracking_v1_fragmentation_count']}",
+        f"tracking_v1_merge_error_count={decision['tracking_v1_merge_error_count']}",
+        f"map_v1_voxel_iou_delta_vs_raw={decision['map_v1_voxel_iou_delta_vs_raw']}",
+        f"map_v1_ghost_delta_vs_raw={decision['map_v1_ghost_delta_vs_raw']}",
         f"summary={summary['outputs'].get('summary', '')}",
-        "===== SEMANTIC_MAP_STAGE0_END =====",
+        end,
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf8")
 
@@ -804,6 +1126,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--clip", help="Evaluate one configured clip only.")
     parser.add_argument("--output-dir")
+    parser.add_argument(
+        "--include-v1-memory",
+        action="store_true",
+        help="Also evaluate raw SAM through V1 persistent object memory.",
+    )
     return parser.parse_args()
 
 

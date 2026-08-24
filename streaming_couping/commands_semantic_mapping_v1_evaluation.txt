@@ -1,0 +1,26 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+CONFIG="${SEMANTIC_MAPPING_CONFIG:-streaming_couping/configs/v0_baseline.yaml}"
+OUTPUT_DIR="${SEMANTIC_MAPPING_V1_EVAL_OUTPUT:-$STORAGE_ROOT/outputs/streaming_couping_semantic_map_v1}"
+CLIP_ARGS=()
+[[ -n "${SEMANTIC_MAPPING_CLIP:-}" ]] && CLIP_ARGS+=(--clip "$SEMANTIC_MAPPING_CLIP")
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+[[ -s "$CONFIG" ]] || { echo "missing config: $CONFIG" >&2; exit 1; }
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+
+echo "Stage 1 V1 persistent object-memory offline evaluation"
+echo "models are not rerun; GT is opened only inside evaluation"
+PYTHONPATH="$ROOT" "$PYTHON_BIN" -m streaming_couping.scripts.smoke_v1_object_memory
+PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT" \
+  "$PYTHON_BIN" -m streaming_couping.scripts.run_semantic_map_evaluation \
+  --config "$CONFIG" \
+  --output-dir "$OUTPUT_DIR" \
+  --include-v1-memory \
+  "${CLIP_ARGS[@]}" \
+  "$@"
