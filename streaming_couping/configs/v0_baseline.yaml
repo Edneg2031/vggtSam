@@ -101,6 +101,7 @@ semantic_map:
   max_map_points: 400000
   v1_object_memory:
     output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v1/semantic_map
+    raw_cache_variant: sam31_online_forward
     min_observation_points: 16
     min_mask_pixels: 32
     min_track_score: 0.50
@@ -123,6 +124,41 @@ semantic_map:
       max_points_per_comparison: 256
       category_hard_gate: true
     use_cached_appearance: false
+  # V1.1 is an independent projection-first identity ablation.  It reuses the
+  # frozen V0 cache and writes to a separate output directory.
+  v1_1_projection_memory:
+    output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v11/semantic_map
+    raw_cache_variant: sam31_online_forward
+    min_observation_points: 16
+    min_mask_pixels: 32
+    min_track_score: 0.50
+    min_geometry_confidence: 0.30
+    max_points_per_object: 4096
+    max_fused_voxels_per_object: 20000
+    center_ema_alpha: 0.25
+    confirmation_frames: 2
+    confirmation_window: 4
+    max_pending_gap: 4
+    voxel_size_ratio: 0.02
+    absolute_voxel_size: 0.02
+    association:
+      # Projection IoU is intentionally the dominant term.  Center distance
+      # is only a weak tie-breaker and is never the primary gate.
+      projection_iou_weight: 0.70
+      projection_recall_weight: 0.12
+      projection_precision_weight: 0.08
+      center_weight: 0.05
+      category_weight: 0.05
+      appearance_weight: 0.0
+      min_projection_iou: 0.025
+      min_match_score: 0.28
+      min_projected_pixels: 8
+      top_k: 5
+      projection_dilation_radius: 3
+      max_projection_points: 4096
+      center_scale_ratio: 0.12
+      absolute_center_scale: 0.02
+      category_hard_gate: true
 
 # Offline Stage 0 evaluation. This section is ignored by the V0 model/cache
 # loader and is consumed only after the frozen cache has been generated.

@@ -860,11 +860,13 @@ def _print_clip_result(result: Mapping[str, object]) -> None:
     for row in result["tracking"]["summary_rows"]:
         print(
             f"  tracking variant={row['variant']} "
-            f"IoU={_format_metric(row['mean_frame_iou'])} "
-            f"frame_IDF1={_format_metric(row['frame_idf1'])} "
-            f"pixel_IDF1={_format_metric(row['pixel_idf1'])} "
-            f"reentry={row['reentry_successes']}/{row['reentry_events']}"
-        )
+                f"IoU={_format_metric(row['mean_frame_iou'])} "
+                f"frame_IDF1={_format_metric(row['frame_idf1'])} "
+                f"pixel_IDF1={_format_metric(row['pixel_idf1'])} "
+                f"reentry={row['reentry_successes']}/{row['reentry_events']} "
+                f"fragmentation={row.get('fragmentation_count', 0)} "
+                f"merge_errors={row.get('merge_error_count', 0)}"
+            )
     for row in result["map"]["summary_rows"]:
         print(
             f"  map variant={row['variant']} "

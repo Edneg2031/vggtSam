@@ -45,6 +45,7 @@ from streaming_couping.scripts.run_v0_semantic_map import _validate_inputs
 
 REVISION = "v1_persistent_3d_instance_semantic_mapping_r1"
 BASELINE_REVISION = "v0_frozen_semantic_mapping_pipeline_r1"
+RAW_CACHE_VARIANT = "sam31_online_forward"
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,7 @@ class V1Run:
     max_map_points: int
     memory: PersistentObjectMemoryConfig
     use_cached_appearance: bool
+    raw_cache_variant: str
 
 
 def main() -> None:
@@ -80,8 +82,16 @@ def main() -> None:
         poses_path=baseline.output_dir / "poses.pt",
         clip=clip,
     )
-    masks = payload["tracking_masks_stream"].detach().bool().cpu()
-    scores = payload["tracking_scores"].detach().float().cpu()
+    variant_masks = payload.get("tracking_variant_masks_stream")
+    variant_scores = payload.get("tracking_variant_scores")
+    if not isinstance(variant_masks, Mapping) or not isinstance(variant_scores, Mapping):
+        raise ValueError("V1 cache lacks tracking variant stream fields.")
+    if run.raw_cache_variant not in variant_masks or run.raw_cache_variant not in variant_scores:
+        raise ValueError(
+            f"V1 cache lacks raw variant {run.raw_cache_variant!r}; rebuild the V0 cache."
+        )
+    masks = variant_masks[run.raw_cache_variant].detach().bool().cpu()
+    scores = variant_scores[run.raw_cache_variant].detach().float().cpu()
     confidence = normalize_confidence(payload["baseline_world_confidence"])
     appearance = None
     if run.use_cached_appearance and "appearance" in payload:
@@ -185,6 +195,7 @@ def _write_outputs(
             "revision": REVISION,
             "baseline_revision": BASELINE_REVISION,
             "identity_mode": "v1_object_memory",
+            "raw_cache_variant": run.raw_cache_variant,
             "clip": payload["clip_name"],
             "frame_indices": frames,
             "reference_sequence_index": int(payload["reference_sequence_index"]),
@@ -246,6 +257,7 @@ def _write_outputs(
         "baseline_version": "v0",
         "baseline_status": "frozen",
         "identity_mode": "v1_object_memory",
+        "raw_cache_variant": run.raw_cache_variant,
         "clip": payload["clip_name"],
         "config": str(run.source_path),
         "cache": str(cache_path_value),
@@ -379,6 +391,7 @@ def _write_copyable(path: Path, summary: Mapping[str, object]) -> None:
         f"revision={summary['revision']}",
         f"clip={summary['clip']}",
         "identity_mode=v1_object_memory",
+        f"raw_cache_variant={summary['raw_cache_variant']}",
         "pose=retrieve_qk",
         "pointmap=raw_full_history_streamvggt_world_pointmap",
         "semantics=sam_observation_to_persistent_3d_object_memory",
@@ -451,6 +464,7 @@ def _load_run(path: str | Path, *, identity_mode: str | None) -> V1Run:
         max_map_points=int(section.get("max_map_points", 400000)),
         memory=memory,
         use_cached_appearance=bool(v1.get("use_cached_appearance", False)),
+        raw_cache_variant=str(v1.get("raw_cache_variant", RAW_CACHE_VARIANT)),
     )
     if not 0.0 <= run.confidence_threshold <= 1.0:
         raise ValueError("semantic_map.confidence_threshold must be in [0,1].")
