@@ -302,7 +302,11 @@ def _write_outputs(
         "tracking_baseline_acceptance_pass": int(
             tracking_audit["tracking_audit_pass"]
         ),
-        "pose_role": "training_free_streamvggt_native_qk_history_retrieval",
+        "pose_role": (
+            "training_free_streamvggt_native_qk_history_retrieval"
+            if pose_selection["selected_pose_branch"] == "retrieve_qk"
+            else "frozen_streamvggt_native_raw_pose_control"
+        ),
         "selected_pose_branch": pose_selection["selected_pose_branch"],
         "selected_pose_exact_raw": int(pose_selection["selected_pose_exact_raw"]),
         "pose_modification_applied": bool(
@@ -315,7 +319,7 @@ def _write_outputs(
         "raw_pose_fallback_available": 1,
         "pose_candidate_provenance": pose_selection["provenance"],
         "sam_pose_inputs": 0,
-        "formal_pose_output": "retrieve_qk",
+        "formal_pose_output": pose_selection["selected_pose_branch"],
         "formal_pointmap_output": "raw_full_history_world_pointmap",
         "formal_semantic_output": "sam_persistent_id_lifted_raw_world_pointmap",
         "candidate_geometry_available": False,

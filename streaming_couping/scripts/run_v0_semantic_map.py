@@ -319,15 +319,18 @@ def _validate_inputs(
     if not summary_path.is_file() or not poses_path.is_file():
         raise FileNotFoundError("Run commands_v0_baseline.txt before map export.")
     summary = json.loads(summary_path.read_text(encoding="utf8"))
+    selected_pose_branch = str(summary.get("selected_pose_branch", ""))
+    if selected_pose_branch not in {"retrieve_qk", "raw_streamvggt"}:
+        raise ValueError(
+            "Baseline summary selected_pose_branch must be retrieve_qk or "
+            f"raw_streamvggt; got {selected_pose_branch!r}."
+        )
     expected = {
         "schema": 6,
         "baseline_status": "frozen",
         "implementation_revision": BASELINE_REVISION,
-        "selected_pose_branch": "retrieve_qk",
-        "selected_pose_exact_raw": 0,
-        "pose_selection_fallback_used": 0,
-        "pose_improvement_claim": True,
-        "formal_pose_output": "retrieve_qk",
+        "selected_pose_branch": selected_pose_branch,
+        "formal_pose_output": selected_pose_branch,
         "formal_pointmap_output": "raw_full_history_world_pointmap",
         "formal_semantic_output": "sam_persistent_id_lifted_raw_world_pointmap",
         "candidate_geometry_available": False,
@@ -342,6 +345,16 @@ def _validate_inputs(
             raise ValueError(
                 f"Baseline summary {name}={summary.get(name)!r}; expected {value!r}."
             )
+    expected_exact_raw = int(selected_pose_branch == "raw_streamvggt")
+    if int(summary.get("selected_pose_exact_raw", -1)) != expected_exact_raw:
+        raise ValueError(
+            "Baseline summary selected_pose_exact_raw disagrees with the "
+            f"selected branch {selected_pose_branch!r}."
+        )
+    if int(summary.get("pose_selection_fallback_used", 0)) not in {0, 1}:
+        raise ValueError("Baseline summary pose fallback flag is invalid.")
+    if not isinstance(summary.get("pose_improvement_claim"), (bool, int)):
+        raise ValueError("Baseline summary pose_improvement_claim is invalid.")
     required = (
         "baseline_world_points",
         "baseline_world_confidence",
@@ -385,7 +398,7 @@ def _validate_inputs(
     expected_pose_fields = {
         "schema": 1,
         "baseline_revision": BASELINE_REVISION,
-        "selected_pose_branch": "retrieve_qk",
+        "selected_pose_branch": selected_pose_branch,
         "pointmap_source": "raw_full_history_streamvggt_world_pointmap",
         "candidate_pointmap_used": False,
     }

@@ -86,6 +86,10 @@ def main() -> None:
     # This makes the generated protocol usable for cache construction.  The
     # per-clip configs below override it before any baseline audit/export.
     planned.setdefault("baseline", {})["clip_name"] = clips[0]["name"]
+    planned["baseline"].setdefault("pose", {})[
+        "selected_branch"
+    ] = "raw_streamvggt"
+    planned["baseline"]["pose"]["allow_raw_fallback"] = True
     planned["baseline"].setdefault("frames", {})["evaluation"] = list(
         _baseline_evaluation_frames(clips[0]["frame_indices"])
     )
@@ -106,6 +110,7 @@ def main() -> None:
         "prompt_selection_annotation_gt_used": 1,
         "runtime_prompt_selection_gt_fields": 0,
         "excluded_labels": sorted(excluded),
+        "pose_policy": "raw_streamvggt_control_qk_diagnostic_only",
         "clips": clips,
         "skipped_scenes": skipped,
         "split": split_map,
@@ -257,6 +262,8 @@ def _write_per_clip_configs(
         baseline = payload.setdefault("baseline", {})
         baseline["clip_name"] = name
         baseline["output_dir"] = str(run_root / "v0" / name)
+        baseline.setdefault("pose", {})["selected_branch"] = "raw_streamvggt"
+        baseline["pose"]["allow_raw_fallback"] = True
         baseline.setdefault("frames", {})["evaluation"] = list(
             _baseline_evaluation_frames(clip["frame_indices"])
         )

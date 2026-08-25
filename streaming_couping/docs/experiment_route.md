@@ -257,6 +257,12 @@ pilot, not as a generalization claim. Do not tune V2.3 thresholds on a sealed
 test scene; use the multi-scene result to decide whether a V2.4 memory change
 is justified.
 
+The generated multi-scene protocol uses the native raw StreamVGGT pose as the
+semantic-map control. QK retrieval is still generated and reported as a
+diagnostic, but it is not silently used when its center/rotation gains are
+inconsistent across scenes. This prevents the pose ablation from confounding
+the SAM recovery and map-memory ablations.
+
 主要目标是：
 
     ghost-point ratio ↓
