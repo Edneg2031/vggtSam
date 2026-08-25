@@ -37,10 +37,12 @@ from streaming_couping.scripts.run_v2_semantic_map import (
     _load_raw_variants,
 )
 from streaming_couping.scripts.run_v21_semantic_map import (
-    _annotate_object_geometry,
     _write_outputs,
 )
-from streaming_couping.scripts.run_v22_semantic_map import _add_validation_stats
+from streaming_couping.scripts.run_v22_semantic_map import (
+    _add_validation_stats,
+    _annotate_object_geometry,
+)
 REVISION = "v2_3_failure_only_confidence_aware_voxel_memory_r1"
 IDENTITY_MODE = "v2_3_failure_only_confidence_aware_voxel_memory"
 SEMANTIC_SOURCE = "sam3_v2_2_recovery_with_confidence_aware_voxel_memory"
