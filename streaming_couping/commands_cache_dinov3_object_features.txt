@@ -1,0 +1,36 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# One-command DINOv3 feature cache.  No path/config variables are required.
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+MULTICLIP_CONFIG="$STORAGE_ROOT/outputs/streaming_couping_multiclip/protocol.yaml"
+CONFIG="$MULTICLIP_CONFIG"
+if [[ ! -s "$CONFIG" ]]; then
+  CONFIG="$ROOT/streaming_couping/configs/v0_baseline.yaml"
+fi
+DINO_ROOT="/home/bod/86Nas/95_data_bak/FoundationModels/dinov3"
+OUTPUT_DIR="$STORAGE_ROOT/outputs/streaming_couping_dinov3_object_features"
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+[[ -s "$CONFIG" ]] || { echo "missing config: $CONFIG" >&2; exit 1; }
+[[ -d "$DINO_ROOT" ]] || { echo "missing DINOv3 root: $DINO_ROOT" >&2; exit 1; }
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+
+CUDA_VISIBLE_DEVICES=3 \
+  PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT" \
+  "$PYTHON_BIN" -m streaming_couping.scripts.smoke_dinov3_object_features
+
+CUDA_VISIBLE_DEVICES=3 \
+  PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT" \
+  "$PYTHON_BIN" -m streaming_couping.scripts.cache_dinov3_object_features \
+  --config "$CONFIG" \
+  --dinov3-root "$DINO_ROOT" \
+  --output-dir "$OUTPUT_DIR" \
+  --device cuda:0 \
+  --preferred-variant dinov3-vitl16 \
+  --dtype bfloat16
+
+echo "DINOv3 object feature cache=$OUTPUT_DIR"
