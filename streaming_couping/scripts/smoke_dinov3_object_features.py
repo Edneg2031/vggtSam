@@ -13,17 +13,28 @@ from streaming_couping.src.dinov3_object_features import (
 
 
 def main() -> None:
-    dense = torch.zeros(2, 2, 3, 4)
-    dense[0, :, :, 0] = 1.0
-    dense[1, :, :, 1] = 1.0
-    masks = torch.zeros(2, 2, 4, 6, dtype=torch.bool)
-    masks[:, 0, :, :3] = True
-    masks[:, 1, :, 3:] = True
+    # Use distinct left/right spatial features.  A previous version made
+    # dense[0, ..., 0] constant over the whole image and then expected the
+    # right-hand mask to have a zero value in that same channel.  That was an
+    # invalid expectation and caused the smoke test to fail before DINOv3 was
+    # loaded.
+    dense = torch.zeros(2, 2, 2, 4)
+    dense[0, :, 0, 0] = 1.0
+    dense[0, :, 1, 1] = 1.0
+    dense[1, :, 0, 2] = 1.0
+    dense[1, :, 1, 3] = 1.0
+    masks = torch.zeros(2, 2, 4, 4, dtype=torch.bool)
+    masks[:, 0, :, :2] = True
+    masks[:, 1, :, 2:] = True
     pooled, valid = masked_mean_pool(dense, masks)
     assert tuple(pooled.shape) == (2, 2, 4)
     assert bool(valid.all())
     assert float(pooled[0, 0, 0]) > 0.99
     assert float(pooled[0, 1, 0]) < 0.01
+    assert float(pooled[0, 1, 1]) > 0.99
+    assert float(pooled[1, 0, 2]) > 0.99
+    assert float(pooled[1, 1, 2]) < 0.01
+    assert float(pooled[1, 1, 3]) > 0.99
 
     single = torch.zeros(4, 2, 4)
     single[:, 0, 0] = 1.0
