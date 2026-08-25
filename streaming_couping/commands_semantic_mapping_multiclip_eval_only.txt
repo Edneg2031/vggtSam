@@ -1,0 +1,24 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# Re-evaluate already generated multi-clip artifacts without rerunning models.
+# This entrypoint intentionally owns the protocol/config paths so the user
+# only needs to execute this file.
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+RUN_ROOT="$STORAGE_ROOT/outputs/streaming_couping_multiclip"
+CONFIG="$RUN_ROOT/protocol.yaml"
+OUTPUT_DIR="$STORAGE_ROOT/outputs/streaming_couping_semantic_map_multiclip_ablation"
+
+cd "$ROOT"
+
+[[ -s "$CONFIG" ]] || {
+  echo "missing multi-clip protocol config: $CONFIG" >&2
+  echo "run zsh streaming_couping/commands_semantic_mapping_multiclip_all.txt first" >&2
+  exit 1
+}
+
+SEMANTIC_MAPPING_MULTICLIP_CONFIG="$CONFIG" \
+SEMANTIC_MAPPING_MULTICLIP_RUN_ROOT="$RUN_ROOT" \
+SEMANTIC_MAPPING_ABLATION_OUTPUT="$OUTPUT_DIR" \
+  zsh streaming_couping/commands_semantic_mapping_multiclip_ablation.txt
