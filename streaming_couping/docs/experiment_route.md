@@ -242,6 +242,10 @@ On the server:
     zsh streaming_couping/commands_run_semantic_mapping_multiclip.txt
     zsh streaming_couping/commands_semantic_mapping_multiclip_ablation.txt
 
+For a single uninterrupted run, use:
+
+    zsh streaming_couping/commands_semantic_mapping_multiclip_all.txt
+
 The first command creates a protocol config and one config per clip. The
 second command accepts `SEMANTIC_MAPPING_MULTICLIP_STAGE=cache|baseline|v21|v22|v23|all`
 so failed stages can be resumed. The last command is evaluation-only and
