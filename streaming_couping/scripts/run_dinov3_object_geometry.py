@@ -512,7 +512,7 @@ def _train_branch(
             point_loss = robust_point_loss(
                 raw + output.correction,
                 target,
-                valid,
+                valid.unsqueeze(0),
                 beta=float(args.point_beta),
             )
             correction_norm = output.correction[0][valid].norm(dim=-1).mean()
