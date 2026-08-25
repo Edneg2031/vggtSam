@@ -133,6 +133,7 @@ def validate_v22_candidate(
     historical_count = int(historical.shape[0])
     candidate_count = int(candidate_points.shape[0])
     base = {
+        "accepted": 0,
         "geometry_validation_attempted": 1,
         "geometry_validation_accepted": 0,
         "candidate_world_point_count": candidate_count,
