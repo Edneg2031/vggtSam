@@ -217,7 +217,41 @@ re-entry 结果明确显示 identity 仍是瓶颈时，才打开 cached appearan
     M1 只使用 SAM score gate
     M2 score + geometry gate
     M3 short-term / long-term clean anchor
-    M4 short/long memory + appearance
+M4 short/long memory + appearance
+
+## 7. V2.3 freeze and multi-clip validation
+
+V2.3 is the current frozen candidate. Before adding V2.4, validate the same
+failure-only recovery and confidence-aware memory policy on more than one
+clip/scene. The new protocol keeps the raw-SAM assignment fixed separately for
+each clip and reports both tracking and map-writing branches:
+
+    raw
+    V2.1
+    V2.2
+    V2.3 tracking + all-visible map writes
+    V2.3 tracking + confidence-aware map writes
+
+The all-visible V2.3 branch is an offline control. It uses the frozen V2.3
+tracking masks but disables the memory write gate, so a difference between the
+two V2.3 rows is attributable to map memory rather than another SAM call.
+
+On the server:
+
+    zsh streaming_couping/commands_plan_semantic_mapping_multiclip.txt
+    zsh streaming_couping/commands_run_semantic_mapping_multiclip.txt
+    zsh streaming_couping/commands_semantic_mapping_multiclip_ablation.txt
+
+The first command creates a protocol config and one config per clip. The
+second command accepts `SEMANTIC_MAPPING_MULTICLIP_STAGE=cache|baseline|v21|v22|v23|all`
+so failed stages can be resumed. The last command is evaluation-only and
+writes per-clip CSV rows plus macro mean/std/min/max summaries.
+
+The strict aggregate decision additionally requires V2.3 ghost rate not to
+exceed raw. A single development clip should therefore be reported as a
+pilot, not as a generalization claim. Do not tune V2.3 thresholds on a sealed
+test scene; use the multi-scene result to decide whether a V2.4 memory change
+is justified.
 
 主要目标是：
 
