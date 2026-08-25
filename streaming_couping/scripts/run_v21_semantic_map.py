@@ -254,6 +254,13 @@ def _write_outputs(
     semantic: SemanticPointMap,
     raw_output: torch.Tensor,
     recovery_config_path: Path,
+    revision: str = REVISION,
+    identity_mode: str = "v2_1_failure_only_candidate_recovery",
+    semantic_source: str = "sam3_raw_tracking_with_failure_only_geometry_recovery",
+    claim: str = "frozen_v2_1_failure_only_candidate_recovery",
+    identity_policy: str = "one_v21_memory_entry_per_existing_v0_sam_slot",
+    recovery_description: str = "only_empty_missing_or_reentry_plus_candidate_score_margin",
+    copyable_writer=None,
 ) -> Path:
     frames = tuple(int(value) for value in payload["frame_indices"])
     track_ids = torch.as_tensor(payload["sam_track_ids"], dtype=torch.long)
@@ -293,9 +300,9 @@ def _write_outputs(
     torch.save(
         {
             "schema": 1,
-            "revision": REVISION,
+            "revision": revision,
             "baseline_revision": BASELINE_REVISION,
-            "identity_mode": "v2_1_failure_only_candidate_recovery",
+            "identity_mode": identity_mode,
             "raw_cache_variant": run.raw_cache_variant,
             "clip": payload["clip_name"],
             "frame_indices": frames,
@@ -333,7 +340,7 @@ def _write_outputs(
             "baseline_world_to_camera": payload["baseline_world_to_camera"],
             "baseline_intrinsics": payload["baseline_intrinsics"],
             "pointmap_source": "raw_full_history_streamvggt_world_pointmap",
-            "semantic_source": "sam3_raw_tracking_with_failure_only_geometry_recovery",
+            "semantic_source": semantic_source,
             "recovery_config": str(recovery_config_path),
         },
         artifact_path,
@@ -363,8 +370,8 @@ def _write_outputs(
         json.dumps(
             {
                 "schema": 1,
-                "revision": REVISION,
-                "identity_policy": "one_v21_memory_entry_per_existing_v0_sam_slot",
+                "revision": revision,
+                "identity_policy": identity_policy,
                 "objects": object_rows,
                 "tensor_artifact": str(artifact_path),
             },
@@ -400,11 +407,11 @@ def _write_outputs(
     )
     summary: dict[str, Any] = {
         "schema": 1,
-        "revision": REVISION,
+        "revision": revision,
         "baseline_version": "v0",
         "baseline_status": "frozen",
         "baseline_revision": BASELINE_REVISION,
-        "identity_mode": "v2_1_failure_only_candidate_recovery",
+        "identity_mode": identity_mode,
         "raw_cache_variant": run.raw_cache_variant,
         "clip": payload["clip_name"],
         "config": str(run.source_path),
@@ -418,7 +425,9 @@ def _write_outputs(
         "sam_pose_inputs": 0,
         "pose_source": "streamvggt_native_qk_history_retrieval",
         "pointmap_source": "raw_full_history_streamvggt_world_pointmap",
-        "semantic_source": "sam3_raw_tracking_with_failure_only_geometry_recovery",
+        "semantic_source": semantic_source,
+        "recovery_description": recovery_description,
+        "identity_policy": identity_policy,
         "prompt_selection_annotation_gt_used": int(
             baseline_summary["prompt_selection_annotation_gt_used"]
         ),
@@ -451,7 +460,7 @@ def _write_outputs(
             and object_rows
             and poses["selected_pose_branch"] == "retrieve_qk"
         ),
-        "claim": "frozen_v2_1_failure_only_candidate_recovery",
+        "claim": claim,
         "outputs": {
             "artifact": str(artifact_path),
             "semantic_ply": str(semantic_ply),
@@ -466,7 +475,10 @@ def _write_outputs(
         json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n",
         encoding="utf8",
     )
-    _write_copyable(run.output_dir / "copyable_result.txt", summary)
+    if copyable_writer is None:
+        _write_copyable(run.output_dir / "copyable_result.txt", summary)
+    else:
+        copyable_writer(run.output_dir / "copyable_result.txt", summary)
     return summary_path
 
 

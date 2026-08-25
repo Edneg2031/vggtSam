@@ -232,6 +232,58 @@ semantic_map:
       support_abs_distance: 0.15
       support_relative_distance: 0.10
 
+  # V2.2 keeps V2.1's failure-only and 2-D score-margin policy, then validates
+  # an accepted candidate in world space before allowing mask replacement.
+  v2_2_geometry_recovery:
+    output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v22/semantic_map
+    raw_cache_variant: sam31_online_forward
+    recovery:
+      unobserved_gap: 2
+      reentry_gap: 3
+      low_score_threshold: 0.50
+      min_mask_pixels: 32
+      min_area_ratio: 0.35
+      max_area_ratio: 2.85
+      min_history_points: 16
+      max_points_per_object: 4096
+      min_memory_update_score: 0.50
+      min_geometry_confidence: 0.30
+      max_positive_points: 6
+      min_candidate_score: 0.50
+      min_candidate_support_recall: 0.15
+      min_candidate_iou: 0.02
+      min_candidate_area_ratio: 0.20
+      max_candidate_area_ratio: 5.00
+      min_geometry_consistency: 0.12
+      min_recovery_score: 0.50
+      replacement_margin: 0.12
+      sam_score_weight: 0.35
+      geometry_score_weight: 0.40
+      temporal_score_weight: 0.25
+      proposal_box_quantile: 0.02
+      proposal_box_padding_ratio: 0.12
+      min_projected_points: 8
+      min_projected_fraction: 0.005
+      min_supported_points: 8
+      min_support_ratio: 0.02
+      support_abs_distance: 0.15
+      support_relative_distance: 0.10
+    validation:
+      max_candidate_points: 2048
+      max_historical_points: 2048
+      min_candidate_points: 8
+      min_historical_points: 16
+      centroid_distance_threshold_m: 0.35
+      centroid_distance_scale: 0.75
+      point_overlap_distance_m: 0.10
+      min_point_overlap_ratio: 0.20
+      min_shape_score: 0.25
+      alpha_2d_score: 0.55
+      beta_3d_score: 0.45
+      final_accept_threshold: 0.58
+      distance_chunk_size: 512
+      covariance_epsilon: 0.000001
+
 # Offline Stage 0 evaluation. This section is ignored by the V0 model/cache
 # loader and is consumed only after the frozen cache has been generated.
 semantic_evaluation:

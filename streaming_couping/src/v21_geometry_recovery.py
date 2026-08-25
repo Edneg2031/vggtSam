@@ -409,8 +409,14 @@ def process_v21_sequence(
     refine_callback: Callable[
         [int, int, str, RevisitCandidate], Sequence[SAM3MaskCandidate]
     ],
+    candidate_validator: Callable[..., Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Run V2.1 over a frozen V0 cache."""
+    """Run V2.1 over a frozen V0 cache.
+
+    ``candidate_validator`` is optional so V2.1 remains unchanged.  V2.2
+    supplies a world-space validator that runs after the 2-D candidate margin
+    gate and before the candidate is applied.
+    """
 
     raw_masks_output = raw_masks_output.detach().cpu().bool()
     raw_scores = raw_scores.detach().cpu().float()
@@ -580,9 +586,8 @@ def process_v21_sequence(
                         if selected.get("selected") is not None:
                             row = selected["selected"]
                             candidate = row["candidate"]
-                            final_output[frame, slot] = candidate.mask.detach().cpu().bool()
-                            final_scores[frame, slot] = float(candidate.score)
-                            final_stream[frame, slot] = output_mask_to_stream(
+                            candidate_mask = candidate.mask.detach().cpu().bool()
+                            candidate_stream = output_mask_to_stream(
                                 candidate.mask,
                                 source_size=tuple(
                                     int(value) for value in source_sizes[frame]
@@ -592,15 +597,8 @@ def process_v21_sequence(
                                 ),
                                 image_mode=str(image_mode),
                             )
-                            source = "geometry_recovery"
-                            applied_by_slot[slot] += 1
-                            if trigger_reason == "reentry_after_gap":
-                                reentry_applied_by_slot[slot] += 1
                             event.update(
                                 {
-                                    "recovery_applied": 1,
-                                    "raw_mask_preserved": 0,
-                                    "recovery_reason": "candidate_beats_raw",
                                     "candidate_score": float(row["candidate_score"]),
                                     "recovery_selection_score": float(
                                         row["recovery_score"]
@@ -624,9 +622,64 @@ def process_v21_sequence(
                                         row["candidate_area_ratio_vs_raw"]
                                     ),
                                     "selected_gate_reason": str(row["reason"]),
-                                    "normal_frame_unchanged": 0,
                                 }
                             )
+                            validation: dict[str, Any] = {
+                                "accepted": 1,
+                                "geometry_validation_reason": "not_requested",
+                            }
+                            if candidate_validator is not None:
+                                try:
+                                    validation = dict(
+                                        candidate_validator(
+                                            frame=frame,
+                                            slot=slot,
+                                            memory=memory,
+                                            proposal=proposal,
+                                            candidate_row=row,
+                                            candidate_mask=candidate_mask,
+                                            candidate_stream_mask=candidate_stream,
+                                            current_world_points=world_points[frame],
+                                            current_confidence=confidence[frame],
+                                        )
+                                    )
+                                except Exception as exc:
+                                    validation = {
+                                        "accepted": 0,
+                                        "geometry_validation_reason": (
+                                            f"validation_error:{type(exc).__name__}"
+                                        ),
+                                    }
+                            for key, value in validation.items():
+                                if key != "accepted":
+                                    event[str(key)] = value
+                            if bool(validation.get("accepted", 0)):
+                                final_output[frame, slot] = candidate_mask
+                                final_scores[frame, slot] = float(candidate.score)
+                                final_stream[frame, slot] = candidate_stream
+                                source = "geometry_recovery"
+                                applied_by_slot[slot] += 1
+                                if trigger_reason == "reentry_after_gap":
+                                    reentry_applied_by_slot[slot] += 1
+                                event.update(
+                                    {
+                                        "recovery_applied": 1,
+                                        "raw_mask_preserved": 0,
+                                        "recovery_reason": "candidate_beats_raw",
+                                        "normal_frame_unchanged": 0,
+                                    }
+                                )
+                            else:
+                                event["recovery_rejected"] = 1
+                                event["recovery_reason"] = (
+                                    "geometry_validation_rejected:"
+                                    + str(
+                                        validation.get(
+                                            "geometry_validation_reason",
+                                            "rejected",
+                                        )
+                                    )
+                                )
                         else:
                             event["recovery_rejected"] = 1
                             event["recovery_reason"] = str(selected.get("reason", "raw_preserved"))
