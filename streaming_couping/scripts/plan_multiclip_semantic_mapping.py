@@ -87,7 +87,7 @@ def main() -> None:
     # per-clip configs below override it before any baseline audit/export.
     planned.setdefault("baseline", {})["clip_name"] = clips[0]["name"]
     planned["baseline"].setdefault("frames", {})["evaluation"] = list(
-        clips[0]["frame_indices"][1:]
+        _baseline_evaluation_frames(clips[0]["frame_indices"])
     )
     _absolutize_static_paths(planned, base_config_path.parent)
 
@@ -258,7 +258,7 @@ def _write_per_clip_configs(
         baseline["clip_name"] = name
         baseline["output_dir"] = str(run_root / "v0" / name)
         baseline.setdefault("frames", {})["evaluation"] = list(
-            clip["frame_indices"][1:]
+            _baseline_evaluation_frames(clip["frame_indices"])
         )
         baseline.setdefault("pose", {})["qk_pose_output"] = str(
             run_root / "v0" / name / "qk_pose_retrieval" / "qk_pose_output.pt"
@@ -283,6 +283,18 @@ def _split_values(value: str | None) -> list[str]:
     if value is None:
         return []
     return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _baseline_evaluation_frames(frame_indices: Iterable[int]) -> list[int]:
+    """Return the twelve future frames required by the frozen V0 protocol."""
+
+    future = [int(value) for value in frame_indices][1:]
+    if len(future) < 12:
+        raise ValueError(
+            "Each multi-clip protocol must contain at least twelve future "
+            f"frames; got {len(future)}."
+        )
+    return _uniform_indices(future, 12)
 
 
 def _parse_args() -> argparse.Namespace:
