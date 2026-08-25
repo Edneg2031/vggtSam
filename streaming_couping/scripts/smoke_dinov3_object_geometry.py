@@ -45,7 +45,7 @@ def main() -> None:
     with torch.no_grad():
         head.residual_head.bias.fill_(1.0)
     masked = head(
-        features,
+        features[:1],
         output_size=(4, 6),
         patch_shape=(2, 3),
         object_masks=masks[:1],
