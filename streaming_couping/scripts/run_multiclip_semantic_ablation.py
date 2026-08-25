@@ -17,10 +17,11 @@ The evaluator deliberately separates tracking from map writing:
     Frozen V2.3 tracking masks and its confidence-aware map-write branch.
 
 For more than one clip, the artifact root may either contain a flat
-``semantic_map.pt`` (single-clip compatibility) or one directory per clip:
-``<root>/<clip_name>/semantic_map.pt``.  A scene/clip nested layout is also
-accepted.  The command wrapper supplies the roots used by the retained
-server outputs.
+``semantic_map.pt`` (single-clip compatibility) or one directory per clip.
+Both ``<root>/<clip_name>/semantic_map.pt`` and the exporter layout
+``<root>/<clip_name>/semantic_map/semantic_map.pt`` are accepted.  A
+scene/clip nested layout is also accepted.  The command wrapper supplies the
+roots used by the retained server outputs.
 """
 
 from __future__ import annotations
@@ -536,8 +537,11 @@ def _resolve_artifact_path(root: Path, clip: ClipConfig) -> Path:
     candidates = [
         root if root.name == "semantic_map.pt" else root / "semantic_map.pt",
         root / clip.name / "semantic_map.pt",
+        root / clip.name / "semantic_map" / "semantic_map.pt",
         root / clip.scene_id / clip.name / "semantic_map.pt",
+        root / clip.scene_id / clip.name / "semantic_map" / "semantic_map.pt",
         root / clip.scene_id / "semantic_map.pt",
+        root / clip.scene_id / "semantic_map" / "semantic_map.pt",
     ]
     seen: set[Path] = set()
     for candidate in candidates:

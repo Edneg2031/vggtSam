@@ -74,6 +74,20 @@ def main() -> None:
             nested / "semantic_map.pt"
         ).resolve()
 
+        exporter_nested = root / "exporter_clip" / "semantic_map"
+        exporter_nested.mkdir(parents=True)
+        exporter_artifact = exporter_nested / "semantic_map.pt"
+        torch.save({"clip": "exporter_clip"}, exporter_artifact)
+        exporter_config = ClipConfig(
+            name="exporter_clip",
+            scene_id="scene",
+            frame_indices=(0,),
+            instance_ids=(0,),
+        )
+        assert _resolve_artifact_path(root, exporter_config) == (
+            exporter_artifact
+        ).resolve()
+
     print("multi-clip semantic ablation smoke passed variants=3 decision=GO")
 
 
