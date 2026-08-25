@@ -320,6 +320,26 @@ def _write_outputs(
             "tracking_masks_stream": result["masks_stream"],
             "tracking_scores": result["scores"],
             "history_masks_output": result["history_masks_output"],
+            # V2.3 keeps tracking masks intact and may provide a separate,
+            # confidence-filtered map-write branch.  Older V2.1/V2.2 result
+            # dictionaries do not contain these optional fields, so their
+            # serialized artifacts remain backward compatible.
+            "map_masks_stream": result.get(
+                "map_masks_stream", result["masks_stream"]
+            ),
+            "map_write_mask": result.get(
+                "map_write_mask",
+                torch.ones(
+                    result["masks_stream"].shape[:2], dtype=torch.bool
+                ),
+            ),
+            "map_observation_confidence": result.get(
+                "map_observation_confidence",
+                torch.ones(result["masks_stream"].shape[:2], dtype=torch.float32),
+            ),
+            "object_memory_confidence": result.get(
+                "object_memory_confidence", {}
+            ),
             "object_metadata": object_rows,
             "object_memory": result["objects"],
             "object_memory_world_points": {
