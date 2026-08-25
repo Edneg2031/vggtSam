@@ -761,6 +761,22 @@ def _evaluate_clip(
                 and math.isfinite(float(row["paired_rmse_m"]))
                 and float(row["paired_rmse_m"]) < raw_value
             )
+    for row in metrics:
+        if row["branch"] == "raw":
+            continue
+        branch_objects = [
+            value
+            for value in objects
+            if value["branch"] == row["branch"]
+        ]
+        row["improved_objects_vs_raw"] = int(
+            sum(int(value["improved_vs_raw"]) for value in branch_objects)
+        )
+        row["improved_object_ratio_vs_raw"] = (
+            float(row["improved_objects_vs_raw"] / len(branch_objects))
+            if branch_objects
+            else 0.0
+        )
     return {
         "clip": data.name,
         "scene_id": data.scene_id,
@@ -786,6 +802,22 @@ def _score_predictions(
     frame_rows: list[dict[str, Any]] = []
     for index in range(points.shape[0]):
         selected = _limited_indices(support[index], int(args.maximum_points_per_frame))
+        if not selected.numel():
+            frame_rows.append(
+                {
+                    "clip": data.name,
+                    "scene_id": data.scene_id,
+                    "split": split,
+                    "branch": branch,
+                    "sequence_index": index,
+                    "frame_index": data.frame_indices[index],
+                    "evaluated_points": 0,
+                    "rmse_m": float("nan"),
+                    "median_m": float("nan"),
+                    "p90_m": float("nan"),
+                }
+            )
+            continue
         error = torch.linalg.vector_norm(
             points[index].reshape(-1, 3).index_select(0, selected)
             - data.target_metric[index].reshape(-1, 3).index_select(0, selected),
@@ -806,7 +838,7 @@ def _score_predictions(
                 "p90_m": float(torch.quantile(error, 0.90)),
             }
         )
-    joined = torch.cat(frame_errors)
+    joined = torch.cat(frame_errors) if frame_errors else torch.empty(0)
     object_rows: list[dict[str, Any]] = []
     for object_index in range(int(gt_masks.shape[1])):
         object_support = gt_masks[:, object_index] & support
@@ -881,8 +913,8 @@ def _score_predictions(
         "branch": branch,
         "evaluated_points": int(joined.numel()),
         "global_rmse_m": _rmse(joined),
-        "global_median_m": float(joined.median()),
-        "global_p90_m": float(torch.quantile(joined, 0.90)),
+        "global_median_m": float(joined.median()) if joined.numel() else float("nan"),
+        "global_p90_m": float(torch.quantile(joined, 0.90)) if joined.numel() else float("nan"),
         "object_count": len(object_rows),
         "object_paired_rmse_m": _finite_mean(object_rows, "paired_rmse_m"),
         "object_fscore_5cm": _finite_mean(object_rows, "fscore_5cm"),
