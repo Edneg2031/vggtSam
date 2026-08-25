@@ -281,6 +281,10 @@ def main() -> None:
 def _write_v23_copyable(path: Path, summary: Mapping[str, Any]) -> None:
     stats = summary["recovery_stats"]
     outputs = summary["outputs"]
+    confidence_output = outputs.get(
+        "object_memory_confidence",
+        str(path.parent / "object_memory_confidence.json"),
+    )
     lines = [
         "===== COPYABLE_V2_3_CONFIDENCE_AWARE_MEMORY_BEGIN =====",
         f"revision={summary['revision']}",
@@ -319,7 +323,7 @@ def _write_v23_copyable(path: Path, summary: Mapping[str, Any]) -> None:
         f"recovery_events_csv={outputs['recovery_events_csv']}",
         f"object_memory_json={outputs['object_memory_json']}",
         f"object_memory_csv={outputs['object_memory_csv']}",
-        f"object_memory_confidence={outputs['object_memory_confidence']}",
+        f"object_memory_confidence={confidence_output}",
         "===== COPYABLE_V2_3_CONFIDENCE_AWARE_MEMORY_END =====",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf8")
