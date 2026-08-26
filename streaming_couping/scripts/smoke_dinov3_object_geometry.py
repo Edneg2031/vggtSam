@@ -8,6 +8,15 @@ import torch
 from streaming_couping.src.dinov3_object_geometry import (
     ObjectConditionedResidualHead,
 )
+from streaming_couping.src.semantic_map_metrics import (
+    SemanticMapMetricConfig,
+    evaluate_semantic_object_map,
+)
+from streaming_couping.src.semantic_tracking_metrics import (
+    GroundTruthInstances,
+    TrackingMetricConfig,
+    evaluate_tracking_variants,
+)
 
 
 def main() -> None:
@@ -66,6 +75,61 @@ def main() -> None:
         object_features=None,
     )
     assert tuple(geometry_only.correction.shape) == (1, 4, 6, 3)
+
+    # Exercise the actual semantic-map readout with a tiny perfect synthetic
+    # object.  This guards the newly added corrected-pointmap evaluator before
+    # a long multi-scene training run starts.
+    points = torch.tensor(
+        [
+            [
+                [[0.0, 0.0, 1.0], [0.1, 0.0, 1.0]],
+                [[0.0, 0.1, 1.0], [0.1, 0.1, 1.0]],
+            ]
+        ]
+    )
+    tiny_masks = torch.ones(1, 1, 2, 2, dtype=torch.bool)
+    tiny_scores = torch.ones(1, 1)
+    tiny_gt = torch.ones(1, 1, 2, 2, dtype=torch.bool)
+    tracking = evaluate_tracking_variants(
+        scene_id="smoke",
+        clip_name="smoke",
+        frame_indices=(0,),
+        variant_masks={"raw_sam": tiny_masks},
+        variant_scores={"raw_sam": tiny_scores},
+        raw_variant="raw_sam",
+        track_ids=(11,),
+        track_prompts=("object",),
+        ground_truth=GroundTruthInstances(
+            masks=tiny_gt,
+            instance_ids=(7,),
+            labels=("object",),
+            all_visible_instance_ids=(7,),
+        ),
+        config=TrackingMetricConfig(),
+    )
+    map_result = evaluate_semantic_object_map(
+        scene_id="smoke",
+        clip_name="smoke",
+        variant="smoke",
+        map_policy="smoke",
+        aligned_world_points=points,
+        target_world_points=points.clone(),
+        confidence=torch.ones(1, 2, 2),
+        predicted_masks=tiny_masks,
+        track_scores=tiny_scores,
+        gt_masks=tiny_gt,
+        gt_instance_ids=(7,),
+        gt_labels=("object",),
+        assignments=tracking["assignments"],
+        track_ids=(11,),
+        config=SemanticMapMetricConfig(
+            max_points_per_object=16,
+            distance_chunk_size=16,
+        ),
+    )
+    assert float(map_result["summary"]["voxel_iou_5cm"]) == 1.0
+    assert float(map_result["summary"]["fscore_5cm"]) == 1.0
+    assert float(map_result["summary"]["ghost_point_ratio"]) == 0.0
     print(
         "DINOv3 object-conditioned geometry smoke passed "
         f"features={tuple(features.shape)} output={tuple(output.correction.shape)}"

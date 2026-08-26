@@ -52,15 +52,22 @@ from streaming_couping.src.learned_pose.cache import cache_path, load_feature_ca
 from streaming_couping.src.learned_pose.config import ClipConfig, LearnedPoseConfig, load_learned_pose_config
 from streaming_couping.src.semantic_map import normalize_confidence
 from streaming_couping.src.semantic_map_metrics import (
+    SemanticMapMetricConfig,
     deterministic_limit_pairs,
     deterministic_limit_points,
+    evaluate_semantic_object_map,
     load_ground_truth_stream_masks,
     object_point_metrics,
 )
-from streaming_couping.src.semantic_tracking_metrics import load_ground_truth_instances
+from streaming_couping.src.semantic_tracking_metrics import (
+    GroundTruthInstances,
+    TrackingMetricConfig,
+    evaluate_tracking_variants,
+    load_ground_truth_instances,
+)
 
 
-REVISION = "dinov3_object_conditioned_geometry_cross_scene_r1"
+REVISION = "dinov3_object_conditioned_geometry_cross_scene_r2"
 BRANCHES = (
     "raw",
     "geometry_only",
@@ -86,7 +93,11 @@ class ClipData:
     target_native: torch.Tensor
     target_metric: torch.Tensor
     support: torch.Tensor
+    confidence: torch.Tensor
     masks: torch.Tensor
+    scores: torch.Tensor
+    track_ids: tuple[int, ...]
+    track_prompts: tuple[str, ...]
     single_features: torch.Tensor
     single_valid: torch.Tensor
     persistent_features: torch.Tensor
@@ -105,6 +116,14 @@ class ClipData:
 class Example:
     clip_index: int
     frame_index: int
+
+
+@dataclass
+class GroundTruthBundle:
+    """GT masks used only for validation/test scoring, never runtime input."""
+
+    instances: GroundTruthInstances
+    stream_masks: torch.Tensor
 
 
 def main() -> None:
@@ -170,6 +189,13 @@ def main() -> None:
             "No train/validation frames have enough valid SAM-object points: "
             f"train={len(train_examples)} validation={len(validation_examples)}."
         )
+    # Validation GT is permitted for checkpoint selection.  It is loaded
+    # before training so selection can use exactly the same GT-support object
+    # metric that will be reported after prediction is frozen.
+    validation_ground_truth = {
+        data.name: _load_ground_truth_bundle(data)
+        for data in validation_data
+    }
     print(
         f"loaded train_frames={len(train_examples)} validation_frames={len(validation_examples)} "
         f"feature_channels={all_loaded[0].features.shape[-1]} "
@@ -195,7 +221,7 @@ def main() -> None:
             train_data=train_data,
             train_examples=train_examples,
             validation_data=validation_data,
-            validation_examples=validation_examples,
+            validation_ground_truth=validation_ground_truth,
             device=device,
             args=args,
         )
@@ -208,8 +234,8 @@ def main() -> None:
         selections[branch] = selection
         print(
             f"    selected epoch={selection['best_epoch'] + 1} "
-            f"val_object_rmse={selection['best_validation_rmse']:.6f} "
-            f"val_object_p90={selection['best_validation_p90']:.6f}"
+            f"val_gt_object_rmse={selection['best_validation_gt_object_rmse']:.6f} "
+            f"val_gt_object_p90={selection['best_validation_gt_object_p90']:.6f}"
         )
         del model
         gc.collect()
@@ -223,7 +249,10 @@ def main() -> None:
         "feature_dir": str(feature_dir),
         "model": model_spec,
         "branches": states,
-        "checkpoint_selection": "validation_object_support_rmse_then_p90",
+        "checkpoint_selection": "validation_gt_object_support_paired_rmse_then_p90",
+        "checkpoint_selection_metric": (
+            "mean_per_object_paired_rmse_m_then_mean_per_object_p90_m"
+        ),
         "test_metrics_read_during_selection": 0,
         "backbone_parameters_updated": 0,
         "point_head_parameters_updated": 0,
@@ -241,10 +270,14 @@ def main() -> None:
         for clip in test_clips
     ]
     _validate_model_compatibility((*validation_data, *test_data))
+    test_ground_truth = {
+        data.name: _load_ground_truth_bundle(data) for data in test_data
+    }
 
     metric_rows: list[dict[str, Any]] = []
     object_rows: list[dict[str, Any]] = []
     frame_rows: list[dict[str, Any]] = []
+    map_metric_rows: list[dict[str, Any]] = []
     for split, split_data in (
         ("validation", validation_data),
         ("test", test_data),
@@ -257,11 +290,15 @@ def main() -> None:
                 device=device,
                 args=args,
                 split=split,
+                ground_truth=(
+                    validation_ground_truth if split == "validation" else test_ground_truth
+                )[data.name],
                 output_dir=output_dir,
             )
             metric_rows.extend(result["metrics"])
             object_rows.extend(result["objects"])
             frame_rows.extend(result["frames"])
+            map_metric_rows.extend(result["map_metrics"])
             _print_clip_metrics(result, split)
 
     summary = _build_summary(
@@ -272,6 +309,7 @@ def main() -> None:
         metric_rows=metric_rows,
         object_rows=object_rows,
         frame_rows=frame_rows,
+        map_metric_rows=map_metric_rows,
         train_clips=train_clips,
         validation_clips=validation_clips,
         test_clips=test_clips,
@@ -279,6 +317,7 @@ def main() -> None:
     _write_json(output_dir / "summary.json", summary)
     _write_csv(output_dir / "training_curve.csv", training_rows)
     _write_csv(output_dir / "branch_summary.csv", metric_rows)
+    _write_csv(output_dir / "semantic_map_metrics.csv", map_metric_rows)
     _write_csv(output_dir / "object_metrics.csv", object_rows)
     _write_csv(output_dir / "frame_metrics.csv", frame_rows)
     _write_copyable(output_dir / "copyable_result.txt", summary)
@@ -337,10 +376,31 @@ def _load_clip_data(
         confidence = confidence[..., 0]
     if tuple(confidence.shape) != tuple(raw_native.shape[:-1]):
         raise ValueError(f"Point confidence shape disagrees in {source}: {confidence.shape}")
-    masks = _load_raw_masks(payload, str(dino.get("raw_cache_variant", "sam31_online_forward")))
+    raw_cache_variant = str(
+        dino.get("raw_cache_variant", "sam31_online_forward")
+    )
+    masks = _load_raw_masks(payload, raw_cache_variant)
+    scores = _load_raw_scores(payload, raw_cache_variant)
+    track_ids = tuple(int(value) for value in torch.as_tensor(
+        payload["sam_track_ids"]
+    ).reshape(-1).tolist())
+    track_prompts = tuple(
+        str(value)
+        for value in dino.get("track_prompts", payload.get("sam_track_prompts", ()))
+    )
     if tuple(masks.shape[0:1] + masks.shape[2:]) != tuple(raw_native.shape[:-1]):
         raise ValueError(
             f"SAM mask/pointmap shape mismatch in {source}: masks={masks.shape} raw={raw_native.shape}"
+        )
+    if tuple(scores.shape) != tuple(masks.shape[:2]):
+        raise ValueError(
+            f"SAM score/mask shape mismatch in {source}: scores={scores.shape} masks={masks.shape}"
+        )
+    if len(track_ids) != int(masks.shape[1]) or len(track_prompts) != int(masks.shape[1]):
+        raise ValueError(
+            "SAM track metadata does not match object mask slots in "
+            f"{source}: ids={len(track_ids)} prompts={len(track_prompts)} "
+            f"slots={masks.shape[1]}"
         )
     single = _tensor_3d(dino, "single_features", dino_path)
     persistent = _tensor_3d(dino, "persistent_features", dino_path)
@@ -384,7 +444,11 @@ def _load_clip_data(
         target_native=target_native,
         target_metric=target_metric,
         support=support,
+        confidence=confidence,
         masks=masks,
+        scores=scores,
+        track_ids=track_ids,
+        track_prompts=track_prompts,
         single_features=single,
         single_valid=single_valid,
         persistent_features=persistent,
@@ -408,6 +472,38 @@ def _load_raw_masks(payload: Mapping[str, Any], variant: str) -> torch.Tensor:
     if fallback is None:
         raise ValueError("Frozen cache lacks tracking masks for DINO geometry.")
     return torch.as_tensor(fallback).bool().cpu()
+
+
+def _load_raw_scores(payload: Mapping[str, Any], variant: str) -> torch.Tensor:
+    variants = payload.get("tracking_variant_scores")
+    if isinstance(variants, Mapping) and variant in variants:
+        return torch.as_tensor(variants[variant]).float().cpu()
+    fallback = payload.get("tracking_scores")
+    if fallback is None:
+        raise ValueError("Frozen cache lacks tracking scores for map evaluation.")
+    return torch.as_tensor(fallback).float().cpu()
+
+
+def _load_ground_truth_bundle(data: ClipData) -> GroundTruthBundle:
+    """Load GT masks for offline validation/evaluation only."""
+
+    instances = load_ground_truth_instances(
+        data.manifest,
+        scene_id=data.scene_id,
+        frame_indices=data.frame_indices,
+        output_size=data.image_size,
+        prompts=data.prompts,
+        prompt_label_aliases=None,
+    )
+    stream_masks = load_ground_truth_stream_masks(
+        data.manifest,
+        scene_id=data.scene_id,
+        frame_indices=data.frame_indices,
+        instance_ids=instances.instance_ids,
+        processed_size=data.image_size,
+        image_mode=data.image_mode,
+    )
+    return GroundTruthBundle(instances=instances, stream_masks=stream_masks)
 
 
 def _tensor_3d(payload: Mapping[str, Any], key: str, path: Path) -> torch.Tensor:
@@ -477,7 +573,7 @@ def _train_branch(
     train_data: Sequence[ClipData],
     train_examples: Sequence[Example],
     validation_data: Sequence[ClipData],
-    validation_examples: Sequence[Example],
+    validation_ground_truth: Mapping[str, GroundTruthBundle],
     device: torch.device,
     args: argparse.Namespace,
 ) -> tuple[list[dict[str, Any]], dict[str, torch.Tensor], dict[str, Any]]:
@@ -537,11 +633,14 @@ def _train_branch(
             model,
             branch=branch,
             data=validation_data,
-            examples=validation_examples,
+            ground_truth=validation_ground_truth,
             device=device,
-            maximum_points=int(args.maximum_points_per_frame),
+            maximum_points=int(args.maximum_object_points),
         )
-        score = (validation["object_rmse"], validation["object_p90"])
+        score = (
+            validation["gt_object_rmse"],
+            validation["gt_object_p90"],
+        )
         selected = int(best_score is None or score < best_score)
         if selected:
             best_score = score
@@ -558,9 +657,11 @@ def _train_branch(
                 "mean_loss": _mean_or_nan(losses),
                 "mean_point_loss": _mean_or_nan(point_losses),
                 "max_gradient_norm": max_gradient,
-                "validation_object_rmse": validation["object_rmse"],
-                "validation_object_median": validation["object_median"],
-                "validation_object_p90": validation["object_p90"],
+                "validation_gt_object_rmse": validation["gt_object_rmse"],
+                "validation_gt_object_median": validation["gt_object_median"],
+                "validation_gt_object_p90": validation["gt_object_p90"],
+                "validation_sam_support_rmse": validation["sam_support_rmse"],
+                "validation_sam_support_p90": validation["sam_support_p90"],
                 "selected_as_best": selected,
             }
         )
@@ -568,7 +669,7 @@ def _train_branch(
             print(
                 f"    epoch={epoch + 1}/{args.epochs} updates={updates} "
                 f"loss={rows[-1]['mean_loss']:.6f} "
-                f"val_rmse={validation['object_rmse']:.6f}"
+                f"val_gt_object_rmse={validation['gt_object_rmse']:.6f}"
             )
     if best_state is None or best_score is None:
         raise RuntimeError(f"No validation checkpoint selected for {branch}.")
@@ -576,14 +677,32 @@ def _train_branch(
         rows,
         best_state,
         {
-            "rule": "minimum_validation_object_support_rmse_then_p90",
+            "rule": "minimum_validation_gt_object_support_paired_rmse_then_p90",
             "best_epoch": best_epoch,
-            "best_validation_rmse": best_score[0],
-            "best_validation_p90": best_score[1],
+            "best_validation_gt_object_rmse": best_score[0],
+            "best_validation_gt_object_p90": best_score[1],
             "epochs_evaluated": int(args.epochs),
             "test_metrics_read_during_selection": 0,
         },
     )
+
+
+@torch.inference_mode()
+def _predict_clip_native(
+    model: ObjectConditionedResidualHead,
+    data: ClipData,
+    branch: str,
+    device: torch.device,
+) -> torch.Tensor:
+    """Run one frozen-cache clip through a learned branch in native gauge."""
+
+    predictions: list[torch.Tensor] = []
+    for frame_index in range(len(data.frame_indices)):
+        output, raw, _, _ = _forward_example(
+            model, data, frame_index, branch, device
+        )
+        predictions.append((raw + output.correction).cpu()[0])
+    return torch.stack(predictions)
 
 
 @torch.inference_mode()
@@ -592,41 +711,78 @@ def _quick_metrics(
     *,
     branch: str,
     data: Sequence[ClipData],
-    examples: Sequence[Example],
+    ground_truth: Mapping[str, GroundTruthBundle],
     device: torch.device,
     maximum_points: int,
 ) -> dict[str, float]:
+    """Compute checkpoint metrics on the exact final GT object support.
+
+    The previous selector used ``SAM mask ∩ geometry support`` while the
+    final evaluator used ``GT object mask ∩ geometry support``.  That allowed
+    an epoch to win on a different population of points from the one used in
+    the reported object metrics.  Validation GT is legal here; test GT is
+    still not opened until all checkpoints are frozen.
+    """
+
     model.eval()
-    errors: list[torch.Tensor] = []
-    for example in examples:
-        clip = data[example.clip_index]
-        output, raw, _, support = _forward_example(
-            model, clip, example.frame_index, branch, device
-        )
-        valid = support[0] & output.object_union[0]
-        if not bool(valid.any()):
-            continue
-        predicted_metric = apply_similarity(
-            raw + output.correction,
+    gt_rmses: list[float] = []
+    gt_medians: list[float] = []
+    gt_p90s: list[float] = []
+    sam_errors: list[torch.Tensor] = []
+    for clip in data:
+        bundle = ground_truth[clip.name]
+        predicted = _predict_clip_native(model, clip, branch, device)
+        aligned = apply_similarity(
+            predicted,
             scale=clip.scale,
             rotation=clip.rotation,
             translation=clip.translation,
-        )[0].cpu()
-        target_metric = clip.target_metric[example.frame_index]
-        selected = _limited_indices(valid.cpu(), maximum_points)
-        error = torch.linalg.vector_norm(
-            predicted_metric.reshape(-1, 3).index_select(0, selected)
-            - target_metric.reshape(-1, 3).index_select(0, selected),
-            dim=-1,
         )
-        errors.append(error)
-    if not errors:
-        raise ValueError(f"Validation has no object support for branch={branch}.")
-    joined = torch.cat(errors)
+        for object_index in range(int(bundle.stream_masks.shape[1])):
+            object_support = bundle.stream_masks[:, object_index] & clip.support
+            paired_pred, paired_target = deterministic_limit_pairs(
+                aligned[object_support],
+                clip.target_metric[object_support],
+                int(maximum_points),
+            )
+            if not paired_pred.numel():
+                continue
+            error = torch.linalg.vector_norm(
+                paired_pred - paired_target, dim=-1
+            )
+            gt_rmses.append(_rmse(error))
+            gt_medians.append(float(error.median()))
+            gt_p90s.append(float(torch.quantile(error, 0.90)))
+
+        # Keep the old support definition as a diagnostic, but never use it
+        # to select a checkpoint.
+        object_union = clip.masks.any(dim=1)
+        for frame_index in range(len(clip.frame_indices)):
+            valid = clip.support[frame_index] & object_union[frame_index]
+            selected = _limited_indices(valid, maximum_points)
+            if not selected.numel():
+                continue
+            error = torch.linalg.vector_norm(
+                aligned[frame_index].reshape(-1, 3).index_select(0, selected)
+                - clip.target_metric[frame_index].reshape(-1, 3).index_select(
+                    0, selected
+                ),
+                dim=-1,
+            )
+            sam_errors.append(error)
+    if not gt_rmses:
+        raise ValueError(f"Validation has no GT object support for branch={branch}.")
+    joined_sam = torch.cat(sam_errors) if sam_errors else torch.empty(0)
     return {
-        "object_rmse": _rmse(joined),
-        "object_median": float(joined.median()),
-        "object_p90": float(torch.quantile(joined, 0.90)),
+        "gt_object_rmse": sum(gt_rmses) / len(gt_rmses),
+        "gt_object_median": sum(gt_medians) / len(gt_medians),
+        "gt_object_p90": sum(gt_p90s) / len(gt_p90s),
+        "sam_support_rmse": _rmse(joined_sam),
+        "sam_support_p90": (
+            float(torch.quantile(joined_sam, 0.90))
+            if joined_sam.numel()
+            else float("nan")
+        ),
     }
 
 
@@ -687,6 +843,7 @@ def _evaluate_clip(
     device: torch.device,
     args: argparse.Namespace,
     split: str,
+    ground_truth: GroundTruthBundle,
     output_dir: Path,
 ) -> dict[str, Any]:
     predictions: dict[str, torch.Tensor] = {
@@ -696,11 +853,7 @@ def _evaluate_clip(
         model = ObjectConditionedResidualHead(**dict(model_spec)).to(device)
         model.load_state_dict(states[branch]["state_dict"], strict=True)
         model.eval()
-        branch_predictions: list[torch.Tensor] = []
-        for index in range(len(data.frame_indices)):
-            output, raw, _, _ = _forward_example(model, data, index, branch, device)
-            branch_predictions.append((raw + output.correction).cpu()[0])
-        predictions[branch] = torch.stack(branch_predictions)
+        predictions[branch] = _predict_clip_native(model, data, branch, device)
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -714,25 +867,35 @@ def _evaluate_clip(
         ).float()
         for branch, points in predictions.items()
     }
-    gt_instances = load_ground_truth_instances(
-        data.manifest,
+    gt_instances = ground_truth.instances
+    gt_masks = ground_truth.stream_masks
+    tracking = evaluate_tracking_variants(
         scene_id=data.scene_id,
+        clip_name=data.name,
         frame_indices=data.frame_indices,
-        output_size=data.image_size,
-        prompts=data.prompts,
+        variant_masks={"raw_sam": data.masks},
+        variant_scores={"raw_sam": data.scores},
+        raw_variant="raw_sam",
+        track_ids=data.track_ids,
+        track_prompts=data.track_prompts,
+        ground_truth=gt_instances,
+        config=TrackingMetricConfig(),
         prompt_label_aliases=None,
     )
-    gt_masks = load_ground_truth_stream_masks(
-        data.manifest,
-        scene_id=data.scene_id,
-        frame_indices=data.frame_indices,
-        instance_ids=gt_instances.instance_ids,
-        processed_size=data.image_size,
-        image_mode=data.image_mode,
+    map_config = SemanticMapMetricConfig(
+        confidence_threshold=float(args.confidence_threshold),
+        track_score_threshold=0.50,
+        max_points_per_object=int(args.maximum_object_points),
+        distance_chunk_size=256,
+        fscore_thresholds_m=(0.05, 0.10),
+        voxel_size_m=0.05,
+        ghost_distance_m=0.10,
+        duplicate_voxel_iou=0.25,
     )
     metrics: list[dict[str, Any]] = []
     objects: list[dict[str, Any]] = []
     frames: list[dict[str, Any]] = []
+    map_metrics: list[dict[str, Any]] = []
     raw_object_lookup: dict[int, float] = {}
     for branch in BRANCHES:
         result = _score_predictions(
@@ -747,6 +910,31 @@ def _evaluate_clip(
         metrics.append(result["summary"])
         objects.extend(result["objects"])
         frames.extend(result["frames"])
+        map_result = evaluate_semantic_object_map(
+            scene_id=data.scene_id,
+            clip_name=data.name,
+            variant=branch,
+            map_policy="same_frozen_raw_sam_masks_corrected_pointmap",
+            aligned_world_points=aligned_predictions[branch],
+            target_world_points=data.target_metric,
+            confidence=data.confidence,
+            predicted_masks=data.masks,
+            track_scores=data.scores,
+            gt_masks=gt_masks,
+            gt_instance_ids=gt_instances.instance_ids,
+            gt_labels=gt_instances.labels,
+            assignments=tracking["assignments"],
+            map_write_mask=data.masks.flatten(2).any(dim=2),
+            track_ids=data.track_ids,
+            config=map_config,
+        )
+        map_summary = dict(map_result["summary"])
+        # The map evaluator calls this field ``variant``; the learned-branch
+        # summary uses ``branch``.  Keep both names so the per-clip printout
+        # and the cross-clip aggregation can consume the same row.
+        map_summary["branch"] = branch
+        map_summary["split"] = split
+        map_metrics.append(map_summary)
         if branch == "raw":
             raw_object_lookup = {
                 int(row["object_index"]): float(row["paired_rmse_m"])
@@ -782,6 +970,7 @@ def _evaluate_clip(
         "scene_id": data.scene_id,
         "split": split,
         "metrics": metrics,
+        "map_metrics": map_metrics,
         "objects": objects,
         "frames": frames,
     }
@@ -939,6 +1128,7 @@ def _build_summary(
     metric_rows: Sequence[Mapping[str, Any]],
     object_rows: Sequence[Mapping[str, Any]],
     frame_rows: Sequence[Mapping[str, Any]],
+    map_metric_rows: Sequence[Mapping[str, Any]],
     train_clips: Sequence[ClipConfig],
     validation_clips: Sequence[ClipConfig],
     test_clips: Sequence[ClipConfig],
@@ -947,6 +1137,11 @@ def _build_summary(
     for branch in BRANCHES:
         rows = [row for row in metric_rows if row["branch"] == branch]
         test_rows = [row for row in rows if row["split"] == "test"]
+        test_map_rows = [
+            row
+            for row in map_metric_rows
+            if row["branch"] == branch and row["split"] == "test"
+        ]
         aggregate[branch] = {
             "test_clips": len(test_rows),
             "test_global_rmse_m": _mean_field(test_rows, "global_rmse_m"),
@@ -956,6 +1151,12 @@ def _build_summary(
             "test_object_voxel_iou_5cm": _mean_field(test_rows, "object_voxel_iou_5cm"),
             "test_object_ghost_rate": _mean_field(test_rows, "object_ghost_rate"),
             "test_improved_objects": sum(int(row["improved_objects_vs_raw"]) for row in test_rows),
+            "test_map_voxel_iou_5cm": _mean_field(test_map_rows, "voxel_iou_5cm"),
+            "test_map_fscore_5cm": _mean_field(test_map_rows, "fscore_5cm"),
+            "test_map_ghost_rate": _mean_field(test_map_rows, "ghost_point_ratio"),
+            "test_map_object_recall_iou25": _mean_field(
+                test_map_rows, "object_recall_iou25"
+            ),
         }
     persistent = aggregate["persistent_dino"]
     single = aggregate["single_view_dino"]
@@ -968,11 +1169,48 @@ def _build_summary(
         persistent["test_object_paired_rmse_m"] < shuffled["test_object_paired_rmse_m"]
         and persistent["test_object_fscore_5cm"] >= shuffled["test_object_fscore_5cm"]
     )
+    persistent_better_geometry = (
+        persistent["test_object_paired_rmse_m"]
+        < aggregate["geometry_only"]["test_object_paired_rmse_m"]
+        and persistent["test_object_fscore_5cm"]
+        >= aggregate["geometry_only"]["test_object_fscore_5cm"]
+    )
+    persistent_map_not_worse_geometry = (
+        persistent["test_map_voxel_iou_5cm"]
+        >= aggregate["geometry_only"]["test_map_voxel_iou_5cm"]
+        and persistent["test_map_fscore_5cm"]
+        >= aggregate["geometry_only"]["test_map_fscore_5cm"]
+        and persistent["test_map_ghost_rate"]
+        <= aggregate["geometry_only"]["test_map_ghost_rate"]
+    )
+    geometry_beats_raw = (
+        aggregate["geometry_only"]["test_object_paired_rmse_m"]
+        < aggregate["raw"]["test_object_paired_rmse_m"]
+    )
     decision = {
+        "persistent_identity_signal": int(
+            persistent_better_single and persistent_better_shuffled
+        ),
         "persistent_better_than_single": int(persistent_better_single),
         "persistent_better_than_shuffled": int(persistent_better_shuffled),
-        "overall": "GO" if persistent_better_single and persistent_better_shuffled else "NO_GO",
-        "rule": "persistent object paired RMSE lower and object F-score not lower than both single-view and shuffled controls",
+        "persistent_better_than_geometry_only": int(persistent_better_geometry),
+        "persistent_map_not_worse_than_geometry_only": int(
+            persistent_map_not_worse_geometry
+        ),
+        "geometry_residual_beats_raw": int(geometry_beats_raw),
+        "overall": (
+            "GO"
+            if persistent_better_single
+            and persistent_better_shuffled
+            and persistent_better_geometry
+            and persistent_map_not_worse_geometry
+            else "NO_GO"
+        ),
+        "rule": (
+            "persistent must beat single-view and shuffled identity controls, "
+            "then beat geometry-only on object RMSE/F-score and not worsen "
+            "semantic-map voxelIoU/F-score/ghost"
+        ),
         "test_metrics_used_after_selection": 1,
     }
     return {
@@ -987,6 +1225,7 @@ def _build_summary(
         "test_scenes": [clip.scene_id for clip in test_clips],
         "checkpoint_selection": dict(selections),
         "metrics": list(metric_rows),
+        "semantic_map_metrics": list(map_metric_rows),
         "aggregate": aggregate,
         "decision": decision,
         "data_policy": {
@@ -1011,6 +1250,12 @@ def _print_clip_metrics(result: Mapping[str, Any], split: str) -> None:
             f"object_rmse={row['object_paired_rmse_m']:.5f} "
             f"object_fscore5={row['object_fscore_5cm']:.5f} "
             f"object_voxelIoU5={row['object_voxel_iou_5cm']:.5f}"
+        )
+    print("    semantic-map geometry-only readout uses the same frozen raw SAM masks")
+    for row in result["map_metrics"]:
+        print(
+            f"    map[{row['variant']}] voxelIoU5={row['voxel_iou_5cm']:.5f} "
+            f"F5cm={row['fscore_5cm']:.5f} ghost={row['ghost_point_ratio']:.5f}"
         )
 
 
@@ -1099,9 +1344,10 @@ def _write_copyable(path: Path, summary: Mapping[str, Any]) -> None:
         "residual_application=SAM_object_mask_union_only",
         "backbone_parameters_updated=0",
         "dinov3_parameters_updated=0",
+        "validation_selection=GT_object_support_paired_RMSE_then_mean_object_P90",
         "test_gt_read_during_checkpoint_selection=0",
         "",
-        "branch,test_object_paired_rmse_m,test_object_fscore_5cm,test_object_voxel_iou_5cm,test_object_ghost_rate",
+        "branch,test_object_paired_rmse_m,test_object_fscore_5cm,test_object_voxel_iou_5cm,test_object_ghost_rate,test_map_voxel_iou_5cm,test_map_fscore_5cm,test_map_ghost_rate",
     ]
     for branch in summary["branches"]:
         value = aggregate[branch]
@@ -1113,6 +1359,9 @@ def _write_copyable(path: Path, summary: Mapping[str, Any]) -> None:
                     str(value["test_object_fscore_5cm"]),
                     str(value["test_object_voxel_iou_5cm"]),
                     str(value["test_object_ghost_rate"]),
+                    str(value["test_map_voxel_iou_5cm"]),
+                    str(value["test_map_fscore_5cm"]),
+                    str(value["test_map_ghost_rate"]),
                 ]
             )
         )
@@ -1122,6 +1371,7 @@ def _write_copyable(path: Path, summary: Mapping[str, Any]) -> None:
             "decision=" + json.dumps(summary["decision"], sort_keys=True),
             f"summary={path.with_name('summary.json')}",
             f"models={path.with_name('models.pt')}",
+            f"semantic_map_metrics={path.with_name('semantic_map_metrics.csv')}",
             "===== COPYABLE_DINOV3_OBJECT_CONDITIONED_GEOMETRY_END =====",
         )
     )
