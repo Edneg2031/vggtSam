@@ -1,0 +1,34 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# One-command analysis of the already-frozen DINOv3 residual experiment.
+# This command does not train or rerun any model.
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+PROTOCOL="$STORAGE_ROOT/outputs/streaming_couping_multiclip/protocol.yaml"
+FEATURE_DIR="$STORAGE_ROOT/outputs/streaming_couping_dinov3_object_features"
+MODEL_PATH="$STORAGE_ROOT/outputs/streaming_couping_dinov3_object_geometry/models.pt"
+OUTPUT_DIR="$STORAGE_ROOT/outputs/streaming_couping_dinov3_residual_calibration"
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+[[ -s "$PROTOCOL" ]] || {
+  echo "missing frozen protocol: $PROTOCOL" >&2
+  echo "run the existing multi-scene setup command first" >&2
+  exit 1
+}
+[[ -d "$FEATURE_DIR" ]] || { echo "missing DINO cache: $FEATURE_DIR" >&2; exit 1; }
+[[ -s "$MODEL_PATH" ]] || {
+  echo "missing frozen geometry model: $MODEL_PATH" >&2
+  echo "run zsh streaming_couping/commands_run_dinov3_object_geometry.txt first" >&2
+  exit 1
+}
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+
+CUDA_VISIBLE_DEVICES=3 \
+  PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT" \
+  "$PYTHON_BIN" -m streaming_couping.scripts.analyze_dinov3_residual_calibration \
+  --device cuda:0
+
+echo "DINOv3 residual calibration output=$OUTPUT_DIR"

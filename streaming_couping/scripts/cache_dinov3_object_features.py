@@ -73,6 +73,7 @@ def main() -> None:
             raise ValueError(f"Image/mask frame count mismatch for {clip.name}.")
         single_rows: list[torch.Tensor] = []
         valid_rows: list[torch.Tensor] = []
+        dense_rows: list[torch.Tensor] = []
         metadata: dict[str, Any] | None = None
         for start in range(0, int(images.shape[0]), max(1, int(args.batch_size))):
             stop = min(int(images.shape[0]), start + max(1, int(args.batch_size)))
@@ -84,9 +85,14 @@ def main() -> None:
             )
             single_rows.append(pooled.cpu())
             valid_rows.append(valid.cpu())
+            # Keep the dense grid for the patch-correspondence diagnostic.
+            # fp16 is sufficient for cosine retrieval and keeps the cache
+            # substantially smaller than a float32 copy.
+            dense_rows.append(dense.to(torch.float16).cpu())
             metadata = current_meta
         single = torch.cat(single_rows, dim=0)
         valid = torch.cat(valid_rows, dim=0)
+        dense_features = torch.cat(dense_rows, dim=0)
         track_ids = torch.as_tensor(payload["sam_track_ids"], dtype=torch.long)
         persistent, persistent_valid = aggregate_persistent_features(
             single,
@@ -101,8 +107,8 @@ def main() -> None:
             seed=int(args.shuffle_seed),
         )
         result = {
-            "schema": 1,
-            "revision": "dinov3_persistent_object_feature_cache_r1",
+            "schema": 2,
+            "revision": "dinov3_persistent_object_feature_cache_r2_dense",
             "clip": clip.name,
             "scene_id": str(payload["scene_id"]),
             "frame_indices": list(payload["frame_indices"]),
@@ -110,6 +116,9 @@ def main() -> None:
             "raw_cache_variant": str(args.raw_cache_variant),
             "checkpoint": str(checkpoint),
             "feature_dim": int(single.shape[-1]),
+            "dense_features": dense_features,
+            "dense_feature_shape": list(dense_features.shape[1:]),
+            "dense_feature_dtype": "float16",
             "ema_beta": float(args.ema_beta),
             "track_ids": track_ids,
             "track_prompts": list(payload["sam_track_prompts"]),
