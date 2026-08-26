@@ -7,6 +7,8 @@ import torch
 
 from streaming_couping.src.dinov3_object_geometry import (
     ObjectConditionedResidualHead,
+    WorldSpaceGateConfig,
+    apply_world_space_consistency_gate,
 )
 from streaming_couping.src.semantic_map_metrics import (
     SemanticMapMetricConfig,
@@ -75,6 +77,39 @@ def main() -> None:
         object_features=None,
     )
     assert tuple(geometry_only.correction.shape) == (1, 4, 6, 3)
+
+    # V2.4 must accept a small, temporally consistent correction and fall
+    # back to raw geometry when a later observation makes a large jump.
+    raw_points = torch.tensor(
+        [
+            [
+                [[0.0, 0.0, 1.0], [0.1, 0.0, 1.0]],
+                [[0.0, 0.1, 1.0], [0.1, 0.1, 1.0]],
+            ],
+            [
+                [[0.0, 0.0, 1.0], [0.1, 0.0, 1.0]],
+                [[0.0, 0.1, 1.0], [0.1, 0.1, 1.0]],
+            ],
+        ]
+    )
+    candidate_points = raw_points.clone()
+    candidate_points[0, ..., 2] += 0.01
+    candidate_points[1, ..., 2] += 0.50
+    gate = apply_world_space_consistency_gate(
+        raw_points,
+        candidate_points,
+        object_masks=torch.ones(2, 1, 2, 2, dtype=torch.bool),
+        point_confidence=torch.ones(2, 2, 2),
+        track_scores=torch.ones(2, 1),
+        config=WorldSpaceGateConfig(
+            min_points=2,
+            max_correction_m=0.05,
+            memory_momentum=0.80,
+        ),
+    )
+    assert gate.object_gate.tolist() == [[True], [False]]
+    assert float((gate.points[0] - candidate_points[0]).abs().max()) == 0.0
+    assert float((gate.points[1] - raw_points[1]).abs().max()) == 0.0
 
     # Exercise the actual semantic-map readout with a tiny perfect synthetic
     # object.  This guards the newly added corrected-pointmap evaluator before
