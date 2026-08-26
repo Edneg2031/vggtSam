@@ -82,6 +82,7 @@ class PatchRecord:
     frame: int
     slot: int
     track_id: int
+    identity_key: tuple[int, int]
     patch_y: int
     patch_x: int
     pixel_y: int
@@ -302,45 +303,41 @@ def _generate_clip_matches(
         raise ValueError(
             f"Track-id count {len(track_ids)} does not match mask slots {slot_count}."
         )
-    if len(set(track_ids)) != len(track_ids):
-        raise ValueError(
-            "Persistent track IDs must be unique within a clip for the same-track "
-            f"retrieval diagnostic; got {track_ids}."
-        )
+    identity_keys = _persistent_identity_keys(track_ids)
 
     generated_matches: dict[str, list[PatchMatch]] = {
         mode: [] for mode in MODES
     }
-    history_by_track: dict[int, list[PatchRecord]] = {
-        track_id: [] for track_id in track_ids
+    history_by_identity: dict[tuple[int, int], list[PatchRecord]] = {
+        identity_key: [] for identity_key in identity_keys
     }
     history_all: list[PatchRecord] = []
-    shuffled_track_for_track = {
-        track_ids[index]: track_ids[(index + 1) % slot_count]
+    shuffled_identity_for_identity = {
+        identity_keys[index]: identity_keys[(index + 1) % slot_count]
         for index in range(slot_count)
     }
     rng = torch.Generator(device="cpu").manual_seed(int(seed))
 
     for frame in range(int(data.raw_native.shape[0])):
         current = list(frame_records.get(frame, ()))
-        current_by_track: dict[int, list[PatchRecord]] = defaultdict(list)
+        current_by_identity: dict[tuple[int, int], list[PatchRecord]] = defaultdict(list)
         for query in current:
-            current_by_track[int(query.track_id)].append(query)
+            current_by_identity[query.identity_key].append(query)
 
-        for track_id, queries in sorted(current_by_track.items()):
+        for identity_key, queries in sorted(current_by_identity.items()):
             correct = _dino_matches(
                 queries,
-                history_by_track.get(track_id, ()),
+                history_by_identity.get(identity_key, ()),
                 device=device,
                 top_k=max(TOP_K_VALUES),
                 mutual_nearest=mutual_nearest,
             )
             _extend_match_dict(generated_matches["correct_track_dino"], correct)
 
-            shuffled_track = shuffled_track_for_track[track_id]
+            shuffled_identity = shuffled_identity_for_identity[identity_key]
             shuffled = _dino_matches(
                 queries,
-                history_by_track.get(shuffled_track, ()),
+                history_by_identity.get(shuffled_identity, ()),
                 device=device,
                 top_k=1,
                 mutual_nearest=mutual_nearest,
@@ -349,7 +346,7 @@ def _generate_clip_matches(
 
             random_matches = _random_matches(
                 queries,
-                history_by_track.get(track_id, ()),
+                history_by_identity.get(identity_key, ()),
                 generator=rng,
                 top_k=max(TOP_K_VALUES),
             )
@@ -367,10 +364,35 @@ def _generate_clip_matches(
         # The update happens only after all current queries have been matched,
         # so no mode can retrieve another patch from the current frame.
         for query in current:
-            history_by_track.setdefault(int(query.track_id), []).append(query)
+            history_by_identity.setdefault(query.identity_key, []).append(query)
             history_all.append(query)
 
     return generated_matches
+
+
+def _persistent_identity_keys(
+    track_ids: Sequence[int],
+) -> tuple[tuple[int, int], ...]:
+    """Make safe history keys while preserving valid SAM persistent IDs.
+
+    ``-1`` denotes an empty SAM slot, and malformed caches can contain a
+    duplicate ID.  Neither case is allowed to merge unrelated histories.  A
+    unique non-negative ID gets key ``(0, track_id)``; invalid or duplicate
+    IDs get a slot-local fallback key ``(1, slot)``.
+    """
+
+    counts: dict[int, int] = defaultdict(int)
+    for track_id in track_ids:
+        if int(track_id) >= 0:
+            counts[int(track_id)] += 1
+    keys: list[tuple[int, int]] = []
+    for slot, track_id in enumerate(track_ids):
+        track_id = int(track_id)
+        if track_id >= 0 and counts[track_id] == 1:
+            keys.append((0, track_id))
+        else:
+            keys.append((1, int(slot)))
+    return tuple(keys)
 
 
 def _hide_evaluation_targets(data: Any) -> None:
@@ -610,6 +632,7 @@ def _build_patch_records(
     track_ids = tuple(int(value) for value in data.track_ids)
     if len(track_ids) != int(data.masks.shape[1]):
         raise ValueError("DINO patch records cannot resolve SAM track IDs.")
+    identity_keys = _persistent_identity_keys(track_ids)
     all_records: list[PatchRecord] = []
     frame_records: dict[int, list[PatchRecord]] = defaultdict(list)
     for frame in range(sequence):
@@ -638,6 +661,7 @@ def _build_patch_records(
                     frame=frame,
                     slot=slot,
                     track_id=track_ids[slot],
+                    identity_key=identity_keys[slot],
                     patch_y=patch_y,
                     patch_x=patch_x,
                     pixel_y=y,
@@ -1568,9 +1592,35 @@ def _aggregate_points(points: Sequence[torch.Tensor]) -> torch.Tensor:
     return torch.stack([value.detach().float().cpu() for value in points]).median(dim=0).values
 
 
-def _patch_centres(patch_count: int, pixel_count: int) -> torch.Tensor:
+def _patch_centres(
+    patch_count: int,
+    pixel_count: int,
+    *,
+    resized_count: int | None = None,
+) -> torch.Tensor:
+    """Map DINO patch centers back to the StreamVGGT pixel grid.
+
+    DINO rounds each image dimension to a multiple of its patch size before
+    encoding.  Using that rounded dimension avoids a one-pixel drift when the
+    StreamVGGT grid is not itself divisible by the DINO patch size.
+    """
+
+    if int(patch_count) <= 0 or int(pixel_count) <= 0:
+        raise ValueError(
+            f"patch_count and pixel_count must be positive, got {patch_count}, {pixel_count}"
+        )
+    resized = int(resized_count) if resized_count is not None else int(pixel_count)
+    if resized <= 0:
+        raise ValueError(f"resized_count must be positive, got {resized_count}")
     return (
-        ((torch.arange(patch_count).float() + 0.5) * float(pixel_count) / float(patch_count) - 0.5)
+        (
+            (torch.arange(patch_count).float() + 0.5)
+            * float(resized)
+            / float(patch_count)
+            * float(pixel_count)
+            / float(resized)
+            - 0.5
+        )
         .round()
         .long()
         .clamp(0, pixel_count - 1)
