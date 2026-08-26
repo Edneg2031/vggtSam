@@ -8,6 +8,7 @@ import torch
 from streaming_couping.src.dinov3_object_geometry import (
     ObjectConditionedResidualHead,
     WorldSpaceGateConfig,
+    apply_soft_world_space_consistency_gate,
     apply_world_space_consistency_gate,
 )
 from streaming_couping.src.semantic_map_metrics import (
@@ -110,6 +111,24 @@ def main() -> None:
     assert gate.object_gate.tolist() == [[True], [False]]
     assert float((gate.points[0] - candidate_points[0]).abs().max()) == 0.0
     assert float((gate.points[1] - raw_points[1]).abs().max()) == 0.0
+
+    soft_gate = apply_soft_world_space_consistency_gate(
+        raw_points,
+        candidate_points,
+        object_masks=torch.ones(2, 1, 2, 2, dtype=torch.bool),
+        point_confidence=torch.ones(2, 2, 2),
+        track_scores=torch.ones(2, 1),
+        config=WorldSpaceGateConfig(
+            min_points=2,
+            max_correction_m=0.05,
+            memory_momentum=0.80,
+        ),
+    )
+    assert 0.0 < float(soft_gate.pixel_weight[0].mean()) < 1.0
+    assert float(soft_gate.pixel_weight[1].mean()) < float(
+        soft_gate.pixel_weight[0].mean()
+    )
+    assert float((soft_gate.points[1] - raw_points[1]).abs().max()) < 0.50
 
     # Exercise the actual semantic-map readout with a tiny perfect synthetic
     # object.  This guards the newly added corrected-pointmap evaluator before

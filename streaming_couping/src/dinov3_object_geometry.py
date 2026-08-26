@@ -10,6 +10,7 @@ object masks; all background pixels remain an exact raw-pointmap fallback.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Mapping, Sequence
 
 import torch
@@ -52,6 +53,7 @@ class WorldSpaceGateOutput:
     points: torch.Tensor
     object_gate: torch.Tensor
     pixel_gate: torch.Tensor
+    pixel_weight: torch.Tensor
     stats: Mapping[str, Any]
 
 
@@ -523,6 +525,7 @@ def apply_world_space_consistency_gate(
         points=gated,
         object_gate=object_gate,
         pixel_gate=pixel_gate,
+        pixel_weight=pixel_gate.float(),
         stats=stats,
     )
 
@@ -531,6 +534,208 @@ def accepted_object_observations_ratio(*, accepted: int, observed: int) -> float
     """Return an object-level gate acceptance ratio with safe empty handling."""
 
     return float(accepted) / max(1, int(observed))
+
+
+def apply_soft_world_space_consistency_gate(
+    raw_points: torch.Tensor,
+    candidate_points: torch.Tensor,
+    *,
+    object_masks: torch.Tensor,
+    point_confidence: torch.Tensor,
+    track_scores: torch.Tensor | None = None,
+    config: WorldSpaceGateConfig = WorldSpaceGateConfig(),
+) -> WorldSpaceGateOutput:
+    """Apply a continuous causal trust weight to residual corrections.
+
+    The hard V2.4 gate is useful as a safety diagnostic, but it can discard an
+    entire object whenever one observation has a large residual.  This soft
+    variant keeps the same causal world-space memory and computes
+
+    ``X = X_raw + w_residual * w_memory * (X_candidate - X_raw)``.
+
+    Large corrections are attenuated exponentially and a candidate that is
+    less consistent with the previous object state receives a lower object
+    weight.  No candidate is allowed outside the SAM/confidence support, and
+    the memory is updated with the blended observation rather than the full
+    untrusted candidate.
+    """
+
+    _validate_world_space_gate_config(config)
+    raw = raw_points.detach().float()
+    candidate = candidate_points.detach().float()
+    masks = object_masks.detach().bool().to(raw.device)
+    confidence = point_confidence.detach().float().to(raw.device)
+    if track_scores is None:
+        scores = torch.ones(
+            masks.shape[:2],
+            dtype=torch.float32,
+            device=raw.device,
+        )
+    else:
+        scores = track_scores.detach().float().to(raw.device)
+    if raw.ndim != 4 or raw.shape[-1] != 3:
+        raise ValueError("raw_points must have shape [S,H,W,3].")
+    if tuple(candidate.shape) != tuple(raw.shape):
+        raise ValueError("raw_points and candidate_points must have the same shape.")
+    sequence, height, width = (int(value) for value in raw.shape[:3])
+    if masks.ndim != 4 or tuple(masks.shape[0:1] + masks.shape[2:]) != (
+        sequence,
+        height,
+        width,
+    ):
+        raise ValueError("object_masks must have shape [S,K,H,W] matching points.")
+    tracks = int(masks.shape[1])
+    if tuple(confidence.shape) != (sequence, height, width):
+        raise ValueError("point_confidence must have shape [S,H,W].")
+    if tuple(scores.shape) != (sequence, tracks):
+        raise ValueError("track_scores must have shape [S,K].")
+
+    gated = raw.clone()
+    object_gate = torch.zeros(
+        sequence,
+        tracks,
+        dtype=torch.bool,
+        device=raw.device,
+    )
+    pixel_gate = torch.zeros(
+        sequence,
+        height,
+        width,
+        dtype=torch.bool,
+        device=raw.device,
+    )
+    pixel_weight = torch.zeros(
+        sequence,
+        height,
+        width,
+        dtype=raw.dtype,
+        device=raw.device,
+    )
+    memory_centroids: list[torch.Tensor | None] = [None] * tracks
+    memory_extents: list[torch.Tensor | None] = [None] * tracks
+    memory_counts = [0] * tracks
+    reason_counts: dict[str, int] = {}
+    valid_points = 0
+    weighted_points = 0.0
+    observed_object_observations = 0
+    object_weight_sum = 0.0
+
+    for frame in range(sequence):
+        finite_raw = torch.isfinite(raw[frame]).all(dim=-1)
+        finite_candidate = torch.isfinite(candidate[frame]).all(dim=-1)
+        finite_confidence = torch.isfinite(confidence[frame])
+        for slot in range(tracks):
+            valid = (
+                masks[frame, slot]
+                & finite_raw
+                & finite_candidate
+                & finite_confidence
+                & (confidence[frame] >= float(config.confidence_threshold))
+                & (scores[frame, slot] >= float(config.track_score_threshold))
+            )
+            count = int(valid.sum().item())
+            valid_points += count
+            if count < int(config.min_points):
+                _increment_reason(reason_counts, "insufficient_points")
+                continue
+            observed_object_observations += 1
+
+            raw_object = raw[frame][valid]
+            candidate_object = candidate[frame][valid]
+            correction = torch.linalg.vector_norm(
+                candidate_object - raw_object,
+                dim=-1,
+            )
+            residual_weight = torch.exp(
+                -correction / float(config.max_correction_m)
+            ).clamp(0.0, 1.0)
+            memory_weight = 1.0
+            if memory_centroids[slot] is not None:
+                raw_centroid, raw_extent = _robust_object_summary(raw_object)
+                candidate_centroid, candidate_extent = _robust_object_summary(
+                    candidate_object
+                )
+                raw_cost = _world_space_consistency_cost(
+                    raw_centroid,
+                    raw_extent,
+                    memory_centroids[slot],
+                    memory_extents[slot],
+                    config,
+                )
+                candidate_cost = _world_space_consistency_cost(
+                    candidate_centroid,
+                    candidate_extent,
+                    memory_centroids[slot],
+                    memory_extents[slot],
+                    config,
+                )
+                excess = max(
+                    0.0,
+                    float(candidate_cost.item())
+                    - float(raw_cost.item())
+                    - float(config.consistency_margin_m),
+                )
+                memory_temperature = max(
+                    float(config.consistency_margin_m),
+                    0.01,
+                )
+                memory_weight = math.exp(-excess / memory_temperature)
+
+            weights = residual_weight * float(memory_weight)
+            blended_object = raw_object + weights.unsqueeze(-1) * (
+                candidate_object - raw_object
+            )
+            gated[frame][valid] = blended_object
+            pixel_weight[frame][valid] = weights
+            pixel_gate[frame][valid] = weights > 0.01
+            mean_weight = float(weights.mean().item())
+            object_weight_sum += mean_weight
+            weighted_points += float(weights.sum().item())
+            if mean_weight >= 0.50:
+                object_gate[frame, slot] = True
+                _increment_reason(reason_counts, "high_trust")
+            elif mean_weight > 0.01:
+                _increment_reason(reason_counts, "attenuated")
+            else:
+                _increment_reason(reason_counts, "suppressed")
+
+            blended_centroid, blended_extent = _robust_object_summary(blended_object)
+            memory_centroids[slot], memory_extents[slot] = _update_world_memory(
+                memory_centroids[slot],
+                memory_extents[slot],
+                blended_centroid,
+                blended_extent,
+                momentum=float(config.memory_momentum),
+            )
+            memory_counts[slot] += 1
+
+    stats = {
+        "sequence": sequence,
+        "tracks": tracks,
+        "accepted_object_observations": int(object_gate.sum().item()),
+        "total_object_observations": int(sequence * tracks),
+        "observed_object_observations": int(observed_object_observations),
+        "accepted_valid_points": int((pixel_gate).sum().item()),
+        "valid_points": int(valid_points),
+        "accepted_point_ratio": float(pixel_gate.sum().item())
+        / max(1, valid_points),
+        "weighted_point_ratio": weighted_points / max(1, valid_points),
+        "mean_object_weight": object_weight_sum
+        / max(1, observed_object_observations),
+        "accepted_object_ratio": accepted_object_observations_ratio(
+            accepted=int(object_gate.sum().item()),
+            observed=observed_object_observations,
+        ),
+        "memory_observations": [int(value) for value in memory_counts],
+        "reject_reasons": reason_counts,
+    }
+    return WorldSpaceGateOutput(
+        points=gated,
+        object_gate=object_gate,
+        pixel_gate=pixel_gate,
+        pixel_weight=pixel_weight,
+        stats=stats,
+    )
 
 
 def _validate_world_space_gate_config(config: WorldSpaceGateConfig) -> None:
@@ -624,6 +829,7 @@ __all__ = [
     "WorldSpaceGateConfig",
     "WorldSpaceGateOutput",
     "apply_similarity",
+    "apply_soft_world_space_consistency_gate",
     "apply_world_space_consistency_gate",
     "invert_similarity",
     "point_head_patch_features",

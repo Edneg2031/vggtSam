@@ -21,6 +21,7 @@ import torch
 from streaming_couping.src.dinov3_object_geometry import (
     ObjectConditionedResidualHead,
     WorldSpaceGateConfig,
+    apply_soft_world_space_consistency_gate,
     apply_world_space_consistency_gate,
     apply_similarity,
 )
@@ -48,8 +49,12 @@ from streaming_couping.scripts.run_dinov3_object_geometry import (
 BASE_REVISION_PREFIX = "dinov3_object_conditioned_geometry_cross_scene_"
 REVISION = "dinov3_object_conditioned_geometry_v24_world_space_gate_r1"
 GATED_BRANCHES = tuple(f"{branch}_v24_gated" for branch in LEARNED_BRANCHES)
-ALL_BRANCHES = (*BRANCHES, *GATED_BRANCHES)
+SOFT_GATED_BRANCHES = tuple(
+    f"{branch}_v24_soft_gated" for branch in LEARNED_BRANCHES
+)
+ALL_BRANCHES = (*BRANCHES, *GATED_BRANCHES, *SOFT_GATED_BRANCHES)
 GATED_TO_BASE = dict(zip(GATED_BRANCHES, LEARNED_BRANCHES))
+SOFT_GATED_TO_BASE = dict(zip(SOFT_GATED_BRANCHES, LEARNED_BRANCHES))
 
 
 def main() -> None:
@@ -256,6 +261,28 @@ def _evaluate_clip(
                 "split": split,
                 "branch": gated_branch,
                 "base_branch": base_branch,
+                "gate_type": "hard",
+                **dict(gate.stats),
+            }
+        )
+    for gated_branch, base_branch in SOFT_GATED_TO_BASE.items():
+        gate = apply_soft_world_space_consistency_gate(
+            aligned_predictions["raw"],
+            aligned_predictions[base_branch],
+            object_masks=data.masks,
+            point_confidence=data.confidence,
+            track_scores=data.scores,
+            config=gate_config,
+        )
+        aligned_predictions[gated_branch] = gate.points
+        gate_rows.append(
+            {
+                "clip": data.name,
+                "scene_id": data.scene_id,
+                "split": split,
+                "branch": gated_branch,
+                "base_branch": base_branch,
+                "gate_type": "soft",
                 **dict(gate.stats),
             }
         )
@@ -421,40 +448,65 @@ def _build_summary(
     persistent = aggregate["persistent_dino"]
     persistent_gated = aggregate["persistent_dino_v24_gated"]
     geometry_gated = aggregate["geometry_only_v24_gated"]
-    persistent_gate_not_worse = _map_not_worse(
+    persistent_soft = aggregate["persistent_dino_v24_soft_gated"]
+    geometry_soft = aggregate["geometry_only_v24_soft_gated"]
+    hard_gate_not_worse = _map_not_worse(
         persistent_gated,
         persistent,
         split="test",
         ghost_tolerance=0.0,
     )
-    persistent_gate_better_geometry = (
+    hard_better_geometry = (
         persistent_gated["test_object_rmse_m"]
         < geometry_gated["test_object_rmse_m"]
         and persistent_gated["test_map_fscore_5cm"]
         >= geometry_gated["test_map_fscore_5cm"]
     )
-    test_map_not_worse_raw = _map_not_worse(
+    hard_test_map_not_worse_raw = _map_not_worse(
         persistent_gated,
         raw,
         split="test",
         ghost_tolerance=0.02,
     )
-    validation_map_not_worse_raw = _map_not_worse(
+    hard_validation_map_not_worse_raw = _map_not_worse(
         aggregate["persistent_dino_v24_gated"],
         aggregate["raw"],
         split="validation",
         ghost_tolerance=0.02,
     )
-    test_object_better_raw = (
-        persistent_gated["test_object_rmse_m"] < raw["test_object_rmse_m"]
+    soft_object_better_raw = (
+        persistent_soft["test_object_rmse_m"] < raw["test_object_rmse_m"]
+    )
+    soft_gate_not_worse = _map_not_worse(
+        persistent_soft,
+        persistent,
+        split="test",
+        ghost_tolerance=0.0,
+    )
+    soft_better_geometry = (
+        persistent_soft["test_object_rmse_m"] < geometry_soft["test_object_rmse_m"]
+        and persistent_soft["test_map_fscore_5cm"]
+        >= geometry_soft["test_map_fscore_5cm"]
+    )
+    soft_test_map_not_worse_raw = _map_not_worse(
+        persistent_soft,
+        raw,
+        split="test",
+        ghost_tolerance=0.02,
+    )
+    soft_validation_map_not_worse_raw = _map_not_worse(
+        persistent_soft,
+        raw,
+        split="validation",
+        ghost_tolerance=0.02,
     )
     enough_test_scenes = len(test_clips) >= 2
     safe_signal = (
-        persistent_gate_not_worse
-        and persistent_gate_better_geometry
-        and test_map_not_worse_raw
-        and test_object_better_raw
-        and validation_map_not_worse_raw
+        soft_gate_not_worse
+        and soft_better_geometry
+        and soft_test_map_not_worse_raw
+        and soft_object_better_raw
+        and soft_validation_map_not_worse_raw
     )
     if not safe_signal:
         overall = "NO_GO"
@@ -463,17 +515,33 @@ def _build_summary(
     else:
         overall = "GO"
     decision = {
-        "v24_gate_not_worse_than_ungated_persistent_test": int(
-            persistent_gate_not_worse
+        "v24_hard_gate_not_worse_than_ungated_persistent_test": int(
+            hard_gate_not_worse
         ),
-        "v24_persistent_better_than_geometry_gated_test": int(
-            persistent_gate_better_geometry
+        "v24_hard_persistent_better_than_geometry_gated_test": int(
+            hard_better_geometry
         ),
-        "v24_persistent_map_not_worse_than_raw_test": int(test_map_not_worse_raw),
-        "v24_persistent_map_not_worse_than_raw_validation": int(
-            validation_map_not_worse_raw
+        "v24_hard_persistent_map_not_worse_than_raw_test": int(
+            hard_test_map_not_worse_raw
         ),
-        "v24_persistent_object_better_than_raw_test": int(test_object_better_raw),
+        "v24_hard_persistent_map_not_worse_than_raw_validation": int(
+            hard_validation_map_not_worse_raw
+        ),
+        "v24_soft_persistent_object_better_than_raw_test": int(
+            soft_object_better_raw
+        ),
+        "v24_soft_gate_not_worse_than_ungated_persistent_test": int(
+            soft_gate_not_worse
+        ),
+        "v24_soft_persistent_better_than_geometry_soft_gated_test": int(
+            soft_better_geometry
+        ),
+        "v24_soft_persistent_map_not_worse_than_raw_test": int(
+            soft_test_map_not_worse_raw
+        ),
+        "v24_soft_persistent_map_not_worse_than_raw_validation": int(
+            soft_validation_map_not_worse_raw
+        ),
         "v24_safe_signal": int(safe_signal),
         "multiple_test_scenes": int(enough_test_scenes),
         "overall": overall,
@@ -493,6 +561,7 @@ def _build_summary(
         "frozen_model": str(model_path),
         "branches": list(ALL_BRANCHES),
         "gated_branches": dict(GATED_TO_BASE),
+        "soft_gated_branches": dict(SOFT_GATED_TO_BASE),
         "model": dict(model_spec),
         "validation_scenes": [clip.scene_id for clip in validation_clips],
         "test_scenes": [clip.scene_id for clip in test_clips],
@@ -545,11 +614,16 @@ def _print_clip_metrics(result: Mapping[str, Any], split: str) -> None:
             f"F5cm={row['fscore_5cm']:.5f} ghost={row['ghost_point_ratio']:.5f}"
         )
     for row in result["gate_rows"]:
+        weighted_ratio = row.get(
+            "weighted_point_ratio", row["accepted_point_ratio"]
+        )
         print(
             f"    gate[{row['branch']}] accepted_objects="
             f"{row['accepted_object_observations']}/"
-            f"{row['total_object_observations']} "
+            f"{row['observed_object_observations']} observed "
+            f"({row['total_object_observations']} slots) "
             f"accepted_points={row['accepted_point_ratio']:.5f} "
+            f"weighted_points={float(weighted_ratio):.5f} "
             f"reasons={row['reject_reasons']}"
         )
 
