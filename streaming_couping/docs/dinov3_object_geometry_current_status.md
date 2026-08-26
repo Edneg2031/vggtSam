@@ -521,6 +521,34 @@ zsh streaming_couping/commands_analyze_dinov3_residual_calibration.txt
 
 ---
 
+## 10. 当前新增的 DINOv3 dense geometry-prior diagnosis
+
+由于 pooled appearance → `ΔXYZ` 的 representation-to-target mismatch，下一轮先不训练任何新 head，只检查 DINOv3 是否覆盖 StreamVGGT 的真实失败区域。
+
+固定入口：
+
+```bash
+zsh streaming_couping/commands_analyze_object_geometry_dinov3_prior.txt
+```
+
+该命令会：
+
+- 用 DINOv3 ViT-L/16 的第 6、12、18、24 个 transformer block 缓存 dense patch features；
+- 在 GT object support 上比较 boundary（0–5 px）、near-boundary（5–15 px）和 interior（>15 px）；
+- 计算 DINO 各层、四层均值、StreamVGGT geometry feature 和 RGB edge 的空间梯度；
+- 只用 train+validation 固定 object size、thinness、error 和 gradient 分位数，再评估 test；
+- 生成固定首帧/中帧/末帧的六面板可视化。
+
+输出目录：
+
+```text
+/data184/open_source/vggtSam/outputs/streaming_couping_object_geometry_dinov3_prior/
+```
+
+这一轮的结论标准是“是否值得进入 dense DINO fusion”，不是“是否已经改善 map”。只有当 boundary/细结构确实是 failure mode，且 DINO 相比 RGB 和 StreamVGGT 自身 feature 都有额外解释力时，才进入下一阶段架构设计。
+
+---
+
 ## 10. 推荐的下一版方法方向
 
 目前最有动机的方向不是继续把 DINO feature 直接接到 `ΔXYZ`，而是改变 DINO 的职责。
@@ -775,9 +803,43 @@ streaming_couping/commands_analyze_dinov3_patch_geometry_retrieval.txt
 zsh streaming_couping/commands_analyze_dinov3_patch_geometry_retrieval.txt
 ```
 
+### 15.1 首次 patch retrieval 输出的阶段性解读
+
+首次运行已经完成候选生成和 object-surface 评估：
+
+```text
+scene                         correct-track   random-same-object   shuffled   unrestricted
+validation retrieved RMSE       0.42286              0.39022          1.48213      1.65928
+test retrieved RMSE             0.54247              0.53040          3.13442      2.56532
+```
+
+对应的 raw object-surface RMSE 分别约为：
+
+```text
+validation: 0.05950
+test:       0.72669
+```
+
+当前可以支持的结论是：
+
+1. `same SAM track` 限制很重要。正确 track 明显优于 shuffled/unrestricted，说明不限制 object identity 时，DINO 会在相似物体或错误历史区域中产生污染。
+2. 还不能支持“DINO 局部 correspondence 有效”。在 validation 和 test 中，`random_same_object` 都略优于 `correct_track_dino`；Top-K coordinate median 也没有优于 Top-1。
+3. test 的正收益更像是历史同物体 observation 对当前坏点图的补救，而不是 DINO 找到了同一局部表面。validation 的 raw 已经很好，历史点反而显著更差，说明历史几何质量和视角/位姿稳定性是主要变量。
+4. MNN 后的匹配覆盖率较低且各 branch 不同：validation correct `62/129`、test correct `135/434`。因此不能直接用不同覆盖率下的 RMSE 做最终因果结论，必须看 `paired_comparison.csv` 和严格 `query-surface` 指标。
+
+因此当前阶段的假设状态为：
+
+```text
+SAM same-object historical geometry:    部分支持
+DINO local patch correspondence:       暂无支持
+DINO → 直接 geometry correction:        NO_GO
+```
+
+在严格 query-surface 结果出来前，不应继续扩大 DINO backbone 或训练 DINO-keyed geometry decoder。若 paired query-surface 仍然不支持 correct > random，下一步应先做 `world-memory-only` baseline，确认“历史同物体几何累积”本身是否有效，再把 DINO 限定为 re-entry/identity confidence。
+
 命令内部固定 protocol、DINOv3 ViT-L/16、服务器 Python、GPU 和所有 output path；只刷新 DINO dense feature cache，不重跑 StreamVGGT/SAM，不训练 residual head。
 
-### 15.1 候选生成
+### 15.2 候选生成
 
 每个当前 patch 只能检索严格更早的 frame。候选模式为：
 
@@ -790,7 +852,7 @@ unrestricted_dino     所有历史 object patch 内的 DINO 检索
 
 DINO 检索默认加入 mutual-nearest-neighbor 过滤，并使用 point confidence 和 SAM track score 过滤无效 patch。候选生成阶段不会读取 GT；脚本还会把 evaluation target 暂时隐藏，所有候选冻结后才恢复 target pointmap 并打开 GT mask。
 
-### 15.2 两种 geometry 判据
+### 15.3 两种 geometry 判据
 
 每个 retrieval 同时报告：
 
@@ -808,7 +870,7 @@ coverage
 
 object-surface 指标只适合作为较宽松的 object-level support 参考。
 
-### 15.3 输出
+### 15.4 输出
 
 结果目录：
 

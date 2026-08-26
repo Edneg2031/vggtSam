@@ -25,6 +25,7 @@ DEFAULT_DINOV3_VARIANTS = (
     "dinov3-vith16",
     "dinov3-vit7b16",
 )
+DEFAULT_DENSE_LAYER_FRACTIONS = (0.25, 0.50, 0.75, 1.0)
 
 
 @dataclass(frozen=True)
@@ -157,19 +158,52 @@ class DinoV3DenseEncoder:
             raise RuntimeError("Cannot infer DINOv3 hidden size from config.")
         return int(value)
 
-    @torch.inference_mode()
-    def encode_dense(self, images: torch.Tensor) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Return ``[B, patch_h, patch_w, C]`` dense features.
+    @property
+    def hidden_layer_count(self) -> int:
+        value = getattr(self.model.config, "num_hidden_layers", None)
+        if value is None:
+            value = getattr(self.model.config, "num_layers", None)
+        if value is None:
+            raise RuntimeError("Cannot infer DINOv3 transformer depth from config.")
+        return int(value)
 
-        Images are resized without center cropping, preserving mask alignment
-        with the original frame.  The dimensions are rounded to the patch
-        size, and the same resize is applied to masks by masked_mean_pool.
-        """
+    def representative_layer_ids(self, count: int = 4) -> tuple[int, ...]:
+        """Return explicit 1-based transformer block IDs spread through depth."""
 
+        count = min(max(1, int(count)), self.hidden_layer_count)
+        fractions = DEFAULT_DENSE_LAYER_FRACTIONS
+        if count != len(fractions):
+            fractions = tuple(
+                float(index + 1) / float(count) for index in range(count)
+            )
+        selected = sorted(
+            {
+                max(1, min(self.hidden_layer_count, round(self.hidden_layer_count * fraction)))
+                for fraction in fractions
+            }
+        )
+        # Rounding can collapse two fractions for unusually shallow models.
+        for layer_id in range(1, self.hidden_layer_count + 1):
+            if len(selected) >= count:
+                break
+            if layer_id not in selected:
+                selected.append(layer_id)
+                selected.sort()
+        return tuple(selected)
+
+    def _prepare_inputs(
+        self, images: torch.Tensor
+    ) -> tuple[torch.Tensor, int, int, int, int]:
         values = _image_tensor(images)
         batch, _, height, width = values.shape
-        target_height = max(self.patch_size, round(height / self.patch_size) * self.patch_size)
-        target_width = max(self.patch_size, round(width / self.patch_size) * self.patch_size)
+        target_height = max(
+            self.patch_size,
+            round(height / self.patch_size) * self.patch_size,
+        )
+        target_width = max(
+            self.patch_size,
+            round(width / self.patch_size) * self.patch_size,
+        )
         if (target_height, target_width) != (height, width):
             values = F.interpolate(
                 values,
@@ -180,7 +214,60 @@ class DinoV3DenseEncoder:
         mean = self.image_mean.to(values.device)
         std = self.image_std.to(values.device)
         values = (values - mean) / std
-        values = values.to(self.device)
+        return values.to(self.device), batch, target_height, target_width, (
+            target_height // self.patch_size
+        ) * (target_width // self.patch_size)
+
+    def _base_metadata(
+        self,
+        *,
+        target_height: int,
+        target_width: int,
+        patch_height: int,
+        patch_width: int,
+        layer_ids: Sequence[int] | None = None,
+    ) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "input_size": [int(target_height), int(target_width)],
+            "patch_size": int(self.patch_size),
+            "patch_shape": [int(patch_height), int(patch_width)],
+            "feature_dim": int(self.feature_dim),
+            "checkpoint": str(self.checkpoint),
+            "num_hidden_layers": int(self.hidden_layer_count),
+        }
+        if layer_ids is not None:
+            metadata["layer_ids"] = [int(value) for value in layer_ids]
+            metadata["layer_indexing"] = "1-based transformer block; hidden_states[0] is embeddings"
+        return metadata
+
+    def _tokens_to_dense(
+        self,
+        tokens: torch.Tensor,
+        *,
+        batch: int,
+        patch_height: int,
+        patch_width: int,
+    ) -> torch.Tensor:
+        patch_count = patch_height * patch_width
+        if int(tokens.shape[1]) < patch_count:
+            raise RuntimeError(
+                "DINOv3 returned fewer tokens than the expected patch grid: "
+                f"tokens={tuple(tokens.shape)}, expected_patches={patch_count}."
+            )
+        return tokens[:, -patch_count:, :].reshape(
+            batch, patch_height, patch_width, int(tokens.shape[-1])
+        ).float().cpu()
+
+    @torch.inference_mode()
+    def encode_dense(self, images: torch.Tensor) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Return ``[B, patch_h, patch_w, C]`` dense features.
+
+        Images are resized without center cropping, preserving mask alignment
+        with the original frame.  The dimensions are rounded to the patch
+        size, and the same resize is applied to masks by masked_mean_pool.
+        """
+
+        values, batch, target_height, target_width, _ = self._prepare_inputs(images)
         with torch.autocast(
             device_type=self.device.type,
             dtype=self.dtype,
@@ -192,23 +279,77 @@ class DinoV3DenseEncoder:
             tokens = output[0]
         patch_height = target_height // self.patch_size
         patch_width = target_width // self.patch_size
-        patch_count = patch_height * patch_width
-        if int(tokens.shape[1]) < patch_count:
-            raise RuntimeError(
-                "DINOv3 returned fewer tokens than the expected patch grid: "
-                f"tokens={tuple(tokens.shape)}, expected_patches={patch_count}."
-            )
-        dense = tokens[:, -patch_count:, :].reshape(
-            batch, patch_height, patch_width, int(tokens.shape[-1])
+        dense = self._tokens_to_dense(
+            tokens,
+            batch=batch,
+            patch_height=patch_height,
+            patch_width=patch_width,
         )
-        dense = dense.float().cpu()
-        metadata = {
-            "input_size": [int(target_height), int(target_width)],
-            "patch_size": int(self.patch_size),
-            "patch_shape": [int(patch_height), int(patch_width)],
-            "feature_dim": int(dense.shape[-1]),
-            "checkpoint": str(self.checkpoint),
+        metadata = self._base_metadata(
+            target_height=target_height,
+            target_width=target_width,
+            patch_height=patch_height,
+            patch_width=patch_width,
+        )
+        return dense, metadata
+
+    @torch.inference_mode()
+    def encode_dense_layers(
+        self,
+        images: torch.Tensor,
+        *,
+        layer_ids: Sequence[int] | None = None,
+    ) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
+        """Return dense features from explicit intermediate transformer blocks."""
+
+        values, batch, target_height, target_width, _ = self._prepare_inputs(images)
+        requested = (
+            self.representative_layer_ids()
+            if layer_ids is None
+            else tuple(int(value) for value in layer_ids)
+        )
+        if not requested or any(
+            value < 1 or value > self.hidden_layer_count for value in requested
+        ):
+            raise ValueError(
+                f"DINO layer IDs must be in [1,{self.hidden_layer_count}], got {requested}."
+            )
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=self.dtype,
+            enabled=self.device.type == "cuda" and self.dtype != torch.float32,
+        ):
+            output = self.model(pixel_values=values, output_hidden_states=True)
+        hidden_states = getattr(output, "hidden_states", None)
+        if hidden_states is None:
+            raise RuntimeError(
+                "DINOv3 model did not return hidden_states; cannot run multi-layer "
+                "geometry-prior diagnosis."
+            )
+        actual_depth = len(hidden_states) - 1
+        if actual_depth < self.hidden_layer_count:
+            raise RuntimeError(
+                f"DINO hidden-state depth is {actual_depth}, config reports "
+                f"{self.hidden_layer_count}."
+            )
+        patch_height = target_height // self.patch_size
+        patch_width = target_width // self.patch_size
+        dense = {
+            int(layer_id): self._tokens_to_dense(
+                hidden_states[int(layer_id)],
+                batch=batch,
+                patch_height=patch_height,
+                patch_width=patch_width,
+            )
+            for layer_id in requested
         }
+        metadata = self._base_metadata(
+            target_height=target_height,
+            target_width=target_width,
+            patch_height=patch_height,
+            patch_width=patch_width,
+            layer_ids=requested,
+        )
         return dense, metadata
 
 

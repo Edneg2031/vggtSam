@@ -200,6 +200,7 @@ def main() -> None:
             all_topk_rows.extend(result["topk_rows"])
             clip_summaries.append(result["summary"])
             _print_clip_summary(result["summary"])
+            _print_paired_summary(result["paired_rows"])
 
     aggregate_scene_rows = _aggregate_scene_rows(scene_rows)
     aggregate_object_rows = _aggregate_object_rows(object_rows)
@@ -1681,7 +1682,25 @@ def _print_clip_summary(summary: Mapping[str, Any]) -> None:
             f"raw_rmse={row['raw_rmse_m']:.5f} "
             f"retrieved_rmse={row['retrieved_rmse_m']:.5f} "
             f"gain={row['mean_gain_m']:.5f} "
-            f"improved={row['improved_fraction']:.3f}"
+            f"improved={row['improved_fraction']:.3f} "
+            f"query_raw_rmse={row['query_raw_rmse_m']:.5f} "
+            f"query_retrieved_rmse={row['query_retrieved_rmse_m']:.5f} "
+            f"query_gain={row['query_mean_gain_m']:.5f} "
+            f"query_improved={row['query_improved_fraction']:.3f}"
+        )
+
+
+def _print_paired_summary(rows: Sequence[Mapping[str, Any]]) -> None:
+    for row in rows:
+        if str(row.get("split")) not in {"validation", "test"}:
+            continue
+        print(
+            f"    paired[{row['comparison']}] mode={row['mode']} "
+            f"common={row['paired_queries']} "
+            f"surface_retrieved_rmse={row['retrieved_rmse_m']:.5f} "
+            f"query_retrieved_rmse={row['query_retrieved_rmse_m']:.5f} "
+            f"surface_gain={row['mean_gain_m']:.5f} "
+            f"query_gain={row['query_mean_gain_m']:.5f}"
         )
 
 

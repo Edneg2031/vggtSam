@@ -43,7 +43,7 @@ def main() -> None:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     device = str(args.device)
-    print("DINOv3 PERSISTENT OBJECT FEATURE CACHE")
+    print("DINOv3 MULTI-LAYER DENSE OBJECT FEATURE CACHE")
     print(f"checkpoint={checkpoint}")
     print(f"device={device} dtype={args.dtype} ema_beta={args.ema_beta}")
     print("models=StreamVGGT and SAM3 caches are reused; no GT is read")
@@ -73,26 +73,56 @@ def main() -> None:
             raise ValueError(f"Image/mask frame count mismatch for {clip.name}.")
         single_rows: list[torch.Tensor] = []
         valid_rows: list[torch.Tensor] = []
-        dense_rows: list[torch.Tensor] = []
+        dense_rows_by_layer: dict[int, list[torch.Tensor]] = {}
+        dense_layer_ids: tuple[int, ...] | None = None
         metadata: dict[str, Any] | None = None
         for start in range(0, int(images.shape[0]), max(1, int(args.batch_size))):
             stop = min(int(images.shape[0]), start + max(1, int(args.batch_size)))
-            dense, current_meta = encoder.encode_dense(images[start:stop])
+            dense_by_layer, current_meta = encoder.encode_dense_layers(
+                images[start:stop]
+            )
+            current_layer_ids = tuple(
+                int(value) for value in current_meta.get("layer_ids", ())
+            )
+            if not current_layer_ids:
+                raise RuntimeError(
+                    "DINOv3 multi-layer encoder returned no layer IDs."
+                )
+            if dense_layer_ids is None:
+                dense_layer_ids = current_layer_ids
+            elif dense_layer_ids != current_layer_ids:
+                raise RuntimeError(
+                    "DINOv3 layer IDs changed between cache batches: "
+                    f"first={dense_layer_ids} current={current_layer_ids}"
+                )
+            for layer_id in dense_layer_ids:
+                if layer_id not in dense_by_layer:
+                    raise RuntimeError(
+                        f"DINOv3 layer {layer_id} is missing from encoder output."
+                    )
+                dense_rows_by_layer.setdefault(layer_id, []).append(
+                    dense_by_layer[layer_id].to(torch.float16).cpu()
+                )
+            final_layer = dense_by_layer[dense_layer_ids[-1]]
             pooled, valid = masked_mean_pool(
-                dense,
+                final_layer,
                 masks[start:stop],
                 normalize=True,
             )
             single_rows.append(pooled.cpu())
             valid_rows.append(valid.cpu())
-            # Keep the dense grid for the patch-correspondence diagnostic.
-            # fp16 is sufficient for cosine retrieval and keeps the cache
-            # substantially smaller than a float32 copy.
-            dense_rows.append(dense.to(torch.float16).cpu())
             metadata = current_meta
         single = torch.cat(single_rows, dim=0)
         valid = torch.cat(valid_rows, dim=0)
-        dense_features = torch.cat(dense_rows, dim=0)
+        if dense_layer_ids is None or not dense_rows_by_layer:
+            raise RuntimeError(f"No DINOv3 dense layers were cached for {clip.name}.")
+        dense_features_by_layer = {
+            str(layer_id): torch.cat(rows, dim=0)
+            for layer_id, rows in sorted(dense_rows_by_layer.items())
+        }
+        # ``dense_features`` remains the final-layer compatibility field used
+        # by the earlier patch-retrieval diagnostic and existing consumers.
+        dense_features = dense_features_by_layer[str(dense_layer_ids[-1])]
         track_ids = torch.as_tensor(payload["sam_track_ids"], dtype=torch.long)
         persistent, persistent_valid = aggregate_persistent_features(
             single,
@@ -107,8 +137,8 @@ def main() -> None:
             seed=int(args.shuffle_seed),
         )
         result = {
-            "schema": 2,
-            "revision": "dinov3_persistent_object_feature_cache_r2_dense",
+            "schema": 3,
+            "revision": "dinov3_persistent_object_feature_cache_r3_multilayer_dense",
             "clip": clip.name,
             "scene_id": str(payload["scene_id"]),
             "frame_indices": list(payload["frame_indices"]),
@@ -119,6 +149,15 @@ def main() -> None:
             "dense_features": dense_features,
             "dense_feature_shape": list(dense_features.shape[1:]),
             "dense_feature_dtype": "float16",
+            "dense_features_by_layer": dense_features_by_layer,
+            "dense_layer_ids": [int(value) for value in dense_layer_ids],
+            "dense_layer_metadata": {
+                str(layer_id): {
+                    "shape": list(dense_features_by_layer[str(layer_id)].shape[1:]),
+                    "dtype": "float16",
+                }
+                for layer_id in dense_layer_ids
+            },
             "ema_beta": float(args.ema_beta),
             "track_ids": track_ids,
             "track_prompts": list(payload["sam_track_prompts"]),
@@ -135,7 +174,8 @@ def main() -> None:
         torch.save(result, output_path)
         print(
             f"  clip={clip.name} frames={single.shape[0]} slots={single.shape[1]} "
-            f"dim={single.shape[2]} valid={int(valid.sum())} output={output_path}"
+            f"dim={single.shape[2]} layers={','.join(str(value) for value in dense_layer_ids)} "
+            f"valid={int(valid.sum())} output={output_path}"
         )
     print(f"DINOv3 feature cache completed output_dir={output_dir}")
 

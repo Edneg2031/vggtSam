@@ -1,17 +1,17 @@
 #!/usr/bin/env zsh
 set -euo pipefail
 
-# One-command causal DINOv3 patch-to-patch geometry feasibility diagnostic.
-# All paths and settings are fixed for the shared server environment.  The
-# command refreshes only the frozen DINO dense-feature cache; it does not
-# rerun StreamVGGT or SAM3 and it does not train or modify XYZ.
+# One-command, frozen diagnosis of DINOv3 complementary object geometry
+# structure.  The user only runs this file; all paths and thresholds are
+# fixed here or in the Python diagnostic.  No StreamVGGT/SAM3 model is rerun,
+# no parameter is updated, and no XYZ correction is written.
 ROOT="/home/wlh50060092/vggtSam"
 STORAGE_ROOT="/data184/open_source/vggtSam"
 PYTHON_BIN="/home/huawei/miniconda3/envs/3am/bin/python"
 DINO_ROOT="/home/bod/86Nas/95_data_bak/FoundationModels/dinov3"
 PROTOCOL="${STORAGE_ROOT}/outputs/streaming_couping_multiclip/protocol.yaml"
 FEATURE_DIR="${STORAGE_ROOT}/outputs/streaming_couping_dinov3_object_features"
-OUTPUT_DIR="${STORAGE_ROOT}/outputs/streaming_couping_dinov3_patch_geometry_retrieval"
+OUTPUT_DIR="${STORAGE_ROOT}/outputs/streaming_couping_object_geometry_dinov3_prior"
 
 cd "${ROOT}"
 [[ -x "${PYTHON_BIN}" ]] || {
@@ -36,7 +36,7 @@ export VGGT_SAM_STORAGE_ROOT="${STORAGE_ROOT}"
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="${ROOT}"
 
-echo "[1/2] refresh frozen DINOv3 dense patch-feature cache"
+echo "[1/2] refresh frozen DINOv3 multi-layer dense-feature cache"
 CUDA_VISIBLE_DEVICES=3 \
   "${PYTHON_BIN}" -m streaming_couping.scripts.cache_dinov3_object_features \
   --config "${PROTOCOL}" \
@@ -50,18 +50,15 @@ CUDA_VISIBLE_DEVICES=3 \
   --raw-cache-variant sam31_online_forward \
   --overwrite
 
-echo "[2/2] generate causal patch-retrieval diagnostics"
-CUDA_VISIBLE_DEVICES=3 \
-  "${PYTHON_BIN}" -m streaming_couping.scripts.analyze_dinov3_patch_geometry_retrieval \
+echo "[2/2] analyze object boundary, size, confidence, and feature complementarity"
+"${PYTHON_BIN}" -m streaming_couping.scripts.analyze_object_geometry_dinov3_prior \
   --protocol "${PROTOCOL}" \
   --feature-dir "${FEATURE_DIR}" \
   --output-dir "${OUTPUT_DIR}" \
-  --device cuda:0 \
-  --seed 2026 \
-  --max-patches-per-object-frame 32 \
-  --max-gt-surface-points 4096 \
-  --mutual-nearest
+  --confidence-threshold 0.30 \
+  --high-confidence-threshold 0.70 \
+  --max-points-per-object-frame 256
 
 echo "===== COPYABLE DIAGNOSTIC SUMMARY ====="
 sed -n '1,240p' "${OUTPUT_DIR}/copyable_result.txt"
-echo "DINOv3 patch geometry retrieval output=${OUTPUT_DIR}"
+echo "DINOv3 object geometry prior output=${OUTPUT_DIR}"
