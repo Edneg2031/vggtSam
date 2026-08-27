@@ -386,6 +386,13 @@ def main() -> None:
         encoding="utf8",
     )
     _write_copyable(copyable_path, summary)
+    _print_diagnostic_summary(
+        summary=summary,
+        depth_rows=depth_rows,
+        tracking_rows=tracking["summary_rows"],
+        map_rows=map_results,
+        projection_summary=projection_summary,
+    )
     print(f"summary={summary_path}")
     print(f"copyable_result={copyable_path}")
     print("decision=DIAGNOSTIC_ONLY")
@@ -929,6 +936,147 @@ def _write_copyable(path: Path, summary: Mapping[str, object]) -> None:
         "===== V0_BIDIRECTIONAL_FEEDBACK_END =====",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf8")
+
+
+def _print_diagnostic_summary(
+    *,
+    summary: Mapping[str, object],
+    depth_rows: Sequence[Mapping[str, object]],
+    tracking_rows: Sequence[Mapping[str, object]],
+    map_rows: Sequence[Mapping[str, object]],
+    projection_summary: Sequence[Mapping[str, object]],
+) -> None:
+    """Print the small report needed for terminal-only experiment review.
+
+    The detailed CSV/JSON artifacts remain the source of record.  This report
+    deliberately prints aggregate rows only, so a 30-frame/16-slot run does
+    not produce hundreds of terminal lines while still exposing every metric
+    needed for the first GO/NO-GO decision.
+    """
+
+    depth = summary["depth_refinement"]
+    static = summary["static_background_pose"]
+    print("===== V0 BIDIRECTIONAL FEEDBACK DIAGNOSTIC SUMMARY =====")
+    print(
+        "static_background "
+        f"synthetic_smoke={static.get('synthetic_gradient_smoke_pass')} "
+        f"real_loss_map={static.get('evaluated_with_real_v0_loss_map')}"
+    )
+    input_pixels = int(depth.get("input_mask_pixels", 0))
+    removed_pixels = int(depth.get("removed_pixels", 0))
+    print(
+        "depth_refinement "
+        f"rows={len(depth_rows)} "
+        f"input_pixels={input_pixels} "
+        f"removed_pixels={removed_pixels} "
+        f"removed_ratio={_display(depth.get('removed_pixel_ratio'))} "
+        f"fallback_rows={depth.get('fallback_rows', 0)}"
+    )
+
+    temporal = summary["temporal_prompt_projection"]
+    temporal_meta = temporal.get("candidate_generation", {})
+    print(
+        "temporal_support "
+        f"history_centers={temporal_meta.get('history_center_count', 0)} "
+        f"center_point_median={_display(temporal_meta.get('center_point_count_median'))} "
+        f"projection_rows={temporal_meta.get('projection_candidate_count', 0)}"
+    )
+
+    print("tracking")
+    for row in tracking_rows:
+        print(
+            "  "
+            f"variant={row.get('variant')} "
+            f"IoU={_display(row.get('mean_frame_iou'))} "
+            f"frame_IDF1={_display(row.get('frame_idf1'))} "
+            f"pixel_IDF1={_display(row.get('pixel_idf1'))} "
+            f"reentry={row.get('reentry_successes', 0)}/"
+            f"{row.get('reentry_events', 0)} "
+            f"fragmentation={row.get('fragmentation_count', 0)} "
+            f"merge_errors={row.get('merge_error_count', 0)}"
+        )
+
+    print("map")
+    for row in map_rows:
+        print(
+            "  "
+            f"variant={row.get('variant')} "
+            f"voxelIoU5cm={_display(row.get('voxel_iou_5cm'))} "
+            f"F5cm={_display(row.get('fscore_5cm'))} "
+            f"ghost={_display(row.get('ghost_point_ratio'))} "
+            f"accuracy_m={_display(row.get('object_accuracy_m'))} "
+            f"completeness_m={_display(row.get('object_completeness_m'))}"
+        )
+
+    raw_map = _row_by_key(map_rows, "variant", "raw_v0")
+    refined_map = _row_by_key(map_rows, "variant", "depth_refined_v0")
+    if raw_map and refined_map:
+        print(
+            "map_delta refined_minus_raw "
+            f"voxelIoU5cm={_display(_difference(refined_map.get('voxel_iou_5cm'), raw_map.get('voxel_iou_5cm')))} "
+            f"F5cm={_display(_difference(refined_map.get('fscore_5cm'), raw_map.get('fscore_5cm')))} "
+            f"ghost={_display(_difference(refined_map.get('ghost_point_ratio'), raw_map.get('ghost_point_ratio')))}"
+        )
+
+    raw_tracking = _row_by_key(tracking_rows, "variant", "raw_v0")
+    refined_tracking = _row_by_key(
+        tracking_rows,
+        "variant",
+        "depth_refined_v0",
+    )
+    if raw_tracking and refined_tracking:
+        print(
+            "tracking_delta refined_minus_raw "
+            f"IoU={_display(_difference(refined_tracking.get('mean_frame_iou'), raw_tracking.get('mean_frame_iou')))} "
+            f"frame_IDF1={_display(_difference(refined_tracking.get('frame_idf1'), raw_tracking.get('frame_idf1')))} "
+            f"pixel_IDF1={_display(_difference(refined_tracking.get('pixel_idf1'), raw_tracking.get('pixel_idf1')))}"
+        )
+
+    print("temporal_projection")
+    for row in projection_summary:
+        print(
+            "  "
+            f"pose={row.get('pose_source')} "
+            f"candidates={row.get('candidate_rows', 0)} "
+            f"in_bounds={_display(row.get('in_bounds_rate'))} "
+            f"raw_mask_hit={_display(row.get('raw_mask_hit_rate'))} "
+            f"gt_mask_hit={_display(row.get('gt_mask_hit_rate'))} "
+            f"mean_history_gap={_display(row.get('mean_history_gap'))}"
+        )
+    print(
+        "interpretation=diagnostic_only; temporal points were not fed back into SAM; "
+        "static pose used synthetic loss smoke only"
+    )
+
+
+def _row_by_key(
+    rows: Sequence[Mapping[str, object]],
+    key: str,
+    value: object,
+) -> Mapping[str, object] | None:
+    for row in rows:
+        if row.get(key) == value:
+            return row
+    return None
+
+
+def _difference(first: object, second: object) -> float:
+    try:
+        return float(first) - float(second)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _display(value: object) -> str:
+    """Format numeric report values without turning missing fields into errors."""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if not math.isfinite(number):
+        return "nan"
+    return f"{number:.6f}"
 
 
 def _write_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> None:

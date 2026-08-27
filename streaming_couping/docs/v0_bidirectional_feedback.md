@@ -96,6 +96,9 @@ map_metrics.csv
 map_object_metrics.csv
 ```
 
+脚本结束时也会在终端打印上述结果中的聚合指标以及 raw/refined delta，不需要再手动
+打开 CSV；CSV/JSON 仍保留完整明细和可复现记录。
+
 ## 如何解释
 
 重点看 `copyable_result.txt` 和 `summary.json`：
