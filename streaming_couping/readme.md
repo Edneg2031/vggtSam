@@ -29,7 +29,13 @@ zsh streaming_couping/commands_semantic_mapping_v1.txt
 zsh streaming_couping/commands_semantic_mapping_v1_evaluation.txt
 zsh streaming_couping/commands_check_scannetpp_data.txt
 zsh streaming_couping/commands_audit_scannetpp_processed.txt
+zsh streaming_couping/commands_run_v0_bidirectional_feedback.txt
 ```
+
+最后一条命令是 V0 单场景的显式空间—时间反馈诊断：复用冻结 cache，比较 raw
+mask 与启发式 depth-refined mask，并统计历史 3D 中心投影作为 SAM 点先验的命中率。
+当前版本不重新运行 SAM、不修改点云，也不会把 V0 的预配置 prompt 变成 prompt-free
+检测。详情见 [v0_bidirectional_feedback.md](docs/v0_bidirectional_feedback.md)。
 
 其中 `commands_semantic_mapping.txt` 只读取已经完成的 V0/V6 cache，离线比较 raw SAM、V6、
 GT-mask oracle 和 object-memory map-write gate，不重新运行模型。
