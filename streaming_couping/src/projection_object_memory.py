@@ -63,6 +63,10 @@ class ProjectionObjectMemoryConfig:
     confirmation_frames: int = 2
     confirmation_window: int = 4
     max_pending_gap: int = 4
+    # ``0`` preserves the original source-track shortcut. A positive value
+    # forces a source track through candidate ranking after this many missing
+    # sequence steps. This is opt-in for the DINO re-entry ablation.
+    reassociation_gap: int = 0
     voxel_size_ratio: float = 0.02
     absolute_voxel_size: float = 0.02
     association: ProjectionAssociationConfig = field(
@@ -346,6 +350,7 @@ class ProjectionObjectMemory:
         self.registry: dict[int, ProjectionObject] = {}
         self.track_to_object: dict[str, int] = {}
         self.pending: dict[str, _PendingTrack] = {}
+        self.source_last_seen: dict[str, int] = {}
         self.events: list[dict[str, object]] = []
         self.scene_scale = 1.0
         self._next_object_id = 0
@@ -405,6 +410,7 @@ class ProjectionObjectMemory:
         image_size: tuple[int, int],
         images: torch.Tensor | None = None,
         appearance: torch.Tensor | None = None,
+        appearance_valid: torch.Tensor | None = None,
     ) -> dict[str, object]:
         """Process a cached clip in causal frame/slot order."""
 
@@ -452,6 +458,10 @@ class ProjectionObjectMemory:
                 tracks,
             ):
                 raise ValueError("appearance must have shape [S,K,D].")
+        if appearance_valid is not None:
+            appearance_valid = appearance_valid.detach().bool().cpu()
+            if tuple(appearance_valid.shape) != (sequence, tracks):
+                raise ValueError("appearance_valid must have shape [S,K].")
 
         self.scene_scale = estimate_scene_scale(points)
         persistent_ids = torch.full((sequence, tracks), -1, dtype=torch.long)
@@ -510,7 +520,13 @@ class ProjectionObjectMemory:
                 if images is not None:
                     colors = images[frame].permute(1, 2, 0)[valid_geometry]
                 appearance_value = (
-                    appearance[frame, slot] if appearance is not None else None
+                    appearance[frame, slot]
+                    if appearance is not None
+                    and (
+                        appearance_valid is None
+                        or bool(appearance_valid[frame, slot])
+                    )
+                    else None
                 )
                 observation = make_projection_observation(
                     sequence_index=frame,
@@ -569,6 +585,10 @@ class ProjectionObjectMemory:
                 str(key): int(value)
                 for key, value in sorted(self.track_to_object.items())
             },
+            "source_last_seen": {
+                str(key): int(value)
+                for key, value in sorted(self.source_last_seen.items())
+            },
             "scene_scale": float(self.scene_scale),
             "persistent_object_count": int(len(self.registry)),
             "pending_track_count": int(len(self.pending)),
@@ -589,6 +609,21 @@ class ProjectionObjectMemory:
 
         source_key = _source_key(observation.sam_track_id, observation.source_slot)
         direct_id = self.track_to_object.get(source_key)
+        last_seen = self.source_last_seen.get(source_key)
+        forced_reassociation = bool(
+            direct_id is not None
+            and int(self.config.reassociation_gap) > 0
+            and last_seen is not None
+            and int(observation.sequence_index) - int(last_seen) - 1
+            >= int(self.config.reassociation_gap)
+        )
+        if forced_reassociation:
+            # Keep the persistent object intact, but remove the active source
+            # shortcut so this re-entry is scored against all objects.
+            # Confirmation restores the mapping after the temporal gate.
+            self.track_to_object.pop(source_key, None)
+            direct_id = None
+        self.source_last_seen[source_key] = int(observation.sequence_index)
         if direct_id is not None:
             obj = self.registry[int(direct_id)]
             self._update_object(obj, observation)
@@ -600,6 +635,7 @@ class ProjectionObjectMemory:
                 top_k=(),
                 source_key=source_key,
                 tentative=0,
+                reassociation_forced=False,
             )
             event["map_write"] = 1
             self.events.append(event)
@@ -657,6 +693,7 @@ class ProjectionObjectMemory:
             top_k=candidates,
             source_key=source_key,
             tentative=1,
+            reassociation_forced=forced_reassociation,
         )
         event["map_write"] = 0
         pending.events.append(event)
@@ -773,6 +810,11 @@ class ProjectionObjectMemory:
                 str(key): int(value)
                 for key, value in sorted(self.track_to_object.items())
             },
+            "source_last_seen": {
+                str(key): int(value)
+                for key, value in sorted(self.source_last_seen.items())
+            },
+            "reassociation_gap": int(self.config.reassociation_gap),
             "event_count": int(len(self.events)),
         }
 
@@ -1069,6 +1111,7 @@ def _event(
     top_k: Sequence[ProjectionCandidate],
     source_key: str,
     tentative: int,
+    reassociation_forced: bool = False,
 ) -> dict[str, object]:
     row: dict[str, object] = {
         "sequence_index": int(observation.sequence_index),
@@ -1086,6 +1129,17 @@ def _event(
         "source_key": str(source_key),
         "tentative": int(tentative),
         "map_write": 0,
+        "reassociation_forced": int(reassociation_forced),
+        "association_candidate_count": int(len(top_k)),
+        "association_appearance_compared": int(
+            any(
+                math.isfinite(float(row.appearance_cosine))
+                for row in top_k
+            )
+        ),
+        "observation_appearance_valid": int(
+            observation.appearance is not None
+        ),
         "association_top_k": json.dumps(
             [row.to_dict() for row in top_k], sort_keys=True
         ),
@@ -1217,6 +1271,8 @@ def _validate_config(config: ProjectionObjectMemoryConfig) -> None:
         raise ValueError("confirmation_window must cover confirmation_frames.")
     if config.max_pending_gap < 1:
         raise ValueError("max_pending_gap must be positive.")
+    if config.reassociation_gap < 0:
+        raise ValueError("reassociation_gap must be non-negative.")
     if config.absolute_voxel_size <= 0.0 or config.voxel_size_ratio < 0.0:
         raise ValueError("Voxel sizes must be positive/non-negative.")
     for name, value in (

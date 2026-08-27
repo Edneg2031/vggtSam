@@ -1,0 +1,47 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# One-command DINOv3 appearance-assisted projection-memory experiment.
+# StreamVGGT/SAM and DINO caches are reused when present.  The Python runner
+# freezes all causal branch artifacts before it opens GT for evaluation.
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+PROTOCOL="$STORAGE_ROOT/outputs/streaming_couping_multiclip/protocol.yaml"
+FEATURE_DIR="$STORAGE_ROOT/outputs/streaming_couping_dinov3_object_features"
+OUTPUT_DIR="$STORAGE_ROOT/outputs/streaming_couping_dinov3_projection_memory"
+BASE_CACHE_DIR="$STORAGE_ROOT/outputs/streaming_couping_v0/cache"
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+
+if [[ ! -s "$PROTOCOL" ]]; then
+  SEMANTIC_MAPPING_SCENES="00a231a370,0a184cf634,1a8e0d78c0,1eacc65607" \
+    zsh streaming_couping/commands_plan_semantic_mapping_multiclip.txt
+fi
+[[ -s "$PROTOCOL" ]] || { echo "missing protocol: $PROTOCOL" >&2; exit 1; }
+
+base_cache_files=("$BASE_CACHE_DIR"/*.pt(N))
+if (( ${#base_cache_files} < 4 )); then
+  echo "frozen StreamVGGT/SAM caches are incomplete; building them first"
+  SEMANTIC_MAPPING_MULTICLIP_STAGE=cache \
+    zsh streaming_couping/commands_run_semantic_mapping_multiclip.txt
+fi
+
+dino_cache_files=("$FEATURE_DIR"/*.pt(N))
+if (( ${#dino_cache_files} < 4 )); then
+  zsh streaming_couping/commands_cache_dinov3_object_features.txt
+fi
+
+CUDA_VISIBLE_DEVICES=3 \
+  PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT" \
+  "$PYTHON_BIN" -m streaming_couping.scripts.smoke_dinov3_projection_memory
+
+PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT" \
+  "$PYTHON_BIN" -m streaming_couping.scripts.run_dinov3_projection_memory \
+  --config "$PROTOCOL" \
+  --feature-dir "$FEATURE_DIR" \
+  --output-dir "$OUTPUT_DIR"
+
+echo "DINOv3 projection-memory output=$OUTPUT_DIR"
