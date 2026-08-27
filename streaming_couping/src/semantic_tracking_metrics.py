@@ -47,8 +47,17 @@ def load_ground_truth_instances(
     output_size: tuple[int, int],
     prompts: Sequence[str],
     prompt_label_aliases: Mapping[str, Sequence[str]] | None = None,
+    include_all_instances: bool = False,
 ) -> GroundTruthInstances:
-    """Open GT masks after candidate generation and select prompt-scope IDs."""
+    """Open GT masks after candidate generation.
+
+    By default only instances compatible with ``prompts`` are returned, which
+    preserves the historical prompt-scope metric.  ``include_all_instances``
+    exposes every positive instance visible in the selected clip and is used
+    by class-agnostic discovery diagnostics.  In both cases the masks are
+    opened only by the evaluation caller; proposal generation never calls
+    this function.
+    """
 
     manifest_path = Path(manifest_path).expanduser().resolve()
     with manifest_path.open("r", encoding="utf8") as handle:
@@ -88,18 +97,21 @@ def load_ground_truth_instances(
             if int(value) > 0
         }
     )
-    eligible = [
-        instance_id
-        for instance_id in all_ids
-        if any(
-            prompt_matches_label(
-                prompt,
-                labels.get(instance_id, "object"),
-                aliases=prompt_label_aliases,
+    if include_all_instances:
+        eligible = list(all_ids)
+    else:
+        eligible = [
+            instance_id
+            for instance_id in all_ids
+            if any(
+                prompt_matches_label(
+                    prompt,
+                    labels.get(instance_id, "object"),
+                    aliases=prompt_label_aliases,
+                )
+                for prompt in prompts
             )
-            for prompt in prompts
-        )
-    ]
+        ]
     height, width = (int(value) for value in output_size)
     if eligible:
         masks = torch.stack(

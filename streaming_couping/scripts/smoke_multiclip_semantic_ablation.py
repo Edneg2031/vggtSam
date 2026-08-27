@@ -21,6 +21,8 @@ def main() -> None:
     assert variants == ("raw", "v23_all_visible", "v23")
     oracle_variants = _parse_variants("raw,oracle")
     assert oracle_variants == ("raw", "oracle")
+    v6_variants = _parse_variants("raw,v6,oracle")
+    assert v6_variants == ("raw", "v6", "oracle")
 
     raw_tracking = {
         "variant": "raw_sam",
@@ -90,7 +92,10 @@ def main() -> None:
             exporter_artifact
         ).resolve()
 
-    print("multi-clip semantic ablation smoke passed variants=3 decision=GO")
+    print(
+        "multi-clip semantic ablation smoke passed "
+        "oracle_and_v6_controls=1 decision=GO"
+    )
 
 
 if __name__ == "__main__":

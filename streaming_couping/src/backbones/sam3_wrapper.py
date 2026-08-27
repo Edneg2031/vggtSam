@@ -121,6 +121,42 @@ class SAM3Wrapper:
             quiet=True,
         )
 
+    def track_auto_points_forward(
+        self,
+        image_paths: Sequence[str | Path],
+        *,
+        output_size: tuple[int, int],
+        max_objects: int,
+        discovery_stride: int = 5,
+        grid_rows: int = 8,
+        grid_columns: int = 12,
+        points_per_discovery: int = 24,
+        min_mask_pixels: int = 128,
+        max_mask_area_ratio: float = 0.35,
+        duplicate_iou: float = 0.80,
+        duplicate_intersection_over_smaller: float = 0.90,
+    ) -> SAM3MultiTrackOutput:
+        """Run category-free visual-point discovery and causal tracking."""
+
+        if self.version != "sam3.1":
+            raise RuntimeError("Automatic point discovery requires SAM3.1.")
+        return self._require_adapter().track_auto_points_forward_from_paths(
+            image_paths,
+            output_size=output_size,
+            max_objects=max_objects,
+            discovery_stride=discovery_stride,
+            grid_rows=grid_rows,
+            grid_columns=grid_columns,
+            points_per_discovery=points_per_discovery,
+            min_mask_pixels=min_mask_pixels,
+            max_mask_area_ratio=max_mask_area_ratio,
+            duplicate_iou=duplicate_iou,
+            duplicate_intersection_over_smaller=(
+                duplicate_intersection_over_smaller
+            ),
+            quiet=True,
+        )
+
     def propose_text_masks(
         self,
         image_path: str | Path,

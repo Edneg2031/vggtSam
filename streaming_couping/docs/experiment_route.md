@@ -113,6 +113,15 @@ GT-mask oracle 的多场景入口现在是：
 区分：如果 oracle 也不能改善地图，继续改 SAM identity/memory 没有意义；如果
 oracle 明显更好，才值得把精力放在 mask ownership 和 re-entry 上。
 
+由于 frozen cache 已经包含 `sam31_online_geometry_compete`，V6 与 oracle 的统一
+对照入口是：
+
+    zsh streaming_couping/commands_semantic_mapping_multiclip_v6_oracle.txt
+
+该实验不重跑 SAM/StreamVGGT，只把 raw cache 中的 V6 mask 作为额外 branch，固定
+raw branch 做跨分支 assignment。它回答的是：V6 的逐帧 mask 优势，是否真的传递到
+IDF1、re-entry 和 object-level map。
+
 ## 4. Stage 1：V6 prompt causal ablation
 
 只有在 Stage 0 完成后，才跑 prompt 消融。第一轮只需要：

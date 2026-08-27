@@ -18,6 +18,8 @@ The evaluator deliberately separates tracking from map writing:
 ``oracle``
     GT masks placed into the frozen raw-SAM slots, used only as a geometry
     upper bound during evaluation.
+``v6``
+    Frozen geometry-prompted SAM3.1 masks already stored in the feature cache.
 
 For more than one clip, the artifact root may either contain a flat
 ``semantic_map.pt`` (single-clip compatibility) or one directory per clip.
@@ -66,10 +68,12 @@ V22_VARIANT = "v2_2_failure_only_geometry_consistency_recovery"
 V23_ALL_VISIBLE_VARIANT = "v2_3_tracking_all_visible_map"
 V23_VARIANT = "v2_3_failure_only_confidence_aware_voxel_memory"
 ORACLE_VARIANT = "gt_mask_oracle"
+V6_VARIANT = "sam31_online_geometry_compete"
 
 SUPPORTED_VARIANTS = {
     "raw",
     "oracle",
+    "v6",
     "v21",
     "v22",
     "v23_all_visible",
@@ -263,8 +267,42 @@ def _evaluate_clip(
             map_policy="all_visible_observations",
         )
     }
+    if "v6" in variants:
+        v6_output, v6_stream, v6_scores = _load_raw_branch(
+            payload, V6_VARIANT
+        )
+        if tuple(v6_output.shape) != tuple(raw_output.shape):
+            raise ValueError(
+                f"V6 output shape {tuple(v6_output.shape)} differs from raw "
+                f"{tuple(raw_output.shape)} for {clip.name}."
+            )
+        if tuple(v6_stream.shape) != tuple(raw_stream.shape):
+            raise ValueError(
+                f"V6 stream shape {tuple(v6_stream.shape)} differs from raw "
+                f"{tuple(raw_stream.shape)} for {clip.name}."
+            )
+        if tuple(v6_scores.shape) != tuple(raw_scores.shape):
+            raise ValueError(
+                f"V6 score shape {tuple(v6_scores.shape)} differs from raw "
+                f"{tuple(raw_scores.shape)} for {clip.name}."
+            )
+        branches["v6"] = Branch(
+            key="v6",
+            label=V6_VARIANT,
+            tracking_output=v6_output,
+            tracking_stream=v6_stream,
+            tracking_scores=v6_scores,
+            map_stream=v6_stream,
+            map_write=v6_stream.flatten(2).any(dim=2),
+            artifact_path=None,
+            artifact_stats={
+                "frozen_cache_variant": V6_VARIANT,
+                "candidate_generation_gt_fields": 0,
+            },
+            map_policy="v6_geometry_prompt_all_visible_observations",
+        )
     for key in variants:
-        if key in {"raw", "oracle"}:
+        if key in {"raw", "v6", "oracle"}:
             continue
         root_key = "v23" if key == "v23_all_visible" else key
         if root_key not in roots or roots[root_key] is None:
@@ -813,6 +851,7 @@ def _variant_label(key: str) -> str:
     return {
         "raw": RAW_VARIANT,
         "oracle": ORACLE_VARIANT,
+        "v6": V6_VARIANT,
         "v21": V21_VARIANT,
         "v22": V22_VARIANT,
         "v23_all_visible": V23_ALL_VISIBLE_VARIANT,
@@ -981,8 +1020,9 @@ def _parse_args() -> argparse.Namespace:
         "--variants",
         default="raw,v21,v22,v23_all_visible,v23",
         help=(
-            "Comma-separated branches: raw,oracle,v21,v22,v23_all_visible,v23. "
-            "oracle is evaluation-only and needs no artifact root."
+            "Comma-separated branches: raw,v6,oracle,v21,v22,v23_all_visible,v23. "
+            "v6 is read from the frozen cache; oracle is evaluation-only and "
+            "needs no artifact root."
         ),
     )
     parser.add_argument("--v21-root")
