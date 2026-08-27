@@ -19,6 +19,8 @@ from streaming_couping.src.learned_pose.config import ClipConfig
 def main() -> None:
     variants = _parse_variants("raw,v23_all_visible,v23")
     assert variants == ("raw", "v23_all_visible", "v23")
+    oracle_variants = _parse_variants("raw,oracle")
+    assert oracle_variants == ("raw", "oracle")
 
     raw_tracking = {
         "variant": "raw_sam",

@@ -37,3 +37,44 @@ The main files are `summary.json`, `copyable_result.txt`,
 `association_summary.csv`, `tracking_summary.csv`, `map_summary.csv`, and one
 `semantic_map.pt` per clip/branch. The fused map rows are marked
 `map_type=fused`; the observation rows are marked `map_type=observation`.
+
+## Server result: r1
+
+The fixed four-clip run completed with `decision=NO_GO`. The DINO path was
+actually exercised: the branches produced roughly 150 candidate events and
+the DINO branches compared appearance on 118--152 events, depending on the
+control. Therefore this is not a `NOT_EXERCISED` result.
+
+The important observations are:
+
+- `single_view_dino` and `persistent_dino` were identical to the geometry-only
+  association/map readout on most clips; DINO rarely changed the accepted
+  object ownership in a way that changed geometry.
+- The aggregate fused-map F5cm was about `0.249`, but fused ghost rate was
+  about `0.52` for geometry-only and about `0.55` for the DINO branches. The
+  direct point fusion is therefore not a safe map representation.
+- On the held-out clip, persistent DINO fused F5cm was `0.14577`, below
+  geometry-only `0.15979`; the shuffled control was `0.16071`. This rejects
+  the claim that the appearance term provides a reliable causal association
+  gain.
+- The observation map also lost coverage because tentative observations are
+  withheld until confirmation. That is an identity-policy side effect, not
+  evidence that the frozen StreamVGGT pointmap improved or worsened by itself.
+
+The correct conclusion is:
+
+```text
+DINO appearance-assisted re-association: NO-GO
+unvalidated direct object-memory fusion:   main failure mode
+```
+
+Do not tune `appearance_weight`, EMA, or the DINO backbone from this result.
+The next diagnostic is the evaluation-only multi-scene GT-mask upper bound:
+
+```zsh
+zsh streaming_couping/commands_semantic_mapping_multiclip_oracle.txt
+```
+
+If the oracle map is still poor, the bottleneck is StreamVGGT geometry or
+world-space fusion. If the oracle is substantially better, the bottleneck is
+SAM ownership/coverage and a mask-side method is justified.

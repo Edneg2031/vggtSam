@@ -15,6 +15,9 @@ The evaluator deliberately separates tracking from map writing:
     the effect of confidence-aware memory from the V2.2/V2.3 mask branch.
 ``v23``
     Frozen V2.3 tracking masks and its confidence-aware map-write branch.
+``oracle``
+    GT masks placed into the frozen raw-SAM slots, used only as a geometry
+    upper bound during evaluation.
 
 For more than one clip, the artifact root may either contain a flat
 ``semantic_map.pt`` (single-clip compatibility) or one directory per clip.
@@ -51,6 +54,7 @@ from streaming_couping.src.semantic_tracking_metrics import (
 from streaming_couping.src.storage import expand_storage_path
 
 from streaming_couping.scripts.run_semantic_map_evaluation import (
+    _build_oracle_variant,
     _load_run as _load_evaluation_run,
 )
 
@@ -61,9 +65,11 @@ V21_VARIANT = "v2_1_failure_only_candidate_recovery"
 V22_VARIANT = "v2_2_failure_only_geometry_consistency_recovery"
 V23_ALL_VISIBLE_VARIANT = "v2_3_tracking_all_visible_map"
 V23_VARIANT = "v2_3_failure_only_confidence_aware_voxel_memory"
+ORACLE_VARIANT = "gt_mask_oracle"
 
 SUPPORTED_VARIANTS = {
     "raw",
+    "oracle",
     "v21",
     "v22",
     "v23_all_visible",
@@ -258,7 +264,7 @@ def _evaluate_clip(
         )
     }
     for key in variants:
-        if key == "raw":
+        if key in {"raw", "oracle"}:
             continue
         root_key = "v23" if key == "v23_all_visible" else key
         if root_key not in roots or roots[root_key] is None:
@@ -276,12 +282,6 @@ def _evaluate_clip(
             raw_stream_shape=tuple(raw_stream.shape),
         )
 
-    variant_masks = {
-        branch.label: branch.tracking_output for branch in branches.values()
-    }
-    variant_scores = {
-        branch.label: branch.tracking_scores for branch in branches.values()
-    }
     output_size = (int(raw_output.shape[-2]), int(raw_output.shape[-1]))
     ground_truth = load_ground_truth_instances(
         data.manifest,
@@ -300,6 +300,59 @@ def _evaluate_clip(
         processed_size=processed_size,
         image_mode=str(payload["image_mode"]),
     )
+
+    # The oracle is an evaluation-only upper bound.  Its slot assignment is
+    # inherited from raw SAM, so it does not give the evaluator a new
+    # annotation-backed matching advantage.  It is deliberately constructed
+    # only after the frozen cache/artifacts have been loaded.
+    if "oracle" in variants:
+        raw_assignment = evaluate_tracking_variants(
+            scene_id=str(payload["scene_id"]),
+            clip_name=str(payload["clip_name"]),
+            frame_indices=frames,
+            variant_masks={RAW_VARIANT: raw_output},
+            variant_scores={RAW_VARIANT: raw_scores},
+            raw_variant=RAW_VARIANT,
+            track_ids=tuple(int(value) for value in payload["sam_track_ids"]),
+            track_prompts=tuple(
+                str(value) for value in payload["sam_track_prompts"]
+            ),
+            ground_truth=ground_truth,
+            config=evaluation_run.tracking,
+            prompt_label_aliases=evaluation_run.prompt_label_aliases,
+        )
+        oracle_output, oracle_scores = _build_oracle_variant(
+            ground_truth.masks,
+            assignments=raw_assignment["assignments"],
+            sequence_shape=tuple(raw_output.shape),
+        )
+        oracle_stream, _ = _build_oracle_variant(
+            gt_stream,
+            assignments=raw_assignment["assignments"],
+            sequence_shape=tuple(raw_stream.shape),
+        )
+        branches["oracle"] = Branch(
+            key="oracle",
+            label=ORACLE_VARIANT,
+            tracking_output=oracle_output,
+            tracking_stream=oracle_stream,
+            tracking_scores=oracle_scores,
+            map_stream=oracle_stream,
+            map_write=oracle_stream.flatten(2).any(dim=2),
+            artifact_path=None,
+            artifact_stats={
+                "gt_mask_oracle": 1,
+                "candidate_generation_gt_fields": 0,
+            },
+            map_policy="gt_mask_oracle_all_visible_observations",
+        )
+
+    variant_masks = {
+        branch.label: branch.tracking_output for branch in branches.values()
+    }
+    variant_scores = {
+        branch.label: branch.tracking_scores for branch in branches.values()
+    }
     tracking = evaluate_tracking_variants(
         scene_id=str(payload["scene_id"]),
         clip_name=str(payload["clip_name"]),
@@ -759,6 +812,7 @@ def _group_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, list[Mapping[str
 def _variant_label(key: str) -> str:
     return {
         "raw": RAW_VARIANT,
+        "oracle": ORACLE_VARIANT,
         "v21": V21_VARIANT,
         "v22": V22_VARIANT,
         "v23_all_visible": V23_ALL_VISIBLE_VARIANT,
@@ -926,7 +980,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--variants",
         default="raw,v21,v22,v23_all_visible,v23",
-        help="Comma-separated branches: raw,v21,v22,v23_all_visible,v23.",
+        help=(
+            "Comma-separated branches: raw,oracle,v21,v22,v23_all_visible,v23. "
+            "oracle is evaluation-only and needs no artifact root."
+        ),
     )
     parser.add_argument("--v21-root")
     parser.add_argument("--v22-root")

@@ -104,6 +104,15 @@ GT mask 只用于 offline evaluation，不能进入 candidate generation。
     V6 map 好，但 pose 不变
         → 这仍然是有效的 semantic-map 结果，不需要强行修改 pose
 
+GT-mask oracle 的多场景入口现在是：
+
+    zsh streaming_couping/commands_semantic_mapping_multiclip_oracle.txt
+
+它把 GT mask 按 raw-SAM 的 frozen slot assignment 放回同样的 mask 槽位，只在
+评估阶段使用 GT，不参与任何候选生成、tracking 或 map-write 决策。这个上界用于
+区分：如果 oracle 也不能改善地图，继续改 SAM identity/memory 没有意义；如果
+oracle 明显更好，才值得把精力放在 mask ownership 和 re-entry 上。
+
 ## 4. Stage 1：V6 prompt causal ablation
 
 只有在 Stage 0 完成后，才跑 prompt 消融。第一轮只需要：
