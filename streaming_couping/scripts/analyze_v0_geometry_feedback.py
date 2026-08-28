@@ -1250,7 +1250,7 @@ def _resize_uv(
 ) -> torch.Tensor:
     source_h, source_w = (int(value) for value in source_size)
     target_h, target_w = (int(value) for value in target_size)
-    del source_h, target_h
+    del source_h
     output = uv.detach().float().clone()
     output[:, 0] = (output[:, 0] + 0.5) * target_w / float(source_w) - 0.5
     output[:, 1] = (output[:, 1] + 0.5) * target_h / float(source_size[0]) - 0.5
