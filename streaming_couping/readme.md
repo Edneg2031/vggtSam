@@ -30,12 +30,19 @@ zsh streaming_couping/commands_semantic_mapping_v1_evaluation.txt
 zsh streaming_couping/commands_check_scannetpp_data.txt
 zsh streaming_couping/commands_audit_scannetpp_processed.txt
 zsh streaming_couping/commands_run_v0_bidirectional_feedback.txt
+zsh streaming_couping/commands_run_v0_temporal_prompt_matrix.txt
 ```
 
-最后一条命令是 V0 单场景的显式空间—时间反馈诊断：复用冻结 cache，比较 raw
+`commands_run_v0_bidirectional_feedback.txt` 是 V0 单场景的显式空间—时间反馈诊断：复用冻结 cache，比较 raw
 mask 与启发式 depth-refined mask，并统计历史 3D 中心投影作为 SAM 点先验的命中率。
 当前版本不重新运行 SAM、不修改点云，也不会把 V0 的预配置 prompt 变成 prompt-free
 检测。详情见 [v0_bidirectional_feedback.md](docs/v0_bidirectional_feedback.md)。
+
+`commands_run_v0_temporal_prompt_matrix.txt` 是后续的 A–E 时序 prompt 冻结诊断：在同一
+V0 cache 上比较单中心、3/5 个空间分散表面点、投影 bounding box，以及 current-depth
+gate。它只使用 raw StreamVGGT pose，先冻结候选再打开 GT，不调用 SAM；precision、
+object-frame coverage、coverage F1 和空间分散度分别输出。详情见
+[v0_temporal_prompt_matrix.md](docs/v0_temporal_prompt_matrix.md)。
 
 其中 `commands_semantic_mapping.txt` 只读取已经完成的 V0/V6 cache，离线比较 raw SAM、V6、
 GT-mask oracle 和 object-memory map-write gate，不重新运行模型。
