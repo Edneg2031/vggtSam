@@ -329,6 +329,28 @@ the SAM recovery and map-memory ablations.
 
 如果只有 pose 变好、semantic map 没变好，不能把它称为 semantic-map improvement。
 
+## 7.1 Stage 4.5：多场景 depth-head affine 诊断
+
+历史深度 Veto 和离散时序 prompt 已经显示出明显的误删/误提示风险。下一步只保留
+一个独立的 geometry diagnostic：对每个 scene 的前 70% 帧做 causal depth
+scale-shift calibration，在后 30% 帧把 depth head 沿原像素射线重建到 raw
+StreamVGGT world frame。
+
+运行：
+
+    zsh streaming_couping/commands_analyze_multiclip_affine_geometry.txt
+
+该实验严格区分 `depth_head -> historical pointmap depth` 与
+`pointmap_z -> historical pointmap depth`，并将 selected/QK pose 限定为
+self-consistency control；geometry branch 固定 raw StreamVGGT pose。它只写入
+独立诊断目录，不修改 V0 baseline。必须同时检查 object-only depth error、
+voxelIoU/F5cm、completeness 和 ghost rate；单看背景 depth RMSE 不能 promote
+affine correction。
+
+只有至少 3/4 clip 的 holdout depth median/P90 同时改善，且主 ray branch 在
+holdout map 指标满足非退化 gate 时，才值得另起 scene rotation 做正式验证。即使
+gate 通过，本阶段输出仍是 `DIAGNOSTIC_ONLY`，不会自动把 correction 写入部署图。
+
 ## 8. Stage 5：独立 geometry memory
 
 RetrieveVGGT / FrameVGGT 风格的 memory 是另一条支线，不要和 SAM token fusion 混在一起。

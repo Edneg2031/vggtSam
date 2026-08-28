@@ -191,6 +191,145 @@ def transform_world_points(
     )
 
 
+def resize_intrinsics(
+    intrinsics: torch.Tensor,
+    source_size: tuple[int, int],
+    target_size: tuple[int, int],
+) -> torch.Tensor:
+    """Map a pinhole matrix between grids using pixel-center coordinates.
+
+    ``intrinsics`` is expressed in ``source_size`` pixel coordinates.  The
+    returned matrix is expressed in ``target_size`` coordinates.  This is the
+    same half-pixel convention used by the repository's image transforms and
+    is needed when a depth head and a pointmap have different resolutions.
+    """
+
+    matrix = _float_tensor(intrinsics, "intrinsics")
+    if tuple(matrix.shape) != (3, 3):
+        raise ValueError("intrinsics must have shape [3,3].")
+    source_height, source_width = _size_2d(source_size, "source_size")
+    target_height, target_width = _size_2d(target_size, "target_size")
+    scale_x = float(target_width) / float(source_width)
+    scale_y = float(target_height) / float(source_height)
+    output = matrix.clone()
+    output[0, :2] *= scale_x
+    output[1, :2] *= scale_y
+    output[0, 2] = (matrix[0, 2] + 0.5) * scale_x - 0.5
+    output[1, 2] = (matrix[1, 2] + 0.5) * scale_y - 0.5
+    return output
+
+
+def apply_ray_depth_affine(
+    raw_world_points: torch.Tensor,
+    source_depth: torch.Tensor,
+    intrinsics: torch.Tensor,
+    world_to_camera: torch.Tensor,
+    *,
+    scale: float,
+    shift: float,
+    update_mask: torch.Tensor | None = None,
+    min_depth: float = DEPTH_EPS,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Replace depth along the existing pixel rays and return world points.
+
+    The source depth is interpreted as camera ``Z`` rather than Euclidean
+    range.  For each pixel ``q=(u,v,1)^T`` we compute
+
+    ``r = K^{-1}q / (K^{-1}q)_z`` and ``X_c' = r * (scale*Z + shift)``.
+
+    The output is transformed back with the inverse of the supplied rigid
+    ``world_to_camera`` pose.  Only ``update_mask`` pixels are replaced; all
+    other pixels, and every invalid result, retain the original pointmap.
+    The returned boolean mask records exactly which pixels were replaced.
+    """
+
+    points = _float_tensor(raw_world_points, "raw_world_points")
+    depth = _float_tensor(source_depth, "source_depth")
+    matrix = _float_tensor(intrinsics, "intrinsics")
+    w2c = _as_pose34(world_to_camera, "world_to_camera")
+    common_dtype = torch.promote_types(
+        torch.promote_types(points.dtype, depth.dtype),
+        torch.promote_types(matrix.dtype, w2c.dtype),
+    )
+    points = points.to(dtype=common_dtype)
+    depth = depth.to(dtype=common_dtype)
+    matrix = matrix.to(dtype=common_dtype)
+    w2c = w2c.to(dtype=common_dtype)
+    if points.ndim != 3 or tuple(points.shape[-1:]) != (3,):
+        raise ValueError("raw_world_points must have shape [H,W,3].")
+    if depth.ndim != 2 or tuple(depth.shape) != tuple(points.shape[:2]):
+        raise ValueError("source_depth must match raw_world_points [H,W].")
+    if tuple(matrix.shape) != (3, 3):
+        raise ValueError("intrinsics must have shape [3,3].")
+    if not math.isfinite(float(scale)) or float(scale) <= 0.0:
+        raise ValueError("scale must be finite and positive.")
+    if not math.isfinite(float(shift)):
+        raise ValueError("shift must be finite.")
+    if float(min_depth) <= 0.0:
+        raise ValueError("min_depth must be positive.")
+
+    height, width = (int(value) for value in depth.shape)
+    if update_mask is None:
+        requested = torch.ones(height, width, dtype=torch.bool)
+    else:
+        requested = _as_bool_tensor(update_mask, "update_mask")
+        if tuple(requested.shape) != (height, width):
+            raise ValueError("update_mask must match source_depth [H,W].")
+
+    finite_points = torch.isfinite(points).all(dim=-1)
+    raw_camera = transform_world_points(points, w2c)
+    finite_raw_camera = torch.isfinite(raw_camera).all(dim=-1)
+    source_valid = torch.isfinite(depth) & (depth > float(min_depth))
+    raw_valid = finite_points & finite_raw_camera & (raw_camera[..., 2] > float(min_depth))
+    corrected_depth = float(scale) * depth + float(shift)
+    corrected_valid = torch.isfinite(corrected_depth) & (
+        corrected_depth > float(min_depth)
+    )
+
+    yy, xx = torch.meshgrid(
+        torch.arange(height, dtype=common_dtype),
+        torch.arange(width, dtype=common_dtype),
+        indexing="ij",
+    )
+    pixels = torch.stack(
+        (
+            xx.reshape(-1),
+            yy.reshape(-1),
+            torch.ones(height * width, dtype=common_dtype),
+        ),
+        dim=1,
+    )
+    inverse_intrinsics = torch.linalg.inv(matrix)
+    rays = pixels @ inverse_intrinsics.T
+    ray_z = rays[:, 2]
+    ray_valid = torch.isfinite(rays).all(dim=1) & (
+        ray_z.abs() > float(min_depth)
+    )
+    safe_ray_z = torch.where(
+        ray_z.abs() > float(min_depth),
+        ray_z,
+        torch.ones_like(ray_z),
+    )
+    rays = rays / safe_ray_z.unsqueeze(1)
+    camera_points = rays * corrected_depth.reshape(-1, 1)
+    rotation = w2c[:, :3]
+    translation = w2c[:, 3]
+    world_points = (camera_points - translation.reshape(1, 3)) @ rotation
+    world_points = world_points.reshape(height, width, 3)
+    reconstructed_valid = torch.isfinite(world_points).all(dim=-1)
+    applied = (
+        requested
+        & source_valid
+        & raw_valid
+        & corrected_valid
+        & ray_valid.reshape(height, width)
+        & reconstructed_valid
+    )
+    output = points.clone()
+    output[applied] = world_points[applied]
+    return output, applied
+
+
 def gather_historical_object_depths(
     *,
     points: torch.Tensor,
@@ -670,3 +809,21 @@ def _as_bool_tensor(value: torch.Tensor, name: str) -> torch.Tensor:
     if not torch.is_tensor(value):
         value = torch.as_tensor(value)
     return value.detach().cpu().bool()
+
+
+def _as_pose34(value: torch.Tensor, name: str) -> torch.Tensor:
+    pose = _float_tensor(value, name)
+    if tuple(pose.shape) == (4, 4):
+        pose = pose[:3]
+    if tuple(pose.shape) != (3, 4):
+        raise ValueError(f"{name} must have shape [3,4] or [4,4].")
+    return pose
+
+
+def _size_2d(value: tuple[int, int], name: str) -> tuple[int, int]:
+    if len(value) != 2:
+        raise ValueError(f"{name} must contain (height,width).")
+    height, width = int(value[0]), int(value[1])
+    if height <= 0 or width <= 0:
+        raise ValueError(f"{name} must contain positive dimensions.")
+    return height, width

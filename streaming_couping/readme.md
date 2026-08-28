@@ -31,6 +31,7 @@ zsh streaming_couping/commands_check_scannetpp_data.txt
 zsh streaming_couping/commands_audit_scannetpp_processed.txt
 zsh streaming_couping/commands_run_v0_bidirectional_feedback.txt
 zsh streaming_couping/commands_run_v0_temporal_prompt_matrix.txt
+zsh streaming_couping/commands_analyze_multiclip_affine_geometry.txt
 ```
 
 `commands_run_v0_bidirectional_feedback.txt` 是 V0 单场景的显式空间—时间反馈诊断：复用冻结 cache，比较 raw
@@ -43,6 +44,12 @@ V0 cache 上比较单中心、3/5 个空间分散表面点、投影 bounding box
 gate。它只使用 raw StreamVGGT pose，先冻结候选再打开 GT，不调用 SAM；precision、
 object-frame coverage、coverage F1 和空间分散度分别输出。详情见
 [v0_temporal_prompt_matrix.md](docs/v0_temporal_prompt_matrix.md)。
+
+`commands_analyze_multiclip_affine_geometry.txt` 是四个 scene-disjoint V0 clip 的
+causal depth scale-shift / depth-head ray reconstruction 诊断。它不重跑模型，先用
+21 帧 calibration 拟合每个 clip 的 affine，再用 9 帧 holdout 评估；只在 raw SAM
+object union 内替换候选点，GT 仅用于候选冻结后的评价。详情见
+[multiclip_affine_geometry.md](docs/multiclip_affine_geometry.md)。
 
 其中 `commands_semantic_mapping.txt` 只读取已经完成的 V0/V6 cache，离线比较 raw SAM、V6、
 GT-mask oracle 和 object-memory map-write gate，不重新运行模型。
