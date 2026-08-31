@@ -137,3 +137,24 @@ pose、遮挡、动态物体和空间非线性畸变影响，单一 per-scene sc
 后续任何新方法都必须在独立 scene-disjoint 数据上，与 raw V0 做同协议比较，并同时
 报告 tracking、depth、map、恶化帧比例和 fallback/coverage；未通过稳定性 gate 前，
 不得写回正式 V0。
+
+## 语义地图 pipeline 实现
+
+在不修改上述 V0 训练和评估路径的前提下，仓库新增了
+`src/semantic_mapping/`。它把模型推理与地图融合解耦：
+
+- `GeometryFrame` 是统一几何 contract，支持 `world_points`，也支持未来后端只提供
+  `depth + intrinsics + camera_to_world` 的情况；
+- `ObjectObservation`/`SegmentationFrame` 是统一的 prompt、实例 ID、mask 和置信度 contract；
+- `StreamVGGTGeometryAdapter`、`SAM31SegmentationAdapter` 接入当前模型；V0 cache
+  adapters 可以在不重新推理模型的情况下重放；
+- `SemanticMapBuilder` 按帧将 mask 投影到世界坐标并融合成体素，同时把动态实例保存到
+  独立 track，避免写入静态地图；
+- `semantic_map.pt`、`semantic_map.ply`、`rgb_map.ply`、`object_tracks.ply` 和
+  `map_summary.json` 记录地图及后端、坐标系、尺度和对象元数据。
+
+运行入口是 `scripts/run_semantic_map.py`。当前 RGB 路径仍调用 StreamVGGT + SAM3.1；
+切换 HorizonStream 时只需实现同样的 `GeometryProvider`，将输出转换为 `GeometryFrame`，
+无需修改地图融合逻辑。当前默认尺度标记为 `unknown`，不会把 StreamVGGT 的 native
+坐标自动宣称为米制坐标；该 pipeline 也不启用已判定 NO-GO 的 temporal point prompt、
+历史深度 Veto 或 affine correction。
