@@ -153,7 +153,8 @@ pose、遮挡、动态物体和空间非线性畸变影响，单一 per-scene sc
 - `semantic_map.pt`、`semantic_map.ply`、`rgb_map.ply`、`object_tracks.ply` 和
   `map_summary.json` 记录地图及后端、坐标系、尺度和对象元数据。
 
-运行入口是 `scripts/run_semantic_map.py`。当前 RGB 路径仍调用 StreamVGGT + SAM3.1；
+运行入口是 `commands_run_semantic_map.txt`（底层为 `scripts/run_semantic_map.py`）。
+当前 RGB 路径仍调用 StreamVGGT + SAM3.1；
 切换 HorizonStream 时只需实现同样的 `GeometryProvider`，将输出转换为 `GeometryFrame`，
 无需修改地图融合逻辑。当前默认尺度标记为 `unknown`，不会把 StreamVGGT 的 native
 坐标自动宣称为米制坐标；该 pipeline 也不启用已判定 NO-GO 的 temporal point prompt、

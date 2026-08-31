@@ -27,7 +27,7 @@ StreamVGGT 与 SAM3.1 通过 adapter 接入，后续替换 HorizonStream 时只�
 从 RGB 和文本 prompt 运行当前模型：
 
 ```bash
-PYTHONPATH=. python -m streaming_couping.scripts.run_semantic_map \
+zsh streaming_couping/commands_run_semantic_map.txt \
   --frames /path/to/rgb_frames \
   --prompts bed wardrobe \
   --output-dir outputs/semantic_map
@@ -36,7 +36,7 @@ PYTHONPATH=. python -m streaming_couping.scripts.run_semantic_map \
 如果已经有 V0 cache，可以不重新运行模型：
 
 ```bash
-PYTHONPATH=. python -m streaming_couping.scripts.run_semantic_map \
+zsh streaming_couping/commands_run_semantic_map.txt \
   --cache outputs/streaming_couping_v0/cache/<clip>.pt \
   --output-dir outputs/semantic_map
 ```
@@ -51,6 +51,7 @@ temporal point prompt、历史深度 Veto 或 affine depth correction。
 ```bash
 zsh streaming_couping/commands_plot_v0_poses.txt
 zsh streaming_couping/commands_semantic_mapping.txt
+zsh streaming_couping/commands_run_semantic_map.txt
 zsh streaming_couping/commands_semantic_mapping_v1.txt
 zsh streaming_couping/commands_semantic_mapping_v1_evaluation.txt
 zsh streaming_couping/commands_check_scannetpp_data.txt

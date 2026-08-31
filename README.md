@@ -30,7 +30,7 @@ zsh streaming_couping/commands_semantic_mapping.txt
 For the backend-neutral RGB + text-prompt pipeline:
 
 ```bash
-PYTHONPATH=. python -m streaming_couping.scripts.run_semantic_map \
+zsh streaming_couping/commands_run_semantic_map.txt \
   --frames /path/to/rgb_frames \
   --prompts bed wardrobe \
   --output-dir outputs/semantic_map

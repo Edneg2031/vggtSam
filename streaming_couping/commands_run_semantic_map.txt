@@ -1,0 +1,29 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# Backend-neutral RGB/prompt semantic-map entrypoint.
+# The Python runner owns the model and map logic; this file only standardizes
+# the server environment and forwards all CLI arguments.
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || {
+  print -u2 "missing Python: $PYTHON_BIN"
+  exit 1
+}
+
+if (( $# == 0 )); then
+  print -u2 "usage: zsh streaming_couping/commands_run_semantic_map.txt --frames <rgb-file-or-directory> [<more-files-or-directories>] --prompts <prompt> [<more-prompts>] --output-dir <directory>"
+  print -u2 "or:    zsh streaming_couping/commands_run_semantic_map.txt --cache <frozen-v0-cache.pt> --output-dir <directory>"
+  exit 2
+fi
+
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+if [[ -n "${SEMANTIC_MAP_CUDA_VISIBLE_DEVICES:-}" ]]; then
+  export CUDA_VISIBLE_DEVICES="$SEMANTIC_MAP_CUDA_VISIBLE_DEVICES"
+fi
+
+PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON_BIN" -m streaming_couping.scripts.run_semantic_map "$@"
