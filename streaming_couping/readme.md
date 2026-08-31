@@ -1,9 +1,8 @@
 # streaming_couping
 
-本目录只保留 `V0` SAM3.1 × StreamVGGT 动态实例几何 baseline。V4–V9.8 的实验设置、有效证据、
-失败方法和结论边界统一记录在：
+本目录只保留 `V0` SAM3.1 × StreamVGGT 动态实例几何 baseline。当前做法、效果、实验结果和结论边界统一记录在：
 
-[本周实验总结](docs/weekly_experiment_summary_2026-08-03_to_2026-08-06.md)
+[当前状态与实验结论](docs/current_status.md)
 
 运行：
 
