@@ -156,6 +156,8 @@ pose、遮挡、动态物体和空间非线性畸变影响，单一 per-scene sc
   场景，后者在场景上下文中覆盖静态 prompt 实例颜色；
 - `semantic_map.ply`/`rgb_map.ply` 只输出静态 prompt 物体的融合体素，
   `object_tracks.ply` 则汇总保留 `frame_id` 的逐帧 track 点，不进行体素融合；
+- `objects/<category>_<instance_id>.ply` 按 persistent instance ID 输出每个静态物体的
+  独立 RGB 体素融合点云；
 - `semantic_map.pt` 和 `map_summary.json` 记录完整场景、语义地图、轨迹及后端、坐标系、尺度
   和对象元数据。
 

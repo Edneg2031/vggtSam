@@ -238,6 +238,22 @@ def main() -> None:
             "map_summary.json",
         ):
             assert (Path(directory) / name).is_file(), name
+        chair_ply = Path(directory).resolve() / "objects" / "chair_7.ply"
+        assert chair_ply.is_file()
+        assert not (Path(directory) / "objects" / "person_9.ply").exists()
+        assert summary["outputs"]["object_plys"] == [str(chair_ply)]
+        assert summary["object_plys"] == [
+            {
+                "instance_id": 7,
+                "category": "chair",
+                "point_count": result.voxel_count,
+                "path": str(chair_ply),
+            }
+        ]
+        chair_header = chair_ply.read_bytes().split(b"end_header", 1)[0].decode(
+            "ascii"
+        )
+        assert f"element vertex {result.voxel_count}" in chair_header
         try:
             artifact = torch.load(
                 Path(directory) / "semantic_map.pt",

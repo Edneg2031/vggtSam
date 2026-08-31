@@ -73,6 +73,7 @@ zsh streaming_couping/commands_run_semantic_map.txt \
 | `scene_semantic_map.ply` | 同一完整场景；静态 prompt 物体按实例着色，其他场景区域显示为较暗 RGB | 所有选中帧按世界坐标叠加后做体素融合 |
 | `semantic_map.ply` | 只包含静态 prompt 物体，按 persistent instance ID 着色 | 多帧体素融合 |
 | `rgb_map.ply` | 与 `semantic_map.ply` 完全相同的物体体素，改用观测 RGB 着色 | 多帧体素融合 |
+| `objects/<category>_<instance_id>.ply` | 每个静态实例单独保存，例如 `bed_0.ply`、`rug_3.ply` | 与语义地图相同的多帧体素融合，使用观测 RGB 着色 |
 | `object_tracks.ply` | 每个 persistent track 的逐帧观测点，包含静态和动态目标 | 多帧点直接汇总，不做体素融合；点中保留 `frame_id` |
 
 `semantic_map.pt` 保存上述完整场景体素、语义体素、轨迹和元数据，`object_tracks.json`
@@ -81,6 +82,10 @@ zsh streaming_couping/commands_run_semantic_map.txt \
 物体在多帧中的点可能重叠。静态目标写入语义体素地图，动态目标只保存在独立 track 中，避免
 污染静态地图。默认使用当前 V0 的 raw pointmap，不启用被否决的 temporal point prompt、
 历史深度 Veto 或 affine depth correction。
+
+当前场景此前冻结实验使用的类别词是 `rug`（地毯）和 `dustbin`（垃圾桶），不是
+`mat`。默认命令使用 `bed wardrobe chair rug dustbin`；完整的历史固定词表还包括
+`desk cabinet nightstand box "guitar case"`。
 
 ## 历史实验
 

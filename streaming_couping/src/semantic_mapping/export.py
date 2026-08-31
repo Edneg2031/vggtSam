@@ -158,8 +158,25 @@ def export_semantic_map(
         frame_ids=track_frames,
     )
 
+    objects_dir = directory / "objects"
+    object_plys = _export_fused_instance_plys(
+        result,
+        objects_dir,
+        category_to_id=category_to_id,
+    )
+
     tracks_path = directory / "object_tracks.json"
     tracks_summary = [_track_summary(track) for track in result.object_tracks]
+    object_ply_by_id = {
+        int(item["instance_id"]): item
+        for item in object_plys
+    }
+    for item in tracks_summary:
+        fused = object_ply_by_id.get(int(item["instance_id"]))
+        item["fused_ply"] = None if fused is None else str(fused["path"])
+        item["fused_voxel_count"] = (
+            0 if fused is None else int(fused["point_count"])
+        )
     tracks_path.write_text(
         json.dumps(tracks_summary, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
         encoding="utf-8",
@@ -188,6 +205,8 @@ def export_semantic_map(
             "rgb_ply": str(rgb_ply_path),
             "object_tracks_ply": str(tracks_ply_path),
             "object_tracks_json": str(tracks_path),
+            "objects_dir": str(objects_dir),
+            "object_plys": [str(item["path"]) for item in object_plys],
         },
         "output_descriptions": {
             "scene_rgb_ply": (
@@ -209,7 +228,12 @@ def export_semantic_map(
                 "Accepted per-frame object observations concatenated by track; not "
                 "voxel-fused, and each point retains its frame_id."
             ),
+            "object_plys": (
+                "One RGB-colored, voxel-fused semantic-map point cloud per static "
+                "instance, named <category>_<persistent_instance_id>.ply."
+            ),
         },
+        "object_plys": object_plys,
         "objects": tracks_summary,
     }
     summary_path = directory / "map_summary.json"
@@ -218,6 +242,88 @@ def export_semantic_map(
         encoding="utf-8",
     )
     return summary
+
+
+def _export_fused_instance_plys(
+    result: SemanticMapResult,
+    directory: Path,
+    *,
+    category_to_id: Mapping[str, int],
+) -> list[dict[str, Any]]:
+    """Export one RGB-colored PLY for each fused semantic-map instance."""
+
+    directory.mkdir(parents=True, exist_ok=True)
+    track_categories = {
+        int(track.instance_id): str(track.category)
+        for track in result.object_tracks
+    }
+    instance_ids = sorted(
+        int(value)
+        for value in result.instance_ids.unique().tolist()
+        if int(value) >= 0
+    )
+    outputs: list[dict[str, Any]] = []
+    for instance_id in instance_ids:
+        selected = result.instance_ids.eq(instance_id)
+        point_count = int(selected.sum())
+        if point_count == 0:
+            continue
+        category = track_categories.get(instance_id)
+        if category is None:
+            category = _dominant_instance_category(result, selected)
+        category_id = int(category_to_id[category])
+        path = directory / f"{_filename_component(category)}_{instance_id}.ply"
+        colors = result.voxel_rgb[selected]
+        if not bool(colors.abs().sum() > 0):
+            color = torch.tensor(
+                INSTANCE_PALETTE_RGB8[instance_id % len(INSTANCE_PALETTE_RGB8)],
+                dtype=torch.float32,
+            ) / 255.0
+            colors = color.expand(point_count, 3)
+        _write_ply(
+            path,
+            points=result.voxel_points[selected],
+            colors=colors,
+            category_ids=torch.full((point_count,), category_id, dtype=torch.long),
+            instance_ids=torch.full((point_count,), instance_id, dtype=torch.long),
+            weights=result.evidence_weights[selected],
+            observations=result.observation_counts[selected],
+        )
+        outputs.append(
+            {
+                "instance_id": instance_id,
+                "category": category,
+                "point_count": point_count,
+                "path": str(path),
+            }
+        )
+    return outputs
+
+
+def _dominant_instance_category(
+    result: SemanticMapResult,
+    selected: torch.Tensor,
+) -> str:
+    weights: dict[str, float] = {}
+    for index in selected.nonzero(as_tuple=False).flatten().tolist():
+        label = str(result.semantic_labels[index])
+        weights[label] = weights.get(label, 0.0) + float(result.evidence_weights[index])
+    return sorted(weights.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+
+def _filename_component(category: str) -> str:
+    value = str(category).strip().lower()
+    output = []
+    pending_separator = False
+    for character in value:
+        if character.isascii() and character.isalnum():
+            if pending_separator and output:
+                output.append("_")
+            output.append(character)
+            pending_separator = False
+        else:
+            pending_separator = True
+    return "".join(output).strip("_") or "object"
 
 
 def _track_payload(tracks: Sequence[ObjectTrackMap]) -> list[dict[str, Any]]:

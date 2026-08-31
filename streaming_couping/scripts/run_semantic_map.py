@@ -67,6 +67,7 @@ def main() -> None:
     print(f"scene_rgb_ply={summary['outputs']['scene_rgb_ply']}")
     print(f"scene_semantic_ply={summary['outputs']['scene_semantic_ply']}")
     print(f"semantic_ply={summary['outputs']['semantic_ply']}")
+    print(f"object_plys={summary['outputs']['objects_dir']}")
 
 
 def _run_from_cache(
