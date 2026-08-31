@@ -8,10 +8,15 @@ ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
 
-# User-editable defaults. Run this file without arguments after filling in
-# FRAME_PATHS, PROMPTS, and OUTPUT_DIR. Set INPUT_MODE to "cache" to replay
-# CACHE_PATH. Command-line arguments, when supplied, override this section.
+# User-editable defaults. The default RGB source is the same processed
+# ScanNet++ manifest used by the previous V0 experiments. Set INPUT_MODE to
+# "cache" to replay CACHE_PATH. Command-line arguments override this section.
 INPUT_MODE="rgb"
+# Existing experiment dataset: processed ScanNet++ pinhole RGB manifest.
+MANIFEST_PATH="$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json"
+SCENE_ID="00a231a370"
+DATASET_FRAME_INDICES=(90 105 120 135 150 165 180 195 210 225 240 255 270 285 300 315 330 345 360 375 390 405 420 435 450 465 480 495 510 525)
+# Set MANIFEST_PATH="" to use explicit RGB files/directories instead.
 FRAME_PATHS=()
 FRAME_START=0
 FRAME_STRIDE=1
@@ -37,15 +42,25 @@ ARGS=("$@")
 if (( $# == 0 )); then
   case "$INPUT_MODE" in
     rgb)
-      if (( ${#FRAME_PATHS[@]} == 0 )); then
-        print -u2 "Edit FRAME_PATHS near the top of this file for RGB mode."
-        exit 2
-      fi
       if (( ${#PROMPTS[@]} == 0 )); then
         print -u2 "PROMPTS must contain at least one text prompt."
         exit 2
       fi
-      ARGS+=(--frames "${FRAME_PATHS[@]}")
+      if [[ -n "$MANIFEST_PATH" ]]; then
+        if [[ -z "$SCENE_ID" ]]; then
+          print -u2 "SCENE_ID must be set when MANIFEST_PATH is used."
+          exit 2
+        fi
+        ARGS+=(--manifest "$MANIFEST_PATH" --scene-id "$SCENE_ID")
+        if (( ${#DATASET_FRAME_INDICES[@]} > 0 )); then
+          ARGS+=(--dataset-frame-indices "${DATASET_FRAME_INDICES[@]}")
+        fi
+      elif (( ${#FRAME_PATHS[@]} > 0 )); then
+        ARGS+=(--frames "${FRAME_PATHS[@]}")
+      else
+        print -u2 "Set MANIFEST_PATH or FRAME_PATHS near the top of this file."
+        exit 2
+      fi
       ARGS+=(--prompts "${PROMPTS[@]}")
       ARGS+=(--frame-start "$FRAME_START")
       ARGS+=(--frame-stride "$FRAME_STRIDE")
@@ -57,6 +72,9 @@ if (( $# == 0 )); then
         exit 2
       fi
       ARGS+=(--cache "$CACHE_PATH")
+      ARGS+=(--frame-start "$FRAME_START")
+      ARGS+=(--frame-stride "$FRAME_STRIDE")
+      ARGS+=(--frame-count "$FRAME_COUNT")
       ;;
     *)
       print -u2 "INPUT_MODE must be either rgb or cache, got: $INPUT_MODE"

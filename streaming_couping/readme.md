@@ -34,6 +34,12 @@ zsh streaming_couping/commands_run_semantic_map.txt \
 展开后排序的序列位置：`FRAME_START` 从 0 开始，`FRAME_STRIDE` 是步长，
 `FRAME_COUNT=0` 表示取完剩余帧。例如 `FRAME_COUNT=30` 表示取前 30 帧。
 
+默认 `MANIFEST_PATH` 是之前实验一直使用的 processed ScanNet++ 数据：
+`/data184/open_source/vggtSam/data/processed/scannetpp_pinhole_2d/manifest.json`，
+默认场景为 `00a231a370`，默认帧序列为 `90,105,...,525`。因此直接修改 prompt
+和帧选择参数即可；不需要另填 RGB 目录。只有在把 `MANIFEST_PATH` 设为空时，才使用
+`FRAME_PATHS` 中的显式图片文件或目录。
+
 命令文件中 `INPUT_MODE="rgb"` 时读取 `FRAME_PATHS`；切换为
 `INPUT_MODE="cache"` 时读取 `CACHE_PATH`。当前默认 cache 路径是：
 

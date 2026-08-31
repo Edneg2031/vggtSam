@@ -9,12 +9,14 @@ converge on the same backend-neutral ``SemanticMapPipeline``.
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Any
 
 import torch
 
 from streaming_couping.src.config import load_config
+from streaming_couping.src.data import resolve_manifest_path
 from streaming_couping.src.semantic_mapping.adapters import (
     SAM31SegmentationAdapter,
     StreamVGGTGeometryAdapter,
@@ -69,6 +71,12 @@ def _run_from_cache(
     mapper: SemanticMapBuilder,
 ):
     payload = _load_payload(args.cache)
+    payload = _select_cache_frames(
+        payload,
+        start=args.frame_start,
+        stride=args.frame_stride,
+        count=args.frame_count,
+    )
     geometry = V0CacheGeometryAdapter(payload, scale_type=args.scale_type)
     segmentation = V0CacheSegmentationAdapter(
         payload,
@@ -92,6 +100,11 @@ def _run_from_cache(
             "input_mode": "frozen_v0_cache",
             "cache": str(Path(args.cache).expanduser().resolve()),
             "scale_type": args.scale_type,
+            "frame_selection": {
+                "start": int(args.frame_start),
+                "stride": int(args.frame_stride),
+                "count": int(args.frame_count),
+            },
         },
     )
 
@@ -103,7 +116,26 @@ def _run_from_rgb(
 ):
     if not prompts:
         raise ValueError("--prompts is required when --cache is not used.")
-    image_paths = _expand_image_paths(args.frames)
+    if args.manifest:
+        image_paths = _expand_manifest_paths(
+            args.manifest,
+            scene_id=args.scene_id,
+            frame_indices=args.dataset_frame_indices,
+        )
+        input_metadata = {
+            "manifest": str(args.manifest.expanduser().resolve()),
+            "scene_id": str(args.scene_id),
+            "dataset_frame_indices": (
+                None
+                if args.dataset_frame_indices is None
+                else [int(value) for value in args.dataset_frame_indices]
+            ),
+        }
+    else:
+        image_paths = _expand_image_paths(args.frames)
+        input_metadata = {
+            "frame_paths": [str(path) for path in image_paths],
+        }
     image_paths = _select_image_paths(
         image_paths,
         start=args.frame_start,
@@ -111,7 +143,7 @@ def _run_from_rgb(
         count=args.frame_count,
     )
     if not image_paths:
-        raise ValueError("No RGB images were found in --frames.")
+        raise ValueError("No RGB images were selected from the requested input.")
     overrides = {}
     if args.sam_device:
         overrides["sam3_device"] = args.sam_device
@@ -161,6 +193,12 @@ def _run_from_rgb(
             "input_mode": "rgb_and_text_prompts",
             "scale_type": args.scale_type,
             "recovery_config": str(Path(args.recovery_config).resolve()),
+            "frame_selection": {
+                "start": int(args.frame_start),
+                "stride": int(args.frame_stride),
+                "count": int(args.frame_count),
+            },
+            **input_metadata,
         },
     )
 
@@ -178,6 +216,26 @@ def _parse_args() -> argparse.Namespace:
         nargs="+",
         type=Path,
         help="RGB files and/or directories, sorted within each directory.",
+    )
+    source.add_argument(
+        "--manifest",
+        type=Path,
+        help="Processed ScanNet++ manifest containing scene RGB paths.",
+    )
+    parser.add_argument(
+        "--scene-id",
+        default=None,
+        help="Scene ID used with --manifest.",
+    )
+    parser.add_argument(
+        "--dataset-frame-indices",
+        nargs="+",
+        type=int,
+        default=None,
+        help=(
+            "Frame positions in the manifest scene. Omit to use every scene "
+            "frame; selection is then applied in manifest order."
+        ),
     )
     parser.add_argument(
         "--prompts",
@@ -269,6 +327,118 @@ def _expand_image_paths(values: list[Path] | None) -> tuple[Path, ...]:
     return tuple(output)
 
 
+def _expand_manifest_paths(
+    manifest_path: Path,
+    *,
+    scene_id: str | None,
+    frame_indices: list[int] | None,
+) -> tuple[Path, ...]:
+    """Resolve RGB paths from the processed dataset manifest."""
+
+    manifest_path = manifest_path.expanduser().resolve()
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"RGB manifest does not exist: {manifest_path}")
+    if not str(scene_id or "").strip():
+        raise ValueError("--scene-id is required when --manifest is used.")
+    with manifest_path.open("r", encoding="utf8") as handle:
+        manifest = json.load(handle)
+    scene = next(
+        (
+            item
+            for item in manifest.get("scenes", [])
+            if str(item.get("scene_id")) == str(scene_id)
+        ),
+        None,
+    )
+    if scene is None:
+        available = [item.get("scene_id") for item in manifest.get("scenes", [])]
+        raise ValueError(
+            f"Scene {scene_id!r} is not present in {manifest_path}. "
+            f"Available scenes: {available[:20]}"
+        )
+    frames = scene.get("frames", [])
+    indices = (
+        list(range(len(frames)))
+        if frame_indices is None
+        else [int(value) for value in frame_indices]
+    )
+    invalid = [index for index in indices if index < 0 or index >= len(frames)]
+    if invalid:
+        raise ValueError(
+            f"Manifest frame positions {invalid} are outside [0, {len(frames) - 1}]."
+        )
+    return tuple(
+        resolve_manifest_path(frames[index]["image_path"], manifest_path)
+        for index in indices
+    )
+
+
+def _select_cache_frames(
+    payload: dict[str, Any],
+    *,
+    start: int,
+    stride: int,
+    count: int,
+) -> dict[str, Any]:
+    """Apply the same deterministic frame selection to a V0 cache replay."""
+
+    frame_indices = payload.get("frame_indices")
+    if frame_indices is None:
+        total = _cache_frame_count(payload)
+        frame_indices = list(range(total))
+    total = len(frame_indices)
+    selected_positions = _selected_positions(total, start, stride, count)
+    if not selected_positions:
+        raise ValueError("Frame selection produced no cache frames.")
+    if len(selected_positions) == total and selected_positions == list(range(total)):
+        return payload
+
+    selected = dict(payload)
+    frame_fields = (
+        "frame_indices",
+        "image_paths",
+        "stream_images",
+        "images",
+        "baseline_world_points",
+        "baseline_world_confidence",
+        "world_points",
+        "confidence",
+        "tracking_masks_stream",
+        "tracking_scores",
+        "quality",
+    )
+    for name in frame_fields:
+        if name not in selected:
+            continue
+        value = selected[name]
+        try:
+            if len(value) != total:
+                continue
+            if isinstance(value, (list, tuple)):
+                selected[name] = type(value)(
+                    value[index] for index in selected_positions
+                )
+            elif hasattr(value, "__getitem__"):
+                selected[name] = value[selected_positions]
+        except (TypeError, IndexError, KeyError):
+            continue
+    return selected
+
+
+def _cache_frame_count(payload: dict[str, Any]) -> int:
+    for name in (
+        "baseline_world_points",
+        "world_points",
+        "tracking_masks_stream",
+        "stream_images",
+        "images",
+    ):
+        value = payload.get(name)
+        if value is not None:
+            return int(len(value))
+    raise ValueError("V0 cache does not expose a frame-indexed field.")
+
+
 def _select_image_paths(
     paths: tuple[Path, ...],
     *,
@@ -281,16 +451,27 @@ def _select_image_paths(
     start = int(start)
     stride = int(stride)
     count = int(count)
+    positions = _selected_positions(len(paths), start, stride, count)
+    return tuple(paths[index] for index in positions)
+
+
+def _selected_positions(
+    total: int,
+    start: int,
+    stride: int,
+    count: int,
+) -> list[int]:
+    start = int(start)
+    stride = int(stride)
+    count = int(count)
     if start < 0:
         raise ValueError("--frame-start must be non-negative.")
     if stride < 1:
         raise ValueError("--frame-stride must be positive.")
     if count < 0:
         raise ValueError("--frame-count must be non-negative; use 0 for all.")
-    selected = paths[start::stride]
-    if count:
-        selected = selected[:count]
-    return tuple(selected)
+    positions = list(range(start, total, stride))
+    return positions[:count] if count else positions
 
 
 def _normalize_prompts(values: list[str] | None) -> tuple[str, ...]:
