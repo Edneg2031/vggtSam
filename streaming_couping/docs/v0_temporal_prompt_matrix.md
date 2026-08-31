@@ -42,11 +42,9 @@ coverage denominator.
 Box prompts are not converted into point precision. They report box purity,
 recall, IoU, IoU-hit rates at 0.25/0.50, availability, and area ratio.
 
-## Run on the V0 server
+## Historical run
 
-```bash
-zsh streaming_couping/commands_run_v0_temporal_prompt_matrix.txt
-```
+该实验命令已归档；本文仅保留冻结诊断的设置、结果和结论。
 
 The command expects the completed V0 cache at
 `$VGGT_SAM_STORAGE_ROOT/outputs/streaming_couping_v0/cache`. It produces:

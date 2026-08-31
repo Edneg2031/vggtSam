@@ -1,10 +1,6 @@
 # V0 联合几何反馈诊断
 
-运行入口：
-
-```bash
-zsh streaming_couping/commands_analyze_v0_geometry_feedback.txt
-```
+运行命令已归档；本文仅保留该历史诊断的设置、结果和结论。
 
 该实验只读取已经完成的 V0 frozen cache，不重跑 StreamVGGT 或 SAM，不训练、不
 修改 pose/pointmap，也不会把任何修正写回正式 baseline。候选生成结束后才打开 GT，

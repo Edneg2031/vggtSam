@@ -1,10 +1,6 @@
 # 多场景 causal affine / depth-head ray 诊断
 
-入口：
-
-```bash
-zsh streaming_couping/commands_analyze_multiclip_affine_geometry.txt
-```
+运行命令已归档；本文仅保留该历史诊断的设置、结果和结论。
 
 该实验复用已经完成的四个 scene-disjoint V0 frozen cache，不重跑
 StreamVGGT/SAM，不训练，也不修改正式 V0 pointmap。默认使用每个 clip 的前

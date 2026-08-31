@@ -8,11 +8,7 @@ scene=00a231a370
 frames=90,105,...,525
 ```
 
-运行入口：
-
-```bash
-zsh streaming_couping/commands_run_v0_bidirectional_feedback.txt
-```
+运行命令已归档；本文仅保留该历史诊断的设置、结果和结论。
 
 输出默认写到：
 

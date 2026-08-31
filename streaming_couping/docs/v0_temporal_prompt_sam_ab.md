@@ -60,25 +60,9 @@ at least `0.50`.
 
 ## Run
 
-First generate the causal matrix:
+该实验的生成和真实 SAM 调用命令均已归档；本文仅保留冻结实验的设置、结果和结论。
 
-```bash
-zsh streaming_couping/commands_run_v0_temporal_prompt_matrix.txt
-```
-
-Then run the real calls:
-
-```bash
-zsh streaming_couping/commands_run_v0_temporal_prompt_sam_ab.txt
-```
-
-The default invokes a common deterministic subset of 96 frame-slot queries,
-which means at most 384 prompted SAM calls. To evaluate every frozen query:
-
-```bash
-V0_TEMPORAL_PROMPT_MAX_QUERIES=0 \
-  zsh streaming_couping/commands_run_v0_temporal_prompt_sam_ab.txt
-```
+历史实验的全量 query 运行方式已随命令文件一并归档。
 
 The output directory contains:
 

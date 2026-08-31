@@ -202,22 +202,15 @@ GT instance mask、GT pointmap 和 Sim(3) 只在候选生成完成之后打开�
 
 ## 4. 当前代码入口
 
-已验证或已有的主要入口：
+当前唯一的运行入口：
 
 ```bash
-zsh streaming_couping/commands_v0_baseline.txt
-zsh streaming_couping/commands_plot_v0_poses.txt
-zsh streaming_couping/commands_semantic_mapping.txt
-zsh streaming_couping/commands_semantic_mapping_v1.txt
-zsh streaming_couping/commands_semantic_mapping_v1_evaluation.txt
-zsh streaming_couping/commands_check_scannetpp_data.txt
-zsh streaming_couping/commands_audit_scannetpp_processed.txt
+zsh streaming_couping/commands_run_semantic_map.txt
 ```
 
-前五个命令分别用于运行 V0、可视化 pose、离线比较 Stage 0 分支、导出 V1 persistent object
-memory 地图、以及比较 V0/V1 identity；后两个命令只读检查服务器上的 ScanNet++ 源数据和已处理
-manifest。V1 只在 SAM observation 到 object memory 的身份层工作，不修改 StreamVGGT、SAM3 或
-SAM hidden memory。
+旧 V0、V1/V2、数据检查和实验诊断命令已从当前运行目录删除。对应实验文档保留的是历史
+结果记录，不再作为当前 pipeline 的执行入口。当前系统只需要配置 RGB/cache、prompt 和
+输出目录后运行上面的命令。
 
 ## 5. 系统定位
 

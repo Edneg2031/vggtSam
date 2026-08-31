@@ -7,15 +7,11 @@ V0 是冻结、免训练的 StreamVGGT + SAM3.1 语义地图 pipeline：
 - SAM3.1 persistent mask、slot 和 track ID 作为点云语义；
 - SAM 不参与 pose，点云不做后处理优化。
 
-模型主运行入口：
+当前唯一的主运行入口是下面的语义地图命令；不需要先运行 V0 baseline：
 
 ```bash
-zsh streaming_couping/commands_v0_baseline.txt
+zsh streaming_couping/commands_run_semantic_map.txt
 ```
-
-运行流程包括：缓存 StreamVGGT 几何和 SAM3.1 多 prompt 实例轨迹；使用 first-frame
-anchor + native QK Top-4 运行 pose-only camera replay；固定 pose 完成 tracking/pose
-审计；最后将 SAM persistent 实例标签投影到未修改的 raw world pointmap。
 
 ## 语义地图 pipeline
 
@@ -61,22 +57,10 @@ zsh streaming_couping/commands_run_semantic_map.txt \
 独立 object track 中，避免污染静态地图。默认使用当前 V0 的 raw pointmap，不启用被否决的
 temporal point prompt、历史深度 Veto 或 affine depth correction。
 
-## 辅助入口
+## 历史实验
 
-```bash
-zsh streaming_couping/commands_plot_v0_poses.txt
-zsh streaming_couping/commands_semantic_mapping.txt
-zsh streaming_couping/commands_run_semantic_map.txt
-zsh streaming_couping/commands_semantic_mapping_v1.txt
-zsh streaming_couping/commands_semantic_mapping_v1_evaluation.txt
-zsh streaming_couping/commands_check_scannetpp_data.txt
-zsh streaming_couping/commands_audit_scannetpp_processed.txt
-zsh streaming_couping/commands_run_v0_bidirectional_feedback.txt
-zsh streaming_couping/commands_run_v0_temporal_prompt_matrix.txt
-zsh streaming_couping/commands_analyze_multiclip_affine_geometry.txt
-```
-
-后续实验命令均为冻结 cache 上的诊断或离线评估，不会自动修改正式 V0。实验记录见：
+旧 baseline、诊断和优化实验的 `commands_*.txt` 已从当前运行目录移除；实验结果和结论
+仍保留在文档中，仅作为历史记录，不属于当前 pipeline 的运行步骤。当前文档见：
 
 - [当前状态与实验结论](docs/current_status.md)
 - [系统 pipeline](docs/system_pipeline.md)

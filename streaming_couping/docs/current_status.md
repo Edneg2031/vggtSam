@@ -47,11 +47,13 @@ RGB 序列
 | geometry residual 训练 | 270–345，步长 15 | 6 |
 | evaluation | 360–525，步长 15 | 12 |
 
-运行入口：
+历史 V0 baseline 的复现命令已归档；当前语义地图系统的运行入口是：
 
 ```bash
-zsh streaming_couping/commands_v0_baseline.txt
+zsh streaming_couping/commands_run_semantic_map.txt
 ```
+
+不需要先运行历史 V0 baseline；下方的 V0 cache 结果仅用于记录和对比。
 
 主要输出在 `outputs/streaming_couping_v0/`：`baseline_summary.json`、
 `frame_diagnostics.csv`、`dynamic_instance_diagnostics.csv` 和 `poses.pt`。

@@ -49,11 +49,7 @@ into the historical GO/NO-GO gate.
 This distinction matters: a high score in `prompt_scope` does not prove that
 the visual-point grid discovers objects outside the configured category set.
 
-Run:
-
-```zsh
-zsh streaming_couping/commands_run_sam31_auto_proposal.txt
-```
+该实验命令已归档；本文仅保留 auto-proposal 诊断的设置、结果和结论。
 
 Changing the grid, discovery stride, area limits, or duplicate thresholds
 requires `--overwrite` in the generation step; existing artifacts are checked

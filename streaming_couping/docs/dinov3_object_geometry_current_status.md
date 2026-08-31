@@ -486,11 +486,7 @@ same raw SAM masks + corrected pointmap
 
 ## 9. 已增加的下一步诊断
 
-已经增加一个只做分析、不训练、不重跑模型的命令：
-
-```bash
-zsh streaming_couping/commands_analyze_dinov3_residual_calibration.txt
-```
+该分析命令已归档；本文仅保留不训练、不重跑模型的历史结果。
 
 它复用现有 frozen cache 和 `models.pt`，分析：
 
@@ -525,11 +521,7 @@ zsh streaming_couping/commands_analyze_dinov3_residual_calibration.txt
 
 由于 pooled appearance → `ΔXYZ` 的 representation-to-target mismatch，下一轮先不训练任何新 head，只检查 DINOv3 是否覆盖 StreamVGGT 的真实失败区域。
 
-固定入口：
-
-```bash
-zsh streaming_couping/commands_analyze_object_geometry_dinov3_prior.txt
-```
+该分析入口已归档；本文仅保留历史结果。
 
 该命令会：
 
@@ -792,16 +784,7 @@ DINO persistent feature
 
 针对上面的新方向，已经增加：
 
-```text
-streaming_couping/scripts/analyze_dinov3_patch_geometry_retrieval.py
-streaming_couping/commands_analyze_dinov3_patch_geometry_retrieval.txt
-```
-
-用户在服务器上只需要执行：
-
-```bash
-zsh streaming_couping/commands_analyze_dinov3_patch_geometry_retrieval.txt
-```
+patch retrieval 的脚本和命令入口已归档；本文仅保留历史结果。
 
 ### 15.1 首次 patch retrieval 输出的阶段性解读
 

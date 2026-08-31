@@ -25,11 +25,7 @@ branch is serialized and reloaded before GT-backed tracking and map metrics
 are computed. If no source track re-enters far enough to trigger ranking, the
 result is `NOT_EXERCISED`, not evidence that DINO failed.
 
-Run it on the server with:
-
-```zsh
-zsh streaming_couping/commands_run_dinov3_projection_memory.txt
-```
+该实验命令已归档；本文仅保留 DINO projection-memory 诊断的设置、结果和结论。
 
 Results are written under
 `$VGGT_SAM_STORAGE_ROOT/outputs/streaming_couping_dinov3_projection_memory/`.
@@ -69,11 +65,7 @@ unvalidated direct object-memory fusion:   main failure mode
 ```
 
 Do not tune `appearance_weight`, EMA, or the DINO backbone from this result.
-The next diagnostic is the evaluation-only multi-scene GT-mask upper bound:
-
-```zsh
-zsh streaming_couping/commands_semantic_mapping_multiclip_oracle.txt
-```
+后续的 evaluation-only multi-scene GT-mask upper-bound 命令也已归档。
 
 If the oracle map is still poor, the bottleneck is StreamVGGT geometry or
 world-space fusion. If the oracle is substantially better, the bottleneck is

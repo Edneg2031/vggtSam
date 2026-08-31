@@ -104,19 +104,15 @@ GT mask 只用于 offline evaluation，不能进入 candidate generation。
     V6 map 好，但 pose 不变
         → 这仍然是有效的 semantic-map 结果，不需要强行修改 pose
 
-GT-mask oracle 的多场景入口现在是：
-
-    zsh streaming_couping/commands_semantic_mapping_multiclip_oracle.txt
+GT-mask oracle 的多场景命令已归档，本文仅保留其历史实验说明：
 
 它把 GT mask 按 raw-SAM 的 frozen slot assignment 放回同样的 mask 槽位，只在
 评估阶段使用 GT，不参与任何候选生成、tracking 或 map-write 决策。这个上界用于
 区分：如果 oracle 也不能改善地图，继续改 SAM identity/memory 没有意义；如果
 oracle 明显更好，才值得把精力放在 mask ownership 和 re-entry 上。
 
-由于 frozen cache 已经包含 `sam31_online_geometry_compete`，V6 与 oracle 的统一
-对照入口是：
-
-    zsh streaming_couping/commands_semantic_mapping_multiclip_v6_oracle.txt
+由于 frozen cache 已经包含 `sam31_online_geometry_compete`，V6 与 oracle 的历史
+统一对照命令也已归档。
 
 该实验不重跑 SAM/StreamVGGT，只把 raw cache 中的 V6 mask 作为额外 branch，固定
 raw branch 做跨分支 assignment。它回答的是：V6 的逐帧 mask 优势，是否真的传递到
@@ -202,10 +198,7 @@ V1 persistent 3-D instance memory 已按下面的 geometry-only 版本实现，�
         ↓ center / voxel overlap / Chamfer / category (+ optional appearance)
     accumulated world points
 
-实现入口：
-
-    zsh streaming_couping/commands_semantic_mapping_v1.txt
-    zsh streaming_couping/commands_semantic_mapping_v1_evaluation.txt
+V1 的历史实现和评估命令已归档。
 
 V0 仍由 `semantic_map.identity_mode: v0_slot` 控制；V1 命令显式使用
 `v1_object_memory`，所以两条路线可以在同一个 frozen cache 上复现。V1 输出
@@ -254,15 +247,7 @@ The all-visible V2.3 branch is an offline control. It uses the frozen V2.3
 tracking masks but disables the memory write gate, so a difference between the
 two V2.3 rows is attributable to map memory rather than another SAM call.
 
-On the server:
-
-    zsh streaming_couping/commands_plan_semantic_mapping_multiclip.txt
-    zsh streaming_couping/commands_run_semantic_mapping_multiclip.txt
-    zsh streaming_couping/commands_semantic_mapping_multiclip_ablation.txt
-
-For a single uninterrupted run, use:
-
-    zsh streaming_couping/commands_semantic_mapping_multiclip_all.txt
+多 clip semantic-mapping 规划、运行、ablation 和 all-in-one 命令均已归档。
 
 The first command creates a protocol config and one config per clip. The
 second command accepts `SEMANTIC_MAPPING_MULTICLIP_STAGE=cache|baseline|v21|v22|v23|all`
@@ -336,9 +321,7 @@ the SAM recovery and map-memory ablations.
 scale-shift calibration，在后 30% 帧把 depth head 沿原像素射线重建到 raw
 StreamVGGT world frame。
 
-运行：
-
-    zsh streaming_couping/commands_analyze_multiclip_affine_geometry.txt
+该 multi-clip affine 诊断命令已归档。
 
 该实验严格区分 `depth_head -> historical pointmap depth` 与
 `pointmap_z -> historical pointmap depth`，并将 selected/QK pose 限定为
