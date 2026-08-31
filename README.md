@@ -36,6 +36,9 @@ zsh streaming_couping/commands_run_semantic_map.txt \
   --output-dir outputs/semantic_map
 ```
 
+You can also edit the configuration block at the top of
+`streaming_couping/commands_run_semantic_map.txt` and run it without arguments.
+
 The commands use `externals/sam3` and `externals/streamvggt`, while datasets,
 checkpoints, caches, and generated evaluations remain local under `data/` and
 `outputs/`.

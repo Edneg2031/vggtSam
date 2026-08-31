@@ -33,6 +33,9 @@ zsh streaming_couping/commands_run_semantic_map.txt \
   --output-dir outputs/semantic_map
 ```
 
+也可以直接修改 `commands_run_semantic_map.txt` 顶部的 `FRAME_PATHS`、`PROMPTS` 和
+`OUTPUT_DIR`，然后不带参数执行；命令行参数仍然可以临时覆盖这些默认值。
+
 如果已经有 V0 cache，可以不重新运行模型：
 
 ```bash

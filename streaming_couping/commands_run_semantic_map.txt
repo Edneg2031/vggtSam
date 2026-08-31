@@ -8,22 +8,48 @@ ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
 
+# User-editable defaults. Run this file without arguments after filling in
+# FRAME_PATHS, PROMPTS, and OUTPUT_DIR. CACHE_PATH selects cache replay when
+# non-empty; command-line arguments, when supplied, override this section.
+FRAME_PATHS=()
+PROMPTS=("bed" "wardrobe")
+OUTPUT_DIR="$STORAGE_ROOT/outputs/semantic_map"
+CACHE_PATH=""
+RECOVERY_CONFIG="streaming_couping/configs/recovery_dynamic_instance.yaml"
+CUDA_DEVICES=""
+
 cd "$ROOT"
 [[ -x "$PYTHON_BIN" ]] || {
   print -u2 "missing Python: $PYTHON_BIN"
   exit 1
 }
 
-if (( $# == 0 )); then
-  print -u2 "usage: zsh streaming_couping/commands_run_semantic_map.txt --frames <rgb-file-or-directory> [<more-files-or-directories>] --prompts <prompt> [<more-prompts>] --output-dir <directory>"
-  print -u2 "or:    zsh streaming_couping/commands_run_semantic_map.txt --cache <frozen-v0-cache.pt> --output-dir <directory>"
-  exit 2
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+if [[ -n "${SEMANTIC_MAP_CUDA_VISIBLE_DEVICES:-$CUDA_DEVICES}" ]]; then
+  export CUDA_VISIBLE_DEVICES="${SEMANTIC_MAP_CUDA_VISIBLE_DEVICES:-$CUDA_DEVICES}"
 fi
 
-export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
-if [[ -n "${SEMANTIC_MAP_CUDA_VISIBLE_DEVICES:-}" ]]; then
-  export CUDA_VISIBLE_DEVICES="$SEMANTIC_MAP_CUDA_VISIBLE_DEVICES"
+ARGS=("$@")
+if (( $# == 0 )); then
+  if [[ -n "$CACHE_PATH" ]]; then
+    ARGS+=(--cache "$CACHE_PATH")
+  elif (( ${#FRAME_PATHS[@]} > 0 )); then
+    ARGS+=(--frames "${FRAME_PATHS[@]}")
+    if (( ${#PROMPTS[@]} == 0 )); then
+      print -u2 "PROMPTS must contain at least one text prompt."
+      exit 2
+    fi
+    ARGS+=(--prompts "${PROMPTS[@]}")
+  else
+    print -u2 "Edit FRAME_PATHS or CACHE_PATH near the top of this file."
+    print -u2 "Alternatively pass the runner arguments on the command line."
+    print -u2 "usage: zsh streaming_couping/commands_run_semantic_map.txt --frames <rgb-file-or-directory> [<more-files-or-directories>] --prompts <prompt> [<more-prompts>] --output-dir <directory>"
+    print -u2 "or:    zsh streaming_couping/commands_run_semantic_map.txt --cache <frozen-v0-cache.pt> --output-dir <directory>"
+    exit 2
+  fi
+  ARGS+=(--output-dir "$OUTPUT_DIR")
+  [[ -n "$RECOVERY_CONFIG" ]] && ARGS+=(--recovery-config "$RECOVERY_CONFIG")
 fi
 
 PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  "$PYTHON_BIN" -m streaming_couping.scripts.run_semantic_map "$@"
+  "$PYTHON_BIN" -m streaming_couping.scripts.run_semantic_map "${ARGS[@]}"
