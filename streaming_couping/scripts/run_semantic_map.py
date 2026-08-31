@@ -104,6 +104,12 @@ def _run_from_rgb(
     if not prompts:
         raise ValueError("--prompts is required when --cache is not used.")
     image_paths = _expand_image_paths(args.frames)
+    image_paths = _select_image_paths(
+        image_paths,
+        start=args.frame_start,
+        stride=args.frame_stride,
+        count=args.frame_count,
+    )
     if not image_paths:
         raise ValueError("No RGB images were found in --frames.")
     overrides = {}
@@ -192,6 +198,24 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--geometry-device", default=None)
     parser.add_argument("--sam-device", default=None)
     parser.add_argument("--output-size", type=_parse_size, default=None)
+    parser.add_argument(
+        "--frame-start",
+        type=int,
+        default=0,
+        help="0-based position in the sorted RGB inputs at which to start.",
+    )
+    parser.add_argument(
+        "--frame-stride",
+        type=int,
+        default=1,
+        help="Take every Nth RGB input after frame-start.",
+    )
+    parser.add_argument(
+        "--frame-count",
+        type=int,
+        default=0,
+        help="Number of selected RGB inputs; 0 means all remaining inputs.",
+    )
     parser.add_argument("--max-objects", type=int, default=16)
     parser.add_argument("--mask-field", default="tracking_masks_stream")
     parser.add_argument(
@@ -243,6 +267,30 @@ def _expand_image_paths(values: list[Path] | None) -> tuple[Path, ...]:
         else:
             raise FileNotFoundError(f"RGB path does not exist: {path}")
     return tuple(output)
+
+
+def _select_image_paths(
+    paths: tuple[Path, ...],
+    *,
+    start: int,
+    stride: int,
+    count: int,
+) -> tuple[Path, ...]:
+    """Select a deterministic subsequence from already sorted RGB inputs."""
+
+    start = int(start)
+    stride = int(stride)
+    count = int(count)
+    if start < 0:
+        raise ValueError("--frame-start must be non-negative.")
+    if stride < 1:
+        raise ValueError("--frame-stride must be positive.")
+    if count < 0:
+        raise ValueError("--frame-count must be non-negative; use 0 for all.")
+    selected = paths[start::stride]
+    if count:
+        selected = selected[:count]
+    return tuple(selected)
 
 
 def _normalize_prompts(values: list[str] | None) -> tuple[str, ...]:

@@ -9,12 +9,16 @@ STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
 
 # User-editable defaults. Run this file without arguments after filling in
-# FRAME_PATHS, PROMPTS, and OUTPUT_DIR. CACHE_PATH selects cache replay when
-# non-empty; command-line arguments, when supplied, override this section.
+# FRAME_PATHS, PROMPTS, and OUTPUT_DIR. Set INPUT_MODE to "cache" to replay
+# CACHE_PATH. Command-line arguments, when supplied, override this section.
+INPUT_MODE="rgb"
 FRAME_PATHS=()
+FRAME_START=0
+FRAME_STRIDE=1
+FRAME_COUNT=0
 PROMPTS=("bed" "wardrobe")
 OUTPUT_DIR="$STORAGE_ROOT/outputs/semantic_map"
-CACHE_PATH=""
+CACHE_PATH="$STORAGE_ROOT/outputs/streaming_couping_v0/cache/00a231a370_90_525_step15_37_68_54.pt"
 RECOVERY_CONFIG="streaming_couping/configs/recovery_dynamic_instance.yaml"
 CUDA_DEVICES=""
 
@@ -31,22 +35,34 @@ fi
 
 ARGS=("$@")
 if (( $# == 0 )); then
-  if [[ -n "$CACHE_PATH" ]]; then
-    ARGS+=(--cache "$CACHE_PATH")
-  elif (( ${#FRAME_PATHS[@]} > 0 )); then
-    ARGS+=(--frames "${FRAME_PATHS[@]}")
-    if (( ${#PROMPTS[@]} == 0 )); then
-      print -u2 "PROMPTS must contain at least one text prompt."
+  case "$INPUT_MODE" in
+    rgb)
+      if (( ${#FRAME_PATHS[@]} == 0 )); then
+        print -u2 "Edit FRAME_PATHS near the top of this file for RGB mode."
+        exit 2
+      fi
+      if (( ${#PROMPTS[@]} == 0 )); then
+        print -u2 "PROMPTS must contain at least one text prompt."
+        exit 2
+      fi
+      ARGS+=(--frames "${FRAME_PATHS[@]}")
+      ARGS+=(--prompts "${PROMPTS[@]}")
+      ARGS+=(--frame-start "$FRAME_START")
+      ARGS+=(--frame-stride "$FRAME_STRIDE")
+      ARGS+=(--frame-count "$FRAME_COUNT")
+      ;;
+    cache)
+      if [[ -z "$CACHE_PATH" ]]; then
+        print -u2 "Set CACHE_PATH near the top of this file for cache mode."
+        exit 2
+      fi
+      ARGS+=(--cache "$CACHE_PATH")
+      ;;
+    *)
+      print -u2 "INPUT_MODE must be either rgb or cache, got: $INPUT_MODE"
       exit 2
-    fi
-    ARGS+=(--prompts "${PROMPTS[@]}")
-  else
-    print -u2 "Edit FRAME_PATHS or CACHE_PATH near the top of this file."
-    print -u2 "Alternatively pass the runner arguments on the command line."
-    print -u2 "usage: zsh streaming_couping/commands_run_semantic_map.txt --frames <rgb-file-or-directory> [<more-files-or-directories>] --prompts <prompt> [<more-prompts>] --output-dir <directory>"
-    print -u2 "or:    zsh streaming_couping/commands_run_semantic_map.txt --cache <frozen-v0-cache.pt> --output-dir <directory>"
-    exit 2
-  fi
+      ;;
+  esac
   ARGS+=(--output-dir "$OUTPUT_DIR")
   [[ -n "$RECOVERY_CONFIG" ]] && ARGS+=(--recovery-config "$RECOVERY_CONFIG")
 fi

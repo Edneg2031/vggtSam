@@ -38,6 +38,9 @@ zsh streaming_couping/commands_run_semantic_map.txt \
 
 You can also edit the configuration block at the top of
 `streaming_couping/commands_run_semantic_map.txt` and run it without arguments.
+`FRAME_COUNT=0` uses all selected RGB inputs; set `FRAME_START` and
+`FRAME_STRIDE` for a deterministic subsequence. `CACHE_PATH` is used only when
+`INPUT_MODE="cache"`; RGB mode does not automatically reuse a stale cache.
 
 The commands use `externals/sam3` and `externals/streamvggt`, while datasets,
 checkpoints, caches, and generated evaluations remain local under `data/` and

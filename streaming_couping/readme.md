@@ -34,7 +34,19 @@ zsh streaming_couping/commands_run_semantic_map.txt \
 ```
 
 也可以直接修改 `commands_run_semantic_map.txt` 顶部的 `FRAME_PATHS`、`PROMPTS` 和
-`OUTPUT_DIR`，然后不带参数执行；命令行参数仍然可以临时覆盖这些默认值。
+`OUTPUT_DIR`，然后不带参数执行；命令行参数仍然可以临时覆盖这些默认值。帧选择使用
+展开后排序的序列位置：`FRAME_START` 从 0 开始，`FRAME_STRIDE` 是步长，
+`FRAME_COUNT=0` 表示取完剩余帧。例如 `FRAME_COUNT=30` 表示取前 30 帧。
+
+命令文件中 `INPUT_MODE="rgb"` 时读取 `FRAME_PATHS`；切换为
+`INPUT_MODE="cache"` 时读取 `CACHE_PATH`。当前默认 cache 路径是：
+
+```text
+/data184/open_source/vggtSam/outputs/streaming_couping_v0/cache/00a231a370_90_525_step15_37_68_54.pt
+```
+
+它只在 cache 模式使用；RGB 模式不会自动读取旧 cache。`OUTPUT_DIR` 默认是
+`/data184/open_source/vggtSam/outputs/semantic_map`。
 
 如果已经有 V0 cache，可以不重新运行模型：
 
