@@ -30,6 +30,7 @@ class SemanticMapConfig:
     max_points_per_observation: int = 8_000
     max_points_per_track: int = 250_000
     max_voxels: int = 1_000_000
+    max_scene_voxels: int = 1_000_000
 
     def validate(self) -> "SemanticMapConfig":
         if float(self.voxel_size_m) <= 0.0:
@@ -45,6 +46,7 @@ class SemanticMapConfig:
             ("max_points_per_observation", self.max_points_per_observation),
             ("max_points_per_track", self.max_points_per_track),
             ("max_voxels", self.max_voxels),
+            ("max_scene_voxels", self.max_scene_voxels),
         ):
             if int(value) < 1:
                 raise ValueError(f"{name} must be positive.")
@@ -60,6 +62,7 @@ class MapUpdateStats:
     dynamic_observation_count: int
     accepted_point_count: int
     static_voxel_count: int
+    scene_voxel_count: int
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,12 @@ class ObjectTrackMap:
 class SemanticMapResult:
     """Serializable result of the backend-neutral map builder."""
 
+    scene_voxel_points: torch.Tensor
+    scene_voxel_rgb: torch.Tensor
+    scene_semantic_labels: tuple[str, ...]
+    scene_instance_ids: torch.Tensor
+    scene_evidence_weights: torch.Tensor
+    scene_observation_counts: torch.Tensor
     voxel_points: torch.Tensor
     voxel_rgb: torch.Tensor
     semantic_labels: tuple[str, ...]
@@ -91,6 +100,14 @@ class SemanticMapResult:
     @property
     def voxel_count(self) -> int:
         return int(self.voxel_points.shape[0])
+
+    @property
+    def scene_voxel_count(self) -> int:
+        return int(self.scene_voxel_points.shape[0])
+
+    @property
+    def scene_labeled_voxel_count(self) -> int:
+        return int(self.scene_instance_ids.ge(0).sum())
 
     @property
     def labeled_voxel_count(self) -> int:
@@ -197,6 +214,7 @@ class SemanticMapBuilder:
 
     def __init__(self, config: SemanticMapConfig | None = None) -> None:
         self.config = (config or SemanticMapConfig()).validate()
+        self._scene_voxels: dict[tuple[int, int, int], _VoxelEvidence] = {}
         self._voxels: dict[tuple[int, int, int], _VoxelEvidence] = {}
         self._tracks: dict[int, _TrackEvidence] = {}
         self._last_frame_id: int | None = None
@@ -231,6 +249,13 @@ class SemanticMapBuilder:
         confidence = geometry_confidence_for_frame(geometry)
         valid = point_valid & (confidence >= self.config.min_geometry_confidence)
         rgb = rgb_for_frame(geometry)
+        if bool(valid.any()):
+            self._add_scene_voxels(
+                points=points[valid],
+                weights=confidence[valid],
+                rgb=rgb[valid] if rgb is not None else None,
+                frame_id=frame_id,
+            )
 
         accepted_observations = 0
         static_observations = 0
@@ -301,6 +326,7 @@ class SemanticMapBuilder:
             dynamic_observation_count=dynamic_observations,
             accepted_point_count=accepted_points,
             static_voxel_count=len(self._voxels),
+            scene_voxel_count=len(self._scene_voxels),
         )
         self._last_stats = stats
         return stats
@@ -308,13 +334,7 @@ class SemanticMapBuilder:
     def finalize(self, metadata: Mapping[str, Any] | None = None) -> SemanticMapResult:
         """Materialize deterministic tensors and object-level tracks."""
 
-        keys = sorted(self._voxels)
-        if len(keys) > int(self.config.max_voxels):
-            keys = sorted(
-                keys,
-                key=lambda key: (-self._voxels[key].weight, key),
-            )[: int(self.config.max_voxels)]
-            keys.sort()
+        keys = _select_voxel_keys(self._voxels, self.config.max_voxels)
 
         points: list[torch.Tensor] = []
         colors: list[torch.Tensor] = []
@@ -330,14 +350,41 @@ class SemanticMapBuilder:
                 colors.append(evidence.rgb_sum / evidence.rgb_weight)
             else:
                 colors.append(torch.zeros(3, dtype=torch.float32))
-            label, instance_id = sorted(
-                evidence.label_weights.items(),
-                key=lambda item: (-item[1], item[0][0], item[0][1]),
-            )[0][0]
+            label, instance_id = _dominant_label(evidence)
             labels.append(label)
             instance_ids.append(int(instance_id))
             evidence_weights.append(float(evidence.weight))
             observation_counts.append(int(evidence.observations))
+
+        scene_keys = _select_voxel_keys(
+            self._scene_voxels,
+            self.config.max_scene_voxels,
+            preferred_keys=self._voxels,
+        )
+        scene_points: list[torch.Tensor] = []
+        scene_colors: list[torch.Tensor] = []
+        scene_labels: list[str] = []
+        scene_instance_ids: list[int] = []
+        scene_evidence_weights: list[float] = []
+        scene_observation_counts: list[int] = []
+        for key in scene_keys:
+            evidence = self._scene_voxels[key]
+            weight = max(float(evidence.weight), 1e-12)
+            scene_points.append(evidence.point_sum / weight)
+            if evidence.rgb_weight > 0.0:
+                scene_colors.append(evidence.rgb_sum / evidence.rgb_weight)
+            else:
+                scene_colors.append(torch.zeros(3, dtype=torch.float32))
+            semantic_evidence = self._voxels.get(key)
+            if semantic_evidence is None:
+                scene_labels.append("")
+                scene_instance_ids.append(-1)
+            else:
+                label, instance_id = _dominant_label(semantic_evidence)
+                scene_labels.append(label)
+                scene_instance_ids.append(int(instance_id))
+            scene_evidence_weights.append(float(evidence.weight))
+            scene_observation_counts.append(int(evidence.observations))
 
         track_maps = tuple(
             self._tracks[instance_id].finalize()
@@ -352,6 +399,18 @@ class SemanticMapBuilder:
         result_metadata.setdefault("map_pose_feedback", False)
         result_metadata.setdefault("pointmap_modified", False)
         return SemanticMapResult(
+            scene_voxel_points=_stack_or_empty(scene_points, (0, 3)),
+            scene_voxel_rgb=_stack_or_empty(scene_colors, (0, 3)).clamp(0.0, 1.0),
+            scene_semantic_labels=tuple(scene_labels),
+            scene_instance_ids=torch.tensor(scene_instance_ids, dtype=torch.long),
+            scene_evidence_weights=torch.tensor(
+                scene_evidence_weights,
+                dtype=torch.float32,
+            ),
+            scene_observation_counts=torch.tensor(
+                scene_observation_counts,
+                dtype=torch.long,
+            ),
             voxel_points=_stack_or_empty(points, (0, 3)),
             voxel_rgb=_stack_or_empty(colors, (0, 3)).clamp(0.0, 1.0),
             semantic_labels=tuple(labels),
@@ -360,6 +419,22 @@ class SemanticMapBuilder:
             observation_counts=torch.tensor(observation_counts, dtype=torch.long),
             object_tracks=track_maps,
             metadata=result_metadata,
+        )
+
+    def _add_scene_voxels(
+        self,
+        *,
+        points: torch.Tensor,
+        weights: torch.Tensor,
+        rgb: torch.Tensor | None,
+        frame_id: int,
+    ) -> None:
+        self._accumulate_voxels(
+            self._scene_voxels,
+            points=points,
+            weights=weights,
+            rgb=rgb,
+            frame_id=frame_id,
         )
 
     def _add_voxels(
@@ -371,6 +446,27 @@ class SemanticMapBuilder:
         weights: torch.Tensor,
         rgb: torch.Tensor | None,
         frame_id: int,
+    ) -> None:
+        self._accumulate_voxels(
+            self._voxels,
+            points=points,
+            weights=weights,
+            rgb=rgb,
+            frame_id=frame_id,
+            label=label,
+            instance_id=instance_id,
+        )
+
+    def _accumulate_voxels(
+        self,
+        voxels: dict[tuple[int, int, int], _VoxelEvidence],
+        *,
+        points: torch.Tensor,
+        weights: torch.Tensor,
+        rgb: torch.Tensor | None,
+        frame_id: int,
+        label: str | None = None,
+        instance_id: int | None = None,
     ) -> None:
         voxel_coords = torch.floor(points / float(self.config.voxel_size_m)).long()
         unique, inverse = torch.unique(
@@ -392,23 +488,56 @@ class SemanticMapBuilder:
         for index in range(group_count):
             key = tuple(int(value) for value in unique[index].tolist())
             weight = float(group_weights[index])
-            evidence = self._voxels.get(key)
+            evidence = voxels.get(key)
             if evidence is None:
                 evidence = _VoxelEvidence(
                     point_sum=torch.zeros(3, dtype=torch.float64),
                     rgb_sum=torch.zeros(3, dtype=torch.float64),
                 )
-                self._voxels[key] = evidence
+                voxels[key] = evidence
             evidence.point_sum += group_points[index]
             evidence.weight += weight
             evidence.observations += 1
             evidence.last_frame_id = int(frame_id)
-            evidence.label_weights[(label, int(instance_id))] = (
-                evidence.label_weights.get((label, int(instance_id)), 0.0) + weight
-            )
+            if label is not None and instance_id is not None:
+                label_key = (str(label), int(instance_id))
+                evidence.label_weights[label_key] = (
+                    evidence.label_weights.get(label_key, 0.0) + weight
+                )
             if group_rgb is not None:
                 evidence.rgb_sum += group_rgb[index]
                 evidence.rgb_weight += weight
+
+
+def _select_voxel_keys(
+    voxels: Mapping[tuple[int, int, int], _VoxelEvidence],
+    limit: int,
+    *,
+    preferred_keys: Mapping[tuple[int, int, int], Any] | None = None,
+) -> list[tuple[int, int, int]]:
+    keys = sorted(voxels)
+    if len(keys) <= int(limit):
+        return keys
+    preferred = set(preferred_keys or ())
+    keys = sorted(
+        keys,
+        key=lambda key: (
+            0 if key in preferred else 1,
+            -voxels[key].weight,
+            key,
+        ),
+    )[: int(limit)]
+    keys.sort()
+    return keys
+
+
+def _dominant_label(evidence: _VoxelEvidence) -> tuple[str, int]:
+    if not evidence.label_weights:
+        raise ValueError("Semantic voxel has no label evidence.")
+    return sorted(
+        evidence.label_weights.items(),
+        key=lambda item: (-item[1], item[0][0], item[0][1]),
+    )[0][0]
 
 
 def _is_static_observation(

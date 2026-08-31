@@ -48,6 +48,7 @@ def main() -> None:
             max_points_per_observation=args.max_points_per_observation,
             max_points_per_track=args.max_points_per_track,
             max_voxels=args.max_voxels,
+            max_scene_voxels=args.max_scene_voxels,
         )
     )
     if args.cache:
@@ -58,10 +59,13 @@ def main() -> None:
     print(
         "semantic map completed "
         f"frames={summary['metadata'].get('frame_count', 0)} "
+        f"scene_voxels={summary['scene_voxel_count']} "
         f"voxels={summary['voxel_count']} "
         f"objects={summary['instance_count']}"
     )
     print(f"semantic_map={summary['outputs']['artifact']}")
+    print(f"scene_rgb_ply={summary['outputs']['scene_rgb_ply']}")
+    print(f"scene_semantic_ply={summary['outputs']['scene_semantic_ply']}")
     print(f"semantic_ply={summary['outputs']['semantic_ply']}")
 
 
@@ -290,6 +294,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-points-per-observation", type=int, default=8_000)
     parser.add_argument("--max-points-per-track", type=int, default=250_000)
     parser.add_argument("--max-voxels", type=int, default=1_000_000)
+    parser.add_argument(
+        "--max-scene-voxels",
+        type=int,
+        default=1_000_000,
+        help="Maximum full-scene voxels retained in exported artifacts.",
+    )
     return parser.parse_args()
 
 

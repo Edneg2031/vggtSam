@@ -37,7 +37,7 @@ def export_semantic_map(
     result: SemanticMapResult,
     output_dir: str | Path,
     *,
-    revision: str = "semantic_mapping_backend_neutral_v1",
+    revision: str = "semantic_mapping_backend_neutral_v2",
 ) -> dict[str, Any]:
     """Write a map artifact and return a JSON-compatible summary."""
 
@@ -50,26 +50,35 @@ def export_semantic_map(
         )
     )
     category_to_id = {label: index for index, label in enumerate(labels)}
-    semantic_rgb = torch.stack(
-        [
-            torch.tensor(
-                INSTANCE_PALETTE_RGB8[int(instance_id) % len(INSTANCE_PALETTE_RGB8)],
-                dtype=torch.float32,
-            )
-            / 255.0
-            for instance_id in result.instance_ids.tolist()
-        ],
-        dim=0,
-    ) if result.voxel_count else torch.empty(0, 3, dtype=torch.float32)
+    semantic_rgb = _instance_colors(result.instance_ids)
     category_ids = torch.tensor(
         [category_to_id[label] for label in result.semantic_labels],
         dtype=torch.long,
     )
+    scene_category_ids = torch.tensor(
+        [category_to_id.get(label, -1) for label in result.scene_semantic_labels],
+        dtype=torch.long,
+    )
+    scene_rgb = _visible_rgb(result.scene_voxel_rgb)
+    scene_semantic_rgb = scene_rgb * 0.35
+    scene_labeled = result.scene_instance_ids.ge(0)
+    if bool(scene_labeled.any()):
+        scene_semantic_rgb[scene_labeled] = _instance_colors(
+            result.scene_instance_ids[scene_labeled]
+        )
 
     artifact_path = directory / "semantic_map.pt"
     payload = {
-        "schema": 1,
+        "schema": 2,
         "revision": revision,
+        "scene_voxel_points": result.scene_voxel_points.detach().float().cpu(),
+        "scene_voxel_rgb": result.scene_voxel_rgb.detach().float().cpu(),
+        "scene_semantic_rgb": scene_semantic_rgb,
+        "scene_semantic_labels": list(result.scene_semantic_labels),
+        "scene_category_ids": scene_category_ids,
+        "scene_instance_ids": result.scene_instance_ids.detach().long().cpu(),
+        "scene_evidence_weights": result.scene_evidence_weights.detach().float().cpu(),
+        "scene_observation_counts": result.scene_observation_counts.detach().long().cpu(),
         "voxel_points": result.voxel_points.detach().float().cpu(),
         "voxel_rgb": result.voxel_rgb.detach().float().cpu(),
         "semantic_rgb": semantic_rgb,
@@ -108,10 +117,36 @@ def export_semantic_map(
         observations=result.observation_counts,
     )
 
-    tracks_ply_path = directory / "object_tracks.ply"
-    track_points, track_colors, track_categories, track_ids, track_weights = (
-        _flatten_tracks(result.object_tracks, category_to_id)
+    scene_rgb_ply_path = directory / "scene_rgb_map.ply"
+    _write_ply(
+        scene_rgb_ply_path,
+        points=result.scene_voxel_points,
+        colors=scene_rgb,
+        category_ids=scene_category_ids,
+        instance_ids=result.scene_instance_ids,
+        weights=result.scene_evidence_weights,
+        observations=result.scene_observation_counts,
     )
+    scene_semantic_ply_path = directory / "scene_semantic_map.ply"
+    _write_ply(
+        scene_semantic_ply_path,
+        points=result.scene_voxel_points,
+        colors=scene_semantic_rgb,
+        category_ids=scene_category_ids,
+        instance_ids=result.scene_instance_ids,
+        weights=result.scene_evidence_weights,
+        observations=result.scene_observation_counts,
+    )
+
+    tracks_ply_path = directory / "object_tracks.ply"
+    (
+        track_points,
+        track_colors,
+        track_categories,
+        track_ids,
+        track_weights,
+        track_frames,
+    ) = _flatten_tracks(result.object_tracks, category_to_id)
     _write_ply(
         tracks_ply_path,
         points=track_points,
@@ -120,6 +155,7 @@ def export_semantic_map(
         instance_ids=track_ids,
         weights=track_weights,
         observations=torch.ones(track_points.shape[0], dtype=torch.long),
+        frame_ids=track_frames,
     )
 
     tracks_path = directory / "object_tracks.json"
@@ -129,8 +165,10 @@ def export_semantic_map(
         encoding="utf-8",
     )
     summary = {
-        "schema": 1,
+        "schema": 2,
         "revision": revision,
+        "scene_voxel_count": result.scene_voxel_count,
+        "scene_labeled_voxel_count": result.scene_labeled_voxel_count,
         "voxel_count": result.voxel_count,
         "labeled_voxel_count": result.labeled_voxel_count,
         "category_names": list(labels),
@@ -144,10 +182,33 @@ def export_semantic_map(
         "metadata": _json_safe(result.metadata),
         "outputs": {
             "artifact": str(artifact_path),
+            "scene_rgb_ply": str(scene_rgb_ply_path),
+            "scene_semantic_ply": str(scene_semantic_ply_path),
             "semantic_ply": str(semantic_ply_path),
             "rgb_ply": str(rgb_ply_path),
             "object_tracks_ply": str(tracks_ply_path),
             "object_tracks_json": str(tracks_path),
+        },
+        "output_descriptions": {
+            "scene_rgb_ply": (
+                "All valid geometry from all selected frames, confidence-weighted "
+                "and voxel-fused, colored with observed RGB."
+            ),
+            "scene_semantic_ply": (
+                "The same full scene; static prompted object voxels use instance "
+                "colors and unlabeled context uses dimmed RGB."
+            ),
+            "semantic_ply": (
+                "Static prompted object voxels only, multi-frame voxel-fused and "
+                "colored by persistent instance ID."
+            ),
+            "rgb_ply": (
+                "The same object-only fused voxels as semantic_ply, colored with RGB."
+            ),
+            "object_tracks_ply": (
+                "Accepted per-frame object observations concatenated by track; not "
+                "voxel-fused, and each point retains its frame_id."
+            ),
         },
         "objects": tracks_summary,
     }
@@ -183,6 +244,7 @@ def _flatten_tracks(
     category_chunks = []
     instance_chunks = []
     weight_chunks = []
+    frame_chunks = []
     for track in tracks:
         if not track.points.numel():
             continue
@@ -204,6 +266,7 @@ def _flatten_tracks(
             torch.full((count,), int(track.instance_id), dtype=torch.long)
         )
         weight_chunks.append(track.weights.detach().float().cpu())
+        frame_chunks.append(track.frame_indices.detach().long().cpu())
     if not point_chunks:
         return (
             torch.empty(0, 3, dtype=torch.float32),
@@ -211,6 +274,7 @@ def _flatten_tracks(
             torch.empty(0, dtype=torch.long),
             torch.empty(0, dtype=torch.long),
             torch.empty(0, dtype=torch.float32),
+            torch.empty(0, dtype=torch.long),
         )
     return (
         torch.cat(point_chunks, dim=0),
@@ -218,7 +282,23 @@ def _flatten_tracks(
         torch.cat(category_chunks, dim=0),
         torch.cat(instance_chunks, dim=0),
         torch.cat(weight_chunks, dim=0),
+        torch.cat(frame_chunks, dim=0),
     )
+
+
+def _instance_colors(instance_ids: torch.Tensor) -> torch.Tensor:
+    values = instance_ids.detach().long().cpu()
+    if not values.numel():
+        return torch.empty(0, 3, dtype=torch.float32)
+    palette = torch.tensor(INSTANCE_PALETTE_RGB8, dtype=torch.float32) / 255.0
+    return palette[torch.remainder(values, len(INSTANCE_PALETTE_RGB8))]
+
+
+def _visible_rgb(colors: torch.Tensor) -> torch.Tensor:
+    value = colors.detach().float().cpu().clamp(0.0, 1.0)
+    if value.numel() and not bool(value.abs().sum() > 0):
+        return torch.full_like(value, 0.5)
+    return value
 
 
 def _track_summary(track: ObjectTrackMap) -> dict[str, Any]:
@@ -256,6 +336,7 @@ def _write_ply(
     instance_ids: torch.Tensor,
     weights: torch.Tensor,
     observations: torch.Tensor,
+    frame_ids: torch.Tensor | None = None,
 ) -> None:
     points = points.detach().float().cpu()
     colors = colors.detach().float().cpu().clamp(0.0, 1.0)
@@ -264,9 +345,13 @@ def _write_ply(
     weights = weights.detach().float().cpu()
     observations = observations.detach().long().cpu()
     count = int(points.shape[0])
+    if frame_ids is None:
+        frame_ids = torch.full((count,), -1, dtype=torch.long)
+    else:
+        frame_ids = frame_ids.detach().long().cpu()
     if any(
         tuple(value.shape) != (count,)
-        for value in (category_ids, instance_ids, weights, observations)
+        for value in (category_ids, instance_ids, weights, observations, frame_ids)
     ) or tuple(colors.shape) != (count, 3):
         raise ValueError("PLY fields have inconsistent lengths.")
     array = np.empty(
@@ -282,6 +367,7 @@ def _write_ply(
             ("instance_id", "<i4"),
             ("evidence_weight", "<f4"),
             ("observations", "<i4"),
+            ("frame_id", "<i4"),
         ],
     )
     if count:
@@ -292,6 +378,7 @@ def _write_ply(
         array["instance_id"] = instance_ids.numpy()
         array["evidence_weight"] = weights.numpy()
         array["observations"] = observations.numpy()
+        array["frame_id"] = frame_ids.numpy()
     header = "\n".join(
         (
             "ply",
@@ -307,6 +394,7 @@ def _write_ply(
             "property int instance_id",
             "property float evidence_weight",
             "property int observations",
+            "property int frame_id",
             "end_header",
             "",
         )

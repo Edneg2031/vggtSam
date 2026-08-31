@@ -134,6 +134,9 @@ def main() -> None:
         prompts=("chair", "person"),
     )
     assert result.voxel_count > 0
+    assert result.scene_voxel_count == 2
+    assert result.scene_labeled_voxel_count == 1
+    assert set(result.scene_instance_ids.tolist()) == {-1, 7}
     assert result.labeled_voxel_count == result.voxel_count
     assert set(result.semantic_labels) == {"chair"}
     assert [track.instance_id for track in result.object_tracks] == [7, 9]
@@ -204,8 +207,11 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="semantic_mapping_smoke_") as directory:
         summary = export_semantic_map(result, directory)
         assert summary["voxel_count"] == result.voxel_count
+        assert summary["scene_voxel_count"] == result.scene_voxel_count
         for name in (
             "semantic_map.pt",
+            "scene_rgb_map.ply",
+            "scene_semantic_map.ply",
             "semantic_map.ply",
             "rgb_map.ply",
             "object_tracks.ply",
@@ -213,6 +219,22 @@ def main() -> None:
             "map_summary.json",
         ):
             assert (Path(directory) / name).is_file(), name
+        try:
+            artifact = torch.load(
+                Path(directory) / "semantic_map.pt",
+                map_location="cpu",
+                weights_only=False,
+            )
+        except TypeError:
+            artifact = torch.load(
+                Path(directory) / "semantic_map.pt",
+                map_location="cpu",
+            )
+        assert artifact["schema"] == 2
+        assert artifact["scene_voxel_points"].shape[0] == result.scene_voxel_count
+        assert "frame_id" in (
+            Path(directory) / "object_tracks.ply"
+        ).read_bytes().split(b"end_header", 1)[0].decode("ascii")
     print(
         "semantic mapping backend-neutral smoke passed "
         f"frames={result.metadata['frame_count']} "

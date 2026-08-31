@@ -152,8 +152,12 @@ pose、遮挡、动态物体和空间非线性畸变影响，单一 per-scene sc
   adapters 可以在不重新推理模型的情况下重放；
 - `SemanticMapBuilder` 按帧将 mask 投影到世界坐标并融合成体素，同时把动态实例保存到
   独立 track，避免写入静态地图；
-- `semantic_map.pt`、`semantic_map.ply`、`rgb_map.ply`、`object_tracks.ply` 和
-  `map_summary.json` 记录地图及后端、坐标系、尺度和对象元数据。
+- `scene_rgb_map.ply` 和 `scene_semantic_map.ply` 输出所有有效几何经过多帧体素融合后的完整
+  场景，后者在场景上下文中覆盖静态 prompt 实例颜色；
+- `semantic_map.ply`/`rgb_map.ply` 只输出静态 prompt 物体的融合体素，
+  `object_tracks.ply` 则汇总保留 `frame_id` 的逐帧 track 点，不进行体素融合；
+- `semantic_map.pt` 和 `map_summary.json` 记录完整场景、语义地图、轨迹及后端、坐标系、尺度
+  和对象元数据。
 
 运行入口是 `commands_run_semantic_map.txt`（底层为 `scripts/run_semantic_map.py`）。
 当前 RGB 路径仍调用 StreamVGGT + SAM3.1；

@@ -58,10 +58,22 @@ zsh streaming_couping/commands_run_semantic_map.txt \
   --output-dir outputs/semantic_map
 ```
 
-输出包括 `semantic_map.pt`、按实例着色的 `semantic_map.ply`、RGB 版本的 `rgb_map.ply`、
-`object_tracks.ply` 和 `map_summary.json`。静态目标写入世界坐标体素地图；动态目标保存在
-独立 object track 中，避免污染静态地图。默认使用当前 V0 的 raw pointmap，不启用被否决的
-temporal point prompt、历史深度 Veto 或 affine depth correction。
+输出会同时保留完整场景、静态语义地图和逐帧 object track：
+
+| 文件 | 包含内容 | 跨帧处理 |
+|---|---|---|
+| `scene_rgb_map.ply` | 所有通过置信度门限的场景点，使用 RGB 着色 | 所有选中帧按世界坐标叠加后做体素融合 |
+| `scene_semantic_map.ply` | 同一完整场景；静态 prompt 物体按实例着色，其他场景区域显示为较暗 RGB | 所有选中帧按世界坐标叠加后做体素融合 |
+| `semantic_map.ply` | 只包含静态 prompt 物体，按 persistent instance ID 着色 | 多帧体素融合 |
+| `rgb_map.ply` | 与 `semantic_map.ply` 完全相同的物体体素，改用观测 RGB 着色 | 多帧体素融合 |
+| `object_tracks.ply` | 每个 persistent track 的逐帧观测点，包含静态和动态目标 | 多帧点直接汇总，不做体素融合；点中保留 `frame_id` |
+
+`semantic_map.pt` 保存上述完整场景体素、语义体素、轨迹和元数据，`object_tracks.json`
+保存每个实例的类别、帧范围和包围盒，`map_summary.json` 保存输出索引和统计。
+`object_tracks.ply` 不是由折线构成的运动轨迹图，而是各帧 mask 对应 3D 点的集合；因此同一
+物体在多帧中的点可能重叠。静态目标写入语义体素地图，动态目标只保存在独立 track 中，避免
+污染静态地图。默认使用当前 V0 的 raw pointmap，不启用被否决的 temporal point prompt、
+历史深度 Veto 或 affine depth correction。
 
 ## 历史实验
 

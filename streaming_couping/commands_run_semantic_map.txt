@@ -24,6 +24,7 @@ FRAME_COUNT=0
 PROMPTS=("bed" "wardrobe")
 OUTPUT_DIR="$STORAGE_ROOT/outputs/semantic_map"
 CACHE_PATH="$STORAGE_ROOT/outputs/streaming_couping_v0/cache/00a231a370_90_525_step15_37_68_54.pt"
+MAX_SCENE_VOXELS=1000000
 RECOVERY_CONFIG="streaming_couping/configs/recovery_dynamic_instance.yaml"
 CUDA_DEVICES=""
 
@@ -82,6 +83,7 @@ if (( $# == 0 )); then
       ;;
   esac
   ARGS+=(--output-dir "$OUTPUT_DIR")
+  ARGS+=(--max-scene-voxels "$MAX_SCENE_VOXELS")
   [[ -n "$RECOVERY_CONFIG" ]] && ARGS+=(--recovery-config "$RECOVERY_CONFIG")
 fi
 
