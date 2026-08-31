@@ -36,7 +36,8 @@ zsh streaming_couping/commands_run_semantic_map.txt \
 
 默认 `MANIFEST_PATH` 是之前实验一直使用的 processed ScanNet++ 数据：
 `/data184/open_source/vggtSam/data/processed/scannetpp_pinhole_2d/manifest.json`，
-默认场景为 `00a231a370`，默认帧序列为 `90,105,...,825`，共 50 帧。因此直接修改 prompt
+默认场景为 `00a231a370`，当前 795 帧 manifest 上默认采样序列为
+`90,104,...,776`，共 50 帧。因此直接修改 prompt
 和帧选择参数即可；不需要另填 RGB 目录。只有在把 `MANIFEST_PATH` 设为空时，才使用
 `FRAME_PATHS` 中的显式图片文件或目录。当前 50 帧默认输出目录是
 `/data184/open_source/vggtSam/outputs/semantic_map_50frames`，不会覆盖之前的 30 帧结果。
