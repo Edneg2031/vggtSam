@@ -1,0 +1,79 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+CONFIG="${SEMANTIC_MAPPING_CONFIG:-streaming_couping/configs/v0_baseline.yaml}"
+OUTPUT_DIR="${SEMANTIC_MAPPING_V23_OUTPUT:-$STORAGE_ROOT/outputs/streaming_couping_v23/semantic_map}"
+V22_MAP_DIR="${SEMANTIC_MAPPING_V22_MAP_DIR:-$STORAGE_ROOT/outputs/streaming_couping_v22/semantic_map}"
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+[[ -s "$CONFIG" ]] || { echo "missing config: $CONFIG" >&2; exit 1; }
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+
+echo "Stage V2.3 failure-only confidence-aware voxel-memory semantic-map export"
+echo "models are not rerun; frozen V2.2 masks, V0 cache and QK pose are reused"
+[[ -s "$V22_MAP_DIR/semantic_map.pt" ]] || {
+  echo "missing frozen V2.2 artifact: $V22_MAP_DIR/semantic_map.pt" >&2
+  exit 1
+}
+PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT" \
+  "$PYTHON_BIN" -m streaming_couping.scripts.smoke_v23_confidence_memory
+
+PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT" \
+  "$PYTHON_BIN" -m streaming_couping.scripts.run_v23_semantic_map \
+  --config "$CONFIG" \
+  --output-dir "$OUTPUT_DIR" \
+  --v22-map-dir "$V22_MAP_DIR" \
+  "$@"
+
+SUMMARY="$OUTPUT_DIR/semantic_map_v23_summary.json"
+[[ -s "$SUMMARY" ]] || { echo "missing V2.3 semantic_map_v23_summary.json" >&2; exit 1; }
+for artifact in semantic_map.pt recovery_events.csv object_memory_confidence.json; do
+  [[ -s "$OUTPUT_DIR/$artifact" ]] || {
+    echo "missing V2.3 $artifact" >&2
+    exit 1
+  }
+done
+
+export SUMMARY
+PYTHONPATH="$ROOT" "$PYTHON_BIN" -c '
+import json
+import os
+from pathlib import Path
+
+summary = json.loads(Path(os.environ["SUMMARY"]).read_text())
+assert summary["identity_mode"] == "v2_3_failure_only_confidence_aware_voxel_memory"
+assert summary["baseline_status"] == "frozen"
+assert summary["map_generation_gt_fields"] == 0
+assert summary["streamvggt_frozen"] == 1
+assert summary["sam3_frozen"] == 1
+assert summary["pointmap_modified"] == 0
+assert summary["selected_pose_branch"] == "retrieve_qk"
+assert summary["semantic_map_pipeline_ready"] == 1
+stats = summary["recovery_stats"]
+assert float(stats["normal_frame_unchanged_ratio"]) >= 1.0 - 1e-12
+assert float(stats["raw_fallback_unchanged_ratio"]) >= 1.0 - 1e-12
+assert stats["memory_update_count"] >= 0
+assert stats["raw_observation_update"] >= 0
+assert stats["validated_recovery_update"] >= 0
+print(
+    "V2.3 export accepted triggers={} geometry_accept={} memory_updates={} "
+    "raw_updates={} recovery_updates={} low_confidence_reject={} "
+    "voxel_conflict_reject={} normal_unchanged={:.4f}".format(
+        stats["recovery_trigger_count"],
+        stats["geometry_validation_accept_count"],
+        stats["memory_update_count"],
+        stats["raw_observation_update"],
+        stats["validated_recovery_update"],
+        stats["low_confidence_reject_count"],
+        stats["voxel_conflict_reject_count"],
+        float(stats["normal_frame_unchanged_ratio"]),
+    )
+)
+'
+
+echo "===== V2.3 COPYABLE RESULT ====="
+sed -n '1,200p' "$OUTPUT_DIR/copyable_result.txt"

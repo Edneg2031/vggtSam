@@ -1,33 +1,49 @@
-# V0: retained SAM3.1 + StreamVGGT baseline.  SAM appearance descriptors are
-# intentionally disabled; SAM contributes dynamic masks/IDs and StreamVGGT
-# contributes camera and local geometry.
+# Frozen V0: QK-retrieved pose, raw full-history world pointmap and SAM3.1
+# persistent semantic lifting. SAM mask/ID never enters pose generation.
 recovery_config: streaming_couping/configs/recovery_dynamic_instance.yaml
-output_dir: outputs/streaming_couping_v0/data_stage
+output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/data_stage
 
 dataset:
-  manifest: data/processed/scannetpp_pinhole_2d/manifest.json
+  manifest: ${VGGT_SAM_STORAGE_ROOT}/data/processed/scannetpp_pinhole_2d/manifest.json
   clips:
     - name: 00a231a370_90_525_step15_37_68_54
       scene_id: 00a231a370
       frame_indices: [90, 105, 120, 135, 150, 165, 180, 195, 210, 225, 240, 255, 270, 285, 300, 315, 330, 345, 360, 375, 390, 405, 420, 435, 450, 465, 480, 495, 510, 525]
       # Permanent capacity slots. A slot is assigned causally at first sight
       # and is never reused, so objects may first appear after frame 90.
-      instance_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+      # Keep the registry capacity aligned with SAM3.1 max_num_objects=16.
+      instance_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
       instance_source: sam31_online
       # SAM3.1 detects all instances of each configured open-vocabulary noun.
-      # Add scene-relevant static concepts here; this is not class-agnostic.
-      instance_prompts: [bed, wardrobe]
+      # Keep object-scale concepts here. A scene-dominant semantic label may
+      # remain for map export, while read-only diagnosis can exclude it.
+      # Prompt breadth controls semantic recall; it does not change the V0
+      # pose or pointmap branches. Wardrobe is retained for semantic mapping
+      # only. The other prompts are bounded, repeatedly visible objects chosen
+      # by the annotation-only planning audit. Diagnosis never changes this
+      # frozen semantic prompt set.
+      instance_prompts:
+        - wardrobe
+        - chair
+        - rug
+        - desk
+        - cabinet
+        - nightstand
+        - dustbin
+        - box
+        - guitar case
       reference_sequence_index: 0
       split: baseline
 
 runtime:
-  streamvggt_devices: [cuda:0, cuda:1]
+  streamvggt_devices: ["cuda:0", "cuda:1"]
   streamvggt_amp_dtype: bfloat16
-  geometry_device: cuda:0
-  sam3_device: cuda:2
+  geometry_device: "cuda:0"
+  sam3_device: "cuda:2"
 
 features:
-  cache_dir: outputs/streaming_couping_v0/cache
+  # Stable V0-owned cache. Rebuild explicitly when it is absent or stale.
+  cache_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/cache
   rebuild: false
   cache_sam_appearance: false
   sam_source: disabled_geometry_only_baseline
@@ -37,6 +53,7 @@ features:
   sam_batch_size: 0
   cache_sam_local_tokens: false
   geometry_prompt_point_confidence_threshold: 0.30
+  # Confidence support used by the exported raw world pointmap.
   point_confidence_threshold: 0.30
   min_instance_points: 128
   sampled_instance_points: 128
@@ -50,33 +67,347 @@ fusion:
   identity_hard_mismatch_max_fitness: 0.02
   dpt_layer_indices: [4, 11, 17, 23]
 
-training:
-  device: cuda:0
-
 baseline:
   version: v0
-  output_dir: outputs/streaming_couping_v0
+  status: frozen
+  output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0
   clip_name: 00a231a370_90_525_step15_37_68_54
-  training_device: cuda:0
-  local_point_count: 32
+  audit_device: "cuda:0"
   frames:
-    camera_base: [105, 120, 135, 150, 165, 180, 195, 210, 225, 240, 255]
-    geometry_refiner: [270, 285, 300, 315, 330, 345]
     evaluation: [360, 375, 390, 405, 420, 435, 450, 465, 480, 495, 510, 525]
-  model:
-    hidden_dim: 256
-    min_track_confidence: 0.50
-    min_geometry_confidence: 0.20
-    min_static_score: 0.20
-    max_rotation_degrees: 15.0
-    max_translation_native: 0.50
-    affinity_temperature: 0.10
-  optimization:
-    base_steps: 1200
-    refiner_steps: 3000
-    learning_rate: 0.001
-    weight_decay: 0.0
-    grad_clip_norm: 5.0
-    translation_weight: 10.0
-    log_every: 200
-    seed: 0
+  pose:
+    # The selection is fixed before GT scoring. It consumes the RGB/QK-only
+    # artifact below; raw StreamVGGT remains an explicit runtime fallback.
+    selected_branch: retrieve_qk
+    qk_pose_output: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/qk_pose_retrieval/qk_pose_output.pt
+    allow_raw_fallback: true
+
+# Training-free pose candidate. RGB/native QK selects history and the frozen
+# camera head emits pose. Depth/point heads and SAM are not run here.
+qk_pose_retrieval:
+  output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/qk_pose_retrieval
+  total_frame_budget: 5
+  anchor_frames: 1
+
+# Deployable semantic map: raw full-history world pointmap plus SAM persistent
+# slot/ID labels. The selected QK pose trajectory is stored alongside the map.
+semantic_map:
+  # v0_slot preserves the original SAM-slot exporter.  The V1 command uses
+  # the same config with --identity-mode v1_object_memory.
+  identity_mode: v0_slot
+  output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/semantic_map
+  confidence_threshold: 0.30
+  track_score_threshold: 0.50
+  max_map_points: 400000
+  v1_object_memory:
+    output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v1/semantic_map
+    raw_cache_variant: sam31_online_forward
+    min_observation_points: 16
+    min_mask_pixels: 32
+    min_track_score: 0.50
+    min_geometry_confidence: 0.30
+    max_points_per_object: 4096
+    center_ema_alpha: 0.25
+    same_frame_merge_score: 0.78
+    association:
+      center_weight: 0.40
+      voxel_weight: 0.25
+      chamfer_weight: 0.20
+      appearance_weight: 0.10
+      category_weight: 0.05
+      min_match_score: 0.50
+      max_center_distance_ratio: 0.35
+      center_scale_ratio: 0.12
+      chamfer_scale_ratio: 0.12
+      voxel_size_ratio: 0.02
+      absolute_voxel_size: 0.02
+      max_points_per_comparison: 256
+      category_hard_gate: true
+    use_cached_appearance: false
+  # V1.1 is an independent projection-first identity ablation.  It reuses the
+  # frozen V0 cache and writes to a separate output directory.
+  v1_1_projection_memory:
+    output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v11/semantic_map
+    raw_cache_variant: sam31_online_forward
+    min_observation_points: 16
+    min_mask_pixels: 32
+    min_track_score: 0.50
+    min_geometry_confidence: 0.30
+    max_points_per_object: 4096
+    max_fused_voxels_per_object: 20000
+    center_ema_alpha: 0.25
+    confirmation_frames: 2
+    confirmation_window: 4
+    max_pending_gap: 4
+    voxel_size_ratio: 0.02
+    absolute_voxel_size: 0.02
+    association:
+      # Projection IoU is intentionally the dominant term.  Center distance
+      # is only a weak tie-breaker and is never the primary gate.
+      projection_iou_weight: 0.70
+      projection_recall_weight: 0.12
+      projection_precision_weight: 0.08
+      center_weight: 0.05
+      category_weight: 0.05
+      appearance_weight: 0.0
+      min_projection_iou: 0.025
+      min_match_score: 0.28
+      min_projected_pixels: 8
+      top_k: 5
+      projection_dilation_radius: 3
+      max_projection_points: 4096
+      center_scale_ratio: 0.12
+      absolute_center_scale: 0.02
+      category_hard_gate: true
+
+  # V2 does not merge SAM tracks.  It keeps the V0 slot identity and invokes
+  # geometry only for low-confidence, lost, area-outlier, or re-entry frames.
+  # The final mask always comes from a frozen SAM3.1 refinement call; the
+  # geometry proposal is never written directly into the pointmap.
+  v2_geometry_recovery:
+    output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v2/semantic_map
+    raw_cache_variant: sam31_online_forward
+    recovery:
+      low_score_threshold: 0.50
+      min_mask_pixels: 32
+      min_area_ratio: 0.35
+      max_area_ratio: 2.85
+      reentry_gap: 3
+      min_history_points: 16
+      max_points_per_object: 4096
+      min_memory_update_score: 0.50
+      min_geometry_confidence: 0.30
+      max_positive_points: 6
+      min_candidate_score: 0.50
+      min_candidate_support_recall: 0.15
+      min_candidate_iou: 0.02
+      min_candidate_area_ratio: 0.20
+      max_candidate_area_ratio: 5.00
+      proposal_box_quantile: 0.02
+      proposal_box_padding_ratio: 0.12
+      min_projected_points: 8
+      min_projected_fraction: 0.005
+      min_supported_points: 8
+      min_support_ratio: 0.02
+      support_abs_distance: 0.15
+      support_relative_distance: 0.10
+
+  # V2.1 is a stricter follow-up to V2.  It never triggers on ordinary
+  # low-confidence, small, or area-outlier masks.  A recovery candidate is
+  # accepted only when its combined SAM/geometry/temporal score beats the raw
+  # SAM candidate by replacement_margin.  Outputs are kept separate from V2.
+  v2_1_geometry_recovery:
+    output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v21/semantic_map
+    raw_cache_variant: sam31_online_forward
+    recovery:
+      unobserved_gap: 2
+      reentry_gap: 3
+      # Compatibility fields; V2.1 does not use these to trigger recovery.
+      low_score_threshold: 0.50
+      min_mask_pixels: 32
+      min_area_ratio: 0.35
+      max_area_ratio: 2.85
+      min_history_points: 16
+      max_points_per_object: 4096
+      min_memory_update_score: 0.50
+      min_geometry_confidence: 0.30
+      max_positive_points: 6
+      min_candidate_score: 0.50
+      min_candidate_support_recall: 0.15
+      min_candidate_iou: 0.02
+      min_candidate_area_ratio: 0.20
+      max_candidate_area_ratio: 5.00
+      min_geometry_consistency: 0.12
+      min_recovery_score: 0.50
+      replacement_margin: 0.12
+      sam_score_weight: 0.35
+      geometry_score_weight: 0.40
+      temporal_score_weight: 0.25
+      proposal_box_quantile: 0.02
+      proposal_box_padding_ratio: 0.12
+      min_projected_points: 8
+      min_projected_fraction: 0.005
+      min_supported_points: 8
+      min_support_ratio: 0.02
+      support_abs_distance: 0.15
+      support_relative_distance: 0.10
+
+  # V2.2 keeps V2.1's failure-only and 2-D score-margin policy, then validates
+  # an accepted candidate in world space before allowing mask replacement.
+  v2_2_geometry_recovery:
+    output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v22/semantic_map
+    raw_cache_variant: sam31_online_forward
+    recovery:
+      unobserved_gap: 2
+      reentry_gap: 3
+      low_score_threshold: 0.50
+      min_mask_pixels: 32
+      min_area_ratio: 0.35
+      max_area_ratio: 2.85
+      min_history_points: 16
+      max_points_per_object: 4096
+      min_memory_update_score: 0.50
+      min_geometry_confidence: 0.30
+      max_positive_points: 6
+      min_candidate_score: 0.50
+      min_candidate_support_recall: 0.15
+      min_candidate_iou: 0.02
+      min_candidate_area_ratio: 0.20
+      max_candidate_area_ratio: 5.00
+      min_geometry_consistency: 0.12
+      min_recovery_score: 0.50
+      replacement_margin: 0.12
+      sam_score_weight: 0.35
+      geometry_score_weight: 0.40
+      temporal_score_weight: 0.25
+      proposal_box_quantile: 0.02
+      proposal_box_padding_ratio: 0.12
+      min_projected_points: 8
+      min_projected_fraction: 0.005
+      min_supported_points: 8
+      min_support_ratio: 0.02
+      support_abs_distance: 0.15
+      support_relative_distance: 0.10
+    validation:
+      max_candidate_points: 2048
+      max_historical_points: 2048
+      min_candidate_points: 8
+      min_historical_points: 16
+      centroid_distance_threshold_m: 0.35
+      centroid_distance_scale: 0.75
+      point_overlap_distance_m: 0.10
+      min_point_overlap_ratio: 0.20
+      min_shape_score: 0.25
+      alpha_2d_score: 0.55
+      beta_3d_score: 0.45
+      final_accept_threshold: 0.58
+      distance_chunk_size: 512
+      covariance_epsilon: 0.000001
+
+  # V2.3 keeps V2.2's frozen failure-only recovery and adds a map-only,
+  # confidence-aware voxel memory. Tracking masks are serialized unchanged;
+  # only map_masks_stream is filtered by this section.
+  v2_3_geometry_recovery:
+    output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v23/semantic_map
+    v22_map_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v22/semantic_map
+    raw_cache_variant: sam31_online_forward
+    recovery:
+      unobserved_gap: 2
+      reentry_gap: 3
+      low_score_threshold: 0.50
+      min_mask_pixels: 32
+      min_area_ratio: 0.35
+      max_area_ratio: 2.85
+      min_history_points: 16
+      max_points_per_object: 4096
+      min_memory_update_score: 0.50
+      min_geometry_confidence: 0.30
+      max_positive_points: 6
+      min_candidate_score: 0.50
+      min_candidate_support_recall: 0.15
+      min_candidate_iou: 0.02
+      min_candidate_area_ratio: 0.20
+      max_candidate_area_ratio: 5.00
+      min_geometry_consistency: 0.12
+      min_recovery_score: 0.50
+      replacement_margin: 0.12
+      sam_score_weight: 0.35
+      geometry_score_weight: 0.40
+      temporal_score_weight: 0.25
+      proposal_box_quantile: 0.02
+      proposal_box_padding_ratio: 0.12
+      min_projected_points: 8
+      min_projected_fraction: 0.005
+      min_supported_points: 8
+      min_support_ratio: 0.02
+      support_abs_distance: 0.15
+      support_relative_distance: 0.10
+    validation:
+      max_candidate_points: 2048
+      max_historical_points: 2048
+      min_candidate_points: 8
+      min_historical_points: 16
+      centroid_distance_threshold_m: 0.35
+      centroid_distance_scale: 0.75
+      point_overlap_distance_m: 0.10
+      min_point_overlap_ratio: 0.20
+      min_shape_score: 0.25
+      alpha_2d_score: 0.55
+      beta_3d_score: 0.45
+      final_accept_threshold: 0.58
+      distance_chunk_size: 512
+      covariance_epsilon: 0.000001
+    memory:
+      voxel_size_m: 0.05
+      max_voxels_per_object: 4096
+      max_points_per_observation: 2048
+      point_confidence_floor: 0.30
+      min_observation_score: 0.50
+      raw_observation_confidence: 1.00
+      validated_recovery_confidence: 0.70
+      recovery_candidate_confidence: 0.30
+      confidence_decay: 0.98
+      recovery_support_distance_m: 0.10
+      min_recovery_support_ratio: 0.20
+      min_recovery_supported_points: 8
+      distance_chunk_size: 512
+      covariance_epsilon: 0.000001
+
+# Offline Stage 0 evaluation. This section is ignored by the V0 model/cache
+# loader and is consumed only after the frozen cache has been generated.
+semantic_evaluation:
+  output_dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_semantic_map_stage0
+  raw_cache_variant: sam31_online_forward
+  v6_cache_variant: sam31_online_geometry_compete
+  tracking:
+    assignment_min_iou: 0.01
+    identity_iou_threshold: 0.50
+    reentry_iou_threshold: 0.25
+    reentry_min_gap: 2
+    reentry_window: 3
+    improvement_epsilon: 0.000001
+    fragmentation_iou_threshold: 0.05
+  map:
+    confidence_threshold: 0.30
+    track_score_threshold: 0.50
+    max_points_per_object: 4096
+    distance_chunk_size: 512
+    fscore_thresholds_m: [0.05, 0.10]
+    voxel_size_m: 0.05
+    ghost_distance_m: 0.10
+    duplicate_voxel_iou: 0.25
+  object_memory:
+    short_term_capacity: 5
+    long_term_capacity: 4
+    min_track_score: 0.50
+    min_geometry_confidence: 0.30
+    min_mask_pixels: 32
+    min_area_ratio: 0.35
+    max_area_ratio: 2.85
+    long_term_min_track_score: 0.75
+    long_term_min_geometry_confidence: 0.50
+    reentry_gap: 3
+  persistent_object_memory:
+    min_observation_points: 16
+    min_mask_pixels: 32
+    min_track_score: 0.50
+    min_geometry_confidence: 0.30
+    max_points_per_object: 4096
+    center_ema_alpha: 0.25
+    same_frame_merge_score: 0.78
+    association:
+      center_weight: 0.40
+      voxel_weight: 0.25
+      chamfer_weight: 0.20
+      appearance_weight: 0.10
+      category_weight: 0.05
+      min_match_score: 0.50
+      max_center_distance_ratio: 0.35
+      center_scale_ratio: 0.12
+      chamfer_scale_ratio: 0.12
+      voxel_size_ratio: 0.02
+      absolute_voxel_size: 0.02
+      max_points_per_comparison: 256
+      category_hard_gate: true
+    use_cached_appearance: false
+  prompt_label_aliases: {}

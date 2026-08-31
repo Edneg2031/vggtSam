@@ -1,0 +1,74 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+CONFIG="${SEMANTIC_MAPPING_CONFIG:-streaming_couping/configs/v0_baseline.yaml}"
+OUTPUT_DIR="${SEMANTIC_MAPPING_V2_OUTPUT:-$STORAGE_ROOT/outputs/streaming_couping_v2/semantic_map}"
+SAM_GPU="${V2_SAM_GPU:-3}"
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+[[ -s "$CONFIG" ]] || { echo "missing config: $CONFIG" >&2; exit 1; }
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+echo "Stage V2 conditional geometry-guided SAM recovery semantic-map export"
+echo "V0 cache and QK pose are reused; StreamVGGT is not rerun"
+echo "physical SAM GPU=$SAM_GPU logical SAM device=cuda:0"
+echo "output=$OUTPUT_DIR"
+PYTHONPATH="$ROOT" "$PYTHON_BIN" -m streaming_couping.scripts.smoke_v2_geometry_recovery
+
+CUDA_VISIBLE_DEVICES="$SAM_GPU" PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT" \
+  "$PYTHON_BIN" -m streaming_couping.scripts.run_v2_semantic_map \
+  --config "$CONFIG" \
+  --output-dir "$OUTPUT_DIR" \
+  --sam3-device cuda:0 \
+  "$@"
+
+[[ -s "$OUTPUT_DIR/semantic_map_summary.json" ]] || {
+  echo "missing V2 semantic_map_summary.json" >&2
+  exit 1
+}
+[[ -s "$OUTPUT_DIR/semantic_map.pt" ]] || {
+  echo "missing V2 semantic_map.pt" >&2
+  exit 1
+}
+[[ -s "$OUTPUT_DIR/recovery_events.csv" ]] || {
+  echo "missing V2 recovery_events.csv" >&2
+  exit 1
+}
+
+SUMMARY="$OUTPUT_DIR/semantic_map_summary.json"
+export SUMMARY
+PYTHONPATH="$ROOT" "$PYTHON_BIN" -c '
+import json
+import os
+from pathlib import Path
+summary = json.loads(Path(os.environ["SUMMARY"]).read_text())
+assert summary["identity_mode"] == "v2_conditional_geometry_guided_sam_recovery"
+assert summary["baseline_status"] == "frozen"
+assert summary["map_generation_gt_fields"] == 0
+assert summary["streamvggt_frozen"] == 1
+assert summary["sam3_frozen"] == 1
+assert summary["pointmap_modified"] == 0
+assert summary["selected_pose_branch"] == "retrieve_qk"
+assert summary["semantic_map_pipeline_ready"] == 1
+stats = summary["recovery_stats"]
+ratio = float(stats["normal_frame_unchanged_ratio"])
+assert ratio == ratio and ratio >= 1.0 - 1e-12
+print(
+    "V2 conditional recovery export accepted "
+    "triggers={} applied={} normal_unchanged={:.4f}".format(
+        stats["recovery_trigger_count"],
+        stats["recovery_success_count"],
+        ratio,
+    )
+)
+'
+
+echo "===== V2 COPYABLE RESULT ====="
+sed -n '1,120p' "$OUTPUT_DIR/copyable_result.txt"

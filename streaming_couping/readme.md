@@ -1,19 +1,21 @@
-# streaming_couping
+# streaming_couping V0
 
-本目录只保留 `V0` SAM3.1 × StreamVGGT 动态实例几何 baseline。当前做法、效果、实验结果和结论边界统一记录在：
+V0 是冻结、免训练的 StreamVGGT + SAM3.1 语义地图 pipeline：
 
-[当前状态与实验结论](docs/current_status.md)
+- QK retrieval 只为 camera head 选择历史并输出相机轨迹；
+- full-history raw StreamVGGT world pointmap 作为地图几何；
+- SAM3.1 persistent mask、slot 和 track ID 作为点云语义；
+- SAM 不参与 pose，点云不做后处理优化。
 
-运行：
+模型主运行入口：
 
 ```bash
 zsh streaming_couping/commands_v0_baseline.txt
 ```
 
-该入口支持多 prompt、多实例、未来帧 birth、永久 slot、几何辅助 mask、静态实例几何 pose residual
-和无有效实例时的 exact camera-baseline fallback。它不缓存 SAM appearance token，也不声称 SAM token
-能改善 pose。旧版本 runner、配置、命令和专用测试已删除；模型、数据、`externals/`、`outputs/`
-均不在本次清理范围。
+运行流程包括：缓存 StreamVGGT 几何和 SAM3.1 多 prompt 实例轨迹；使用 first-frame
+anchor + native QK Top-4 运行 pose-only camera replay；固定 pose 完成 tracking/pose
+审计；最后将 SAM persistent 实例标签投影到未修改的 raw world pointmap。
 
 ## 语义地图 pipeline
 
@@ -43,3 +45,27 @@ PYTHONPATH=. python -m streaming_couping.scripts.run_semantic_map \
 `object_tracks.ply` 和 `map_summary.json`。静态目标写入世界坐标体素地图；动态目标保存在
 独立 object track 中，避免污染静态地图。默认使用当前 V0 的 raw pointmap，不启用被否决的
 temporal point prompt、历史深度 Veto 或 affine depth correction。
+
+## 辅助入口
+
+```bash
+zsh streaming_couping/commands_plot_v0_poses.txt
+zsh streaming_couping/commands_semantic_mapping.txt
+zsh streaming_couping/commands_semantic_mapping_v1.txt
+zsh streaming_couping/commands_semantic_mapping_v1_evaluation.txt
+zsh streaming_couping/commands_check_scannetpp_data.txt
+zsh streaming_couping/commands_audit_scannetpp_processed.txt
+zsh streaming_couping/commands_run_v0_bidirectional_feedback.txt
+zsh streaming_couping/commands_run_v0_temporal_prompt_matrix.txt
+zsh streaming_couping/commands_analyze_multiclip_affine_geometry.txt
+```
+
+后续实验命令均为冻结 cache 上的诊断或离线评估，不会自动修改正式 V0。实验记录见：
+
+- [当前状态与实验结论](docs/current_status.md)
+- [系统 pipeline](docs/system_pipeline.md)
+- [语义地图实验路线](docs/experiment_route.md)
+
+当前单序列证据只支持 QK pose 改善；V0 不声明 SAM 改善 pose 或几何。SAM 的正式作用
+是实例发现、跨帧 persistent identity 和语义投影。新方法必须在 scene-disjoint 数据上
+与 raw V0 按同一协议比较，并报告 tracking、depth、map、恶化帧比例和 fallback/coverage。

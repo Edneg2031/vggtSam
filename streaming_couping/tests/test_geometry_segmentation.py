@@ -313,7 +313,7 @@ def test_sam31_geometry_points_refine_the_box_selected_object(
     positive[25, 50] = True
     candidates = wrapper.propose_geometry_point_refined_masks(
         image_path,
-        prompt="bed",
+        prompt="chair",
         output_size=(50, 100),
         geometry_prompt=geometry,
         positive_prompt=positive,
@@ -321,7 +321,7 @@ def test_sam31_geometry_points_refine_the_box_selected_object(
 
     assert len(candidates) == 1
     assert len(predictor.calls) == 2
-    assert predictor.calls[0]["text"] == "bed"
+    assert predictor.calls[0]["text"] == "chair"
     assert "points" not in predictor.calls[0]
     assert "text" not in predictor.calls[1]
     assert predictor.calls[1]["obj_id"] == 7

@@ -1,6 +1,6 @@
 # Frozen backbone/runtime configuration for the retained baseline.
 dataset:
-  manifest: data/processed/scannetpp_pinhole_2d/manifest.json
+  manifest: ${VGGT_SAM_STORAGE_ROOT}/data/processed/scannetpp_pinhole_2d/manifest.json
   scene_id: 00a231a370
   frame_indices: [90, 105]
   min_pixels: 128
@@ -54,4 +54,4 @@ point_cloud:
   metric_thresholds: [0.05, 0.10]
 
 output:
-  dir: outputs/streaming_couping_v0/recovery
+  dir: ${VGGT_SAM_STORAGE_ROOT}/outputs/streaming_couping_v0/recovery

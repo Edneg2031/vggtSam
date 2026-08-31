@@ -1,8 +1,12 @@
 # SAM3.1-assisted StreamVGGT
 
-The repository currently retains the V0 SAM3.1 × StreamVGGT dynamic-instance
-geometry baseline. Its method, measured effect, rejected experiments, and
-claim boundaries are recorded in
+The active implementation is the frozen V0 semantic-mapping pipeline. StreamVGGT
+provides the camera trajectory and raw full-history world pointmap; SAM3.1
+provides prompted multi-instance masks, persistent identities, and future object
+births. No rejected temporal point-prompt loop, historical-depth veto, affine
+depth correction, or SAM appearance-token pose path is active.
+
+Measured results, rejected experiments, and claim boundaries are recorded in
 [the current status](streaming_couping/docs/current_status.md).
 
 Initialize the two upstream model repositories once:
@@ -11,14 +15,32 @@ Initialize the two upstream model repositories once:
 git submodule update --init --recursive
 ```
 
-Run the retained V0 baseline from the repository root:
+Run V0 from the repository root:
 
 ```bash
 zsh streaming_couping/commands_v0_baseline.txt
+```
+
+After the frozen cache is ready, run the offline semantic-map evaluation:
+
+```bash
+zsh streaming_couping/commands_semantic_mapping.txt
+```
+
+For the backend-neutral RGB + text-prompt pipeline:
+
+```bash
+PYTHONPATH=. python -m streaming_couping.scripts.run_semantic_map \
+  --frames /path/to/rgb_frames \
+  --prompts bed wardrobe \
+  --output-dir outputs/semantic_map
 ```
 
 The commands use `externals/sam3` and `externals/streamvggt`, while datasets,
 checkpoints, caches, and generated evaluations remain local under `data/` and
 `outputs/`.
 
-See [the package README](streaming_couping/readme.md) for the code entry point.
+See the [package README](streaming_couping/readme.md) for outputs, the
+[system pipeline](streaming_couping/docs/system_pipeline.md) for the current
+data flow, and the [experiment route](streaming_couping/docs/experiment_route.md)
+for the next semantic-map evaluations and claim boundary.

@@ -199,6 +199,7 @@ class SAM3VideoTrackerAdapter:
         output_size: tuple[int, int],
         prompt_frame_idx: int = 0,
         reference_mask: torch.Tensor | np.ndarray | None = None,
+        propagation_direction: str = "both",
         quiet: bool = True,
     ) -> SAM3TrackOutput:
         if not image_paths:
@@ -208,6 +209,11 @@ class SAM3VideoTrackerAdapter:
             raise ValueError(
                 f"prompt_frame_idx={prompt_frame_idx} is out of range for "
                 f"{len(image_paths)} frames."
+            )
+        propagation_direction = str(propagation_direction).strip().lower()
+        if propagation_direction not in {"forward", "both"}:
+            raise ValueError(
+                "propagation_direction must be 'forward' or 'both'."
             )
 
         with tempfile.TemporaryDirectory(prefix="sam3_track_") as tmp:
@@ -241,9 +247,13 @@ class SAM3VideoTrackerAdapter:
                     propagated = list(
                         self.predictor.propagate_in_video(
                             session_id=session_id,
-                            propagation_direction="both",
+                            propagation_direction=propagation_direction,
                             start_frame_idx=prompt_frame_idx,
-                            max_frame_num_to_track=len(image_paths),
+                            max_frame_num_to_track=(
+                                len(image_paths) - prompt_frame_idx
+                                if propagation_direction == "forward"
+                                else len(image_paths)
+                            ),
                             output_prob_thresh=self.output_prob_thresh,
                         )
                     )
@@ -281,6 +291,7 @@ class SAM3VideoTrackerAdapter:
             aux={
                 "prompt": prompt,
                 "num_frames": len(image_paths),
+                "propagation_direction": propagation_direction,
                 "frame_object_counts": {
                     int(frame_idx): len(objects)
                     for frame_idx, objects in frame_objects.items()
@@ -316,6 +327,8 @@ class SAM3VideoTrackerAdapter:
             raise ValueError("At least one image path is required for SAM3 tracking.")
         if int(max_objects) < 1:
             raise ValueError("max_objects must be positive.")
+        if len(output_size) != 2 or any(int(value) < 1 for value in output_size):
+            raise ValueError("output_size must contain two positive dimensions.")
 
         with tempfile.TemporaryDirectory(prefix="sam31_track_all_") as tmp:
             tmp_dir = Path(tmp)
@@ -381,6 +394,477 @@ class SAM3VideoTrackerAdapter:
                 "dropped_object_ids": tuple(ordered[int(max_objects) :]),
             },
         )
+
+    @torch.no_grad()
+    def track_auto_points_forward_from_paths(
+        self,
+        image_paths: Sequence[str | Path],
+        *,
+        output_size: tuple[int, int],
+        max_objects: int,
+        discovery_stride: int = 5,
+        grid_rows: int = 8,
+        grid_columns: int = 12,
+        points_per_discovery: int = 24,
+        min_mask_pixels: int = 128,
+        max_mask_area_ratio: float = 0.35,
+        duplicate_iou: float = 0.80,
+        duplicate_intersection_over_smaller: float = 0.90,
+        quiet: bool = True,
+    ) -> SAM3MultiTrackOutput:
+        """Discover objects from visual point prompts without category text.
+
+        Discovery is causal.  At fixed frames, deterministic grid points not
+        already covered by a retained mask are submitted as positive visual
+        prompts.  A proposal is admitted immediately from its birth-frame
+        mask, after area filtering and mask NMS, and its slot is never reused.
+        Ground truth, future masks, and semantic noun phrases are not used.
+        """
+
+        if not image_paths:
+            raise ValueError("At least one image path is required for SAM3 tracking.")
+        if int(max_objects) < 1:
+            raise ValueError("max_objects must be positive.")
+        if len(output_size) != 2 or any(int(value) < 1 for value in output_size):
+            raise ValueError("output_size must contain two positive dimensions.")
+        if int(discovery_stride) < 1:
+            raise ValueError("discovery_stride must be positive.")
+        if int(points_per_discovery) < 1:
+            raise ValueError("points_per_discovery must be positive.")
+        _validate_auto_proposal_thresholds(
+            grid_rows=grid_rows,
+            grid_columns=grid_columns,
+            min_mask_pixels=min_mask_pixels,
+            max_mask_area_ratio=max_mask_area_ratio,
+            duplicate_iou=duplicate_iou,
+            duplicate_intersection_over_smaller=(
+                duplicate_intersection_over_smaller
+            ),
+        )
+
+        sequence = len(image_paths)
+        discovery_frames = list(range(0, sequence, int(discovery_stride)))
+        grid = auto_proposal_point_grid(grid_rows, grid_columns)
+        retained_ids: list[int] = []
+        birth_indices: dict[int, int] = {}
+        diagnostics: list[dict[str, Any]] = []
+        results: list[Dict[str, Any]] = []
+        next_obj_id = 1
+
+        with tempfile.TemporaryDirectory(prefix="sam31_auto_points_") as tmp:
+            video_dir = Path(tmp)
+            materialize_video_dir(image_paths, video_dir)
+            with quiet_sam3_output(quiet):
+                session = self.predictor.start_session(
+                    resource_path=str(video_dir)
+                )
+                session_id = (
+                    session["session_id"]
+                    if isinstance(session, dict)
+                    else session
+                )
+                causal_settings = _set_causal_multiplex_settings(
+                    self.predictor
+                )
+                try:
+                    for discovery_index, frame_idx in enumerate(
+                        discovery_frames
+                    ):
+                        frame_objects = collect_frame_objects(
+                            results,
+                            output_size=output_size,
+                        ).get(frame_idx, {})
+                        retained_masks = [
+                            frame_objects[obj_id]
+                            for obj_id in retained_ids
+                            if obj_id in frame_objects
+                            and bool(frame_objects[obj_id].any())
+                        ]
+                        ordered_points = auto_proposal_points_for_discovery(
+                            grid,
+                            discovery_index=discovery_index,
+                            limit=points_per_discovery,
+                        )
+                        for grid_index, point_x, point_y in ordered_points:
+                            if len(retained_ids) >= int(max_objects):
+                                break
+                            if _point_is_covered(
+                                retained_masks,
+                                point_x=point_x,
+                                point_y=point_y,
+                            ):
+                                diagnostics.append(
+                                    {
+                                        "sequence_index": int(frame_idx),
+                                        "grid_index": int(grid_index),
+                                        "point_x": float(point_x),
+                                        "point_y": float(point_y),
+                                        "obj_id": -1,
+                                        "accepted": 0,
+                                        "reason": "covered_by_retained_mask",
+                                        "mask_pixels": 0,
+                                        "mask_area_ratio": 0.0,
+                                        "maximum_iou": 0.0,
+                                        "maximum_intersection_over_smaller": 0.0,
+                                    }
+                                )
+                                continue
+
+                            obj_id = int(next_obj_id)
+                            next_obj_id += 1
+                            prompted = self.predictor.add_prompt(
+                                session_id=session_id,
+                                frame_idx=int(frame_idx),
+                                text=None,
+                                points=torch.tensor(
+                                    [[point_x, point_y]],
+                                    dtype=torch.float32,
+                                ),
+                                point_labels=torch.tensor(
+                                    [1],
+                                    dtype=torch.int32,
+                                ),
+                                obj_id=obj_id,
+                                rel_coordinates=True,
+                                output_prob_thresh=self.output_prob_thresh,
+                            )
+                            results.append(prompted)
+                            prompted_objects = collect_frame_objects(
+                                [prompted],
+                                output_size=output_size,
+                            ).get(frame_idx, {})
+                            candidate = prompted_objects.get(obj_id)
+                            assessment = assess_auto_proposal_mask(
+                                candidate,
+                                retained_masks=retained_masks,
+                                point_x=point_x,
+                                point_y=point_y,
+                                output_size=output_size,
+                                min_mask_pixels=min_mask_pixels,
+                                max_mask_area_ratio=max_mask_area_ratio,
+                                duplicate_iou=duplicate_iou,
+                                duplicate_intersection_over_smaller=(
+                                    duplicate_intersection_over_smaller
+                                ),
+                            )
+                            diagnostics.append(
+                                {
+                                    "sequence_index": int(frame_idx),
+                                    "grid_index": int(grid_index),
+                                    "point_x": float(point_x),
+                                    "point_y": float(point_y),
+                                    "obj_id": obj_id,
+                                    **assessment,
+                                }
+                            )
+                            if not bool(assessment["accepted"]):
+                                # A point prompt can register an object even
+                                # when postprocessing returns no usable mask.
+                                # Always remove rejected IDs so failed
+                                # proposals cannot consume multiplex capacity.
+                                removed = self.predictor.remove_object(
+                                    session_id=session_id,
+                                    frame_idx=int(frame_idx),
+                                    obj_id=obj_id,
+                                    is_user_action=False,
+                                )
+                                results.append(removed)
+                                continue
+                            retained_ids.append(obj_id)
+                            birth_indices[obj_id] = int(frame_idx)
+                            retained_masks.append(candidate.bool())
+
+                        next_frame = (
+                            discovery_frames[discovery_index + 1]
+                            if discovery_index + 1 < len(discovery_frames)
+                            and len(retained_ids) < int(max_objects)
+                            else sequence - 1
+                        )
+                        if retained_ids and next_frame >= frame_idx:
+                            results.extend(
+                                self.predictor.propagate_in_video(
+                                    session_id=session_id,
+                                    propagation_direction="forward",
+                                    start_frame_idx=int(frame_idx),
+                                    max_frame_num_to_track=int(
+                                        next_frame - frame_idx
+                                    ),
+                                    output_prob_thresh=(
+                                        self.output_prob_thresh
+                                    ),
+                                )
+                            )
+                        if len(retained_ids) >= int(max_objects):
+                            break
+                finally:
+                    _restore_multiplex_settings(
+                        self.predictor,
+                        causal_settings,
+                    )
+                    self.predictor.close_session(session_id)
+
+        frame_objects = collect_frame_objects(
+            results,
+            output_size=output_size,
+        )
+        frame_scores = collect_frame_scores(results)
+        height, width = (int(value) for value in output_size)
+        masks = torch.zeros(
+            sequence,
+            len(retained_ids),
+            height,
+            width,
+            dtype=torch.bool,
+        )
+        scores = torch.zeros(
+            sequence,
+            len(retained_ids),
+            dtype=torch.float32,
+        )
+        for slot, obj_id in enumerate(retained_ids):
+            for frame_idx in range(sequence):
+                mask = frame_objects.get(frame_idx, {}).get(obj_id)
+                if mask is None or not bool(mask.any()):
+                    continue
+                masks[frame_idx, slot] = mask.bool()
+                # Point-prompt tracking does not consistently expose a
+                # detector probability.  Prompted visibility is therefore
+                # the score fallback, matching the existing wrapper policy.
+                scores[frame_idx, slot] = float(
+                    frame_scores.get(frame_idx, {}).get(obj_id, 1.0)
+                )
+        return SAM3MultiTrackOutput(
+            masks=masks,
+            scores=scores,
+            obj_ids=tuple(retained_ids),
+            birth_indices=tuple(
+                birth_indices[obj_id] for obj_id in retained_ids
+            ),
+            frame_objects=frame_objects,
+            aux={
+                "proposal_source": "class_agnostic_visual_point_grid",
+                "semantic_prompt": None,
+                "propagation_direction": "forward",
+                "causal_confirmation": True,
+                "discovery_frames": tuple(discovery_frames),
+                "grid_rows": int(grid_rows),
+                "grid_columns": int(grid_columns),
+                "points_per_discovery": int(points_per_discovery),
+                "proposal_diagnostics": diagnostics,
+                "retained_object_count": len(retained_ids),
+                "next_unused_obj_id": int(next_obj_id),
+            },
+        )
+
+
+def auto_proposal_point_grid(
+    rows: int,
+    columns: int,
+) -> tuple[tuple[int, float, float], ...]:
+    """Return deterministic normalized cell-centre prompts."""
+
+    rows = int(rows)
+    columns = int(columns)
+    if rows < 1 or columns < 1:
+        raise ValueError("Auto-proposal grid dimensions must be positive.")
+    values = []
+    for row in range(rows):
+        for column in range(columns):
+            index = row * columns + column
+            values.append(
+                (
+                    index,
+                    (column + 0.5) / float(columns),
+                    (row + 0.5) / float(rows),
+                )
+            )
+    # A centre-out order usually finds bounded foreground objects before
+    # image-edge background surfaces.  The ordering remains fixed and GT-free.
+    return tuple(
+        sorted(
+            values,
+            key=lambda value: (
+                (value[1] - 0.5) ** 2 + (value[2] - 0.5) ** 2,
+                value[0],
+            ),
+        )
+    )
+
+
+def auto_proposal_points_for_discovery(
+    grid: Sequence[tuple[int, float, float]],
+    *,
+    discovery_index: int,
+    limit: int,
+) -> tuple[tuple[int, float, float], ...]:
+    """Rotate a fixed grid so later discovery frames inspect new cells."""
+
+    values = tuple(grid)
+    if not values:
+        return ()
+    limit = min(max(1, int(limit)), len(values))
+    start = (max(0, int(discovery_index)) * limit) % len(values)
+    return tuple(
+        values[(start + offset) % len(values)]
+        for offset in range(limit)
+    )
+
+
+def assess_auto_proposal_mask(
+    mask: torch.Tensor | None,
+    *,
+    retained_masks: Sequence[torch.Tensor],
+    point_x: float,
+    point_y: float,
+    output_size: tuple[int, int],
+    min_mask_pixels: int,
+    max_mask_area_ratio: float,
+    duplicate_iou: float,
+    duplicate_intersection_over_smaller: float,
+) -> dict[str, object]:
+    """Apply birth-frame-only admission tests to one visual proposal."""
+
+    height, width = (int(value) for value in output_size)
+    if mask is None:
+        return _auto_assessment(False, "no_mask")
+    candidate = mask.detach().cpu().bool()
+    if tuple(candidate.shape) != (height, width):
+        raise ValueError(
+            "Auto-proposal mask does not match configured output size."
+        )
+    pixels = int(candidate.sum())
+    area_ratio = pixels / float(height * width)
+    if pixels < int(min_mask_pixels):
+        return _auto_assessment(
+            False,
+            "mask_too_small",
+            pixels=pixels,
+            area_ratio=area_ratio,
+        )
+    if area_ratio > float(max_mask_area_ratio):
+        return _auto_assessment(
+            False,
+            "mask_too_large",
+            pixels=pixels,
+            area_ratio=area_ratio,
+        )
+    point_column = min(width - 1, max(0, int(float(point_x) * width)))
+    point_row = min(height - 1, max(0, int(float(point_y) * height)))
+    if not bool(candidate[point_row, point_column]):
+        return _auto_assessment(
+            False,
+            "prompt_point_outside_mask",
+            pixels=pixels,
+            area_ratio=area_ratio,
+        )
+
+    maximum_iou = 0.0
+    maximum_ios = 0.0
+    for retained in retained_masks:
+        current = retained.detach().cpu().bool()
+        if tuple(current.shape) != (height, width):
+            raise ValueError("Retained auto-proposal masks have mixed sizes.")
+        retained_pixels = int(current.sum())
+        if not retained_pixels:
+            continue
+        intersection = int((candidate & current).sum())
+        union = pixels + retained_pixels - intersection
+        maximum_iou = max(
+            maximum_iou,
+            intersection / float(union) if union else 0.0,
+        )
+        maximum_ios = max(
+            maximum_ios,
+            intersection / float(min(pixels, retained_pixels)),
+        )
+    if maximum_iou >= float(duplicate_iou):
+        return _auto_assessment(
+            False,
+            "duplicate_iou",
+            pixels=pixels,
+            area_ratio=area_ratio,
+            maximum_iou=maximum_iou,
+            maximum_ios=maximum_ios,
+        )
+    if maximum_ios >= float(duplicate_intersection_over_smaller):
+        return _auto_assessment(
+            False,
+            "duplicate_containment",
+            pixels=pixels,
+            area_ratio=area_ratio,
+            maximum_iou=maximum_iou,
+            maximum_ios=maximum_ios,
+        )
+    return _auto_assessment(
+        True,
+        "accepted",
+        pixels=pixels,
+        area_ratio=area_ratio,
+        maximum_iou=maximum_iou,
+        maximum_ios=maximum_ios,
+    )
+
+
+def _auto_assessment(
+    accepted: bool,
+    reason: str,
+    *,
+    pixels: int = 0,
+    area_ratio: float = 0.0,
+    maximum_iou: float = 0.0,
+    maximum_ios: float = 0.0,
+) -> dict[str, object]:
+    return {
+        "accepted": int(bool(accepted)),
+        "reason": str(reason),
+        "mask_pixels": int(pixels),
+        "mask_area_ratio": float(area_ratio),
+        "maximum_iou": float(maximum_iou),
+        "maximum_intersection_over_smaller": float(maximum_ios),
+    }
+
+
+def _point_is_covered(
+    masks: Sequence[torch.Tensor],
+    *,
+    point_x: float,
+    point_y: float,
+) -> bool:
+    for mask in masks:
+        current = mask.detach().cpu().bool()
+        if current.ndim != 2 or not current.numel():
+            continue
+        height, width = current.shape
+        column = min(width - 1, max(0, int(float(point_x) * width)))
+        row = min(height - 1, max(0, int(float(point_y) * height)))
+        if bool(current[row, column]):
+            return True
+    return False
+
+
+def _validate_auto_proposal_thresholds(
+    *,
+    grid_rows: int,
+    grid_columns: int,
+    min_mask_pixels: int,
+    max_mask_area_ratio: float,
+    duplicate_iou: float,
+    duplicate_intersection_over_smaller: float,
+) -> None:
+    if int(grid_rows) < 1 or int(grid_columns) < 1:
+        raise ValueError("Auto-proposal grid dimensions must be positive.")
+    if int(min_mask_pixels) < 1:
+        raise ValueError("min_mask_pixels must be positive.")
+    for name, value in (
+        ("max_mask_area_ratio", max_mask_area_ratio),
+        ("duplicate_iou", duplicate_iou),
+        (
+            "duplicate_intersection_over_smaller",
+            duplicate_intersection_over_smaller,
+        ),
+    ):
+        if not 0.0 < float(value) <= 1.0:
+            raise ValueError(f"{name} must be in (0,1].")
 
 
 @contextlib.contextmanager

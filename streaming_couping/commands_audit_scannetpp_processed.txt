@@ -1,0 +1,106 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+MANIFEST="$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json"
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || { echo "missing Python: $PYTHON_BIN" >&2; exit 1; }
+[[ -s "$MANIFEST" ]] || { echo "missing processed manifest: $MANIFEST" >&2; exit 1; }
+
+export MANIFEST
+PYTHONPATH="$ROOT/src" "$PYTHON_BIN" - <<'PY'
+import json
+import os
+from pathlib import Path
+
+manifest_path = Path(os.environ["MANIFEST"]).resolve()
+payload = json.loads(manifest_path.read_text(encoding="utf8"))
+required = [
+    "00a231a370",
+    "0a184cf634",
+    "1a8e0d78c0",
+    "1eacc65607",
+]
+scenes = {
+    str(scene.get("scene_id")): scene
+    for scene in payload.get("scenes", ())
+    if isinstance(scene, dict) and scene.get("scene_id")
+}
+
+print("PROCESSED SCANNET++ REQUIRED-ASSET AUDIT")
+print(f"manifest={manifest_path}")
+print(f"manifest_scene_count={len(scenes)}")
+failed = False
+
+def resolve(value):
+    if not value:
+        return None
+    path = Path(value)
+    return path if path.is_absolute() else manifest_path.parent / path
+
+for scene_id in required:
+    scene = scenes.get(scene_id)
+    if scene is None:
+        print(f"INCOMPLETE scene={scene_id} missing=scene_manifest")
+        failed = True
+        continue
+
+    frames = list(scene.get("frames", ()))
+    missing = []
+    bad_rgb_reference = []
+    asset_keys = {
+        "image": "image_path",
+        "pointmap": "pointmap",
+        "semantic_mask": "semantic_mask",
+        "instance_mask": "instance_mask",
+    }
+    counts = {name: 0 for name in asset_keys}
+    for index, frame in enumerate(frames):
+        for name, key in asset_keys.items():
+            path = resolve(frame.get(key))
+            if path is not None and path.is_file():
+                counts[name] += 1
+            else:
+                missing.append((index, name))
+        source = frame.get("image_source_path")
+        image = frame.get("image_path")
+        source_path = resolve(source)
+        image_path = resolve(image)
+        if (
+            frame.get("image_storage") != "source_reference"
+            or source_path is None
+            or image_path != source_path
+            or not source_path.is_file()
+        ):
+            bad_rgb_reference.append(index)
+
+    if missing or bad_rgb_reference or len(frames) < 30:
+        failed = True
+        print(
+            f"INCOMPLETE scene={scene_id} frames={len(frames)} "
+            f"image={counts['image']} pointmap={counts['pointmap']} "
+            f"semantic_mask={counts['semantic_mask']} "
+            f"instance_mask={counts['instance_mask']} "
+            f"missing_preview={missing[:8]} "
+            f"bad_rgb_reference_preview={bad_rgb_reference[:8]}"
+        )
+    else:
+        print(
+            f"READY scene={scene_id} frames={len(frames)} "
+            f"image={counts['image']} pointmap={counts['pointmap']} "
+            f"semantic_mask={counts['semantic_mask']} "
+            f"instance_mask={counts['instance_mask']}"
+        )
+
+extra = sorted(set(scenes) - set(required))
+if extra:
+    print(f"extra_manifest_scenes={extra}")
+
+if failed:
+    print("processed_audit_result=INCOMPLETE")
+    raise SystemExit(1)
+print("processed_audit_result=READY")
+PY

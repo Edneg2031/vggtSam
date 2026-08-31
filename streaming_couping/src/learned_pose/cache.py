@@ -40,10 +40,19 @@ from ..streamvggt_geometry_prompt import build_streamvggt_geometry_prompts
 from ..tracking_recovery import run_natural_recovery_tracking
 from ..types import TrackingSequence
 from ..geometry_segmentation import (
+    CONTROL_RANDOM_POSITIVE_VARIANT,
+    CONTROL_SHIFTED_GEOMETRY_VARIANT,
+    CONTROL_STALE_GEOMETRY_VARIANT,
+    ONLINE_GEOMETRY_BOX_ONLY_VARIANT,
+    ONLINE_GEOMETRY_POINTS_ONLY_VARIANT,
+    ONLINE_GEOMETRY_VARIANT,
     V6_DEPLOYED_VARIANT,
     V6GeometrySegmentationConfig,
     causal_prompts_after_birth,
+    randomized_positive_prompts,
     segment_instance_with_geometry_prompts,
+    shifted_geometry_prompts,
+    stale_geometry_prompts,
 )
 from .config import ClipConfig, LearnedPoseConfig
 from .observations import (
@@ -57,7 +66,8 @@ from .observations import (
 
 CACHE_VERSION = 3
 ONLINE_RAW_VARIANT = "sam31_online_forward"
-ONLINE_GEOMETRY_VARIANT = "sam31_online_geometry_compete"
+ONLINE_COUPLED_VARIANT = "sam31_online_coupled"
+ONLINE_PER_OBJECT_VARIANT = "sam31_online_per_object_retrack"
 
 
 def build_feature_caches(config: LearnedPoseConfig) -> list[Path]:
@@ -385,17 +395,22 @@ def _build_geometry_cache(
         image_size_hw=geometry_sequence.processed_size,
     )
     segmentation_diagnostics: list[dict[str, object]] = []
+    tracking_variants: dict[
+        str,
+        dict[int, TrackingSequence],
+    ] = {}
     if clip.instance_source == "sam31_online":
-        recovered, segmentation_diagnostics = (
+        recovered, segmentation_diagnostics, tracking_variants = (
             _load_or_run_sam31_online_tracking(
                 recovery,
+                config,
                 clip,
                 shared=shared,
                 sam_video_holder=sam_video_holder,
             )
         )
-        if config.features.sam_segmentation_variant == ONLINE_GEOMETRY_VARIANT:
-            recovered, correction_rows = (
+        if config.features.geometry_prompt_variants:
+            corrected_variants, correction_rows = (
                 _run_sam31_online_geometry_correction(
                     recovery,
                     config,
@@ -409,7 +424,10 @@ def _build_geometry_cache(
                     sam_video_holder=sam_video_holder,
                 )
             )
+            tracking_variants.update(corrected_variants)
             segmentation_diagnostics.extend(correction_rows)
+        if config.features.sam_segmentation_variant == ONLINE_GEOMETRY_VARIANT:
+            recovered = tracking_variants[ONLINE_GEOMETRY_VARIANT]
         elif config.features.sam_segmentation_variant != ONLINE_RAW_VARIANT:
             raise ValueError(
                 "sam31_online supports segmentation variants "
@@ -483,6 +501,36 @@ def _build_geometry_cache(
         [recovered[int(instance_id)].scores for instance_id in clip.instance_ids],
         dim=1,
     )
+    tracking_variant_masks_output: dict[str, torch.Tensor] = {}
+    tracking_variant_masks_stream: dict[str, torch.Tensor] = {}
+    tracking_variant_scores: dict[str, torch.Tensor] = {}
+    for variant, variant_tracking in tracking_variants.items():
+        variant_grid_by_id = tracking_masks_to_geometry_grid(
+            variant_tracking,
+            geometry=geometry_sequence,
+            image_mode=recovery.image_mode,
+        )
+        tracking_variant_masks_output[str(variant)] = torch.stack(
+            [
+                variant_tracking[int(instance_id)].masks
+                for instance_id in clip.instance_ids
+            ],
+            dim=1,
+        ).bool()
+        tracking_variant_masks_stream[str(variant)] = torch.stack(
+            [
+                variant_grid_by_id[int(instance_id)]
+                for instance_id in clip.instance_ids
+            ],
+            dim=1,
+        ).bool()
+        tracking_variant_scores[str(variant)] = torch.stack(
+            [
+                variant_tracking[int(instance_id)].scores
+                for instance_id in clip.instance_ids
+            ],
+            dim=1,
+        ).float()
     refinement = InstanceRefinementConfig(
         min_instance_points=config.features.min_instance_points,
         compute_device=config.geometry_device,
@@ -619,6 +667,15 @@ def _build_geometry_cache(
     geometry_birth_indices = [
         int(value) for value in observations["instance_birth_indices"]
     ]
+    sam_prompt_diagnostics = next(
+        (
+            list(row["prompt_discovery_diagnostics"])
+            for row in segmentation_diagnostics
+            if isinstance(row.get("prompt_discovery_diagnostics"), list)
+            and row["prompt_discovery_diagnostics"]
+        ),
+        [],
+    )
     dynamic_instance_diagnostics = []
     if clip.instance_source == "sam31_online":
         for frame, frame_index in enumerate(clip.frame_indices):
@@ -724,6 +781,7 @@ def _build_geometry_cache(
         "instance_prompts": list(_clip_instance_prompts(clip)),
         "sam_track_ids": sam_track_ids,
         "sam_track_prompts": sam_track_prompts,
+        "sam_prompt_diagnostics": sam_prompt_diagnostics,
         "sam_birth_indices": sam_birth_indices,
         "instance_birth_indices": geometry_birth_indices,
         "dynamic_instance_diagnostics": dynamic_instance_diagnostics,
@@ -739,6 +797,19 @@ def _build_geometry_cache(
         "sam_segmentation_variant": (
             config.features.sam_segmentation_variant
         ),
+        "sam_memory_policy": config.features.sam_memory_policy,
+        "geometry_prompt_variants": list(
+            config.features.geometry_prompt_variants
+        ),
+        "geometry_control_shift_xy": list(
+            config.features.geometry_control_shift_xy
+        ),
+        "geometry_control_stale_lag": int(
+            config.features.geometry_control_stale_lag
+        ),
+        "geometry_control_seed": int(
+            config.features.geometry_control_seed
+        ),
         "streamvggt_execution": (
             "layer_sharded_full_history"
             if config.streamvggt_devices
@@ -749,6 +820,11 @@ def _build_geometry_cache(
         "segmentation_diagnostics": segmentation_diagnostics,
         "image_paths": [str(path) for path in shared.image_paths],
         "image_size": list(geometry_sequence.processed_size),
+        "source_sizes": [
+            [int(height), int(width)]
+            for height, width in geometry_sequence.source_sizes
+        ],
+        "image_mode": str(recovery.image_mode),
         "patch_start_idx": int(output.geometry.aux["patch_start_idx"]),
         "patch_shape": list(output.geometry.aux["patch_shape"]),
         # Keep the frozen-head inputs in fp32.  The module-off control is
@@ -756,6 +832,8 @@ def _build_geometry_cache(
         # cache approximation of them.
         "camera_hidden": camera_hidden.float(),
         "baseline_pose_encoding": output.geometry.camera_tokens.detach().float().cpu()[0],
+        "baseline_world_to_camera": baseline_w2c.detach().float().cpu()[0],
+        "baseline_intrinsics": baseline_intrinsics.detach().float().cpu()[0],
         "baseline_depth": depth.float(),
         "baseline_depth_confidence": depth_confidence.float(),
         "baseline_world_points": geometry_sequence.world_points.float(),
@@ -791,6 +869,9 @@ def _build_geometry_cache(
         "associated_tracking_masks_output": associated_masks_output.bool(),
         "associated_tracking_masks_stream": associated_masks_stream.bool(),
         "tracking_scores": scores.float(),
+        "tracking_variant_masks_output": tracking_variant_masks_output,
+        "tracking_variant_masks_stream": tracking_variant_masks_stream,
+        "tracking_variant_scores": tracking_variant_scores,
         "instance_uvd": instance_uvd.float(),
         "instance_uvd_valid": uvd_valid.bool(),
         "instance_rigid_weight": rigid_weight.float(),
@@ -1003,11 +1084,16 @@ def _load_or_run_tracking(
 
 def _load_or_run_sam31_online_tracking(
     recovery,
+    config: LearnedPoseConfig,
     clip: ClipConfig,
     *,
     shared,
     sam_video_holder: dict[str, SAM3Wrapper],
-) -> tuple[dict[int, TrackingSequence], list[dict[str, object]]]:
+) -> tuple[
+    dict[int, TrackingSequence],
+    list[dict[str, object]],
+    dict[str, dict[int, TrackingSequence]],
+]:
     """Discover persistent SAM3.1 IDs for several concrete concepts.
 
     SAM3.1 exhaustively detects instances of a prompted noun phrase; it is not
@@ -1029,17 +1115,26 @@ def _load_or_run_sam31_online_tracking(
     )
     prompts = tuple(clip.instance_prompts) or (clip.instance_prompt,)
     prompt_signature = "|".join(prompts)
+    memory_policy = config.features.sam_memory_policy
     if cached is not None and all(
         str(row.get("configured_prompts", "")) == prompt_signature
         and str(row.get("propagation_direction", "")) == "forward"
         and int(row.get("causal_confirmation", 0)) == 1
+        and str(row.get("sam_memory_policy", "")) == memory_policy
         for row in cached[2]
     ):
         print(f"reusing SAM3.1 online tracking cache: {path}")
-        return cached[1], [dict(row) for row in cached[2]]
+        variants = {
+            ONLINE_COUPLED_VARIANT: cached[0],
+            ONLINE_RAW_VARIANT: cached[1],
+        }
+        if memory_policy == "per_object_retrack":
+            variants[ONLINE_PER_OBJECT_VARIANT] = cached[1]
+        return cached[1], [dict(row) for row in cached[2]], variants
 
     sam3 = _sam_video_model(recovery, sam_video_holder)
     raw_candidates: list[dict[str, object]] = []
+    prompt_diagnostics: list[dict[str, object]] = []
     detected_count = 0
     per_prompt_limit = max(
         int(recovery.sam3_max_num_objects),
@@ -1058,15 +1153,27 @@ def _load_or_run_sam31_online_tracking(
             f"clip={clip.name} concept={prompt!r} "
             f"discovered={len(tracked.obj_ids)}"
         )
+        eligible_count = 0
+        raw_visible_track_frames = 0
+        raw_mask_pixels = 0
+        raw_maximum_pixels = 0
         for source_slot, obj_id in enumerate(tracked.obj_ids):
             masks = tracked.masks[:, source_slot].detach().cpu().bool()
             birth = int(tracked.birth_indices[source_slot])
             birth_pixels = int(masks[birth].sum())
             birth_ratio = float(masks[birth].float().mean())
+            frame_pixels = masks.flatten(1).sum(dim=1)
+            raw_visible_track_frames += int((frame_pixels > 0).sum())
+            raw_mask_pixels += int(frame_pixels.sum())
+            raw_maximum_pixels = max(
+                raw_maximum_pixels,
+                int(frame_pixels.max()),
+            )
             # Slot admission consults only the birth frame. Later observations
             # may diagnose the track but can never retroactively create it.
             if birth_pixels < int(recovery.min_pixels) or birth_ratio > 0.90:
                 continue
+            eligible_count += 1
             raw_candidates.append(
                 {
                     "prompt_index": int(prompt_index),
@@ -1081,6 +1188,20 @@ def _load_or_run_sam31_online_tracking(
                     .float(),
                 }
             )
+        prompt_diagnostics.append(
+            {
+                "prompt_index": int(prompt_index),
+                "prompt": str(prompt),
+                "raw_detections": int(len(tracked.obj_ids)),
+                "birth_eligible_tracks": int(eligible_count),
+                "birth_filtered_tracks": int(
+                    len(tracked.obj_ids) - eligible_count
+                ),
+                "raw_visible_track_frames": int(raw_visible_track_frames),
+                "raw_mask_pixels": int(raw_mask_pixels),
+                "raw_maximum_mask_pixels": int(raw_maximum_pixels),
+            }
+        )
 
     raw_candidates.sort(
         key=lambda item: (
@@ -1101,6 +1222,16 @@ def _load_or_run_sam31_online_tracking(
         candidates.append(candidate)
         if len(candidates) == len(clip.instance_ids):
             break
+    for diagnostic in prompt_diagnostics:
+        prompt_index = int(diagnostic["prompt_index"])
+        retained = sum(
+            int(candidate["prompt_index"]) == prompt_index
+            for candidate in candidates
+        )
+        diagnostic["retained_tracks"] = int(retained)
+        diagnostic["not_retained_after_dedup_or_capacity"] = int(
+            int(diagnostic["birth_eligible_tracks"]) - retained
+        )
     if not candidates:
         raise RuntimeError(
             "SAM3.1 online discovery found no usable instance for concrete "
@@ -1129,12 +1260,38 @@ def _load_or_run_sam31_online_tracking(
             source_obj_id = int(candidate["source_obj_id"])
             instance_prompt = str(candidate["prompt"])
             birth = int(candidate["birth"])
-            sequence = TrackingSequence(
+            coupled_sequence = TrackingSequence(
                 masks=torch.as_tensor(candidate["masks"]).bool(),
                 scores=torch.as_tensor(candidate["scores"]).float(),
                 selected_obj_id=sam_obj_id,
             )
-        originals[instance_id] = sequence
+            sequence = coupled_sequence
+            if memory_policy == "per_object_retrack":
+                reference_mask = coupled_sequence.masks[birth].bool()
+                retracked = sam3.track(
+                    shared.image_paths,
+                    prompt=instance_prompt,
+                    output_size=recovery.output_size,
+                    reference_frame_idx=birth,
+                    reference_mask=reference_mask,
+                    propagation_direction="forward",
+                )
+                retracked_masks = retracked.masks.detach().cpu().bool()
+                retracked_scores = retracked.scores.detach().cpu().float()
+                retracked_masks[:birth] = False
+                retracked_scores[:birth] = 0.0
+                # Both memory policies start from exactly the same causal birth
+                # observation; only subsequent propagation is under ablation.
+                retracked_masks[birth] = reference_mask
+                retracked_scores[birth] = coupled_sequence.scores[birth]
+                sequence = TrackingSequence(
+                    masks=retracked_masks,
+                    scores=retracked_scores,
+                    selected_obj_id=sam_obj_id,
+                )
+        originals[instance_id] = (
+            sequence if slot >= len(candidates) else coupled_sequence
+        )
         recovered[instance_id] = sequence
         rows.append(
             {
@@ -1156,13 +1313,26 @@ def _load_or_run_sam31_online_tracking(
                 ),
                 "propagation_direction": "forward",
                 "causal_confirmation": 1,
+                "sam_memory_policy": memory_policy,
+                "memory_ablation_scope": (
+                    "independent_forward_session_per_retained_object"
+                    if memory_policy == "per_object_retrack"
+                    else "native_multiplex_coupled_session"
+                ),
+                # The tracking cache requires one row per permanent slot.
+                # Store this audit once so zero-hit prompts remain observable
+                # after the SAM session has closed.
+                "prompt_discovery_diagnostics": (
+                    prompt_diagnostics if slot == 0 else []
+                ),
             }
         )
     print(
         "SAM3.1 online instances "
         f"clip={clip.name} prompts={prompts!r} discovered={detected_count} "
         f"eligible={len(raw_candidates)} duplicates={duplicate_count} "
-        f"retained={len(candidates)} slots={len(clip.instance_ids)}"
+        f"retained={len(candidates)} slots={len(clip.instance_ids)} "
+        f"memory_policy={memory_policy}"
     )
     save_tracking_cache(
         path,
@@ -1173,7 +1343,13 @@ def _load_or_run_sam31_online_tracking(
         recovered=recovered,
         tracking_rows=rows,
     )
-    return recovered, rows
+    variants = {
+        ONLINE_COUPLED_VARIANT: originals,
+        ONLINE_RAW_VARIANT: recovered,
+    }
+    if memory_policy == "per_object_retrack":
+        variants[ONLINE_PER_OBJECT_VARIANT] = recovered
+    return recovered, rows, variants
 
 
 def _run_sam31_online_geometry_correction(
@@ -1188,17 +1364,22 @@ def _run_sam31_online_geometry_correction(
     world_to_camera: torch.Tensor,
     intrinsics: torch.Tensor,
     sam_video_holder: dict[str, SAM3Wrapper],
-) -> tuple[dict[int, TrackingSequence], list[dict[str, object]]]:
-    """Apply the validated geometry compete policy after each causal birth.
+) -> tuple[
+    dict[str, dict[int, TrackingSequence]],
+    list[dict[str, object]],
+]:
+    """Run pre-registered geometry prompt and negative-control branches.
 
-    The raw multiplex session remains the owner of persistent IDs.  Geometry
-    correction changes only the masks consumed by downstream observations; it
-    never rewrites earlier frames and currently does not feed a prompted mask
-    back into the live multiplex memory.
+    The selected raw memory policy remains the owner of persistent IDs. Every
+    branch sees the same raw masks and adaptive geometry gate. Prompted masks
+    are output-only and never write into live SAM memory or earlier frames.
     """
 
     sam3: SAM3Wrapper | None = None
-    corrected: dict[int, TrackingSequence] = {}
+    variants = tuple(config.features.geometry_prompt_variants)
+    corrected: dict[str, dict[int, TrackingSequence]] = {
+        variant: {} for variant in variants
+    }
     diagnostics: list[dict[str, object]] = []
     segmentation_config = V6GeometrySegmentationConfig()
     prompt_by_instance = {
@@ -1211,7 +1392,8 @@ def _run_sam31_online_geometry_correction(
         visible = raw.masks.flatten(1).any(dim=1)
         positions = torch.nonzero(visible, as_tuple=False).flatten()
         if not positions.numel():
-            corrected[instance_id] = raw
+            for variant in variants:
+                corrected[variant][instance_id] = raw
             continue
         birth = int(positions[0])
         prompt = prompt_by_instance.get(instance_id, "") or clip.instance_prompt
@@ -1245,44 +1427,97 @@ def _run_sam31_online_geometry_correction(
         )
         if sam3 is None:
             sam3 = _sam_video_model(recovery, sam_video_holder)
-        result = segment_instance_with_geometry_prompts(
-            sequence=sequence,
-            reference_mask=reference_mask,
-            raw_tracking=raw,
-            geometry_prompts=causal_prompts,
-            output_size=recovery.output_size,
-            sam3=sam3,
-            config=segmentation_config,
-        )
-        masks = result["masks"][V6_DEPLOYED_VARIANT].bool()
-        scores = result["scores"][V6_DEPLOYED_VARIANT].float()
-        if bool(masks[:birth].any()):
-            raise RuntimeError(
-                "Geometry correction created a mask before SAM track birth."
+        for variant in variants:
+            variant_prompts, prompt_mode = _geometry_variant_prompts(
+                causal_prompts,
+                variant=variant,
+                shift_xy=config.features.geometry_control_shift_xy,
+                stale_lag=config.features.geometry_control_stale_lag,
+                seed=(
+                    config.features.geometry_control_seed
+                    + 10_007 * instance_id
+                    + _stable_text_seed(clip.name)
+                ),
             )
-        corrected[instance_id] = TrackingSequence(
-            masks=masks,
-            scores=scores,
-            selected_obj_id=raw.selected_obj_id,
-        )
-        for segmentation_row, backend_row in zip(
-            result["diagnostics"], prompt_batch.diagnostics
-        ):
-            frame = int(segmentation_row["sequence_index"])
-            diagnostics.append(
-                {
-                    "clip": clip.name,
-                    "instance_id": instance_id,
-                    "instance_prompt": str(prompt),
-                    "selected_variant": ONLINE_GEOMETRY_VARIANT,
-                    "birth_sequence_index": birth,
-                    "causal_prompt_allowed": int(frame > birth),
-                    "memory_writeback": 0,
-                    **backend_row,
-                    **segmentation_row,
-                }
+            result = segment_instance_with_geometry_prompts(
+                sequence=sequence,
+                reference_mask=reference_mask,
+                raw_tracking=raw,
+                geometry_prompts=variant_prompts,
+                output_size=recovery.output_size,
+                sam3=sam3,
+                config=segmentation_config,
+                corrected_variant=variant,
+                prompt_mode=prompt_mode,
             )
+            masks = result["masks"][variant].bool()
+            scores = result["scores"][variant].float()
+            if bool(masks[:birth].any()):
+                raise RuntimeError(
+                    "Geometry correction created a mask before SAM track birth."
+                )
+            corrected[variant][instance_id] = TrackingSequence(
+                masks=masks,
+                scores=scores,
+                selected_obj_id=raw.selected_obj_id,
+            )
+            for segmentation_row, backend_row in zip(
+                result["diagnostics"], prompt_batch.diagnostics
+            ):
+                frame = int(segmentation_row["sequence_index"])
+                source_frame = (
+                    frame - config.features.geometry_control_stale_lag
+                    if variant == CONTROL_STALE_GEOMETRY_VARIANT
+                    and frame >= config.features.geometry_control_stale_lag
+                    else frame
+                )
+                diagnostics.append(
+                    {
+                        "clip": clip.name,
+                        "instance_id": instance_id,
+                        "instance_prompt": str(prompt),
+                        "selected_variant": variant,
+                        "birth_sequence_index": birth,
+                        "causal_prompt_allowed": int(
+                            variant_prompts[frame] is not None
+                        ),
+                        "control_prompt_source_sequence_index": source_frame,
+                        "memory_writeback": 0,
+                        **backend_row,
+                        **segmentation_row,
+                    }
+                )
     return corrected, diagnostics
+
+
+def _geometry_variant_prompts(
+    prompts,
+    *,
+    variant: str,
+    shift_xy: tuple[float, float],
+    stale_lag: int,
+    seed: int,
+) -> tuple[tuple[object, ...], str]:
+    if variant == ONLINE_GEOMETRY_VARIANT:
+        return tuple(prompts), "box_points"
+    if variant == ONLINE_GEOMETRY_BOX_ONLY_VARIANT:
+        return tuple(prompts), "box_only"
+    if variant == ONLINE_GEOMETRY_POINTS_ONLY_VARIANT:
+        return tuple(prompts), "points_only"
+    if variant == CONTROL_SHIFTED_GEOMETRY_VARIANT:
+        return shifted_geometry_prompts(prompts, shift_xy=shift_xy), "box_points"
+    if variant == CONTROL_RANDOM_POSITIVE_VARIANT:
+        return randomized_positive_prompts(prompts, seed=seed), "box_points"
+    if variant == CONTROL_STALE_GEOMETRY_VARIANT:
+        return stale_geometry_prompts(prompts, lag=stale_lag), "box_points"
+    raise ValueError(f"Unsupported geometry prompt variant: {variant!r}.")
+
+
+def _stable_text_seed(value: str) -> int:
+    return sum(
+        (index + 1) * ord(character)
+        for index, character in enumerate(str(value))
+    )
 
 
 def _online_tracks_duplicate_at_birth(
@@ -1689,6 +1924,38 @@ def _cache_complete(
             "sam_birth_indices",
             "instance_birth_indices",
             "dynamic_instance_diagnostics",
+            "sam_memory_policy",
+            "geometry_prompt_variants",
+            "tracking_variant_masks_output",
+            "tracking_variant_masks_stream",
+            "tracking_variant_scores",
+            "source_sizes",
+            "image_mode",
+            "baseline_world_to_camera",
+            "baseline_intrinsics",
+        )
+    ):
+        return False
+    if (
+        config is not None
+        and clip.instance_source == "sam31_online"
+        and (
+            str(payload.get("sam_memory_policy", ""))
+            != config.features.sam_memory_policy
+            or tuple(
+                str(value)
+                for value in payload.get("geometry_prompt_variants", ())
+            )
+            != config.features.geometry_prompt_variants
+            or tuple(
+                float(value)
+                for value in payload.get("geometry_control_shift_xy", ())
+            )
+            != config.features.geometry_control_shift_xy
+            or int(payload.get("geometry_control_stale_lag", -1))
+            != config.features.geometry_control_stale_lag
+            or int(payload.get("geometry_control_seed", -1))
+            != config.features.geometry_control_seed
         )
     ):
         return False
@@ -1761,6 +2028,15 @@ def _geometry_cache_reusable(
                 "sam_birth_indices",
                 "instance_birth_indices",
                 "dynamic_instance_diagnostics",
+                "sam_memory_policy",
+                "geometry_prompt_variants",
+                "tracking_variant_masks_output",
+                "tracking_variant_masks_stream",
+                "tracking_variant_scores",
+                "source_sizes",
+                "image_mode",
+                "baseline_world_to_camera",
+                "baseline_intrinsics",
             }
         )
     if any(name not in payload for name in core_fields):
@@ -1783,6 +2059,33 @@ def _geometry_cache_reusable(
         or _payload_instance_prompts(payload) != _clip_instance_prompts(clip)
         or int(payload.get("reference_sequence_index", -1))
         != clip.reference_sequence_index
+        or (
+            clip.instance_source == "sam31_online"
+            and (
+                str(payload.get("sam_memory_policy", ""))
+                != config.features.sam_memory_policy
+                or tuple(
+                    str(value)
+                    for value in payload.get(
+                        "geometry_prompt_variants",
+                        (),
+                    )
+                )
+                != config.features.geometry_prompt_variants
+                or tuple(
+                    float(value)
+                    for value in payload.get(
+                        "geometry_control_shift_xy",
+                        (),
+                    )
+                )
+                != config.features.geometry_control_shift_xy
+                or int(payload.get("geometry_control_stale_lag", -1))
+                != config.features.geometry_control_stale_lag
+                or int(payload.get("geometry_control_seed", -1))
+                != config.features.geometry_control_seed
+            )
+        )
     ):
         return False
     expected_execution = (

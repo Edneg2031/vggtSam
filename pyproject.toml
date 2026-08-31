@@ -8,10 +8,17 @@ dependencies = [
     "pillow>=9.0",
     "pyyaml>=6.0",
     "matplotlib>=3.6",
+    "scipy>=1.9",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+preprocess = [
+    "numba>=0.58",
+    "opencv-python-headless>=4.8",
+    "plyfile>=1.0",
+    "tqdm>=4.65",
+]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

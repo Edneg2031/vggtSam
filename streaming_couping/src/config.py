@@ -8,6 +8,8 @@ from typing import Any
 
 import yaml
 
+from .storage import expand_storage_path
+
 
 @dataclass(frozen=True)
 class ExperimentConfig:
@@ -209,4 +211,4 @@ def load_config(
 def _path(value: Any) -> Path:
     if value is None or str(value).strip() == "":
         raise ValueError("A required path is missing from the configuration.")
-    return Path(value).expanduser()
+    return expand_storage_path(value)

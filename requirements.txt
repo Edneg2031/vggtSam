@@ -2,6 +2,7 @@ numpy>=1.23
 pillow>=9.0
 pyyaml>=6.0
 matplotlib>=3.6
+scipy>=1.9
 
 # Install torch and torchvision separately for the server's CUDA version.
 # SAM3 and StreamVGGT dependencies are provided by their external repositories.

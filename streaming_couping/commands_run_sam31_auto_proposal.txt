@@ -1,0 +1,59 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# Class-agnostic SAM3.1 discovery ablation. Phase 1 uses only frozen RGB/cache
+# geometry metadata and visual point prompts. Phase 2 opens GT after every
+# auto-proposal artifact has been serialized.
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+RUN_ROOT="${SEMANTIC_MAPPING_MULTICLIP_RUN_ROOT:-$STORAGE_ROOT/outputs/streaming_couping_multiclip}"
+CONFIG="$RUN_ROOT/protocol.yaml"
+ARTIFACT_ROOT="${SAM31_AUTO_PROPOSAL_ROOT:-$STORAGE_ROOT/outputs/streaming_couping_sam31_auto_proposal}"
+EVALUATION_DIR="$ARTIFACT_ROOT/evaluation"
+SAM_GPU="${SAM31_AUTO_PROPOSAL_GPU:-2}"
+
+cd "$ROOT"
+[[ -x "$PYTHON_BIN" ]] || {
+  echo "missing Python: $PYTHON_BIN" >&2
+  exit 1
+}
+[[ -s "$CONFIG" ]] || {
+  echo "missing multi-clip protocol: $CONFIG" >&2
+  echo "run zsh streaming_couping/commands_plan_semantic_mapping_multiclip.txt first" >&2
+  exit 1
+}
+
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="$ROOT"
+
+"$PYTHON_BIN" -m streaming_couping.scripts.smoke_sam31_auto_proposal
+
+echo "[1/2] freeze class-agnostic SAM3.1 visual-point tracks"
+CUDA_VISIBLE_DEVICES="$SAM_GPU" \
+  "$PYTHON_BIN" -m streaming_couping.scripts.generate_sam31_auto_proposals \
+    --config "$CONFIG" \
+    --output-dir "$ARTIFACT_ROOT" \
+    --device cuda:0 \
+    --raw-cache-variant sam31_online_forward \
+    --discovery-stride 5 \
+    --grid-rows 8 \
+    --grid-columns 12 \
+    --points-per-discovery 24 \
+    --min-mask-pixels 128 \
+    --max-mask-area-ratio 0.35 \
+    --duplicate-iou 0.80 \
+    --duplicate-intersection-over-smaller 0.90 \
+    --overwrite
+
+echo "[2/2] open GT and compare prompt-SAM, auto-SAM, oracle, and all-instance recall"
+"$PYTHON_BIN" -m streaming_couping.scripts.evaluate_sam31_auto_proposals \
+  --config "$CONFIG" \
+  --artifact-root "$ARTIFACT_ROOT" \
+  --output-dir "$EVALUATION_DIR" \
+  --raw-cache-variant sam31_online_forward
+
+echo "===== COPYABLE AUTO-PROPOSAL RESULT ====="
+sed -n '1,200p' "$EVALUATION_DIR/copyable_result.txt"
+echo "SAM3.1 auto-proposal output=$ARTIFACT_ROOT"

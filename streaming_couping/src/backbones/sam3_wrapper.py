@@ -78,6 +78,7 @@ class SAM3Wrapper:
         output_size: tuple[int, int],
         reference_frame_idx: int,
         reference_mask: torch.Tensor,
+        propagation_direction: str = "both",
     ) -> TrackingSequence:
         """Run the frozen original SAM3 tracker."""
 
@@ -88,6 +89,7 @@ class SAM3Wrapper:
             output_size=output_size,
             prompt_frame_idx=reference_frame_idx,
             reference_mask=reference_mask,
+            propagation_direction=propagation_direction,
             quiet=True,
         )
         scores = output.scores
@@ -119,6 +121,42 @@ class SAM3Wrapper:
             quiet=True,
         )
 
+    def track_auto_points_forward(
+        self,
+        image_paths: Sequence[str | Path],
+        *,
+        output_size: tuple[int, int],
+        max_objects: int,
+        discovery_stride: int = 5,
+        grid_rows: int = 8,
+        grid_columns: int = 12,
+        points_per_discovery: int = 24,
+        min_mask_pixels: int = 128,
+        max_mask_area_ratio: float = 0.35,
+        duplicate_iou: float = 0.80,
+        duplicate_intersection_over_smaller: float = 0.90,
+    ) -> SAM3MultiTrackOutput:
+        """Run category-free visual-point discovery and causal tracking."""
+
+        if self.version != "sam3.1":
+            raise RuntimeError("Automatic point discovery requires SAM3.1.")
+        return self._require_adapter().track_auto_points_forward_from_paths(
+            image_paths,
+            output_size=output_size,
+            max_objects=max_objects,
+            discovery_stride=discovery_stride,
+            grid_rows=grid_rows,
+            grid_columns=grid_columns,
+            points_per_discovery=points_per_discovery,
+            min_mask_pixels=min_mask_pixels,
+            max_mask_area_ratio=max_mask_area_ratio,
+            duplicate_iou=duplicate_iou,
+            duplicate_intersection_over_smaller=(
+                duplicate_intersection_over_smaller
+            ),
+            quiet=True,
+        )
+
     def propose_text_masks(
         self,
         image_path: str | Path,
@@ -146,10 +184,43 @@ class SAM3Wrapper:
     ) -> list[SAM3MaskCandidate]:
         """Run SAM3.1 text+box detection, then geometry-point refinement."""
 
+        return self.propose_geometry_prompted_masks(
+            image_path,
+            prompt=prompt,
+            output_size=output_size,
+            geometry_prompt=geometry_prompt,
+            positive_prompt=positive_prompt,
+            max_positive_points=max_positive_points,
+            use_box=True,
+            use_points=True,
+        )
+
+    def propose_geometry_prompted_masks(
+        self,
+        image_path: str | Path,
+        *,
+        prompt: str,
+        output_size: tuple[int, int],
+        geometry_prompt: torch.Tensor,
+        positive_prompt: torch.Tensor,
+        max_positive_points: int = 6,
+        use_box: bool = True,
+        use_points: bool = True,
+    ) -> list[SAM3MaskCandidate]:
+        """Run a controlled text/box/point SAM3.1 prompt ablation.
+
+        The geometry masks are always retained for candidate scoring, while
+        ``use_box`` and ``use_points`` control only which prompts SAM3.1 sees.
+        This keeps the candidate budget and post-prompt geometry gate matched
+        across box-only, points-only, and box+points variants.
+        """
+
         if self.version != "sam3.1":
             raise RuntimeError(
                 "Geometry point refinement requires a SAM3.1 predictor."
             )
+        if not bool(use_box) and not bool(use_points):
+            raise ValueError("At least one geometry prompt type is required.")
         prompt_box = mask_to_normalized_box(
             geometry_prompt.detach().cpu().bool(),
             image_path=Path(image_path),
@@ -158,7 +229,9 @@ class SAM3Wrapper:
             positive_prompt,
             limit=max_positive_points,
         )
-        if prompt_box is None or not positive:
+        if (bool(use_box) and prompt_box is None) or (
+            bool(use_points) and not positive
+        ):
             return []
         predictor = self._require_predictor()
         with tempfile.TemporaryDirectory(
@@ -172,14 +245,16 @@ class SAM3Wrapper:
                 )
                 session_id = _session_id(session)
                 try:
-                    detected = predictor.add_prompt(
-                        session_id=session_id,
-                        frame_idx=0,
-                        text=prompt,
-                        bounding_boxes=[prompt_box],
-                        bounding_box_labels=[1],
-                        output_prob_thresh=self.output_threshold,
-                    )
+                    detection_kwargs = {
+                        "session_id": session_id,
+                        "frame_idx": 0,
+                        "text": prompt,
+                        "output_prob_thresh": self.output_threshold,
+                    }
+                    if bool(use_box):
+                        detection_kwargs["bounding_boxes"] = [prompt_box]
+                        detection_kwargs["bounding_box_labels"] = [1]
+                    detected = predictor.add_prompt(**detection_kwargs)
                     detected_objects = collect_frame_objects(
                         [detected],
                         output_size=output_size,
@@ -189,20 +264,25 @@ class SAM3Wrapper:
                         positive_prompt=positive_prompt,
                         geometry_prompt=geometry_prompt,
                     )
-                    if selected_obj_id is None:
+                    if selected_obj_id is None and bool(use_points):
                         selected_obj_id = (
                             max(detected_objects, default=0) + 1
                         )
-                    refined = predictor.add_prompt(
-                        session_id=session_id,
-                        frame_idx=0,
-                        points=positive,
-                        point_labels=[1] * len(positive),
-                        clear_old_points=True,
-                        obj_id=int(selected_obj_id),
-                        rel_coordinates=True,
-                        output_prob_thresh=self.output_threshold,
-                    )
+                    if selected_obj_id is None:
+                        return []
+                    if bool(use_points):
+                        refined = predictor.add_prompt(
+                            session_id=session_id,
+                            frame_idx=0,
+                            points=positive,
+                            point_labels=[1] * len(positive),
+                            clear_old_points=True,
+                            obj_id=int(selected_obj_id),
+                            rel_coordinates=True,
+                            output_prob_thresh=self.output_threshold,
+                        )
+                    else:
+                        refined = detected
                 finally:
                     predictor.close_session(session_id)
 

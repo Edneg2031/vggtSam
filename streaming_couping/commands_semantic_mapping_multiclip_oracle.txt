@@ -1,0 +1,25 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# Evaluation-only upper bound: compare raw SAM ownership with GT masks placed
+# into the frozen raw-SAM slots.  No model or recovery artifact is rerun.
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+RUN_ROOT="${SEMANTIC_MAPPING_MULTICLIP_RUN_ROOT:-$STORAGE_ROOT/outputs/streaming_couping_multiclip}"
+CONFIG="$RUN_ROOT/protocol.yaml"
+OUTPUT_DIR="${SEMANTIC_MAPPING_ORACLE_OUTPUT:-$STORAGE_ROOT/outputs/streaming_couping_semantic_map_multiclip_oracle}"
+
+cd "$ROOT"
+[[ -s "$CONFIG" ]] || {
+  echo "missing multi-clip protocol config: $CONFIG" >&2
+  echo "run zsh streaming_couping/commands_plan_semantic_mapping_multiclip.txt first" >&2
+  exit 1
+}
+
+SEMANTIC_MAPPING_MULTICLIP_CONFIG="$CONFIG" \
+SEMANTIC_MAPPING_MULTICLIP_RUN_ROOT="$RUN_ROOT" \
+SEMANTIC_MAPPING_ABLATION_OUTPUT="$OUTPUT_DIR" \
+SEMANTIC_MAPPING_ABLATION_VARIANTS="raw,oracle" \
+  zsh streaming_couping/commands_semantic_mapping_multiclip_ablation.txt
+
+echo "GT-mask oracle output=$OUTPUT_DIR"

@@ -1,0 +1,32 @@
+# Read the existing ScanNet++ release in place. Only newly processed artifacts
+# are written below VGGT_SAM_STORAGE_ROOT.
+data_root: /data184/open_source/scannet_pp_pinhole/data
+annotation_root: /data184/open_source/scannet_pp/data
+metadata_root: /data184/open_source/scannet_pp_pinhole/metadata
+scene_list: /data184/open_source/scannet_pp_pinhole/scannetpp_part_valid_scenes.txt
+output_root: ${VGGT_SAM_STORAGE_ROOT}/data/processed/scannetpp_pinhole_2d
+
+# Empty means: use scene_list when present, otherwise discover data_root.
+scene_ids: []
+limit_scenes:
+
+mesh_filename: mesh_aligned_0.05.ply
+annotation_scan_subdir: scans
+semantic_mesh_filename: mesh_aligned_0.05_semantic.ply
+segments_filename: segments.json
+annotations_filename: segments_anno.json
+semantic_classes_file:
+
+frame_step: 1
+max_frames:
+near: 0.001
+semantic_ignore_label: 65535
+
+save_visualizations: false
+save_raster: false
+save_pointmaps: true
+# RGB stays in the historical read-only dataset. manifest.json points to the
+# original image path; only masks and pointmaps are generated on process_data.
+cache_images: false
+skip_existing: true
+dry_run: false
