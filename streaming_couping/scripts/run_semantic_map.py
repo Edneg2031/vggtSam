@@ -154,6 +154,13 @@ def _run_from_rgb(
     if args.geometry_device:
         overrides["geometry_device"] = args.geometry_device
     recovery = load_config(args.recovery_config, overrides)
+    print(
+        "semantic map runtime "
+        f"frames={len(image_paths)} "
+        f"sam_device={recovery.sam3_device} "
+        f"sam_grounding_batch={args.sam_grounding_batch_size} "
+        f"sam_video_cpu_offload={int(args.sam_offload_video_to_cpu)}"
+    )
     from streaming_couping.src.backbones.sam3_wrapper import SAM3Wrapper
     from streaming_couping.src.backbones.streamvggt_wrapper import StreamVGGTWrapper
 
@@ -174,6 +181,8 @@ def _run_from_rgb(
         use_fa3=recovery.sam3_use_fa3,
         max_num_objects=recovery.sam3_max_num_objects,
         multiplex_count=recovery.sam3_multiplex_count,
+        grounding_batch_size=args.sam_grounding_batch_size,
+        offload_video_to_cpu=args.sam_offload_video_to_cpu,
     ).load()
     geometry = StreamVGGTGeometryAdapter(
         stream,
@@ -259,6 +268,18 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--geometry-device", default=None)
     parser.add_argument("--sam-device", default=None)
+    parser.add_argument(
+        "--sam-grounding-batch-size",
+        type=int,
+        default=4,
+        help="Frames per SAM3.1 grounding batch; lower values reduce peak VRAM.",
+    )
+    parser.add_argument(
+        "--sam-offload-video-to-cpu",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep decoded SAM video frames in CPU memory until they are needed.",
+    )
     parser.add_argument("--output-size", type=_parse_size, default=None)
     parser.add_argument(
         "--frame-start",

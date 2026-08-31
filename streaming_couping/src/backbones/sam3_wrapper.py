@@ -39,6 +39,8 @@ class SAM3Wrapper:
         use_fa3: bool = False,
         max_num_objects: int = 16,
         multiplex_count: int = 16,
+        grounding_batch_size: int = 16,
+        offload_video_to_cpu: bool = False,
     ) -> None:
         self.repo_path = Path(repo_path)
         self.checkpoint_path = Path(checkpoint_path)
@@ -49,6 +51,8 @@ class SAM3Wrapper:
         self.use_fa3 = bool(use_fa3)
         self.max_num_objects = int(max_num_objects)
         self.multiplex_count = int(multiplex_count)
+        self.grounding_batch_size = int(grounding_batch_size)
+        self.offload_video_to_cpu = bool(offload_video_to_cpu)
         self.predictor = None
         self.adapter = None
 
@@ -61,12 +65,14 @@ class SAM3Wrapper:
             use_fa3=self.use_fa3,
             max_num_objects=self.max_num_objects,
             multiplex_count=self.multiplex_count,
+            grounding_batch_size=self.grounding_batch_size,
             quiet=True,
         )
         self.adapter = SAM3VideoTrackerAdapter(
             self.predictor,
             output_prob_thresh=self.output_threshold,
             prompt_with_box=self.prompt_with_box,
+            offload_video_to_cpu=self.offload_video_to_cpu,
         )
         return self
 

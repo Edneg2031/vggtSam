@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 
 import torch
 
@@ -26,6 +27,10 @@ from streaming_couping.src.semantic_mapping.mapping import (
     SemanticMapConfig,
 )
 from streaming_couping.src.semantic_mapping.pipeline import SemanticMapPipeline
+from streaming_couping.src.backbones.sam3_video import (
+    SAM3VideoTrackerAdapter,
+    _set_sam31_grounding_batch_size,
+)
 
 
 @dataclass
@@ -61,6 +66,20 @@ class _FakeSAMWrapper:
 
 
 def main() -> None:
+    fake_predictor = SimpleNamespace(
+        model=SimpleNamespace(batched_grounding_batch_size=16)
+    )
+    _set_sam31_grounding_batch_size(
+        fake_predictor,
+        grounding_batch_size=4,
+    )
+    assert fake_predictor.model.batched_grounding_batch_size == 4
+    memory_adapter = SAM3VideoTrackerAdapter(
+        fake_predictor,
+        offload_video_to_cpu=True,
+    )
+    assert memory_adapter.offload_video_to_cpu is True
+
     height, width = 2, 3
     points = torch.tensor(
         [

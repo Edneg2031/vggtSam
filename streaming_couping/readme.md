@@ -42,6 +42,11 @@ zsh streaming_couping/commands_run_semantic_map.txt \
 `FRAME_PATHS` 中的显式图片文件或目录。当前 50 帧默认输出目录是
 `/data184/open_source/vggtSam/outputs/semantic_map_50frames`，不会覆盖之前的 30 帧结果。
 
+50 帧 SAM3.1 传播默认使用 `SAM_GROUNDING_BATCH_SIZE=4`，并启用
+`SAM_OFFLOAD_VIDEO_TO_CPU=1`。前者只缩小高分辨率 grounding 的帧批次，后者把解码后的
+视频帧保存在 CPU 按需送入 GPU；两者都不拆分 video session，也不重置 persistent track ID。
+若服务器显存仍不足，可继续把 batch size 从 4 降为 2 或 1，代价是运行时间增加。
+
 命令文件中 `INPUT_MODE="rgb"` 时读取 `FRAME_PATHS`；切换为
 `INPUT_MODE="cache"` 时读取 `CACHE_PATH`。当前默认 cache 路径是：
 

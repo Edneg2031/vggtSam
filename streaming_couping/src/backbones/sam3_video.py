@@ -61,6 +61,7 @@ def load_sam3_video_predictor(
     use_fa3: bool = False,
     max_num_objects: int = 16,
     multiplex_count: int = 16,
+    grounding_batch_size: int = 16,
     async_loading_frames: bool = False,
     quiet: bool = True,
 ):
@@ -84,6 +85,8 @@ def load_sam3_video_predictor(
             f"Unsupported SAM video version {version!r}; "
             "expected 'sam3' or 'sam3.1'."
         )
+    if int(grounding_batch_size) < 1:
+        raise ValueError("grounding_batch_size must be positive.")
 
     with quiet_sam3_output(quiet):
         try:
@@ -121,6 +124,10 @@ def load_sam3_video_predictor(
                 multiplex_count=int(multiplex_count),
                 async_loading_frames=async_loading_frames,
             )
+            _set_sam31_grounding_batch_size(
+                predictor,
+                grounding_batch_size=int(grounding_batch_size),
+            )
             _filter_init_state_kwargs(predictor)
             return predictor
         return build_sam3_video_predictor(
@@ -155,6 +162,19 @@ def _filter_init_state_kwargs(predictor) -> None:
     model.init_state = compatible_init_state
 
 
+def _set_sam31_grounding_batch_size(
+    predictor,
+    *,
+    grounding_batch_size: int,
+) -> None:
+    """Limit the frame batch used by SAM3.1's high-resolution detector."""
+
+    model = getattr(predictor, "model", None)
+    if model is None or not hasattr(model, "batched_grounding_batch_size"):
+        raise RuntimeError("SAM3.1 predictor lacks batched grounding controls.")
+    model.batched_grounding_batch_size = int(grounding_batch_size)
+
+
 def _bool_compatible_argsort(
     tensor: torch.Tensor,
     *args,
@@ -185,10 +205,12 @@ class SAM3VideoTrackerAdapter:
         *,
         output_prob_thresh: float = 0.5,
         prompt_with_box: bool = True,
+        offload_video_to_cpu: bool = False,
     ) -> None:
         self.predictor = predictor
         self.output_prob_thresh = float(output_prob_thresh)
         self.prompt_with_box = bool(prompt_with_box)
+        self.offload_video_to_cpu = bool(offload_video_to_cpu)
 
     @torch.no_grad()
     def track_from_paths(
@@ -220,7 +242,10 @@ class SAM3VideoTrackerAdapter:
             tmp_dir = Path(tmp)
             materialize_video_dir(image_paths, tmp_dir)
             with quiet_sam3_output(quiet):
-                session = self.predictor.start_session(resource_path=str(tmp_dir))
+                session = self.predictor.start_session(
+                    resource_path=str(tmp_dir),
+                    offload_video_to_cpu=self.offload_video_to_cpu,
+                )
                 session_id = session["session_id"] if isinstance(session, dict) else session
                 try:
                     prompt_box = None
@@ -334,7 +359,10 @@ class SAM3VideoTrackerAdapter:
             tmp_dir = Path(tmp)
             materialize_video_dir(image_paths, tmp_dir)
             with quiet_sam3_output(quiet):
-                session = self.predictor.start_session(resource_path=str(tmp_dir))
+                session = self.predictor.start_session(
+                    resource_path=str(tmp_dir),
+                    offload_video_to_cpu=self.offload_video_to_cpu,
+                )
                 session_id = session["session_id"] if isinstance(session, dict) else session
                 causal_settings = _set_causal_multiplex_settings(self.predictor)
                 try:
@@ -456,7 +484,8 @@ class SAM3VideoTrackerAdapter:
             materialize_video_dir(image_paths, video_dir)
             with quiet_sam3_output(quiet):
                 session = self.predictor.start_session(
-                    resource_path=str(video_dir)
+                    resource_path=str(video_dir),
+                    offload_video_to_cpu=self.offload_video_to_cpu,
                 )
                 session_id = (
                     session["session_id"]
