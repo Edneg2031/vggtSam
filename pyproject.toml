@@ -1,7 +1,7 @@
 [project]
 name = "streaming-couping"
 version = "0.1.0"
-description = "StreamVGGT + SAM3 instance-guided pointmap and camera-pose refinement."
+description = "Backend-neutral HorizonStream/StreamVGGT + SAM3 semantic mapping."
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.23",

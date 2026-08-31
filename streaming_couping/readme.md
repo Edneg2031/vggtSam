@@ -1,101 +1,96 @@
-# streaming_couping V0
+# HorizonStream + SAM3.1 语义地图
 
-V0 是冻结、免训练的 StreamVGGT + SAM3.1 语义地图 pipeline：
+当前主线是免训练的 RGB + 文本 prompt 语义实例地图：
 
-- QK retrieval 只为 camera head 选择历史并输出相机轨迹；
-- full-history raw StreamVGGT world pointmap 作为地图几何；
-- SAM3.1 persistent mask、slot 和 track ID 作为点云语义；
-- SAM 不参与 pose，点云不做后处理优化。
+- HorizonStream 输出 metric depth、相机内参、在线因果位姿和置信度；
+- SAM3.1 输出 prompt 对应的 mask 与 persistent instance ID；
+- 通用 mapping 层把每帧 mask 内的深度反投影到世界坐标并做多帧体素融合；
+- 每个静态实例单独输出 `<category>_<instance_id>.ply`。
 
-当前唯一的主运行入口是下面的语义地图命令；不需要先运行 V0 baseline：
+StreamVGGT 仍可作为兼容后端，但不再是默认几何来源。历史优化实验没有通过多场景 gate，
+当前 pipeline 不启用 temporal point prompt、historical-depth veto 或 affine correction。
+
+## 直接运行
+
+服务器先同步代码和子模块：
 
 ```bash
+git checkout main
+git pull --ff-only origin main
+git submodule update --init externals/horizonstream externals/sam3
 zsh streaming_couping/commands_run_semantic_map.txt
 ```
 
-## 语义地图 pipeline
-
-新增的 `src/semantic_mapping/` 是独立于具体模型的语义实例地图层。它使用统一的
-`GeometryFrame`、`ObjectObservation` 和 `SegmentationFrame` contract；当前的
-StreamVGGT 与 SAM3.1 通过 adapter 接入，后续替换 HorizonStream 时只需新增几何 adapter，
-不需要修改体素融合和导出逻辑。
-
-从 RGB 和文本 prompt 运行当前模型：
-
-```bash
-zsh streaming_couping/commands_run_semantic_map.txt \
-  --frames /path/to/rgb_frames \
-  --prompts bed wardrobe \
-  --output-dir outputs/semantic_map
-```
-
-也可以直接修改 `commands_run_semantic_map.txt` 顶部的 `FRAME_PATHS`、`PROMPTS` 和
-`OUTPUT_DIR`，然后不带参数执行；命令行参数仍然可以临时覆盖这些默认值。帧选择使用
-展开后排序的序列位置：`FRAME_START` 从 0 开始，`FRAME_STRIDE` 是步长，
-`FRAME_COUNT=0` 表示取完剩余帧。例如 `FRAME_COUNT=30` 表示取前 30 帧。
-
-默认 `MANIFEST_PATH` 是之前实验一直使用的 processed ScanNet++ 数据：
-`/data184/open_source/vggtSam/data/processed/scannetpp_pinhole_2d/manifest.json`，
-默认场景为 `00a231a370`，当前 795 帧 manifest 上默认采样序列为
-`90,104,...,776`，共 50 帧。因此直接修改 prompt
-和帧选择参数即可；不需要另填 RGB 目录。只有在把 `MANIFEST_PATH` 设为空时，才使用
-`FRAME_PATHS` 中的显式图片文件或目录。当前 50 帧默认输出目录是
-`/data184/open_source/vggtSam/outputs/semantic_map_50frames`，不会覆盖之前的 30 帧结果。
-
-50 帧 SAM3.1 传播默认使用 `SAM_GROUNDING_BATCH_SIZE=4`，并启用
-`SAM_OFFLOAD_VIDEO_TO_CPU=1`。前者只缩小高分辨率 grounding 的帧批次，后者把解码后的
-视频帧保存在 CPU 按需送入 GPU；两者都不拆分 video session，也不重置 persistent track ID。
-若服务器显存仍不足，可继续把 batch size 从 4 降为 2 或 1，代价是运行时间增加。
-
-命令文件中 `INPUT_MODE="rgb"` 时读取 `FRAME_PATHS`；切换为
-`INPUT_MODE="cache"` 时读取 `CACHE_PATH`。当前默认 cache 路径是：
+唯一需要日常修改的文件是 `commands_run_semantic_map.txt` 顶部配置。默认值为：
 
 ```text
-/data184/open_source/vggtSam/outputs/streaming_couping_v0/cache/00a231a370_90_525_step15_37_68_54.pt
+scene                 00a231a370
+manifest positions    90,104,...,776
+frame count           50
+prompts               bed wardrobe chair rug dustbin
+HorizonStream weight  /home/bod/86Nas/95_data_bak/FoundationModels/HorizonStream.pt
+HorizonStream env     /home/huawei/miniconda3/envs/horizonstream/bin/python
+SAM env               /home/huawei/miniconda3/envs/3am/bin/python
+output                 /data184/open_source/vggtSam/outputs/semantic_map_50frames_horizonstream
 ```
 
-它只在 cache 模式使用；RGB 模式不会自动读取旧 cache。`OUTPUT_DIR` 默认是
-`/data184/open_source/vggtSam/outputs/semantic_map`。
+不需要先运行 V0 baseline，也没有训练步骤。命令串行启动两个独立进程：
 
-如果已经有 V0 cache，可以不重新运行模型：
+1. `horizonstream` 环境生成 `horizonstream_geometry.pt`，随后进程退出并释放模型和显存；
+2. `3am` 环境加载几何 cache，运行 SAM3.1 并构建语义地图。
 
-```bash
-zsh streaming_couping/commands_run_semantic_map.txt \
-  --cache outputs/streaming_couping_v0/cache/<clip>.pt \
-  --output-dir outputs/semantic_map
+这样不会把 HorizonStream 的 PyTorch 2.8 依赖安装进 `3am`，也不会让两个大模型同时驻留
+GPU。cache 会校验原图顺序、权重、源码 revision 和推理设置；完全匹配时自动复用。修改
+帧选择或 HorizonStream 参数后会自动重建。若想强制重建，设置
+`HORIZON_REUSE_CACHE=0`。
+
+显存不足时，先把 `HORIZON_SLIDING_SIZE` 从 `21` 调成 `1`；SAM 默认使用稳妥的
+`SAM_GROUNDING_BATCH_SIZE=1`，确认显存充足后可调成 `2` 或 `4`。两阶段使用不同进程，因此也可以分别
+设置 `HORIZON_CUDA_VISIBLE_DEVICES` 和 `SAM_CUDA_VISIBLE_DEVICES`。
+
+## 输入与帧数
+
+`FRAME_START`、`FRAME_STRIDE`、`FRAME_COUNT` 都是展开后的序列位置，`FRAME_COUNT=0`
+表示取完剩余帧。默认 manifest 是此前一直使用的 processed ScanNet++ 数据：
+
+```text
+/data184/open_source/vggtSam/data/processed/scannetpp_pinhole_2d/manifest.json
 ```
 
-输出会同时保留完整场景、静态语义地图和逐帧 object track：
+设置 `MANIFEST_PATH=""` 后可通过 `FRAME_PATHS` 指定图片或目录。HorizonStream 和 SAM 使用
+同一个冻结图片清单；HorizonStream 实际看到的 center-cropped RGB 也保存在 cache 中并交给
+SAM，避免 depth 与 mask 像素错位。
 
-| 文件 | 包含内容 | 跨帧处理 |
-|---|---|---|
-| `scene_rgb_map.ply` | 所有通过置信度门限的场景点，使用 RGB 着色 | 所有选中帧按世界坐标叠加后做体素融合 |
-| `scene_semantic_map.ply` | 同一完整场景；静态 prompt 物体按实例着色，其他场景区域显示为较暗 RGB | 所有选中帧按世界坐标叠加后做体素融合 |
-| `semantic_map.ply` | 只包含静态 prompt 物体，按 persistent instance ID 着色 | 多帧体素融合 |
-| `rgb_map.ply` | 与 `semantic_map.ply` 完全相同的物体体素，改用观测 RGB 着色 | 多帧体素融合 |
-| `objects/<category>_<instance_id>.ply` | 每个静态实例单独保存，例如 `bed_0.ply`、`rug_3.ply` | 与语义地图相同的多帧体素融合，使用观测 RGB 着色 |
-| `object_tracks.ply` | 每个 persistent track 的逐帧观测点，包含静态和动态目标 | 多帧点直接汇总，不做体素融合；点中保留 `frame_id` |
+`INPUT_MODE="cache"` 是旧 V0 cache 的离线重放模式。`GEOMETRY_BACKEND="streamvggt"`
+可临时回退到旧后端。
 
-`semantic_map.pt` 保存上述完整场景体素、语义体素、轨迹和元数据，`object_tracks.json`
-保存每个实例的类别、帧范围和包围盒，`map_summary.json` 保存输出索引和统计。
-`object_tracks.ply` 不是由折线构成的运动轨迹图，而是各帧 mask 对应 3D 点的集合；因此同一
-物体在多帧中的点可能重叠。静态目标写入语义体素地图，动态目标只保存在独立 track 中，避免
-污染静态地图。默认使用当前 V0 的 raw pointmap，不启用被否决的 temporal point prompt、
-历史深度 Veto 或 affine depth correction。
+## 输出
 
-当前场景此前冻结实验使用的类别词是 `rug`（地毯）和 `dustbin`（垃圾桶），不是
-`mat`。默认命令使用 `bed wardrobe chair rug dustbin`；完整的历史固定词表还包括
-`desk cabinet nightstand box "guitar case"`。
+| 文件 | 内容 |
+|---|---|
+| `scene_rgb_map.ply` | 所有有效深度按世界坐标融合后的完整 RGB 场景 |
+| `scene_semantic_map.ply` | 完整场景，prompt 实例使用 instance 颜色 |
+| `semantic_map.ply` | 仅静态 prompt 实例，多帧体素融合 |
+| `rgb_map.ply` | 与 `semantic_map.ply` 相同的体素，使用 RGB 着色 |
+| `objects/<category>_<id>.ply` | 单个静态实例的融合点云，例如 `bed_0.ply` |
+| `object_tracks.ply` | 各帧 object mask 对应 3D 点的直接汇总，保留 `frame_id`，不做体素融合 |
+| `semantic_map.pt` | 完整场景、语义体素、轨迹和运行元数据 |
+| `map_summary.json` | 输出索引、实例统计和后端信息 |
+| `horizonstream_geometry.pt` | 两个 conda 环境之间传递的 depth/pose/intrinsics/RGB cache |
 
-## 历史实验
+这些 PLY 都来自多帧观测。`scene_*` 和 `objects/*` 是世界坐标下的体素融合结果；
+`object_tracks.ply` 才是未融合的逐帧观测集合。当前场景使用 `rug` 和 `dustbin`，不是
+`mat`。
 
-旧 baseline、诊断和优化实验的 `commands_*.txt` 已从当前运行目录移除；实验结果和结论
-仍保留在文档中，仅作为历史记录，不属于当前 pipeline 的运行步骤。当前文档见：
+## 代码边界
 
-- [当前状态与实验结论](docs/current_status.md)
-- [系统 pipeline](docs/system_pipeline.md)
-- [语义地图实验路线](docs/experiment_route.md)
+`src/semantic_mapping/` 只依赖统一 contract：
 
-当前单序列证据只支持 QK pose 改善；V0 不声明 SAM 改善 pose 或几何。SAM 的正式作用
-是实例发现、跨帧 persistent identity 和语义投影。新方法必须在 scene-disjoint 数据上
-与 raw V0 按同一协议比较，并报告 tracking、depth、map、恶化帧比例和 fallback/coverage。
+- `GeometryFrame`: `depth + intrinsics + camera_to_world` 或直接 world pointmap；
+- `SegmentationFrame`: 每帧 prompt mask、分数和 persistent instance ID；
+- `SemanticMapBuilder`: 后端无关的反投影、track 保存和体素融合；
+- adapters: HorizonStream cache、StreamVGGT、SAM3.1 和旧 V0 cache。
+
+HorizonStream 源码固定为子模块 `externals/horizonstream`，当前 revision 为 `9602f53`；权重
+保留在 NAS，不提交到 Git。详细设计见 [系统 pipeline](docs/system_pipeline.md)，已有实验证据
+见 [当前状态](docs/current_status.md)。

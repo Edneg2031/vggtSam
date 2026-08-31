@@ -1,23 +1,37 @@
 #!/usr/bin/env python3
 """Build a semantic-instance map from RGB prompts or a frozen V0 cache.
 
-The model path uses the current StreamVGGT and SAM3.1 wrappers.  The cache path
-is useful for replaying a V0 run without rerunning either model.  Both paths
-converge on the same backend-neutral ``SemanticMapPipeline``.
+The RGB path accepts either an isolated HorizonStream geometry cache or the
+legacy in-process StreamVGGT wrapper, then runs SAM3.1.  The V0 cache path
+replays both frozen providers.  Every path converges on the same
+backend-neutral ``SemanticMapPipeline``.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
+import tempfile
 from typing import Any
 
 import torch
 
 from streaming_couping.src.config import load_config
-from streaming_couping.src.data import resolve_manifest_path
+from streaming_couping.src.horizonstream_cache import (
+    load_horizonstream_cache,
+    materialize_horizonstream_rgb,
+    validate_horizonstream_cache,
+)
+from streaming_couping.src.rgb_inputs import (
+    IMAGE_SUFFIXES,
+    expand_image_paths,
+    expand_manifest_paths,
+    resolve_rgb_inputs,
+    select_image_paths,
+    selected_positions,
+)
 from streaming_couping.src.semantic_mapping.adapters import (
+    HorizonStreamGeometryCacheAdapter,
     SAM31SegmentationAdapter,
     StreamVGGTGeometryAdapter,
     V0CacheGeometryAdapter,
@@ -121,32 +135,16 @@ def _run_from_rgb(
 ):
     if not prompts:
         raise ValueError("--prompts is required when --cache is not used.")
-    if args.manifest:
-        image_paths = _expand_manifest_paths(
-            args.manifest,
-            scene_id=args.scene_id,
-            frame_indices=args.dataset_frame_indices,
-        )
-        input_metadata = {
-            "manifest": str(args.manifest.expanduser().resolve()),
-            "scene_id": str(args.scene_id),
-            "dataset_frame_indices": (
-                None
-                if args.dataset_frame_indices is None
-                else [int(value) for value in args.dataset_frame_indices]
-            ),
-        }
-    else:
-        image_paths = _expand_image_paths(args.frames)
-        input_metadata = {
-            "frame_paths": [str(path) for path in image_paths],
-        }
-    image_paths = _select_image_paths(
-        image_paths,
+    selection = resolve_rgb_inputs(
+        frames=args.frames,
+        manifest=args.manifest,
+        scene_id=args.scene_id,
+        dataset_frame_indices=args.dataset_frame_indices,
         start=args.frame_start,
         stride=args.frame_stride,
         count=args.frame_count,
     )
+    image_paths = selection.image_paths
     if not image_paths:
         raise ValueError("No RGB images were selected from the requested input.")
     overrides = {}
@@ -155,23 +153,48 @@ def _run_from_rgb(
     if args.geometry_device:
         overrides["geometry_device"] = args.geometry_device
     recovery = load_config(args.recovery_config, overrides)
+
+    geometry_payload = None
+    if args.geometry_cache is not None:
+        geometry_payload = load_horizonstream_cache(args.geometry_cache)
+        validate_horizonstream_cache(
+            geometry_payload,
+            expected_image_paths=image_paths,
+        )
+        geometry = HorizonStreamGeometryCacheAdapter(geometry_payload)
+        geometry_backend = geometry.backend_name
+        geometry_scale_type = "metric"
+        segmentation_output_size = geometry.image_size
+    else:
+        from streaming_couping.src.backbones.streamvggt_wrapper import (
+            StreamVGGTWrapper,
+        )
+
+        stream = StreamVGGTWrapper(
+            repo_path=recovery.streamvggt_repo,
+            checkpoint_path=recovery.streamvggt_checkpoint,
+            device=recovery.geometry_device,
+            image_mode=recovery.image_mode,
+            streaming_cache=recovery.streaming_cache,
+        ).load()
+        geometry = StreamVGGTGeometryAdapter(
+            stream,
+            scale_type=args.scale_type,
+        )
+        geometry_backend = geometry.backend_name
+        geometry_scale_type = args.scale_type
+        segmentation_output_size = tuple(args.output_size or recovery.output_size)
+
     print(
         "semantic map runtime "
         f"frames={len(image_paths)} "
+        f"geometry_backend={geometry_backend} "
         f"sam_device={recovery.sam3_device} "
         f"sam_grounding_batch={args.sam_grounding_batch_size} "
         f"sam_video_cpu_offload={int(args.sam_offload_video_to_cpu)}"
     )
     from streaming_couping.src.backbones.sam3_wrapper import SAM3Wrapper
-    from streaming_couping.src.backbones.streamvggt_wrapper import StreamVGGTWrapper
 
-    stream = StreamVGGTWrapper(
-        repo_path=recovery.streamvggt_repo,
-        checkpoint_path=recovery.streamvggt_checkpoint,
-        device=recovery.geometry_device,
-        image_mode=recovery.image_mode,
-        streaming_cache=recovery.streaming_cache,
-    ).load()
     sam = SAM3Wrapper(
         repo_path=recovery.sam3_repo,
         checkpoint_path=recovery.sam3_checkpoint,
@@ -185,36 +208,44 @@ def _run_from_rgb(
         grounding_batch_size=args.sam_grounding_batch_size,
         offload_video_to_cpu=args.sam_offload_video_to_cpu,
     ).load()
-    geometry = StreamVGGTGeometryAdapter(
-        stream,
-        scale_type=args.scale_type,
-    )
     segmentation = SAM31SegmentationAdapter(
         sam,
-        output_size=tuple(args.output_size or recovery.output_size),
+        output_size=segmentation_output_size,
         max_objects_per_prompt=recovery.sam3_max_num_objects,
         max_total_objects=args.max_objects,
         min_birth_pixels=recovery.min_pixels,
     )
-    return SemanticMapPipeline(
+    pipeline = SemanticMapPipeline(
         geometry=geometry,
         segmentation=segmentation,
         mapper=mapper,
-    ).run(
-        image_paths,
-        prompts=prompts,
-        metadata={
-            "input_mode": "rgb_and_text_prompts",
-            "scale_type": args.scale_type,
-            "recovery_config": str(Path(args.recovery_config).resolve()),
-            "frame_selection": {
-                "start": int(args.frame_start),
-                "stride": int(args.frame_stride),
-                "count": int(args.frame_count),
-            },
-            **input_metadata,
-        },
     )
+    metadata = {
+        "input_mode": "rgb_and_text_prompts",
+        "scale_type": geometry_scale_type,
+        "recovery_config": str(Path(args.recovery_config).resolve()),
+        "geometry_cache": (
+            None
+            if args.geometry_cache is None
+            else str(args.geometry_cache.expanduser().resolve())
+        ),
+        "source_image_paths": [str(path) for path in image_paths],
+        "source_positions": list(selection.source_positions),
+        "source_count": int(selection.source_count),
+        "frame_selection": {
+            "start": int(args.frame_start),
+            "stride": int(args.frame_stride),
+            "count": int(args.frame_count),
+        },
+        **selection.metadata,
+    }
+    if geometry_payload is None:
+        return pipeline.run(image_paths, prompts=prompts, metadata=metadata)
+
+    # SAM must see the exact center-cropped pixels used for cached geometry.
+    with tempfile.TemporaryDirectory(prefix="horizonstream_sam_rgb_") as directory:
+        aligned_paths = materialize_horizonstream_rgb(geometry_payload, directory)
+        return pipeline.run(aligned_paths, prompts=prompts, metadata=metadata)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -255,6 +286,15 @@ def _parse_args() -> argparse.Namespace:
         "--prompts",
         nargs="+",
         help="Text prompts, either as separate arguments or comma-separated.",
+    )
+    parser.add_argument(
+        "--geometry-cache",
+        type=Path,
+        default=None,
+        help=(
+            "HorizonStream geometry cache for RGB mode. Geometry is not rerun "
+            "and StreamVGGT is not loaded."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -322,7 +362,10 @@ def _parse_args() -> argparse.Namespace:
         default=1_000_000,
         help="Maximum full-scene voxels retained in exported artifacts.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.cache is not None and args.geometry_cache is not None:
+        parser.error("--geometry-cache cannot be combined with the frozen V0 --cache.")
+    return args
 
 
 def _load_payload(path: Path) -> dict[str, Any]:
@@ -339,24 +382,7 @@ def _load_payload(path: Path) -> dict[str, Any]:
 
 
 def _expand_image_paths(values: list[Path] | None) -> tuple[Path, ...]:
-    if not values:
-        return ()
-    output = []
-    for value in values:
-        path = value.expanduser()
-        if path.is_dir():
-            output.extend(
-                sorted(
-                    candidate
-                    for candidate in path.iterdir()
-                    if candidate.is_file() and candidate.suffix.lower() in IMAGE_SUFFIXES
-                )
-            )
-        elif path.is_file():
-            output.append(path)
-        else:
-            raise FileNotFoundError(f"RGB path does not exist: {path}")
-    return tuple(output)
+    return expand_image_paths(values)
 
 
 def _expand_manifest_paths(
@@ -365,44 +391,12 @@ def _expand_manifest_paths(
     scene_id: str | None,
     frame_indices: list[int] | None,
 ) -> tuple[Path, ...]:
-    """Resolve RGB paths from the processed dataset manifest."""
-
-    manifest_path = manifest_path.expanduser().resolve()
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"RGB manifest does not exist: {manifest_path}")
-    if not str(scene_id or "").strip():
-        raise ValueError("--scene-id is required when --manifest is used.")
-    with manifest_path.open("r", encoding="utf8") as handle:
-        manifest = json.load(handle)
-    scene = next(
-        (
-            item
-            for item in manifest.get("scenes", [])
-            if str(item.get("scene_id")) == str(scene_id)
-        ),
-        None,
+    paths, _, _ = expand_manifest_paths(
+        manifest_path,
+        scene_id=scene_id,
+        frame_indices=frame_indices,
     )
-    if scene is None:
-        available = [item.get("scene_id") for item in manifest.get("scenes", [])]
-        raise ValueError(
-            f"Scene {scene_id!r} is not present in {manifest_path}. "
-            f"Available scenes: {available[:20]}"
-        )
-    frames = scene.get("frames", [])
-    indices = (
-        list(range(len(frames)))
-        if frame_indices is None
-        else [int(value) for value in frame_indices]
-    )
-    invalid = [index for index in indices if index < 0 or index >= len(frames)]
-    if invalid:
-        raise ValueError(
-            f"Manifest frame positions {invalid} are outside [0, {len(frames) - 1}]."
-        )
-    return tuple(
-        resolve_manifest_path(frames[index]["image_path"], manifest_path)
-        for index in indices
-    )
+    return paths
 
 
 def _select_cache_frames(
@@ -483,8 +477,7 @@ def _select_image_paths(
     start = int(start)
     stride = int(stride)
     count = int(count)
-    positions = _selected_positions(len(paths), start, stride, count)
-    return tuple(paths[index] for index in positions)
+    return select_image_paths(paths, start=start, stride=stride, count=count)
 
 
 def _selected_positions(
@@ -493,17 +486,7 @@ def _selected_positions(
     stride: int,
     count: int,
 ) -> list[int]:
-    start = int(start)
-    stride = int(stride)
-    count = int(count)
-    if start < 0:
-        raise ValueError("--frame-start must be non-negative.")
-    if stride < 1:
-        raise ValueError("--frame-stride must be positive.")
-    if count < 0:
-        raise ValueError("--frame-count must be non-negative; use 0 for all.")
-    positions = list(range(start, total, stride))
-    return positions[:count] if count else positions
+    return selected_positions(total, start, stride, count)
 
 
 def _normalize_prompts(values: list[str] | None) -> tuple[str, ...]:

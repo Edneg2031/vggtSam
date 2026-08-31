@@ -1,101 +1,200 @@
 #!/usr/bin/env zsh
 set -euo pipefail
 
-# Backend-neutral RGB/prompt semantic-map entrypoint.
-# The Python runner owns the model and map logic; this file only standardizes
-# the server environment and forwards all CLI arguments.
+# Edit this section, then run:
+#   zsh streaming_couping/commands_run_semantic_map.txt
 ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
-PYTHON_BIN="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+HORIZON_PYTHON="${HORIZONSTREAM_PYTHON:-/home/huawei/miniconda3/envs/horizonstream/bin/python}"
+SAM_PYTHON="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
 
-# User-editable defaults. The default RGB source is the same processed
-# ScanNet++ manifest used by the previous V0 experiments. Set INPUT_MODE to
-# "cache" to replay CACHE_PATH. Command-line arguments override this section.
-INPUT_MODE="rgb"
-# Existing experiment dataset: processed ScanNet++ pinhole RGB manifest.
+INPUT_MODE="rgb"                 # rgb | cache
+GEOMETRY_BACKEND="horizonstream" # horizonstream | streamvggt
 MANIFEST_PATH="$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json"
 SCENE_ID="00a231a370"
-# Empty means frame selection below is applied to the complete scene manifest.
 DATASET_FRAME_INDICES=()
-# Set MANIFEST_PATH="" to use explicit RGB files/directories instead.
 FRAME_PATHS=()
 FRAME_START=90
 FRAME_STRIDE=14
 FRAME_COUNT=50
 PROMPTS=("bed" "wardrobe" "chair" "rug" "dustbin")
-OUTPUT_DIR="$STORAGE_ROOT/outputs/semantic_map_50frames"
-CACHE_PATH="$STORAGE_ROOT/outputs/streaming_couping_v0/cache/00a231a370_90_525_step15_37_68_54.pt"
-MAX_SCENE_VOXELS=1000000
-SAM_GROUNDING_BATCH_SIZE=4
-SAM_OFFLOAD_VIDEO_TO_CPU=1
+
+OUTPUT_DIR="$STORAGE_ROOT/outputs/semantic_map_50frames_horizonstream"
+HORIZON_CACHE_PATH="$OUTPUT_DIR/horizonstream_geometry.pt"
+V0_CACHE_PATH="$STORAGE_ROOT/outputs/streaming_couping_v0/cache/00a231a370_90_525_step15_37_68_54.pt"
 RECOVERY_CONFIG="streaming_couping/configs/recovery_dynamic_instance.yaml"
-CUDA_DEVICES=""
+
+# HorizonStream runs first and exits before SAM is loaded.
+HORIZON_REPO="externals/horizonstream"
+HORIZON_CHECKPOINT="/home/bod/86Nas/95_data_bak/FoundationModels/HorizonStream.pt"
+HORIZON_DEVICE="cuda:0"
+HORIZON_WINDOW_SIZE=10
+HORIZON_SLIDING_SIZE=21       # Set to 1 if HorizonStream runs out of VRAM.
+HORIZON_IMAGE_SIZE=518
+HORIZON_PATCH_SIZE=14
+HORIZON_CROP=1
+HORIZON_PRECISION="float16"  # float16 | bfloat16 | float32
+HORIZON_REUSE_CACHE=1
+
+# Leave empty to use sam3.device from RECOVERY_CONFIG (currently cuda:2).
+SAM_DEVICE=""
+SAM_GROUNDING_BATCH_SIZE=1    # Raise to 2 or 4 only after a successful run.
+SAM_OFFLOAD_VIDEO_TO_CPU=1
+MAX_SCENE_VOXELS=1000000
+
+# Optional per-process GPU visibility. Device indices are remapped after this.
+HORIZON_CUDA_VISIBLE_DEVICES=""
+SAM_CUDA_VISIBLE_DEVICES=""
 
 cd "$ROOT"
-[[ -x "$PYTHON_BIN" ]] || {
-  print -u2 "missing Python: $PYTHON_BIN"
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+[[ -x "$SAM_PYTHON" ]] || {
+  print -u2 "missing SAM Python: $SAM_PYTHON"
   exit 1
 }
 
-export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-if [[ -n "${SEMANTIC_MAP_CUDA_VISIBLE_DEVICES:-$CUDA_DEVICES}" ]]; then
-  export CUDA_VISIBLE_DEVICES="${SEMANTIC_MAP_CUDA_VISIBLE_DEVICES:-$CUDA_DEVICES}"
+# Explicit CLI arguments are an advanced, map-stage-only escape hatch. They
+# must include --geometry-cache when HorizonStream geometry is desired.
+if (( $# > 0 )); then
+  PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "$SAM_PYTHON" -m streaming_couping.scripts.run_semantic_map "$@"
+  exit $?
 fi
 
-ARGS=("$@")
-if (( $# == 0 )); then
-  case "$INPUT_MODE" in
-    rgb)
-      if (( ${#PROMPTS[@]} == 0 )); then
-        print -u2 "PROMPTS must contain at least one text prompt."
-        exit 2
-      fi
-      if [[ -n "$MANIFEST_PATH" ]]; then
-        if [[ -z "$SCENE_ID" ]]; then
-          print -u2 "SCENE_ID must be set when MANIFEST_PATH is used."
-          exit 2
-        fi
-        ARGS+=(--manifest "$MANIFEST_PATH" --scene-id "$SCENE_ID")
-        if (( ${#DATASET_FRAME_INDICES[@]} > 0 )); then
-          ARGS+=(--dataset-frame-indices "${DATASET_FRAME_INDICES[@]}")
-        fi
-      elif (( ${#FRAME_PATHS[@]} > 0 )); then
-        ARGS+=(--frames "${FRAME_PATHS[@]}")
-      else
-        print -u2 "Set MANIFEST_PATH or FRAME_PATHS near the top of this file."
-        exit 2
-      fi
-      ARGS+=(--prompts "${PROMPTS[@]}")
-      ARGS+=(--frame-start "$FRAME_START")
-      ARGS+=(--frame-stride "$FRAME_STRIDE")
-      ARGS+=(--frame-count "$FRAME_COUNT")
-      ;;
-    cache)
-      if [[ -z "$CACHE_PATH" ]]; then
-        print -u2 "Set CACHE_PATH near the top of this file for cache mode."
-        exit 2
-      fi
-      ARGS+=(--cache "$CACHE_PATH")
-      ARGS+=(--frame-start "$FRAME_START")
-      ARGS+=(--frame-stride "$FRAME_STRIDE")
-      ARGS+=(--frame-count "$FRAME_COUNT")
-      ;;
-    *)
-      print -u2 "INPUT_MODE must be either rgb or cache, got: $INPUT_MODE"
+SOURCE_ARGS=()
+if [[ "$INPUT_MODE" == "rgb" ]]; then
+  if [[ -n "$MANIFEST_PATH" ]]; then
+    [[ -n "$SCENE_ID" ]] || {
+      print -u2 "SCENE_ID must be set when MANIFEST_PATH is used."
       exit 2
-      ;;
-  esac
-  ARGS+=(--output-dir "$OUTPUT_DIR")
-  ARGS+=(--max-scene-voxels "$MAX_SCENE_VOXELS")
-  ARGS+=(--sam-grounding-batch-size "$SAM_GROUNDING_BATCH_SIZE")
-  if (( SAM_OFFLOAD_VIDEO_TO_CPU )); then
-    ARGS+=(--sam-offload-video-to-cpu)
+    }
+    SOURCE_ARGS+=(--manifest "$MANIFEST_PATH" --scene-id "$SCENE_ID")
+    if (( ${#DATASET_FRAME_INDICES[@]} > 0 )); then
+      SOURCE_ARGS+=(--dataset-frame-indices "${DATASET_FRAME_INDICES[@]}")
+    fi
+  elif (( ${#FRAME_PATHS[@]} > 0 )); then
+    SOURCE_ARGS+=(--frames "${FRAME_PATHS[@]}")
   else
-    ARGS+=(--no-sam-offload-video-to-cpu)
+    print -u2 "Set MANIFEST_PATH or FRAME_PATHS near the top of this file."
+    exit 2
   fi
-  [[ -n "$RECOVERY_CONFIG" ]] && ARGS+=(--recovery-config "$RECOVERY_CONFIG")
 fi
 
-PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  "$PYTHON_BIN" -m streaming_couping.scripts.run_semantic_map "${ARGS[@]}"
+SELECTION_ARGS=(
+  --frame-start "$FRAME_START"
+  --frame-stride "$FRAME_STRIDE"
+  --frame-count "$FRAME_COUNT"
+)
+MAP_ARGS=()
+
+case "$INPUT_MODE" in
+  rgb)
+    if (( ${#PROMPTS[@]} == 0 )); then
+      print -u2 "PROMPTS must contain at least one text prompt."
+      exit 2
+    fi
+    case "$GEOMETRY_BACKEND" in
+      horizonstream)
+        [[ -x "$HORIZON_PYTHON" ]] || {
+          print -u2 "missing HorizonStream Python: $HORIZON_PYTHON"
+          exit 1
+        }
+        [[ -d "$HORIZON_REPO/horizonstream" ]] || {
+          print -u2 "missing HorizonStream source: $ROOT/$HORIZON_REPO"
+          print -u2 "run: git submodule update --init externals/horizonstream"
+          exit 1
+        }
+        [[ -f "$HORIZON_CHECKPOINT" ]] || {
+          print -u2 "missing HorizonStream checkpoint: $HORIZON_CHECKPOINT"
+          exit 1
+        }
+        HORIZON_ARGS=(
+          "${SOURCE_ARGS[@]}"
+          "${SELECTION_ARGS[@]}"
+          --repo-path "$HORIZON_REPO"
+          --checkpoint "$HORIZON_CHECKPOINT"
+          --output-cache "$HORIZON_CACHE_PATH"
+          --device "$HORIZON_DEVICE"
+          --window-size "$HORIZON_WINDOW_SIZE"
+          --sliding-size "$HORIZON_SLIDING_SIZE"
+          --image-size "$HORIZON_IMAGE_SIZE"
+          --patch-size "$HORIZON_PATCH_SIZE"
+          --precision "$HORIZON_PRECISION"
+        )
+        if (( HORIZON_CROP )); then
+          HORIZON_ARGS+=(--crop)
+        else
+          HORIZON_ARGS+=(--no-crop)
+        fi
+        if (( HORIZON_REUSE_CACHE )); then
+          HORIZON_ARGS+=(--reuse-if-valid)
+        else
+          HORIZON_ARGS+=(--no-reuse-if-valid)
+        fi
+        print "[1/2] HorizonStream geometry cache"
+        if [[ -n "$HORIZON_CUDA_VISIBLE_DEVICES" ]]; then
+          CUDA_VISIBLE_DEVICES="$HORIZON_CUDA_VISIBLE_DEVICES" \
+            PYTHONUNBUFFERED=1 \
+            PYTHONPATH="$ROOT/$HORIZON_REPO:$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+            "$HORIZON_PYTHON" \
+            -m streaming_couping.scripts.generate_horizonstream_geometry_cache \
+            "${HORIZON_ARGS[@]}"
+        else
+          PYTHONUNBUFFERED=1 \
+            PYTHONPATH="$ROOT/$HORIZON_REPO:$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+            "$HORIZON_PYTHON" \
+            -m streaming_couping.scripts.generate_horizonstream_geometry_cache \
+            "${HORIZON_ARGS[@]}"
+        fi
+        MAP_ARGS+=(--geometry-cache "$HORIZON_CACHE_PATH")
+        ;;
+      streamvggt)
+        print "[1/2] StreamVGGT geometry will run inside the map process"
+        ;;
+      *)
+        print -u2 "GEOMETRY_BACKEND must be horizonstream or streamvggt."
+        exit 2
+        ;;
+    esac
+    MAP_ARGS+=("${SOURCE_ARGS[@]}" "${SELECTION_ARGS[@]}")
+    MAP_ARGS+=(--prompts "${PROMPTS[@]}")
+    ;;
+  cache)
+    [[ -f "$V0_CACHE_PATH" ]] || {
+      print -u2 "missing frozen V0 cache: $V0_CACHE_PATH"
+      exit 1
+    }
+    MAP_ARGS+=(--cache "$V0_CACHE_PATH" "${SELECTION_ARGS[@]}")
+    ;;
+  *)
+    print -u2 "INPUT_MODE must be rgb or cache."
+    exit 2
+    ;;
+esac
+
+MAP_ARGS+=(--output-dir "$OUTPUT_DIR")
+MAP_ARGS+=(--max-scene-voxels "$MAX_SCENE_VOXELS")
+MAP_ARGS+=(--sam-grounding-batch-size "$SAM_GROUNDING_BATCH_SIZE")
+if (( SAM_OFFLOAD_VIDEO_TO_CPU )); then
+  MAP_ARGS+=(--sam-offload-video-to-cpu)
+else
+  MAP_ARGS+=(--no-sam-offload-video-to-cpu)
+fi
+[[ -n "$RECOVERY_CONFIG" ]] && MAP_ARGS+=(--recovery-config "$RECOVERY_CONFIG")
+if [[ -n "$SAM_DEVICE" ]]; then
+  MAP_ARGS+=(--sam-device "$SAM_DEVICE")
+elif [[ -n "$SAM_CUDA_VISIBLE_DEVICES" ]]; then
+  MAP_ARGS+=(--sam-device "cuda:0")
+fi
+
+print "[2/2] SAM3.1 semantic-map fusion"
+if [[ -n "$SAM_CUDA_VISIBLE_DEVICES" ]]; then
+  CUDA_VISIBLE_DEVICES="$SAM_CUDA_VISIBLE_DEVICES" \
+    PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "$SAM_PYTHON" -m streaming_couping.scripts.run_semantic_map "${MAP_ARGS[@]}"
+else
+  PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "$SAM_PYTHON" -m streaming_couping.scripts.run_semantic_map "${MAP_ARGS[@]}"
+fi

@@ -41,7 +41,8 @@ class _FakeAutoPredictor:
         self.closed = False
         self.num_frames = 0
 
-    def start_session(self, *, resource_path):
+    def start_session(self, *, resource_path, offload_video_to_cpu=False):
+        del offload_video_to_cpu
         self.num_frames = len(tuple(Path(resource_path).glob("*.jpg")))
         self.active.clear()
         self.closed = False

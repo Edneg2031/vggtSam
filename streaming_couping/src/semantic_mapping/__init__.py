@@ -14,6 +14,7 @@ from .contracts import (
     StreamingGeometryProvider,
 )
 from .adapters import (
+    HorizonStreamGeometryCacheAdapter,
     SAM31SegmentationAdapter,
     StreamVGGTGeometryAdapter,
     V0CacheGeometryAdapter,
@@ -32,6 +33,7 @@ from .pipeline import SemanticMapPipeline
 __all__ = [
     "GeometryFrame",
     "GeometryProvider",
+    "HorizonStreamGeometryCacheAdapter",
     "SAM31SegmentationAdapter",
     "StreamVGGTGeometryAdapter",
     "V0CacheGeometryAdapter",

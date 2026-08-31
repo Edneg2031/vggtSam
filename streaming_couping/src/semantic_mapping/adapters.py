@@ -4,16 +4,19 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import numpy as np
 import torch
 from PIL import Image
 
-from ..backbones.sam3_wrapper import SAM3Wrapper
-from ..backbones.streamvggt_wrapper import StreamVGGTWrapper
+from ..horizonstream_cache import validate_horizonstream_cache
 from ..types import GeometrySequence
 from .contracts import GeometryFrame, ObjectObservation, SegmentationFrame
+
+if TYPE_CHECKING:
+    from ..backbones.sam3_wrapper import SAM3Wrapper
+    from ..backbones.streamvggt_wrapper import StreamVGGTWrapper
 
 
 class StreamVGGTGeometryAdapter:
@@ -42,6 +45,96 @@ class StreamVGGTGeometryAdapter:
             backend=self.backend_name,
             scale_type=self.scale_type,
         )
+
+
+class HorizonStreamGeometryCacheAdapter:
+    """Expose isolated HorizonStream depth and poses as canonical geometry."""
+
+    backend_name = "horizonstream"
+
+    def __init__(self, payload: Mapping[str, Any]) -> None:
+        validate_horizonstream_cache(payload)
+        self.payload = payload
+        self.depth = torch.as_tensor(payload["depth"]).detach().float().cpu()
+        if self.depth.ndim == 4 and self.depth.shape[-1] == 1:
+            self.depth = self.depth[..., 0]
+        self.confidence = (
+            torch.as_tensor(payload["confidence"]).detach().float().cpu()
+        )
+        if self.confidence.ndim == 4 and self.confidence.shape[-1] == 1:
+            self.confidence = self.confidence[..., 0]
+        self.world_to_camera = (
+            torch.as_tensor(payload["world_to_camera"]).detach().float().cpu()
+        )
+        self.intrinsics = (
+            torch.as_tensor(payload["intrinsics"]).detach().float().cpu()
+        )
+        self.rgb = (
+            torch.as_tensor(payload["processed_rgb"])
+            .detach()
+            .float()
+            .cpu()
+            .div(255.0)
+        )
+        self.image_paths = tuple(Path(path) for path in payload["image_paths"])
+        self.source_sizes = tuple(
+            tuple(int(value) for value in size)
+            for size in payload["source_sizes"]
+        )
+        self.frame_ids = tuple(
+            int(value)
+            for value in payload.get("frame_ids", range(int(self.depth.shape[0])))
+        )
+        if self.frame_ids != tuple(range(int(self.depth.shape[0]))):
+            raise ValueError(
+                "HorizonStream cache frame_ids must be zero-based and contiguous."
+            )
+
+    @property
+    def image_size(self) -> tuple[int, int]:
+        return int(self.depth.shape[1]), int(self.depth.shape[2])
+
+    def infer(
+        self,
+        image_paths: Sequence[str | Path],
+    ) -> tuple[GeometryFrame, ...]:
+        if len(image_paths) != len(self.frame_ids):
+            raise ValueError(
+                "Image count differs from HorizonStream geometry cache frame count."
+            )
+        height, width = self.image_size
+        output = []
+        for index, frame_id in enumerate(self.frame_ids):
+            depth = self.depth[index]
+            output.append(
+                GeometryFrame(
+                    frame_id=frame_id,
+                    image_size=(height, width),
+                    depth=depth,
+                    intrinsics=self.intrinsics[index],
+                    camera_to_world=_invert_world_to_camera(
+                        self.world_to_camera[index]
+                    ),
+                    confidence=self.confidence[index],
+                    valid=torch.isfinite(depth) & (depth > 0.0),
+                    rgb=self.rgb[index],
+                    scale_type="metric",
+                    backend=self.backend_name,
+                    metadata={
+                        "source_image": str(self.image_paths[index]),
+                        "source_size": self.source_sizes[index],
+                        "processed_size": (height, width),
+                        "pose_convention_source": "world_to_camera",
+                        "pose_source": str(
+                            self.payload.get("pose_source", "online_motion_averaged")
+                        ),
+                        "cache_schema_version": int(
+                            self.payload.get("schema_version", 0)
+                        ),
+                    },
+                )
+            )
+        return tuple(output)
 
 
 def geometry_frames_from_sequence(
