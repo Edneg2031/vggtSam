@@ -10,6 +10,7 @@ backend-neutral ``SemanticMapPipeline``.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 from pathlib import Path
 import tempfile
 from typing import Any
@@ -155,6 +156,7 @@ def _run_from_rgb(
     recovery = load_config(args.recovery_config, overrides)
 
     geometry_payload = None
+    pipeline_image_paths = image_paths
     if args.geometry_cache is not None:
         geometry_payload = load_horizonstream_cache(args.geometry_cache)
         validate_horizonstream_cache(
@@ -168,6 +170,7 @@ def _run_from_rgb(
     else:
         from streaming_couping.src.backbones.streamvggt_wrapper import (
             StreamVGGTWrapper,
+            materialize_streamvggt_rgb,
         )
 
         stream = StreamVGGTWrapper(
@@ -183,69 +186,95 @@ def _run_from_rgb(
         )
         geometry_backend = geometry.backend_name
         geometry_scale_type = args.scale_type
-        segmentation_output_size = tuple(args.output_size or recovery.output_size)
 
-    print(
-        "semantic map runtime "
-        f"frames={len(image_paths)} "
-        f"geometry_backend={geometry_backend} "
-        f"sam_device={recovery.sam3_device} "
-        f"sam_grounding_batch={args.sam_grounding_batch_size} "
-        f"sam_video_cpu_offload={int(args.sam_offload_video_to_cpu)}"
-    )
-    from streaming_couping.src.backbones.sam3_wrapper import SAM3Wrapper
+    with ExitStack() as stack:
+        if geometry_payload is None:
+            # StreamVGGT's pointmap is indexed on its processed image grid.
+            # SAM must consume those same processed pixels; resizing a
+            # 256x384 mask onto the pointmap grid is not a valid alignment.
+            directory = stack.enter_context(
+                tempfile.TemporaryDirectory(prefix="streamvggt_sam_rgb_")
+            )
+            pipeline_image_paths, processed_size = materialize_streamvggt_rgb(
+                image_paths,
+                directory,
+                image_mode=recovery.image_mode,
+            )
+            segmentation_output_size = tuple(args.output_size or processed_size)
+        else:
+            # SAM must see the exact center-cropped pixels used for cached
+            # HorizonStream geometry.
+            directory = stack.enter_context(
+                tempfile.TemporaryDirectory(prefix="horizonstream_sam_rgb_")
+            )
+            pipeline_image_paths = materialize_horizonstream_rgb(
+                geometry_payload,
+                directory,
+            )
+            segmentation_output_size = geometry.image_size
 
-    sam = SAM3Wrapper(
-        repo_path=recovery.sam3_repo,
-        checkpoint_path=recovery.sam3_checkpoint,
-        device=recovery.sam3_device,
-        output_threshold=recovery.sam3_output_threshold,
-        prompt_with_box=recovery.prompt_with_box,
-        version=recovery.sam3_version,
-        use_fa3=recovery.sam3_use_fa3,
-        max_num_objects=recovery.sam3_max_num_objects,
-        multiplex_count=recovery.sam3_multiplex_count,
-        grounding_batch_size=args.sam_grounding_batch_size,
-        offload_video_to_cpu=args.sam_offload_video_to_cpu,
-    ).load()
-    segmentation = SAM31SegmentationAdapter(
-        sam,
-        output_size=segmentation_output_size,
-        max_objects_per_prompt=recovery.sam3_max_num_objects,
-        max_total_objects=args.max_objects,
-        min_birth_pixels=recovery.min_pixels,
-    )
-    pipeline = SemanticMapPipeline(
-        geometry=geometry,
-        segmentation=segmentation,
-        mapper=mapper,
-    )
-    metadata = {
-        "input_mode": "rgb_and_text_prompts",
-        "scale_type": geometry_scale_type,
-        "recovery_config": str(Path(args.recovery_config).resolve()),
-        "geometry_cache": (
-            None
-            if args.geometry_cache is None
-            else str(args.geometry_cache.expanduser().resolve())
-        ),
-        "source_image_paths": [str(path) for path in image_paths],
-        "source_positions": list(selection.source_positions),
-        "source_count": int(selection.source_count),
-        "frame_selection": {
-            "start": int(args.frame_start),
-            "stride": int(args.frame_stride),
-            "count": int(args.frame_count),
-        },
-        **selection.metadata,
-    }
-    if geometry_payload is None:
-        return pipeline.run(image_paths, prompts=prompts, metadata=metadata)
+        print(
+            "semantic map runtime "
+            f"frames={len(image_paths)} "
+            f"geometry_backend={geometry_backend} "
+            f"model_input_size={segmentation_output_size} "
+            f"sam_device={recovery.sam3_device} "
+            f"sam_grounding_batch={args.sam_grounding_batch_size} "
+            f"sam_video_cpu_offload={int(args.sam_offload_video_to_cpu)}"
+        )
+        from streaming_couping.src.backbones.sam3_wrapper import SAM3Wrapper
 
-    # SAM must see the exact center-cropped pixels used for cached geometry.
-    with tempfile.TemporaryDirectory(prefix="horizonstream_sam_rgb_") as directory:
-        aligned_paths = materialize_horizonstream_rgb(geometry_payload, directory)
-        return pipeline.run(aligned_paths, prompts=prompts, metadata=metadata)
+        sam = SAM3Wrapper(
+            repo_path=recovery.sam3_repo,
+            checkpoint_path=recovery.sam3_checkpoint,
+            device=recovery.sam3_device,
+            output_threshold=recovery.sam3_output_threshold,
+            prompt_with_box=recovery.prompt_with_box,
+            version=recovery.sam3_version,
+            use_fa3=recovery.sam3_use_fa3,
+            max_num_objects=recovery.sam3_max_num_objects,
+            multiplex_count=recovery.sam3_multiplex_count,
+            grounding_batch_size=args.sam_grounding_batch_size,
+            offload_video_to_cpu=args.sam_offload_video_to_cpu,
+        ).load()
+        segmentation = SAM31SegmentationAdapter(
+            sam,
+            output_size=segmentation_output_size,
+            max_objects_per_prompt=recovery.sam3_max_num_objects,
+            max_total_objects=args.max_objects,
+            min_birth_pixels=recovery.min_pixels,
+        )
+        pipeline = SemanticMapPipeline(
+            geometry=geometry,
+            segmentation=segmentation,
+            mapper=mapper,
+        )
+        metadata = {
+            "input_mode": "rgb_and_text_prompts",
+            "scale_type": geometry_scale_type,
+            "recovery_config": str(Path(args.recovery_config).resolve()),
+            "geometry_cache": (
+                None
+                if args.geometry_cache is None
+                else str(args.geometry_cache.expanduser().resolve())
+            ),
+            "source_image_paths": [str(path) for path in image_paths],
+            "source_positions": list(selection.source_positions),
+            "source_count": int(selection.source_count),
+            "frame_selection": {
+                "start": int(args.frame_start),
+                "stride": int(args.frame_stride),
+                "count": int(args.frame_count),
+            },
+            "model_input_size": list(segmentation_output_size),
+            "shared_geometry_segmentation_pixels": True,
+            **selection.metadata,
+        }
+        return pipeline.run(
+            pipeline_image_paths,
+            prompts=prompts,
+            metadata=metadata,
+        )
 
 
 def _parse_args() -> argparse.Namespace:

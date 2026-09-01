@@ -16,6 +16,75 @@ from .streamvggt_latent import (
 from ..types import GeometrySequence
 
 
+def materialize_streamvggt_rgb(
+    image_paths: Sequence[str | Path],
+    output_dir: str | Path,
+    *,
+    image_mode: str = "crop",
+) -> tuple[tuple[Path, ...], tuple[int, int]]:
+    """Write StreamVGGT's processed RGB frames for another path-based backend.
+
+    StreamVGGT and SAM3 both consume image paths, but their model-space grids
+    must refer to the same pixels before a SAM mask is fused with a pointmap.
+    Reusing the upstream StreamVGGT preprocessing here makes the temporary
+    files the single source of truth for both providers.  JPEG is used to keep
+    compatibility with SAM3's video loader; the same files are then read by
+    StreamVGGT and SAM3.
+    """
+
+    paths = tuple(Path(path).expanduser().resolve() for path in image_paths)
+    if not paths:
+        raise ValueError("At least one image path is required.")
+    output = Path(output_dir).expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    output.chmod(0o755)
+
+    from streamvggt.utils.load_fn import load_and_preprocess_images
+
+    images = load_and_preprocess_images(
+        [str(path) for path in paths],
+        mode=str(image_mode),
+    )
+    if not torch.is_tensor(images) or images.ndim != 4:
+        raise ValueError(
+            "StreamVGGT preprocessing must return [T,3,H,W], got "
+            f"{type(images)!r} with shape {getattr(images, 'shape', None)}."
+        )
+    if int(images.shape[0]) != len(paths) or int(images.shape[1]) != 3:
+        raise ValueError(
+            "StreamVGGT preprocessing changed the frame list or channel count: "
+            f"images={tuple(images.shape)} paths={len(paths)}."
+        )
+    height, width = int(images.shape[-2]), int(images.shape[-1])
+    if height < 1 or width < 1:
+        raise ValueError(f"Invalid processed image size: {(height, width)}.")
+
+    aligned_paths: list[Path] = []
+    for index, frame in enumerate(images):
+        array = (
+            frame.detach()
+            .float()
+            .cpu()
+            .clamp(0.0, 1.0)
+            .mul(255.0)
+            .round()
+            .to(torch.uint8)
+            .permute(1, 2, 0)
+            .contiguous()
+            .numpy()
+        )
+        path = output / f"{index:06d}.jpg"
+        Image.fromarray(array, mode="RGB").save(
+            path,
+            format="JPEG",
+            quality=95,
+            subsampling=0,
+        )
+        path.chmod(0o644)
+        aligned_paths.append(path)
+    return tuple(aligned_paths), (height, width)
+
+
 class StreamVGGTWrapper:
     def __init__(
         self,

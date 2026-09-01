@@ -1,4 +1,6 @@
 from pathlib import Path
+import sys
+import types
 
 import pytest
 import torch
@@ -15,6 +17,9 @@ from streaming_couping.src.horizonstream_cache import (
 )
 from streaming_couping.src.semantic_mapping.adapters import (
     HorizonStreamGeometryCacheAdapter,
+)
+from streaming_couping.src.backbones.streamvggt_wrapper import (
+    materialize_streamvggt_rgb,
 )
 from streaming_couping.src.semantic_mapping.geometry import world_points_for_frame
 from streaming_couping.src.rgb_inputs import selected_positions
@@ -96,6 +101,52 @@ def test_horizonstream_cache_rejects_path_order(tmp_path: Path) -> None:
             payload,
             expected_image_paths=list(reversed(image_paths)),
         )
+
+
+def test_streamvggt_materialize_uses_processed_grid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_paths = []
+    for index in range(2):
+        path = tmp_path / f"source_{index}.jpg"
+        Image.new("RGB", (12, 8), color=(index, 10, 20)).save(path)
+        source_paths.append(path)
+
+    processed = torch.zeros(2, 3, 4, 6)
+    processed[0, 0] = 1.0
+    calls: dict[str, object] = {}
+
+    def fake_loader(paths, *, mode):
+        calls["paths"] = tuple(paths)
+        calls["mode"] = mode
+        return processed.clone()
+
+    fake_package = types.ModuleType("streamvggt")
+    fake_package.__path__ = []
+    fake_utils = types.ModuleType("streamvggt.utils")
+    fake_utils.__path__ = []
+    fake_load_fn = types.ModuleType("streamvggt.utils.load_fn")
+    fake_load_fn.load_and_preprocess_images = fake_loader
+    monkeypatch.setitem(sys.modules, "streamvggt", fake_package)
+    monkeypatch.setitem(sys.modules, "streamvggt.utils", fake_utils)
+    monkeypatch.setitem(sys.modules, "streamvggt.utils.load_fn", fake_load_fn)
+
+    aligned_paths, processed_size = materialize_streamvggt_rgb(
+        source_paths,
+        tmp_path / "aligned",
+        image_mode="crop",
+    )
+
+    assert processed_size == (4, 6)
+    assert calls == {
+        "paths": tuple(str(path.resolve()) for path in source_paths),
+        "mode": "crop",
+    }
+    assert len(aligned_paths) == 2
+    with Image.open(aligned_paths[0]) as image:
+        assert image.size == (6, 4)
+        assert image.mode == "RGB"
 
 
 def test_horizonstream_confidence_normalization_is_per_frame() -> None:
