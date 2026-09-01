@@ -8,8 +8,8 @@ STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 HORIZON_PYTHON="${HORIZONSTREAM_PYTHON:-/home/huawei/miniconda3/envs/horizonstream/bin/python}"
 SAM_PYTHON="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
 
-INPUT_MODE="rgb"                 # rgb | cache
-GEOMETRY_BACKEND="horizonstream" # horizonstream | streamvggt
+INPUT_MODE="rgb"               # rgb | cache
+GEOMETRY_BACKEND="streamvggt"  # horizonstream | streamvggt
 MANIFEST_PATH="$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json"
 SCENE_ID="00a231a370"
 DATASET_FRAME_INDICES=()
@@ -19,7 +19,7 @@ FRAME_STRIDE=1
 FRAME_COUNT=50
 PROMPTS=("bed" "wardrobe" "chair" "rug" "dustbin")
 
-OUTPUT_DIR="$STORAGE_ROOT/outputs/semantic_map_50frames_horizonstream_consecutive"
+OUTPUT_DIR="$STORAGE_ROOT/outputs/semantic_map_50frames_streamvggt_consecutive"
 HORIZON_CACHE_PATH="$OUTPUT_DIR/horizonstream_geometry.pt"
 V0_CACHE_PATH="$STORAGE_ROOT/outputs/streaming_couping_v0/cache/00a231a370_90_525_step15_37_68_54.pt"
 RECOVERY_CONFIG="streaming_couping/configs/recovery_dynamic_instance.yaml"
