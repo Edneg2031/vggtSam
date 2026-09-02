@@ -20,7 +20,7 @@ PROMPTS=("bed" "wardrobe" "chair" "rug" "dustbin")
 # This is the cache from the existing baseline run.
 BASELINE_OUTPUT_DIR="$STORAGE_ROOT/outputs/semantic_map_50frames_horizonstream_consecutive"
 GEOMETRY_CACHE="$BASELINE_OUTPUT_DIR/horizonstream_geometry.pt"
-OUTPUT_DIR="${OBJECT_POSE_OUTPUT_DIR:-$STORAGE_ROOT/outputs/semantic_map_50frames_horizonstream_object_pose_b0}"
+OUTPUT_DIR="${OBJECT_POSE_OUTPUT_DIR:-$STORAGE_ROOT/outputs/semantic_map_50frames_horizonstream_object_pose_dinov3}"
 RECOVERY_CONFIG="streaming_couping/configs/recovery_dynamic_instance.yaml"
 RUN_LOG="$OUTPUT_DIR/run.log"
 
@@ -39,7 +39,7 @@ OBJECT_POSE_MIN_GEOMETRY_POINTS=24
 OBJECT_POSE_MIN_GEOMETRY_CONFIDENCE=0.30
 OBJECT_POSE_MAX_PAIRS_PER_INSTANCE=8
 OBJECT_POSE_MAX_TOTAL_CANDIDATE_PAIRS=256
-OBJECT_POSE_FEATURE_BACKEND="${OBJECT_POSE_FEATURE_BACKEND:-rgb_patch}"
+OBJECT_POSE_FEATURE_BACKEND="${OBJECT_POSE_FEATURE_BACKEND:-dinov3}"
 OBJECT_POSE_FEATURE_PATCH_SIZE=8
 OBJECT_POSE_FEATURE_MAX_POINTS=1024
 OBJECT_POSE_FEATURE_COSINE_THRESHOLD=0.65

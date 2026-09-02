@@ -45,11 +45,11 @@ zsh streaming_couping/commands_run_object_pose_refinement.txt
 它复用 baseline 已生成的 `horizonstream_geometry.pt`，并把完整日志保存到
 `OUTPUT_DIR/run.log`，终端只打印 pose-edge 和 raw/refined 地图的关键统计。
 
-当前 `rgb_patch` 仅用于无额外模型的 smoke test。如果它产生的有效 edge 太少，可以在
-服务器已有 DINOv3 checkpoint 时运行同一命令切换 backend：
+当前独立 B0 命令默认使用 DINOv3，因为 `rgb_patch` smoke test 在大视角变化下产生的有效
+edge 太少。如果需要复现之前的无额外模型 smoke test，可以切回 `rgb_patch`：
 
 ```zsh
-OBJECT_POSE_FEATURE_BACKEND=dinov3 \
+OBJECT_POSE_FEATURE_BACKEND=rgb_patch \
 zsh streaming_couping/commands_run_object_pose_refinement.txt
 ```
 
