@@ -16,12 +16,17 @@ from .geometry import (
     rgb_for_frame,
     world_points_for_frame,
 )
+from .temporal_consensus import (
+    TemporalConsensusConfig,
+    TemporalConsensusMemory,
+)
 
 
 @dataclass(frozen=True)
 class SemanticMapConfig:
     """Policy for map fusion; model backends do not need to know this type."""
 
+    fusion_policy: str = "raw"
     voxel_size_m: float = 0.05
     min_geometry_confidence: float = 0.30
     min_track_score: float = 0.50
@@ -35,8 +40,18 @@ class SemanticMapConfig:
     map_write_gate: "MapWriteGateConfig" = field(
         default_factory=lambda: MapWriteGateConfig()
     )
+    temporal_consensus: TemporalConsensusConfig = field(
+        default_factory=lambda: TemporalConsensusConfig()
+    )
 
     def validate(self) -> "SemanticMapConfig":
+        if str(self.fusion_policy).strip().lower() not in {
+            "raw",
+            "temporal_consensus",
+        }:
+            raise ValueError(
+                "fusion_policy must be 'raw' or 'temporal_consensus'."
+            )
         if float(self.voxel_size_m) <= 0.0:
             raise ValueError("voxel_size_m must be positive.")
         for name, value in (
@@ -55,6 +70,7 @@ class SemanticMapConfig:
             if int(value) < 1:
                 raise ValueError(f"{name} must be positive.")
         self.map_write_gate.validate()
+        self.temporal_consensus.validate()
         return self
 
 
@@ -162,6 +178,9 @@ class MapUpdateStats:
     map_gate_rejected_count: int = 0
     map_write_weight_sum: float = 0.0
     object_memory_count: int = 0
+    map_written_point_count: int = 0
+    consensus_filtered_point_count: int = 0
+    consensus_downweighted_point_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -683,6 +702,11 @@ class SemanticMapBuilder:
         self._tracks: dict[int, _TrackEvidence] = {}
         self._object_memory: dict[int, _ObjectMemoryState] = {}
         self._object_memory_events: list[dict[str, object]] = []
+        self._temporal_consensus = (
+            TemporalConsensusMemory(self.config.temporal_consensus)
+            if self.config.fusion_policy == "temporal_consensus"
+            else None
+        )
         self._last_frame_id: int | None = None
         self._frame_count = 0
         self._last_stats: MapUpdateStats | None = None
@@ -730,6 +754,9 @@ class SemanticMapBuilder:
         map_write_observations = 0
         map_gate_rejected = 0
         map_write_weight_sum = 0.0
+        map_written_point_count = 0
+        consensus_filtered_point_count = 0
+        consensus_downweighted_point_count = 0
         for observation in segmentation.observations:
             if float(observation.score) < self.config.min_track_score:
                 continue
@@ -771,6 +798,65 @@ class SemanticMapBuilder:
             geometry_score = float(confidence[selected].mean())
             center = selected_points.mean(dim=0)
             extent = selected_points.max(dim=0).values - selected_points.min(dim=0).values
+            map_points = selected_points
+            map_weights = selected_weights
+            map_rgb = selected_rgb
+            consensus_event: dict[str, object] = {
+                "enabled": False,
+                "reason": "disabled:raw_fusion_policy",
+                "raw_points": int(selected_points.shape[0]),
+                "output_points": int(selected_points.shape[0]),
+                "filtered_points": 0,
+                "downweighted_points": 0,
+            }
+            if is_static and self._temporal_consensus is not None:
+                consensus_decision = self._temporal_consensus.decide(
+                    int(observation.instance_id),
+                    selected_points,
+                    selected_weights,
+                    frame_id=frame_id,
+                )
+                map_points = selected_points[consensus_decision.keep_mask]
+                map_weights = selected_weights[
+                    consensus_decision.keep_mask
+                ] * consensus_decision.weight_multipliers[
+                    consensus_decision.keep_mask
+                ]
+                map_rgb = (
+                    None
+                    if selected_rgb is None
+                    else selected_rgb[consensus_decision.keep_mask]
+                )
+                consensus_event = {
+                    "enabled": True,
+                    **consensus_decision.to_dict(),
+                    "raw_points": int(selected_points.shape[0]),
+                    "output_points": int(map_points.shape[0]),
+                    "filtered_points": int(
+                        selected_points.shape[0] - map_points.shape[0]
+                    ),
+                    "downweighted_points": int(
+                        (
+                            consensus_decision.weight_multipliers[
+                                consensus_decision.keep_mask
+                            ]
+                            < 1.0
+                        ).sum()
+                    ),
+                }
+                self._temporal_consensus.update(
+                    int(observation.instance_id),
+                    selected_points,
+                    selected_weights,
+                    frame_id=frame_id,
+                    decision=consensus_decision,
+                )
+                consensus_filtered_point_count += int(
+                    consensus_event["filtered_points"]
+                )
+                consensus_downweighted_point_count += int(
+                    consensus_event["downweighted_points"]
+                )
             gate_decision = memory_state.evaluate(
                 frame_id=frame_id,
                 area=area,
@@ -804,6 +890,8 @@ class SemanticMapBuilder:
                 "track_score": float(observation.score),
                 "geometry_confidence": float(geometry_score),
                 "static_observation": int(is_static),
+                "fusion_policy": str(self.config.fusion_policy),
+                "temporal_consensus": consensus_event,
                 **gate_decision.to_dict(),
                 "semantic_map_write": int(semantic_map_write),
             }
@@ -813,12 +901,13 @@ class SemanticMapBuilder:
                 if semantic_map_write:
                     map_write_observations += 1
                     map_write_weight_sum += float(gate_decision.weight)
+                    map_written_point_count += int(map_points.shape[0])
                     self._add_voxels(
                         label=str(observation.category),
                         instance_id=int(observation.instance_id),
-                        points=selected_points,
-                        weights=selected_weights * float(gate_decision.weight),
-                        rgb=selected_rgb,
+                        points=map_points,
+                        weights=map_weights * float(gate_decision.weight),
+                        rgb=map_rgb,
                         frame_id=frame_id,
                     )
                 else:
@@ -855,6 +944,9 @@ class SemanticMapBuilder:
             map_gate_rejected_count=map_gate_rejected,
             map_write_weight_sum=float(map_write_weight_sum),
             object_memory_count=len(self._object_memory),
+            map_written_point_count=map_written_point_count,
+            consensus_filtered_point_count=consensus_filtered_point_count,
+            consensus_downweighted_point_count=consensus_downweighted_point_count,
         )
         self._last_stats = stats
         return stats
@@ -920,6 +1012,7 @@ class SemanticMapBuilder:
         )
         result_metadata = dict(metadata or {})
         result_metadata.setdefault("schema", 1)
+        result_metadata.setdefault("fusion_policy", str(self.config.fusion_policy))
         result_metadata.setdefault("voxel_size_m", float(self.config.voxel_size_m))
         result_metadata.setdefault("frame_count", int(self._frame_count))
         result_metadata.setdefault("last_frame_id", self._last_frame_id)
@@ -970,6 +1063,18 @@ class SemanticMapBuilder:
                 ],
                 "events": list(self._object_memory_events),
             },
+        )
+        result_metadata.setdefault(
+            "temporal_consensus",
+            (
+                self._temporal_consensus.summary()
+                if self._temporal_consensus is not None
+                else {
+                    "enabled": False,
+                    "config": self.config.temporal_consensus.to_dict(),
+                    "reason": "fusion_policy_raw",
+                }
+            ),
         )
         return SemanticMapResult(
             scene_voxel_points=_stack_or_empty(scene_points, (0, 3)),

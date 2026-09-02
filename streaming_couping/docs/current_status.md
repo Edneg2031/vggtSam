@@ -11,7 +11,7 @@ selected RGB frames
     ├─ HorizonStream (horizonstream conda env)
     │    └─ metric depth + confidence + intrinsics + online causal pose
     │            ↓ normalized geometry cache; process exits
-    └─ SAM3.1 (3am conda env)
+    └─ SAM3.1 (same horizonstream env by default)
          └─ text masks + persistent instance IDs
                     ↓
         depth backprojection + world-coordinate voxel fusion
@@ -19,9 +19,10 @@ selected RGB frames
         full scene + semantic map + per-instance PLY
 ```
 
-该系统没有训练。HorizonStream 和 SAM3.1 都使用冻结权重；SAM 不修改 pose/depth，mapping
-层也不执行 BA、ICP 或 affine correction。两个模型在独立进程中顺序运行，以隔离依赖并降低
-峰值显存。
+该系统没有训练。HorizonStream 和 SAM3.1 都使用冻结权重；默认 SAM 不修改 pose/depth，
+mapping 层也不执行 BA、ICP 或 affine correction。两个模型在独立进程中顺序运行，以隔离
+显存峰值；命令文件默认共用 `horizonstream` 环境，旧的 SAM 环境可通过
+`STREAMING_COUPING_PYTHON` 覆盖。
 
 默认实验仍使用 processed ScanNet++ 场景 `00a231a370`，从 795 帧中选择位置
 `90,91,...,139` 共 50 个连续帧，prompt 为 `bed wardrobe chair rug dustbin`。
@@ -36,8 +37,10 @@ selected RGB frames
 - SAM 使用 cache 中与 depth 完全对齐的处理后 RGB，而不是对原图做不一致的简单 resize；
 - cache 与当前选帧、权重、模型配置或源码不一致时拒绝复用；
 - StreamVGGT 兼容路径和旧 V0 cache replay 仍保留，但不再是默认路径。
-- 已实现但默认关闭的 geometry guidance 和 map-write gate 只作为可审计实验组件，不能
-  视为已经通过验证的性能改进；两者都不会改变 raw baseline 的输出路径。
+- 已实现但默认关闭的 geometry guidance、map-write gate 和 SAM instance-guided pose
+  refinement 只作为可审计实验组件，不能视为已经通过验证的性能改进；这些开关都不会改变
+  raw baseline 的输出路径。refinement 说明见
+  [`object_pose_refinement.md`](object_pose_refinement.md)。
 
 运行入口：
 

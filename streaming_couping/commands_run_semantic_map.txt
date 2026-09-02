@@ -6,7 +6,10 @@ set -euo pipefail
 ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 HORIZON_PYTHON="${HORIZONSTREAM_PYTHON:-/home/huawei/miniconda3/envs/horizonstream/bin/python}"
-SAM_PYTHON="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+# SAM3.1 is importable from the HorizonStream environment on the target
+# server, so both stages use one interpreter by default.  Set
+# STREAMING_COUPING_PYTHON only when an older split environment is needed.
+SAM_PYTHON="${STREAMING_COUPING_PYTHON:-$HORIZON_PYTHON}"
 
 INPUT_MODE="rgb"               # rgb | cache
 GEOMETRY_BACKEND="horizonstream"  # horizonstream | streamvggt
@@ -23,6 +26,11 @@ OUTPUT_DIR="$STORAGE_ROOT/outputs/semantic_map_50frames_horizonstream_consecutiv
 HORIZON_CACHE_PATH="$OUTPUT_DIR/horizonstream_geometry.pt"
 V0_CACHE_PATH="$STORAGE_ROOT/outputs/streaming_couping_v0/cache/00a231a370_90_525_step15_37_68_54.pt"
 RECOVERY_CONFIG="streaming_couping/configs/recovery_dynamic_instance.yaml"
+
+# Run both map policies from one shared HorizonStream + SAM inference.  The
+# raw branch remains the baseline; temporal_consensus is an isolated candidate
+# under OUTPUT_DIR/temporal_consensus.
+FUSION_POLICY="both"       # raw | temporal_consensus | both
 
 # HorizonStream runs first and exits before SAM is loaded.
 HORIZON_REPO="externals/horizonstream"
@@ -68,6 +76,60 @@ MAP_WRITE_MIN_REPROJECTION_CONSISTENCY=0.20
 MAP_WRITE_MIN_AREA_RATIO=0.35
 MAP_WRITE_MAX_AREA_RATIO=2.85
 MAP_WRITE_SOFT_WEIGHT_FLOOR=0.25
+
+# Causal temporal-consensus map branch.  These settings affect only semantic
+# voxel writes; raw object_tracks are always retained unchanged.
+TEMPORAL_CONSENSUS_HISTORY_FRAMES=8
+TEMPORAL_CONSENSUS_MAX_HISTORY_POINTS=4096
+TEMPORAL_CONSENSUS_MIN_HISTORY_POINTS=16
+TEMPORAL_CONSENSUS_SUPPORT_RADIUS_M=0.08
+TEMPORAL_CONSENSUS_MIN_SUPPORT_POINTS=16
+TEMPORAL_CONSENSUS_MIN_SUPPORT_RATIO=0.20
+TEMPORAL_CONSENSUS_MAX_NOVEL_POINTS=256
+TEMPORAL_CONSENSUS_NOVEL_WEIGHT=0.20
+
+# Optional SAM persistent-instance pose refinement.  This is a post-geometry,
+# training-free ablation and is deliberately disabled for the baseline.
+# When enabled, OUTPUT_DIR receives raw_pose/ and object_pose_refined/ maps,
+# plus object_pose_refinement/ diagnostics.  The HorizonStream cache is never
+# overwritten by this stage.
+OBJECT_POSE_REFINEMENT=0
+OBJECT_POSE_MIN_GAP=10
+OBJECT_POSE_MIN_TRACK_SCORE=0.50
+OBJECT_POSE_MIN_MASK_PIXELS=32
+OBJECT_POSE_MAX_MASK_AREA_RATIO=0.85
+OBJECT_POSE_MIN_GEOMETRY_POINTS=24
+OBJECT_POSE_MIN_GEOMETRY_CONFIDENCE=0.30
+OBJECT_POSE_MAX_PAIRS_PER_INSTANCE=8
+OBJECT_POSE_MAX_TOTAL_CANDIDATE_PAIRS=256
+OBJECT_POSE_FEATURE_BACKEND="rgb_patch"  # rgb_patch | dinov3
+OBJECT_POSE_FEATURE_PATCH_SIZE=8
+OBJECT_POSE_FEATURE_MAX_POINTS=1024
+OBJECT_POSE_FEATURE_COSINE_THRESHOLD=0.65
+OBJECT_POSE_FEATURE_RATIO_MARGIN=0.02
+OBJECT_POSE_MAX_FEATURE_MATCHES=256
+OBJECT_POSE_RANSAC_ITERATIONS=256
+OBJECT_POSE_RANSAC_INLIER_THRESHOLD=0.10
+OBJECT_POSE_MIN_MATCHES=12
+OBJECT_POSE_MIN_INLIERS=6
+OBJECT_POSE_MIN_INLIER_RATIO=0.30
+OBJECT_POSE_MAX_REGISTRATION_RMSE=0.12
+OBJECT_POSE_MAX_ROTATION_DISAGREEMENT=60.0
+OBJECT_POSE_MAX_TRANSLATION_DISAGREEMENT=1.0
+OBJECT_POSE_REJECT_EXTREME_MULTIPLIER=2.0
+OBJECT_POSE_LOW_CONSISTENCY_WEIGHT=0.25
+OBJECT_POSE_WEIGHT=1.0
+OBJECT_POSE_SEQUENTIAL_WEIGHT=10.0
+OBJECT_POSE_HUBER_DELTA=0.10
+OBJECT_POSE_ROTATION_RESIDUAL_SCALE=1.0
+OBJECT_POSE_MAX_CORRECTION_ROTATION=45.0
+OBJECT_POSE_MAX_CORRECTION_TRANSLATION=1.0
+OBJECT_POSE_OPTIMIZER_MAX_NFEV=100
+OBJECT_POSE_DINOV3_CHECKPOINT=""
+OBJECT_POSE_DINOV3_ROOT="/home/bod/86Nas/95_data_bak/FoundationModels/dinov3"
+OBJECT_POSE_DINOV3_VARIANT="dinov3-vitl16"
+OBJECT_POSE_DINOV3_DEVICE="cuda:0"
+OBJECT_POSE_DINOV3_DTYPE="bfloat16"
 
 # Optional per-process GPU visibility. Device indices are remapped after this.
 HORIZON_CUDA_VISIBLE_DEVICES=""
@@ -202,8 +264,19 @@ case "$INPUT_MODE" in
 esac
 
 MAP_ARGS+=(--output-dir "$OUTPUT_DIR")
+MAP_ARGS+=(--fusion-policy "$FUSION_POLICY")
 MAP_ARGS+=(--max-scene-voxels "$MAX_SCENE_VOXELS")
 MAP_ARGS+=(--sam-grounding-batch-size "$SAM_GROUNDING_BATCH_SIZE")
+MAP_ARGS+=(
+  --temporal-consensus-history-frames "$TEMPORAL_CONSENSUS_HISTORY_FRAMES"
+  --temporal-consensus-max-history-points "$TEMPORAL_CONSENSUS_MAX_HISTORY_POINTS"
+  --temporal-consensus-min-history-points "$TEMPORAL_CONSENSUS_MIN_HISTORY_POINTS"
+  --temporal-consensus-support-radius-m "$TEMPORAL_CONSENSUS_SUPPORT_RADIUS_M"
+  --temporal-consensus-min-support-points "$TEMPORAL_CONSENSUS_MIN_SUPPORT_POINTS"
+  --temporal-consensus-min-support-ratio "$TEMPORAL_CONSENSUS_MIN_SUPPORT_RATIO"
+  --temporal-consensus-max-novel-points "$TEMPORAL_CONSENSUS_MAX_NOVEL_POINTS"
+  --temporal-consensus-novel-weight "$TEMPORAL_CONSENSUS_NOVEL_WEIGHT"
+)
 if (( SAM_OFFLOAD_VIDEO_TO_CPU )); then
   MAP_ARGS+=(--sam-offload-video-to-cpu)
 else
@@ -238,6 +311,49 @@ if (( MAP_WRITE_GATE )); then
     --map-write-max-area-ratio "$MAP_WRITE_MAX_AREA_RATIO"
     --map-write-soft-weight-floor "$MAP_WRITE_SOFT_WEIGHT_FLOOR"
   )
+fi
+if (( OBJECT_POSE_REFINEMENT )); then
+  MAP_ARGS+=(
+    --object-pose-refinement
+    --object-pose-min-gap "$OBJECT_POSE_MIN_GAP"
+    --object-pose-min-track-score "$OBJECT_POSE_MIN_TRACK_SCORE"
+    --object-pose-min-mask-pixels "$OBJECT_POSE_MIN_MASK_PIXELS"
+    --object-pose-max-mask-area-ratio "$OBJECT_POSE_MAX_MASK_AREA_RATIO"
+    --object-pose-min-geometry-points "$OBJECT_POSE_MIN_GEOMETRY_POINTS"
+    --object-pose-min-geometry-confidence "$OBJECT_POSE_MIN_GEOMETRY_CONFIDENCE"
+    --object-pose-max-pairs-per-instance "$OBJECT_POSE_MAX_PAIRS_PER_INSTANCE"
+    --object-pose-max-total-candidate-pairs "$OBJECT_POSE_MAX_TOTAL_CANDIDATE_PAIRS"
+    --object-pose-feature-backend "$OBJECT_POSE_FEATURE_BACKEND"
+    --object-pose-feature-patch-size "$OBJECT_POSE_FEATURE_PATCH_SIZE"
+    --object-pose-feature-max-points "$OBJECT_POSE_FEATURE_MAX_POINTS"
+    --object-pose-feature-cosine-threshold "$OBJECT_POSE_FEATURE_COSINE_THRESHOLD"
+    --object-pose-feature-ratio-margin "$OBJECT_POSE_FEATURE_RATIO_MARGIN"
+    --object-pose-max-feature-matches "$OBJECT_POSE_MAX_FEATURE_MATCHES"
+    --object-pose-ransac-iterations "$OBJECT_POSE_RANSAC_ITERATIONS"
+    --object-pose-ransac-inlier-threshold "$OBJECT_POSE_RANSAC_INLIER_THRESHOLD"
+    --object-pose-min-matches "$OBJECT_POSE_MIN_MATCHES"
+    --object-pose-min-inliers "$OBJECT_POSE_MIN_INLIERS"
+    --object-pose-min-inlier-ratio "$OBJECT_POSE_MIN_INLIER_RATIO"
+    --object-pose-max-registration-rmse "$OBJECT_POSE_MAX_REGISTRATION_RMSE"
+    --object-pose-max-rotation-disagreement "$OBJECT_POSE_MAX_ROTATION_DISAGREEMENT"
+    --object-pose-max-translation-disagreement "$OBJECT_POSE_MAX_TRANSLATION_DISAGREEMENT"
+    --object-pose-reject-extreme-disagreement-multiplier "$OBJECT_POSE_REJECT_EXTREME_MULTIPLIER"
+    --object-pose-low-consistency-weight "$OBJECT_POSE_LOW_CONSISTENCY_WEIGHT"
+    --object-pose-weight "$OBJECT_POSE_WEIGHT"
+    --object-pose-sequential-weight "$OBJECT_POSE_SEQUENTIAL_WEIGHT"
+    --object-pose-huber-delta "$OBJECT_POSE_HUBER_DELTA"
+    --object-pose-rotation-residual-scale "$OBJECT_POSE_ROTATION_RESIDUAL_SCALE"
+    --object-pose-max-pose-correction-rotation "$OBJECT_POSE_MAX_CORRECTION_ROTATION"
+    --object-pose-max-pose-correction-translation "$OBJECT_POSE_MAX_CORRECTION_TRANSLATION"
+    --object-pose-optimizer-max-nfev "$OBJECT_POSE_OPTIMIZER_MAX_NFEV"
+    --object-pose-dinov3-root "$OBJECT_POSE_DINOV3_ROOT"
+    --object-pose-dinov3-variant "$OBJECT_POSE_DINOV3_VARIANT"
+    --object-pose-dinov3-device "$OBJECT_POSE_DINOV3_DEVICE"
+    --object-pose-dinov3-dtype "$OBJECT_POSE_DINOV3_DTYPE"
+  )
+  if [[ -n "$OBJECT_POSE_DINOV3_CHECKPOINT" ]]; then
+    MAP_ARGS+=(--object-pose-dinov3-checkpoint "$OBJECT_POSE_DINOV3_CHECKPOINT")
+  fi
 fi
 [[ -n "$RECOVERY_CONFIG" ]] && MAP_ARGS+=(--recovery-config "$RECOVERY_CONFIG")
 if [[ -n "$SAM_DEVICE" ]]; then

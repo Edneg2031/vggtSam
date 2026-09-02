@@ -58,8 +58,7 @@ geometry confidence  0.30
 SAM track score      0.50
 HorizonStream device cuda:0
 SAM device           cuda:2
-HorizonStream env    /home/huawei/miniconda3/envs/horizonstream/bin/python
-SAM env              /home/huawei/miniconda3/envs/3am/bin/python
+Python env           /home/huawei/miniconda3/envs/horizonstream/bin/python (默认两阶段共用)
 output               /data184/open_source/vggtSam/outputs/semantic_map_50frames_horizonstream_consecutive
 ```
 
@@ -69,7 +68,9 @@ output               /data184/open_source/vggtSam/outputs/semantic_map_50frames_
 
 ## 3. 两阶段执行方式
 
-两个模型使用不同的 conda 环境，并且按顺序运行：
+两个模型按顺序运行。当前命令文件默认让两个阶段共用
+`/home/huawei/miniconda3/envs/horizonstream/bin/python`；如果服务器上的 SAM 依赖仍需
+旧环境，可以通过 `STREAMING_COUPING_PYTHON` 覆盖第二阶段解释器。
 
 ### 阶段 A：HorizonStream 几何
 
@@ -126,7 +127,7 @@ HorizonStream 生成的 cache 会保存：
 
 ### 阶段 B：SAM3.1 语义追踪与建图
 
-HorizonStream 进程结束后，才使用 `3am` 环境启动 `run_semantic_map.py`。第二阶段
+HorizonStream 进程结束后，才启动 `run_semantic_map.py`。第二阶段
 加载几何 cache，不会加载或运行 StreamVGGT：
 
 ```text
@@ -230,7 +231,22 @@ voxel = floor(X_world / 0.05)
 SAM 的 forward tracking 保证；mapper 本身按帧更新、不读取未来观测，但当前命令
 不是严格意义上的一帧输入、一帧立即输出的低延迟版本。
 
-## 7. 输出文件
+## 7. SAM instance-guided pose refinement（默认关闭）
+
+设置命令文件中的 `OBJECT_POSE_REFINEMENT=1` 可运行独立的 training-free pose-graph
+ablation。它使用 SAM persistent instance ID 选择大时间间隔的 frame pair，在两个 mask 内
+做 RGB patch matching，把各自 depth/intrinsics 反投影成 local-camera 3D correspondence，
+经 RANSAC/weighted SVD 和 conservative pose-consistency gate 后，加入 HorizonStream
+相邻帧 relative pose 组成 robust pose graph。只有 camera pose 被替换，原始 depth、
+intrinsics、SAM mask/ID 和 HorizonStream cache 都不变；随后复用原 mapper 生成 refined
+map。
+
+该开关默认关闭，因此普通 baseline 命令的行为不变。开启后输出 `raw_pose/` 和
+`object_pose_refined/` 两份地图，以及 `object_pose_refinement/` 下的候选、接受/拒绝
+edge、轨迹和统计。完整参数与 A0/B0 运行方式见
+[`object_pose_refinement.md`](object_pose_refinement.md)。
+
+## 8. 输出文件
 
 输出目录由命令文件中的 `OUTPUT_DIR` 指定，当前为：
 

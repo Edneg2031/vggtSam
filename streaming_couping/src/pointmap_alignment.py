@@ -37,7 +37,7 @@ def prepare_map_evaluation(
 ) -> MapEvaluationContext:
     """Fit one reference-frame Sim(3); later frames remain evaluation-only."""
 
-    gt_pointmaps = _load_gt_pointmaps(
+    gt_pointmaps = load_ground_truth_pointmaps(
         config.manifest,
         scene_id=scene_id,
         frame_indices=frame_indices,
@@ -78,14 +78,23 @@ def prepare_map_evaluation(
     )
 
 
-def _load_gt_pointmaps(
+def load_ground_truth_pointmaps(
     manifest_path: str | Path,
     *,
     scene_id: str,
     frame_indices: Sequence[int],
     processed_size: tuple[int, int],
     image_mode: str,
+    target_size: int = 518,
+    patch_size: int = 14,
 ) -> torch.Tensor:
+    """Load mesh-rasterized GT pointmaps on a model's processed grid.
+
+    This helper is shared by evaluation-only tools.  It mirrors the spatial
+    resize/crop/pad convention used by the StreamVGGT-compatible preprocess;
+    HorizonStream's cache uses the same convention for its processed RGB.
+    """
+
     manifest_path = Path(manifest_path).expanduser().resolve()
     with manifest_path.open("r", encoding="utf8") as handle:
         manifest = json.load(handle)
@@ -114,9 +123,30 @@ def _load_gt_pointmaps(
                 ),
                 processed_size,
                 image_mode=image_mode,
+                target_size=target_size,
+                patch_size=patch_size,
             )
         )
     return torch.from_numpy(np.stack(pointmaps)).float()
+
+
+def _load_gt_pointmaps(
+    manifest_path: str | Path,
+    *,
+    scene_id: str,
+    frame_indices: Sequence[int],
+    processed_size: tuple[int, int],
+    image_mode: str,
+) -> torch.Tensor:
+    """Backward-compatible private alias for older evaluation callers."""
+
+    return load_ground_truth_pointmaps(
+        manifest_path,
+        scene_id=scene_id,
+        frame_indices=frame_indices,
+        processed_size=processed_size,
+        image_mode=image_mode,
+    )
 
 
 def _transform_dense_map(
@@ -124,10 +154,17 @@ def _transform_dense_map(
     output_size: tuple[int, int],
     *,
     image_mode: str,
+    target_size: int = 518,
+    patch_size: int = 14,
 ) -> np.ndarray:
     if values.ndim != 3 or values.shape[-1] != 3:
         raise ValueError(f"Expected pointmap [H,W,3], got {values.shape}.")
-    transform = streamvggt_image_transform(values.shape[:2], mode=image_mode)
+    transform = streamvggt_image_transform(
+        values.shape[:2],
+        mode=image_mode,
+        target_size=int(target_size),
+        patch_size=int(patch_size),
+    )
     output_height, output_width = map(int, output_size)
     target_y, target_x = np.meshgrid(
         np.arange(output_height, dtype=np.float32),
@@ -210,6 +247,25 @@ def _robust_similarity(
     )
     rmse = float(torch.sqrt(residual[keep].square().mean()))
     return scale, rotation, translation, int(keep.sum()), rmse
+
+
+def robust_similarity(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    min_points: int,
+    trim_fraction: float = 0.7,
+    iterations: int = 4,
+) -> tuple[float, torch.Tensor, torch.Tensor, int, float]:
+    """Fit a trimmed evaluation-only Sim(3) from paired point samples."""
+
+    return _robust_similarity(
+        source,
+        target,
+        min_points=min_points,
+        trim_fraction=trim_fraction,
+        iterations=iterations,
+    )
 
 
 def _umeyama(

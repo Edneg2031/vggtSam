@@ -34,6 +34,8 @@ def load_ground_truth_stream_masks(
     instance_ids: Sequence[int],
     processed_size: tuple[int, int],
     image_mode: str,
+    target_size: int = 518,
+    patch_size: int = 14,
 ) -> torch.Tensor:
     """Transform native GT instance labels onto the StreamVGGT point grid."""
 
@@ -65,6 +67,8 @@ def load_ground_truth_stream_masks(
                     native,
                     processed_size,
                     mode=image_mode,
+                    target_size=int(target_size),
+                    patch_size=int(patch_size),
                 ).copy()
             ).long()
         )

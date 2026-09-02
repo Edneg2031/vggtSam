@@ -1,0 +1,52 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# Offline evaluation only.  This command reads exported semantic_map.pt files
+# and opens GT pointmaps/masks after runtime inference has finished.
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/3am/bin/python}"
+
+INPUT_DIR="${SEMANTIC_MAP_INPUT_DIR:-$STORAGE_ROOT/outputs/semantic_map_50frames_horizonstream_consecutive}"
+OUTPUT_DIR="${SEMANTIC_MAP_EVAL_OUTPUT_DIR:-$INPUT_DIR/evaluation}"
+
+# Leave these empty to infer them from semantic_map.pt metadata.  Explicit
+# values are useful after moving artifacts to another server.
+MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-}"
+SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-}"
+GEOMETRY_CACHE="${SEMANTIC_MAP_GEOMETRY_CACHE:-}"
+
+MAP_SOURCE="semantic"       # semantic | tracks
+ALIGNMENT="reference"       # reference | none
+ALIGNMENT_REFERENCE=0
+PROMPTS=()                   # empty: reuse prompts recorded in the artifact
+PROMPT_ALIASES_JSON=""      # optional JSON object, e.g. {"dustbin":["trash can"]}
+ALL_GT_INSTANCES=0
+
+cd "$ROOT"
+[[ -x "$PYTHON" ]] || {
+  print -u2 "missing Python: $PYTHON"
+  exit 1
+}
+[[ -d "$INPUT_DIR" || -f "$INPUT_DIR" ]] || {
+  print -u2 "missing semantic-map input: $INPUT_DIR"
+  exit 1
+}
+
+ARGS=(
+  --input-dir "$INPUT_DIR"
+  --output-dir "$OUTPUT_DIR"
+  --map-source "$MAP_SOURCE"
+  --alignment "$ALIGNMENT"
+  --alignment-reference "$ALIGNMENT_REFERENCE"
+)
+[[ -n "$MANIFEST_PATH" ]] && ARGS+=(--manifest "$MANIFEST_PATH")
+[[ -n "$SCENE_ID" ]] && ARGS+=(--scene-id "$SCENE_ID")
+[[ -n "$GEOMETRY_CACHE" ]] && ARGS+=(--geometry-cache "$GEOMETRY_CACHE")
+[[ -n "$PROMPT_ALIASES_JSON" ]] && ARGS+=(--prompt-aliases-json "$PROMPT_ALIASES_JSON")
+(( ${#PROMPTS[@]} > 0 )) && ARGS+=(--prompts "${PROMPTS[@]}")
+(( ALL_GT_INSTANCES )) && ARGS+=(--all-gt-instances)
+
+PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m streaming_couping.scripts.evaluate_exported_semantic_map \
+  "${ARGS[@]}"

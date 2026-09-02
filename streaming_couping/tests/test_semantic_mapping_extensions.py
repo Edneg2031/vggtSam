@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from streaming_couping.src.semantic_mapping.adapters import (
@@ -23,6 +24,16 @@ from streaming_couping.src.semantic_mapping.mapping import (
     MapWriteGateConfig,
     SemanticMapBuilder,
     SemanticMapConfig,
+)
+from streaming_couping.src.semantic_mapping.evaluation import (
+    ExportedMapMetricConfig,
+    evaluate_exported_semantic_map,
+    fit_reference_alignment,
+)
+from streaming_couping.src.semantic_map_metrics import SemanticMapMetricConfig
+from streaming_couping.src.semantic_mapping.temporal_consensus import (
+    TemporalConsensusConfig,
+    TemporalConsensusMemory,
 )
 from streaming_couping.src.types import SAM3MaskCandidate
 
@@ -295,3 +306,181 @@ def test_dynamic_observation_is_not_counted_as_semantic_map_write() -> None:
     }
     assert states[3]["map_write_count"] == 1
     assert states[4]["map_write_count"] == 0
+
+
+def test_temporal_consensus_keeps_support_and_limits_novel_points() -> None:
+    memory = TemporalConsensusMemory(
+        TemporalConsensusConfig(
+            min_history_points=2,
+            min_support_points=2,
+            min_support_ratio=0.5,
+            support_radius_m=0.1,
+            max_novel_points=1,
+            novel_weight=0.2,
+        )
+    )
+    first = torch.tensor(
+        [
+            [0.00, 0.00, 1.00],
+            [0.05, 0.00, 1.00],
+            [0.00, 0.05, 1.00],
+            [0.05, 0.05, 1.00],
+        ]
+    )
+    weights = torch.ones(4)
+    first_decision = memory.decide(7, first, weights, frame_id=0)
+    assert first_decision.reason == "fallback:history_insufficient"
+    memory.update(7, first, weights, frame_id=0, decision=first_decision)
+
+    current = torch.cat(
+        (
+            first[:3],
+            torch.tensor([[0.02, 0.03, 1.00], [1.00, 1.00, 1.00]]),
+        ),
+        dim=0,
+    )
+    decision = memory.decide(7, current, torch.ones(5), frame_id=1)
+    assert decision.use_consensus is True
+    assert decision.supported_points == 4
+    assert decision.novel_points == 1
+    assert decision.output_points == 5
+    assert decision.filtered_point_ratio == 0.0
+    assert float(decision.weight_multipliers[-1]) == pytest.approx(0.2)
+
+
+def test_temporal_consensus_filters_large_outlier_but_tracks_remain_raw() -> None:
+    size = (2, 3)
+    first_points = torch.tensor(
+        [
+            [
+                [0.00, 0.00, 1.00],
+                [0.05, 0.00, 1.00],
+                [0.10, 0.00, 1.00],
+            ],
+            [
+                [0.00, 0.05, 1.00],
+                [0.05, 0.05, 1.00],
+                [0.10, 0.05, 1.00],
+            ],
+        ]
+    )
+    second_points = first_points.clone()
+    second_points[0, 2] = torch.tensor([1.0, 1.0, 1.0])
+    second_points[1, 2] = torch.tensor([1.1, 1.0, 1.0])
+    geometries = tuple(
+        GeometryFrame(
+            frame_id=index,
+            image_size=size,
+            world_points=points,
+            confidence=torch.ones(size),
+            valid=torch.ones(size, dtype=torch.bool),
+            rgb=torch.ones(*size, 3),
+            backend="fake_geometry",
+        )
+        for index, points in enumerate((first_points, second_points))
+    )
+    mask = torch.ones(size, dtype=torch.bool)
+    segmentations = tuple(
+        SegmentationFrame(
+            frame_id=index,
+            image_size=size,
+            observations=(
+                ObjectObservation(
+                    category="chair",
+                    instance_id=2,
+                    mask=mask,
+                    score=0.9,
+                ),
+            ),
+            backend="fake_segmentation",
+        )
+        for index in range(2)
+    )
+    builder = SemanticMapBuilder(
+        SemanticMapConfig(
+            fusion_policy="temporal_consensus",
+            voxel_size_m=0.02,
+            temporal_consensus=TemporalConsensusConfig(
+                min_history_points=2,
+                min_support_points=2,
+                min_support_ratio=0.5,
+                support_radius_m=0.08,
+                max_novel_points=0 + 1,
+                novel_weight=0.1,
+            ),
+        )
+    )
+    builder.update(geometries[0], segmentations[0])
+    second = builder.update(geometries[1], segmentations[1])
+    result = builder.finalize()
+
+    assert second.consensus_filtered_point_count == 1
+    assert second.consensus_downweighted_point_count == 1
+    assert result.object_tracks[0].points.shape[0] == 12
+    assert result.metadata["fusion_policy"] == "temporal_consensus"
+    assert result.metadata["temporal_consensus"]["consensus_count"] == 1
+    assert result.voxel_count < 8
+
+
+def test_exported_map_evaluation_reports_object_and_alignment_metrics() -> None:
+    size = (4, 4)
+    yy, xx = torch.meshgrid(
+        torch.arange(size[0], dtype=torch.float32),
+        torch.arange(size[1], dtype=torch.float32),
+        indexing="ij",
+    )
+    target = torch.stack((xx, yy, torch.ones_like(xx)), dim=-1).repeat(2, 1, 1, 1)
+    gt_mask = torch.zeros(2, 1, *size, dtype=torch.bool)
+    gt_mask[:, 0, :2, :2] = True
+    object_points = target[gt_mask[:, 0]]
+    payload = {
+        "voxel_points": object_points.unique(dim=0),
+        "voxel_rgb": torch.ones(object_points.unique(dim=0).shape[0], 3),
+        "semantic_labels": ["chair"] * object_points.unique(dim=0).shape[0],
+        "instance_ids": torch.zeros(object_points.unique(dim=0).shape[0], dtype=torch.long),
+        "evidence_weights": torch.ones(object_points.unique(dim=0).shape[0]),
+        "scene_voxel_points": target[0].reshape(-1, 3),
+        "object_tracks": [
+            {
+                "instance_id": 0,
+                "category": "chair",
+                "points": object_points,
+            }
+        ],
+    }
+    result = evaluate_exported_semantic_map(
+        payload,
+        scene_id="synthetic",
+        clip_name="clip",
+        variant="raw",
+        target_world_points=target,
+        gt_masks=gt_mask,
+        gt_instance_ids=(5,),
+        gt_labels=("chair",),
+        map_source="semantic",
+        config=ExportedMapMetricConfig(
+            object_metrics=SemanticMapMetricConfig(
+                max_points_per_object=64,
+                distance_chunk_size=16,
+            ),
+            max_points_per_scene=64,
+        ),
+    )
+    summary = result["summary"]
+    assert summary["matched_objects"] == 1
+    assert summary["object_accuracy_m"] == pytest.approx(0.0)
+    assert summary["object_completeness_m"] == pytest.approx(0.0)
+    assert summary["fscore_5cm"] == pytest.approx(1.0)
+    assert summary["fscore_10cm"] == pytest.approx(1.0)
+    assert summary["voxel_iou_5cm"] == pytest.approx(1.0)
+    assert summary["duplicate_object_rate"] == pytest.approx(0.0)
+
+    source = target[:1] * 2.0 + torch.tensor([3.0, -2.0, 0.5])
+    alignment = fit_reference_alignment(
+        source,
+        target[:1],
+        torch.ones(1, *size),
+        max_points=64,
+        min_points=4,
+    )
+    assert alignment.scale == pytest.approx(0.5, rel=1e-4)
