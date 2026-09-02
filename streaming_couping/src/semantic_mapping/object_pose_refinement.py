@@ -1455,6 +1455,7 @@ def _build_summary(
 ) -> dict[str, Any]:
     match_values = [int(edge.num_matches) for edge in accepted]
     inlier_values = [int(edge.num_inliers) for edge in accepted]
+    inlier_ratio_values = [float(edge.inlier_ratio) for edge in accepted]
     rmse_values = [float(edge.rmse) for edge in accepted]
     rotation_changes = []
     translation_changes = []
@@ -1478,7 +1479,11 @@ def _build_summary(
         "rejected_reason_counts": dict(reasons),
         "match_statistics": _statistics(match_values),
         "inlier_statistics": _statistics(inlier_values),
+        "inlier_ratio_statistics": _statistics(inlier_ratio_values),
         "registration_rmse_statistics": _statistics(rmse_values),
+        "accepted_consistency_counts": dict(
+            Counter(str(edge.consistency) for edge in accepted)
+        ),
         "mean_object_registration_rmse": _mean_or_zero(rmse_values),
         "raw_vs_refined_pose_change": {
             "mean_rotation_correction_deg": _mean_or_zero(rotation_changes),

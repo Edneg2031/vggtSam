@@ -134,6 +134,7 @@ ARGS=(
 )
 
 print "running B0; full log will be saved to $RUN_LOG"
+print "B0 config: frames=$FRAME_COUNT sam_device=$SAM_DEVICE feature_backend=$OBJECT_POSE_FEATURE_BACKEND min_gap=$OBJECT_POSE_MIN_GAP"
 set +e
 PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   "$SAM_PYTHON" -m streaming_couping.scripts.run_semantic_map "${ARGS[@]}" \
@@ -172,9 +173,14 @@ print(
 print("rejected_reasons=" + json.dumps(summary.get("rejected_reason_counts", {}), sort_keys=True))
 match = summary.get("match_statistics", {})
 inlier = summary.get("inlier_statistics", {})
+inlier_ratio = summary.get("inlier_ratio_statistics", {})
 print(
-    "matches_mean={0} inliers_mean={1} registration_rmse_mean_m={2}".format(
-        match.get("mean"), inlier.get("mean"), summary.get("mean_object_registration_rmse")
+    "matches_mean={0} inliers_mean={1} inlier_ratio_mean={2} "
+    "registration_rmse_mean_m={3}".format(
+        match.get("mean"),
+        inlier.get("mean"),
+        inlier_ratio.get("mean"),
+        summary.get("mean_object_registration_rmse"),
     )
 )
 change = summary.get("raw_vs_refined_pose_change", {})
@@ -209,6 +215,16 @@ for name in ("raw_pose", "object_pose_refined"):
             row.get("object_tracks_ply"),
         )
     )
+raw_map = comparison.get("maps", {}).get("raw_pose", {})
+refined_map = comparison.get("maps", {}).get("object_pose_refined", {})
+print(
+    "map_delta refined_minus_raw: scene_voxels={0} semantic_voxels={1} objects={2}".format(
+        (refined_map.get("scene_voxel_count") or 0)
+        - (raw_map.get("scene_voxel_count") or 0),
+        (refined_map.get("voxel_count") or 0) - (raw_map.get("voxel_count") or 0),
+        (refined_map.get("instance_count") or 0) - (raw_map.get("instance_count") or 0),
+    )
+)
 print("summary=" + str(summary_path))
 print("comparison=" + str(comparison_path))
 print("full_log=" + str(output_dir / "run.log"))
