@@ -139,12 +139,12 @@ set +e
 PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   "$SAM_PYTHON" -m streaming_couping.scripts.run_semantic_map "${ARGS[@]}" \
   >"$RUN_LOG" 2>&1
-status=$?
+run_exit_code=$?
 set -e
-if (( status != 0 )); then
-  print -u2 "B0 failed status=$status log=$RUN_LOG"
+if (( run_exit_code != 0 )); then
+  print -u2 "B0 failed status=$run_exit_code log=$RUN_LOG"
   tail -n 40 "$RUN_LOG"
-  exit "$status"
+  exit "$run_exit_code"
 fi
 
 SUMMARY_PATH="$OUTPUT_DIR/object_pose_refinement/pose_refinement_summary.json"
