@@ -1,182 +1,293 @@
-# 当前方法与实验结果
+# 当前语义地图实现
 
+更新时间：2026-09-02
 
-## 1. 研究目标
+本文描述当前 `main` 分支实际使用的语义地图 pipeline。当前主线不是旧的
+StreamVGGT/V0 实验，也不是 3D Gaussian Splatting 训练流程，而是一个免训练的
+`HorizonStream + SAM3.1` 三维语义实例地图系统。
 
-本项目面向室内场景的 3D Gaussian Splatting 联合重建与分割，核心问题是：
+## 1. 系统目标
 
-> 在共享高斯几何的前提下，解耦 RGB、语义和几何的可见性与梯度，避免有噪声的
-> 深度或语义伪标签破坏外观，同时让重建得到的高斯适合二维和三维分割。
+输入一段 RGB 图像和若干文本 prompt，输出：
 
-当前包含两条语义路线：
+- 完整场景 RGB 点云；
+- 带实例颜色的完整场景语义点云；
+- 仅包含 prompt 物体的语义地图；
+- 每个物体独立的实例点云，例如 `bed_0.ply`、`rug_1.ply`；
+- 跨帧保持一致的 persistent instance ID。
 
-- **封闭集语义**：DINOv2 + Mask2Former，固定为 21 类，用于 FourFloor、
-  RobotLab 和 ScanNet++ 等室内数据。
-- **开放词汇语义**：采用 GLS 风格的 SAM + OpenCLIP + DEVA，用于 LERF-OVS
-  自由文本查询。
-
-## 2. 整体流程
-
-```text
-RGB 图像 + COLMAP 相机与稀疏点云
-        |
-        +-- Metric3D 逆深度 -- 使用 SfM 点进行逐帧尺度校正
-        |
-        +-- 封闭集：DINOv2 + Mask2Former --> 21 维类别 soft logits
-        |
-        `-- 开放词汇：
-              SAM 区域 --> OpenCLIP 512 维 --> 场景自编码器 --> 16 维语言监督
-              DEVA 跨视图跟踪 ----------------------------> 实例 ID
-
-gsplat 联合训练
-        |
-        +-- RGB 分支：SH + RGB opacity --> L1 + SSIM --> PPISP
-        +-- 语义分支：语义特征 + 语义 opacity
-        +-- 几何分支：尺度校正后的逆深度 + 深度法线 + E-rank
-        `-- 采样与拓扑：共视图像对 batch + 标准增密和剪枝
-
-输出
-        +-- RGB/PPISP 渲染与重建指标
-        +-- 语义/语言渲染与二维 mIoU、mBIoU
-        `-- 语义 PLY、三维类别/实例提取和包围框
-```
-
-### 2.1 共享表示与解耦
-
-每个高斯包含标准 3DGS 的几何与外观参数：
+整体数据流如下：
 
 ```text
-中心位置、尺度、旋转、SH、rgb_opacity
+RGB 图像 + text prompts
+        │
+        ├─ HorizonStream
+        │    └─ metric depth / confidence / intrinsics / online pose
+        │                 ↓
+        │       horizonstream_geometry.pt
+        │
+        └─ SAM3.1
+             └─ text mask / track score / instance ID
+                              ↓
+                 depth backprojection to world coordinates
+                              ↓
+                    5 cm voxel-based fusion
+                              ↓
+          full scene map + semantic map + object-level PLYs
 ```
 
-语义分支额外增加：
+## 2. 当前 baseline 配置
+
+运行入口是：
+
+```bash
+zsh streaming_couping/commands_run_semantic_map.txt
+```
+
+当前命令文件顶部的默认配置为：
 
 ```text
-semantic_feature、semantic_opacity
+dataset              processed ScanNet++
+manifest             /data184/open_source/vggtSam/data/processed/scannetpp_pinhole_2d/manifest.json
+scene                00a231a370
+frame selection      start=90, stride=1, count=50
+selected positions   90, 91, ..., 139
+prompts              bed wardrobe chair rug dustbin
+voxel size           0.05 m
+geometry confidence  0.30
+SAM track score      0.50
+HorizonStream device cuda:0
+SAM device           cuda:2
+HorizonStream env    /home/huawei/miniconda3/envs/horizonstream/bin/python
+SAM env              /home/huawei/miniconda3/envs/3am/bin/python
+output               /data184/open_source/vggtSam/outputs/semantic_map_50frames_horizonstream_consecutive
 ```
 
-两种 opacity 分别用于独立的 alpha blending：
+`FRAME_START`、`FRAME_STRIDE` 和 `FRAME_COUNT` 是整个 manifest 展开后的序列位置，
+不是图像文件名。当前场景从 795 帧中取连续 50 帧。没有写入 prompt 的类别不会被
+赋予语义实例标签；当前 prompt 使用的是 `rug` 和 `dustbin`，不是 `mat`。
 
-- RGB 渲染使用 `rgb_opacity`；
-- 语义或语言渲染使用 `semantic_opacity`；
-- 语义损失不能直接修改 RGB opacity 或 RGB 颜色；
-- 两条分支仍共享高斯位置和增密拓扑，因此几何是重建与分割之间的交互接口。
+## 3. 两阶段执行方式
 
-这是当前方法的主要语义/外观解耦。作为对照，GLS 控制组在 RGB 和语言渲染中
-共用 RGB opacity。
+两个模型使用不同的 conda 环境，并且按顺序运行：
 
-### 2.2 损失函数
+### 阶段 A：HorizonStream 几何
 
-整体目标函数为：
+第一阶段使用 `horizonstream` 环境运行
+`generate_horizonstream_geometry_cache.py`：
 
-$$
-\mathcal{L}=\mathcal{L}_{rgb}+\mathcal{L}_{semantic}
-+\lambda_d\mathcal{L}_{depth}+\lambda_n\mathcal{L}_{normal}
-+\lambda_e\mathcal{L}_{erank}+\lambda_p\mathcal{L}_{PPISP}.
-$$
+```text
+输入 RGB 清单
+    → HorizonStream
+    → depth、confidence、pose、intrinsics、processed RGB
+    → horizonstream_geometry.pt
+```
 
-- `L_rgb`：L1 + SSIM。
-- 封闭集 `L_semantic`：逐像素平均的 soft KL + hard cross-entropy。
-- 开放词汇 `L_semantic`：SAM 区域 OpenCLIP 特征 L1 + `0.3` 倍 DEVA 实例 CE。
-- `L_depth`：渲染逆深度与 Metric3D 逆深度之间的损失，Metric3D 深度预先经过
-  鲁棒的 SfM 尺度校正。
-- `L_normal`：渲染深度法线的一致性损失。
-- `L_erank`：抑制针状的高各向异性高斯。
-- `L_PPISP`：相机相关的光度校正及其正则项。
+当前参数为：
 
-当前开放词汇配置中，语言损失会更新语言特征和语义 opacity；向高斯中心回传
-`0.05` 倍梯度，并停止向尺度和旋转回传。与完整的语言到几何反向传播相比，该
-设置更加稳定。
+```text
+window_size  = 10
+sliding_size = 1
+image_size   = 518
+patch_size   = 14
+crop         = center crop
+precision    = float16
+pose         = online motion averaging
+offline pose = disabled
+```
 
-### 2.3 可选研究模块
+HorizonStream 的当前输出是每帧的深度图、置信度和相机位姿，不是已经融合好的单个
+场景点云。所有选中的 50 帧会先由 dataloader 读到 CPU；随后按 chunk 送入 GPU：
 
-- **B6 证据门控**：只有当语义不一致和深度残差共同表明监督不可靠时，才降低
-  对应区域的几何监督。
-- **SGAD 切向偏移**：通过有界的一维源相机射线偏移，将几何锚点与 RGB 外观
-  渲染位置解耦。
-- **FDS-GS Random Drop**：带梯度 warmup 条件的后期高斯随机丢弃。
-- **Guided-MVS**：可选的外部深度预处理模块。
+```text
+第一个 chunk：10 帧
+后续 chunk：每次新增 1 帧
+```
 
-这些模块是围绕稳定基线设计的消融实验，并不会默认同时启用。
+`window_size` 表示模型使用的时序上下文，`sliding_size` 在当前封装中表示首个
+窗口之后每个 chunk 新增多少帧。`sliding_size=1` 不是把窗口改成 1，而是以一帧
+一帧的方式推进，并通过 HorizonStream 的 KV cache 保留历史上下文。
 
-## 3. 主要实验结果
+当前使用 `sliding_size=1` 主要是因为较大的增量 chunk 会显著增加显存峰值，且此前
+`sliding_size=10/21` 的运行出现过显存不足或更明显的位姿偏移。
 
-### 3.1 FourFloor 封闭集重建与分割
+HorizonStream 生成的 cache 会保存：
 
-| 方法 | Raw PSNR | PPISP PSNR | mIoU | 高斯数量 |
-| --- | ---: | ---: | ---: | ---: |
-| 稳定基线 B0 | 22.751 | **25.024** | 0.7022 | 2,370,961 |
-| B6 证据门控 | **22.787** | 24.929 | **0.7060** | 2,401,687 |
+- 选中的绝对 RGB 路径和原始 manifest 位置；
+- `depth[S,H,W]`；
+- 归一化到 `[0,1]` 的 confidence；
+- `world_to_camera[S,3,4]`；
+- `intrinsics[S,3,3]`；
+- center-cropped 后的 `processed_rgb[S,H,W,3]`；
+- checkpoint、源码 revision、预处理和推理参数。
 
-B6 在原始重建质量基本不变的情况下，将 mIoU 提高了 `0.38` 个百分点。该提升
-真实但较小，因此 B0 仍作为稳定参照，B6 作为语义引导几何的主要消融。
+如果图片顺序、图片文件状态、checkpoint、源码 revision 或 HorizonStream 参数发生
+变化，cache 会被判定为无效并重新生成。
 
-### 3.2 ScanNet++ 全分辨率重建
+### 阶段 B：SAM3.1 语义追踪与建图
 
-实验使用场景 `b20a261fdf` 和 `8b5caf3398`，分辨率为 `1920 x 1440`，batch
-size 为 2，训练 15k 个优化步。下表为两个场景的平均值。
+HorizonStream 进程结束后，才使用 `3am` 环境启动 `run_semantic_map.py`。第二阶段
+加载几何 cache，不会加载或运行 StreamVGGT：
 
-| 方法 | PSNR | SSIM | LPIPS |
-| --- | ---: | ---: | ---: |
-| 基线，Raw | 20.946 | 0.8959 | 0.2270 |
-| 基线，PPISP | **22.617** | 0.9020 | 0.2151 |
-| SGAD tangent，Raw | 20.927 | 0.8957 | 0.2308 |
-| SGAD tangent，PPISP | 22.565 | **0.9029** | 0.2186 |
-| GLS 论文 | 20.690 | 0.8496 | **0.1709** |
+```text
+horizonstream_geometry.pt
+    + processed RGB
+    → SAM3.1 text tracking
+    → SemanticMapBuilder
+    → PLY / PT / JSON
+```
 
-基线的 PSNR 和 SSIM 高于 GLS 论文报告值，其中 PPISP 对 PSNR 的改善明显；GLS
-报告的 LPIPS 更好。SGAD tangent 在 `b20a261fdf` 上有所提升，但在
-`8b5caf3398` 上使多数指标下降，因此目前将其作为几何/外观解耦消融，而不是
-默认方法。
+SAM 使用 cache 中保存的 processed RGB。代码会把它们写入临时目录，再交给 SAM3.1，
+使 mask 与 HorizonStream depth 使用完全一致的裁剪后像素坐标。
 
-该 GLS 对比仍属于参考对比，因为 LPIPS backbone、初始化和渲染实现尚未确认
-完全一致。
+## 4. SAM3.1 实例追踪
 
-### 3.3 LERF-OVS 开放词汇分割
+每一个 prompt 使用一个独立的 SAM3.1 forward tracking session：
 
-当前评估器使用 polygon JSON GT、GLS hardest-negative OpenCLIP relevancy、固定
-阈值 `0.5`，并对所有“标注帧-查询对象”组合的指标取平均。
+```text
+prompt
+  → 从第 0 帧开始检测
+  → 目标首次出现时创建 track
+  → 只向后续帧传播
+  → 转换为 pipeline 内的 persistent instance ID
+```
 
-| 场景 | 本项目解耦语言分支 mIoU | GLS 论文 mIoU | 本地 GLS 复现 |
-| --- | ---: | ---: | ---: |
-| Figurines | 0.4992 | 0.4973 | - |
-| Ramen | 0.2106 | 0.3121 | 约 0.20 |
-| Teatime | 0.4973 | 0.5801 | 约 0.30 |
-| Waldo Kitchen | 0.3353 | 0.3215 | 约 0.15 |
-| 四场景平均 | 0.3856 | 0.4278 | - |
+当前追踪策略包括：
 
-结果说明：
+- forward-only，不使用未来帧回溯修正过去帧；
+- hot-start delay 设置为 0；
+- 连续检测确认阈值设置为 1；
+- grounding batch size 为 1；
+- 视频帧默认 offload 到 CPU，以降低显存峰值；
+- 每个 prompt 最多保留 16 个目标；
+- 所有 prompt 合计最多保留 16 个实例；
+- birth mask 少于 128 像素或覆盖超过 90% 图像时丢弃；
+- 不同 prompt 的轨迹在共同可见帧上 IoU 达到 0.80 时去重；
+- 实例 ID 按首次出现帧、prompt 顺序和 SAM 原始 ID 确定。
 
-- 表中本项目结果来自已有的 30k checkpoint，并统一使用固定阈值 `0.5`。
-- Ramen 使用修正后的 GLS `default` SAM 层时，mIoU 可从 `0.2106` 提高到
-  `0.2181`。
-- 本地 GLS 复现值是当前记录的近似结果。只有在评估帧、查询集合、阈值和聚合
-  方式完全相同时，才能与本项目结果直接比较。
-- `gls-exact` 共享 RGB opacity 控制组在 Ramen 上得到 `0.2070`，与本地 GLS
-  复现的约 `0.20` 接近。
-- 当前解耦分支在 Ramen 上与本地 GLS 接近，在 Teatime 和 Waldo Kitchen 上明显
-  更高；相对于 GLS 论文表格，主要短板仍是 Ramen 的小物体分割。
+SAM 的原始 track ID 只作为 provenance 保存。最终导出的 `instance_id` 是 pipeline
+内部的连续 ID，不等于 SAM 模型内部的 object ID。
 
-Ramen 中最明显的失败类别是 `corn`、`onion segments`、`kamaboko` 和 `spoon`
-等小型或细长物体。区域均衡采样能够改善部分小类别，但会降低其他类别，整体
-mIoU 没有提高，因此只保留为消融。
+## 5. 从深度到世界坐标
 
-## 4. 当前结论
+`HorizonStreamGeometryCacheAdapter` 将 cache 中的 `world_to_camera` 求逆得到
+`camera_to_world`。对像素 `(u,v)` 和 camera-z depth `z`，先计算相机坐标：
 
-1. **独立语义 opacity 有效。** GLS 风格的共享 opacity 控制组没有超过解耦分支，
-   而且 Ramen 的定位准确率明显更低。
-2. **几何是当前剩余的耦合通道。** 不受限制的语义几何梯度会破坏高斯尺度与
-   形状；弱化的中心位置梯度是目前更稳定的折中。
-3. **语义尚未参与增密统计。** 当前 GLS 风格语言特征通过独立的 N-D pass 渲染。
-   其梯度可以更新高斯参数，但不会进入 RGB rasterization 对应的增密统计，因此
-   可能限制语义边界处的新高斯生成。
-4. **GLS 论文值与本地复现值差异明显。** 最终论文对比必须使用同一个评估器，
-   并明确记录评估帧、查询数量、阈值、LPIPS backbone 和指标聚合方式。
+```text
+X_camera = ((u-cx)/fx * z,
+            (v-cy)/fy * z,
+            z)
+```
 
-## 5. 当前论文主线
+再变换到统一世界坐标：
 
-当前论文主线可以概括为：
+```text
+X_world = R_camera_to_world * X_camera + t_camera_to_world
+```
 
-> 基于任务特定 opacity 和受控梯度路由的外观、几何与语义联合高斯重建。
+每一帧因此得到一张 `[H,W,3]` 的世界坐标点图。有效点必须满足：
 
+```text
+depth 有限且大于 0
+geometry confidence >= 0.30
+```
 
+## 6. 世界坐标体素融合
+
+`SemanticMapBuilder` 按帧 ID 递增处理 geometry frame 和 segmentation frame。当前
+体素大小为 5 cm：
+
+```text
+voxel = floor(X_world / 0.05)
+```
+
+### 完整场景地图
+
+所有有效深度点都会进入完整场景 voxel map，不要求像素属于某个 prompt。每个体素
+保存：
+
+- confidence 加权后的点位置；
+- confidence 加权后的 RGB；
+- 观测次数；
+- 如果有语义观测，则保存 dominant category 和 instance ID。
+
+### 语义实例地图
+
+对每个 SAM observation：
+
+1. 将 mask 对齐到几何图像尺寸；
+2. 取 `valid_geometry AND mask` 的像素；
+3. 使用 `geometry_confidence * SAM_track_score` 作为点权重；
+4. 每个 observation 最多保留 8,000 个最高权重点；
+5. 写入对应实例的语义 voxel map。
+
+当前 live SAM observation 没有额外的 `static_score`，而配置
+`require_static_score=false`，所以通过 score 和几何过滤的 live observation 会被
+当作静态实例写入语义地图。单个实例的 track 原始点最多保留 250,000 个。
+
+需要注意：当前 `SemanticMapPipeline.run()` 会先让两个 provider 完成整段序列的
+推理，然后按照递增帧 ID 调用 mapper。因果性主要由 HorizonStream 的缓存推理和
+SAM 的 forward tracking 保证；mapper 本身按帧更新、不读取未来观测，但当前命令
+不是严格意义上的一帧输入、一帧立即输出的低延迟版本。
+
+## 7. 输出文件
+
+输出目录由命令文件中的 `OUTPUT_DIR` 指定，当前为：
+
+```text
+/data184/open_source/vggtSam/outputs/semantic_map_50frames_horizonstream_consecutive
+```
+
+| 文件 | 内容 |
+|---|---|
+| `scene_rgb_map.ply` | 所有帧的有效世界点，经过 5 cm 体素融合，使用 RGB 着色 |
+| `scene_semantic_map.ply` | 与完整场景相同；有 prompt 标签的实例使用实例颜色，未标注区域使用变暗 RGB |
+| `semantic_map.ply` | 仅静态 prompt 实例的体素融合地图，按实例着色 |
+| `rgb_map.ply` | 与 `semantic_map.ply` 使用相同的物体体素，但按 RGB 着色 |
+| `objects/<category>_<id>.ply` | 单个实例的体素融合点云，例如 `bed_0.ply` |
+| `object_tracks.ply` | 每帧物体观测点直接按 track 拼接，未做体素融合，并保留 `frame_id` |
+| `object_tracks.json` | 每个实例的类别、帧范围、点数、包围盒和融合 PLY 路径 |
+| `semantic_map.pt` | 场景体素、语义体素、实例 track、权重和运行元数据 |
+| `map_summary.json` | 输出文件索引、类别列表、实例统计和后端信息 |
+| `horizonstream_geometry.pt` | 两个 conda 环境之间传递的深度、pose、内参和 processed RGB cache |
+
+其中：
+
+- `scene_*` 和 `objects/*` 是世界坐标下的体素融合结果；
+- `object_tracks.ply` 是未体素融合的逐帧观测集合，因此同一物体可能出现重复点或
+  多层点；
+- PLY 中保存的是 `category_id`、`instance_id`、`evidence_weight`、`observations`
+  和 `frame_id` 等数值字段，类别字符串和文件命名信息保存在 JSON 中。
+
+## 8. 代码结构与可扩展性
+
+核心实现位于 [`streaming_couping/src/semantic_mapping/`](../src/semantic_mapping/)：
+
+- `contracts.py`：定义统一的 `GeometryFrame`、`SegmentationFrame` 和 provider 接口；
+- `adapters.py`：适配 HorizonStream cache、StreamVGGT 和 SAM3.1；
+- `geometry.py`：深度反投影、RGB 和 mask 尺寸处理；
+- `mapping.py`：世界坐标点云、语义实例和体素证据融合；
+- `pipeline.py`：串联 geometry provider、segmentation provider 和 mapper；
+- `export.py`：导出 PLY、PT、JSON。
+
+因此以后替换为 HorizonStream 之外的几何后端时，主要新增一个符合
+`GeometryProvider` 的 adapter，mapping、SAM 和导出层不需要重写。接口既支持直接
+提供 world pointmap，也支持提供 `depth + intrinsics + camera_to_world`，后者由通用
+mapper 反投影。
+
+## 9. 当前明确未启用的内容
+
+当前 baseline 没有：
+
+- 训练或微调；
+- StreamVGGT 几何推理；
+- ICP、BA 或 loop closure；
+- affine correction；
+- historical-depth veto 或 quantile veto；
+- 使用 SAM 结果修改 HorizonStream pose/depth；
+- 语义反馈几何；
+- GT 参与候选生成或正式建图。
+
+旧的 StreamVGGT/V0、历史深度 veto 和多场景 affine 实验仍属于诊断或兼容代码，不能
+当作当前 HorizonStream baseline 的性能结论。当前 HorizonStream 的真实性能应以服务器
+实际运行后的几何轨迹、完整场景点云、实例点云和评测结果为准。
