@@ -39,7 +39,7 @@ OBJECT_POSE_MIN_GEOMETRY_POINTS=24
 OBJECT_POSE_MIN_GEOMETRY_CONFIDENCE=0.30
 OBJECT_POSE_MAX_PAIRS_PER_INSTANCE=8
 OBJECT_POSE_MAX_TOTAL_CANDIDATE_PAIRS=256
-OBJECT_POSE_FEATURE_BACKEND="rgb_patch"
+OBJECT_POSE_FEATURE_BACKEND="${OBJECT_POSE_FEATURE_BACKEND:-rgb_patch}"
 OBJECT_POSE_FEATURE_PATCH_SIZE=8
 OBJECT_POSE_FEATURE_MAX_POINTS=1024
 OBJECT_POSE_FEATURE_COSINE_THRESHOLD=0.65
@@ -62,6 +62,11 @@ OBJECT_POSE_ROTATION_RESIDUAL_SCALE=1.0
 OBJECT_POSE_MAX_CORRECTION_ROTATION=45.0
 OBJECT_POSE_MAX_CORRECTION_TRANSLATION=1.0
 OBJECT_POSE_OPTIMIZER_MAX_NFEV=100
+OBJECT_POSE_DINOV3_CHECKPOINT="${OBJECT_POSE_DINOV3_CHECKPOINT:-}"
+OBJECT_POSE_DINOV3_ROOT="${OBJECT_POSE_DINOV3_ROOT:-/home/bod/86Nas/95_data_bak/FoundationModels/dinov3}"
+OBJECT_POSE_DINOV3_VARIANT="${OBJECT_POSE_DINOV3_VARIANT:-dinov3-vitl16}"
+OBJECT_POSE_DINOV3_DEVICE="${OBJECT_POSE_DINOV3_DEVICE:-cuda:0}"
+OBJECT_POSE_DINOV3_DTYPE="${OBJECT_POSE_DINOV3_DTYPE:-bfloat16}"
 
 cd "$ROOT"
 export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
@@ -131,7 +136,14 @@ ARGS=(
   --object-pose-max-pose-correction-rotation "$OBJECT_POSE_MAX_CORRECTION_ROTATION"
   --object-pose-max-pose-correction-translation "$OBJECT_POSE_MAX_CORRECTION_TRANSLATION"
   --object-pose-optimizer-max-nfev "$OBJECT_POSE_OPTIMIZER_MAX_NFEV"
+  --object-pose-dinov3-root "$OBJECT_POSE_DINOV3_ROOT"
+  --object-pose-dinov3-variant "$OBJECT_POSE_DINOV3_VARIANT"
+  --object-pose-dinov3-device "$OBJECT_POSE_DINOV3_DEVICE"
+  --object-pose-dinov3-dtype "$OBJECT_POSE_DINOV3_DTYPE"
 )
+if [[ -n "$OBJECT_POSE_DINOV3_CHECKPOINT" ]]; then
+  ARGS+=(--object-pose-dinov3-checkpoint "$OBJECT_POSE_DINOV3_CHECKPOINT")
+fi
 
 print "running B0; full log will be saved to $RUN_LOG"
 print "B0 config: frames=$FRAME_COUNT sam_device=$SAM_DEVICE feature_backend=$OBJECT_POSE_FEATURE_BACKEND min_gap=$OBJECT_POSE_MIN_GAP"
@@ -202,7 +214,9 @@ print(
 )
 optimizer = summary.get("optimizer", {})
 print(
-    "optimizer_success={0} initial_cost={1} final_cost={2} nfev={3}".format(
+    "optimizer_attempted={0} optimizer_success={1} initial_cost={2} "
+    "final_cost={3} nfev={4}".format(
+        optimizer.get("attempted"),
         optimizer.get("success"),
         optimizer.get("initial_cost"),
         optimizer.get("final_cost"),
