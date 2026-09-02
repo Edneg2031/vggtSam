@@ -28,6 +28,9 @@ SAM_DEVICE="${SAM_DEVICE:-cuda:2}"
 SAM_GROUNDING_BATCH_SIZE=1
 SAM_OFFLOAD_VIDEO_TO_CPU=1
 
+print "B0 command loaded; output=$OUTPUT_DIR"
+print "B0 will reuse geometry cache=$GEOMETRY_CACHE"
+
 # Conservative first-pass object-edge settings.
 OBJECT_POSE_MIN_GAP=10
 OBJECT_POSE_MIN_TRACK_SCORE=0.50
