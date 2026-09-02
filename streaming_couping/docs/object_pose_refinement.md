@@ -36,7 +36,16 @@ instance ID 只用于确认两次观察属于同一个候选物体，不会把 o
 
 ## 运行
 
-编辑 `streaming_couping/commands_run_semantic_map.txt`：
+推荐直接运行独立的 B0 命令：
+
+```zsh
+zsh streaming_couping/commands_run_object_pose_refinement.txt
+```
+
+它复用 baseline 已生成的 `horizonstream_geometry.pt`，并把完整日志保存到
+`OUTPUT_DIR/run.log`，终端只打印 pose-edge 和 raw/refined 地图的关键统计。
+
+如果需要手动配置，也可以编辑 `streaming_couping/commands_run_semantic_map.txt`：
 
 ```zsh
 OBJECT_POSE_REFINEMENT=1

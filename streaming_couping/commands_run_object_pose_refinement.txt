@@ -1,0 +1,212 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# B0: HorizonStream online pose + SAM3.1 persistent-instance pose refinement.
+# This command deliberately reuses the geometry cache produced by
+# commands_run_semantic_map.txt, so it does not rerun HorizonStream and never
+# overwrites the baseline output directory.
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+HORIZON_PYTHON="${HORIZONSTREAM_PYTHON:-/home/huawei/miniconda3/envs/horizonstream/bin/python}"
+SAM_PYTHON="${STREAMING_COUPING_PYTHON:-$HORIZON_PYTHON}"
+
+MANIFEST_PATH="$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json"
+SCENE_ID="00a231a370"
+FRAME_START=90
+FRAME_STRIDE=1
+FRAME_COUNT=50
+PROMPTS=("bed" "wardrobe" "chair" "rug" "dustbin")
+
+# This is the cache from the existing baseline run.
+BASELINE_OUTPUT_DIR="$STORAGE_ROOT/outputs/semantic_map_50frames_horizonstream_consecutive"
+GEOMETRY_CACHE="$BASELINE_OUTPUT_DIR/horizonstream_geometry.pt"
+OUTPUT_DIR="$STORAGE_ROOT/outputs/semantic_map_50frames_horizonstream_object_pose_b0"
+RECOVERY_CONFIG="streaming_couping/configs/recovery_dynamic_instance.yaml"
+RUN_LOG="$OUTPUT_DIR/run.log"
+
+SAM_DEVICE="${SAM_DEVICE:-cuda:2}"
+SAM_GROUNDING_BATCH_SIZE=1
+SAM_OFFLOAD_VIDEO_TO_CPU=1
+
+# Conservative first-pass object-edge settings.
+OBJECT_POSE_MIN_GAP=10
+OBJECT_POSE_MIN_TRACK_SCORE=0.50
+OBJECT_POSE_MIN_MASK_PIXELS=32
+OBJECT_POSE_MIN_GEOMETRY_POINTS=24
+OBJECT_POSE_MIN_GEOMETRY_CONFIDENCE=0.30
+OBJECT_POSE_MAX_PAIRS_PER_INSTANCE=8
+OBJECT_POSE_MAX_TOTAL_CANDIDATE_PAIRS=256
+OBJECT_POSE_FEATURE_BACKEND="rgb_patch"
+OBJECT_POSE_FEATURE_PATCH_SIZE=8
+OBJECT_POSE_FEATURE_MAX_POINTS=1024
+OBJECT_POSE_FEATURE_COSINE_THRESHOLD=0.65
+OBJECT_POSE_FEATURE_RATIO_MARGIN=0.02
+OBJECT_POSE_MAX_FEATURE_MATCHES=256
+OBJECT_POSE_RANSAC_ITERATIONS=256
+OBJECT_POSE_RANSAC_INLIER_THRESHOLD=0.10
+OBJECT_POSE_MIN_MATCHES=12
+OBJECT_POSE_MIN_INLIERS=6
+OBJECT_POSE_MIN_INLIER_RATIO=0.30
+OBJECT_POSE_MAX_REGISTRATION_RMSE=0.12
+OBJECT_POSE_MAX_ROTATION_DISAGREEMENT=60.0
+OBJECT_POSE_MAX_TRANSLATION_DISAGREEMENT=1.0
+OBJECT_POSE_REJECT_EXTREME_MULTIPLIER=2.0
+OBJECT_POSE_LOW_CONSISTENCY_WEIGHT=0.25
+OBJECT_POSE_WEIGHT=1.0
+OBJECT_POSE_SEQUENTIAL_WEIGHT=10.0
+OBJECT_POSE_HUBER_DELTA=0.10
+OBJECT_POSE_ROTATION_RESIDUAL_SCALE=1.0
+OBJECT_POSE_MAX_CORRECTION_ROTATION=45.0
+OBJECT_POSE_MAX_CORRECTION_TRANSLATION=1.0
+OBJECT_POSE_OPTIMIZER_MAX_NFEV=100
+
+cd "$ROOT"
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+[[ -x "$SAM_PYTHON" ]] || {
+  print -u2 "missing Python: $SAM_PYTHON"
+  exit 1
+}
+[[ -f "$MANIFEST_PATH" ]] || {
+  print -u2 "missing manifest: $MANIFEST_PATH"
+  exit 1
+}
+[[ -f "$GEOMETRY_CACHE" ]] || {
+  print -u2 "missing baseline HorizonStream cache: $GEOMETRY_CACHE"
+  print -u2 "run the baseline command first: zsh streaming_couping/commands_run_semantic_map.txt"
+  exit 1
+}
+[[ -f "$RECOVERY_CONFIG" ]] || {
+  print -u2 "missing recovery config: $RECOVERY_CONFIG"
+  exit 1
+}
+
+mkdir -p "$OUTPUT_DIR"
+ARGS=(
+  --manifest "$MANIFEST_PATH"
+  --scene-id "$SCENE_ID"
+  --frame-start "$FRAME_START"
+  --frame-stride "$FRAME_STRIDE"
+  --frame-count "$FRAME_COUNT"
+  --prompts "${PROMPTS[@]}"
+  --geometry-cache "$GEOMETRY_CACHE"
+  --output-dir "$OUTPUT_DIR"
+  --fusion-policy raw
+  --recovery-config "$RECOVERY_CONFIG"
+  --sam-device "$SAM_DEVICE"
+  --sam-grounding-batch-size "$SAM_GROUNDING_BATCH_SIZE"
+  --sam-offload-video-to-cpu
+  --object-pose-refinement
+  --object-pose-min-gap "$OBJECT_POSE_MIN_GAP"
+  --object-pose-min-track-score "$OBJECT_POSE_MIN_TRACK_SCORE"
+  --object-pose-min-mask-pixels "$OBJECT_POSE_MIN_MASK_PIXELS"
+  --object-pose-min-geometry-points "$OBJECT_POSE_MIN_GEOMETRY_POINTS"
+  --object-pose-min-geometry-confidence "$OBJECT_POSE_MIN_GEOMETRY_CONFIDENCE"
+  --object-pose-max-pairs-per-instance "$OBJECT_POSE_MAX_PAIRS_PER_INSTANCE"
+  --object-pose-max-total-candidate-pairs "$OBJECT_POSE_MAX_TOTAL_CANDIDATE_PAIRS"
+  --object-pose-feature-backend "$OBJECT_POSE_FEATURE_BACKEND"
+  --object-pose-feature-patch-size "$OBJECT_POSE_FEATURE_PATCH_SIZE"
+  --object-pose-feature-max-points "$OBJECT_POSE_FEATURE_MAX_POINTS"
+  --object-pose-feature-cosine-threshold "$OBJECT_POSE_FEATURE_COSINE_THRESHOLD"
+  --object-pose-feature-ratio-margin "$OBJECT_POSE_FEATURE_RATIO_MARGIN"
+  --object-pose-max-feature-matches "$OBJECT_POSE_MAX_FEATURE_MATCHES"
+  --object-pose-ransac-iterations "$OBJECT_POSE_RANSAC_ITERATIONS"
+  --object-pose-ransac-inlier-threshold "$OBJECT_POSE_RANSAC_INLIER_THRESHOLD"
+  --object-pose-min-matches "$OBJECT_POSE_MIN_MATCHES"
+  --object-pose-min-inliers "$OBJECT_POSE_MIN_INLIERS"
+  --object-pose-min-inlier-ratio "$OBJECT_POSE_MIN_INLIER_RATIO"
+  --object-pose-max-registration-rmse "$OBJECT_POSE_MAX_REGISTRATION_RMSE"
+  --object-pose-max-rotation-disagreement "$OBJECT_POSE_MAX_ROTATION_DISAGREEMENT"
+  --object-pose-max-translation-disagreement "$OBJECT_POSE_MAX_TRANSLATION_DISAGREEMENT"
+  --object-pose-reject-extreme-disagreement-multiplier "$OBJECT_POSE_REJECT_EXTREME_MULTIPLIER"
+  --object-pose-low-consistency-weight "$OBJECT_POSE_LOW_CONSISTENCY_WEIGHT"
+  --object-pose-weight "$OBJECT_POSE_WEIGHT"
+  --object-pose-sequential-weight "$OBJECT_POSE_SEQUENTIAL_WEIGHT"
+  --object-pose-huber-delta "$OBJECT_POSE_HUBER_DELTA"
+  --object-pose-rotation-residual-scale "$OBJECT_POSE_ROTATION_RESIDUAL_SCALE"
+  --object-pose-max-pose-correction-rotation "$OBJECT_POSE_MAX_CORRECTION_ROTATION"
+  --object-pose-max-pose-correction-translation "$OBJECT_POSE_MAX_CORRECTION_TRANSLATION"
+  --object-pose-optimizer-max-nfev "$OBJECT_POSE_OPTIMIZER_MAX_NFEV"
+)
+
+print "running B0; full log will be saved to $RUN_LOG"
+set +e
+PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$SAM_PYTHON" -m streaming_couping.scripts.run_semantic_map "${ARGS[@]}" \
+  >"$RUN_LOG" 2>&1
+status=$?
+set -e
+if (( status != 0 )); then
+  print -u2 "B0 failed status=$status log=$RUN_LOG"
+  tail -n 40 "$RUN_LOG"
+  exit "$status"
+fi
+
+SUMMARY_PATH="$OUTPUT_DIR/object_pose_refinement/pose_refinement_summary.json"
+COMPARISON_PATH="$OUTPUT_DIR/pose_refinement_comparison.json"
+[[ -f "$SUMMARY_PATH" && -f "$COMPARISON_PATH" ]] || {
+  print -u2 "B0 finished without expected summary files"
+  print -u2 "log=$RUN_LOG"
+  exit 1
+}
+
+print "===== B0 OBJECT POSE REFINEMENT SUMMARY ====="
+"$SAM_PYTHON" - "$SUMMARY_PATH" "$COMPARISON_PATH" "$OUTPUT_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+summary_path, comparison_path, output_dir = map(Path, sys.argv[1:])
+summary = json.loads(summary_path.read_text(encoding="utf-8"))
+comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
+
+print(
+    "frames={frame_count} tracked_instances={tracked_instance_count} "
+    "candidates={candidate_pair_count} accepted_edges={accepted_edge_count} "
+    "rejected_edges={rejected_edge_count}".format(**summary)
+)
+print("rejected_reasons=" + json.dumps(summary.get("rejected_reason_counts", {}), sort_keys=True))
+match = summary.get("match_statistics", {})
+inlier = summary.get("inlier_statistics", {})
+print(
+    "matches_mean={0} inliers_mean={1} registration_rmse_mean_m={2}".format(
+        match.get("mean"), inlier.get("mean"), summary.get("mean_object_registration_rmse")
+    )
+)
+change = summary.get("raw_vs_refined_pose_change", {})
+print(
+    "pose_correction_mean_deg={0} pose_correction_max_deg={1} "
+    "translation_correction_mean_m={2} translation_correction_max_m={3}".format(
+        change.get("mean_rotation_correction_deg"),
+        change.get("max_rotation_correction_deg"),
+        change.get("mean_translation_correction_m"),
+        change.get("max_translation_correction_m"),
+    )
+)
+optimizer = summary.get("optimizer", {})
+print(
+    "optimizer_success={0} initial_cost={1} final_cost={2} nfev={3}".format(
+        optimizer.get("success"),
+        optimizer.get("initial_cost"),
+        optimizer.get("final_cost"),
+        optimizer.get("nfev"),
+    )
+)
+for name in ("raw_pose", "object_pose_refined"):
+    row = comparison.get("maps", {}).get(name, {})
+    print(
+        "map={0} scene_voxels={1} semantic_voxels={2} objects={3} "
+        "semantic_ply={4} object_tracks_ply={5}".format(
+            name,
+            row.get("scene_voxel_count"),
+            row.get("voxel_count"),
+            row.get("instance_count"),
+            row.get("semantic_ply"),
+            row.get("object_tracks_ply"),
+        )
+    )
+print("summary=" + str(summary_path))
+print("comparison=" + str(comparison_path))
+print("full_log=" + str(output_dir / "run.log"))
+PY
