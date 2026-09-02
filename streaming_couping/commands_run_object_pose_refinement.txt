@@ -183,6 +183,13 @@ print(
         summary.get("mean_object_registration_rmse"),
     )
 )
+feature = summary.get("candidate_feature_match_statistics", {})
+valid_3d = summary.get("candidate_valid_3d_correspondence_statistics", {})
+print(
+    "candidate_feature_matches_mean={0} candidate_valid_3d_mean={1}".format(
+        feature.get("mean"), valid_3d.get("mean")
+    )
+)
 change = summary.get("raw_vs_refined_pose_change", {})
 print(
     "pose_correction_mean_deg={0} pose_correction_max_deg={1} "

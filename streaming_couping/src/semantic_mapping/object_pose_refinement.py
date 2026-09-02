@@ -1457,6 +1457,13 @@ def _build_summary(
     inlier_values = [int(edge.num_inliers) for edge in accepted]
     inlier_ratio_values = [float(edge.inlier_ratio) for edge in accepted]
     rmse_values = [float(edge.rmse) for edge in accepted]
+    candidate_rows = [edge.provenance for edge in accepted] + list(rejected)
+    feature_match_values = _present_numeric_values(
+        candidate_rows, "num_feature_matches"
+    )
+    valid_3d_values = _present_numeric_values(
+        candidate_rows, "num_valid_3d_correspondences"
+    )
     rotation_changes = []
     translation_changes = []
     for raw, refined in zip(raw_poses, refined_poses):
@@ -1481,6 +1488,8 @@ def _build_summary(
         "inlier_statistics": _statistics(inlier_values),
         "inlier_ratio_statistics": _statistics(inlier_ratio_values),
         "registration_rmse_statistics": _statistics(rmse_values),
+        "candidate_feature_match_statistics": _statistics(feature_match_values),
+        "candidate_valid_3d_correspondence_statistics": _statistics(valid_3d_values),
         "accepted_consistency_counts": dict(
             Counter(str(edge.consistency) for edge in accepted)
         ),
@@ -1512,6 +1521,18 @@ def _statistics(values: Sequence[float | int]) -> dict[str, float | int | None]:
 
 def _mean_or_zero(values: Sequence[float]) -> float:
     return 0.0 if not values else float(np.mean([float(value) for value in values]))
+
+
+def _present_numeric_values(
+    rows: Sequence[Mapping[str, Any]], key: str
+) -> list[float]:
+    values: list[float] = []
+    for row in rows:
+        value = row.get(key)
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            if math.isfinite(float(value)):
+                values.append(float(value))
+    return values
 
 
 def _relative_pose_disagreement(
