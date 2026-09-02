@@ -1,6 +1,6 @@
 # 当前做法与实验状态
 
-更新时间：2026-08-31
+更新时间：2026-09-02
 
 ## 当前方案
 
@@ -24,7 +24,7 @@ selected RGB frames
 峰值显存。
 
 默认实验仍使用 processed ScanNet++ 场景 `00a231a370`，从 795 帧中选择位置
-`90,104,...,776` 共 50 帧，prompt 为 `bed wardrobe chair rug dustbin`。
+`90,91,...,139` 共 50 个连续帧，prompt 为 `bed wardrobe chair rug dustbin`。
 
 ## 当前代码状态
 
@@ -36,6 +36,8 @@ selected RGB frames
 - SAM 使用 cache 中与 depth 完全对齐的处理后 RGB，而不是对原图做不一致的简单 resize；
 - cache 与当前选帧、权重、模型配置或源码不一致时拒绝复用；
 - StreamVGGT 兼容路径和旧 V0 cache replay 仍保留，但不再是默认路径。
+- 已实现但默认关闭的 geometry guidance 和 map-write gate 只作为可审计实验组件，不能
+  视为已经通过验证的性能改进；两者都不会改变 raw baseline 的输出路径。
 
 运行入口：
 

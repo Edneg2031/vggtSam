@@ -291,3 +291,21 @@ mapper 反投影。
 旧的 StreamVGGT/V0、历史深度 veto 和多场景 affine 实验仍属于诊断或兼容代码，不能
 当作当前 HorizonStream baseline 的性能结论。当前 HorizonStream 的真实性能应以服务器
 实际运行后的几何轨迹、完整场景点云、实例点云和评测结果为准。
+
+## 10. 已实现但默认关闭的下一步实验层
+
+为了让后续优化可以复用同一套 pipeline，当前代码还提供两个显式 opt-in 的模块，默认
+不会改变 baseline：
+
+- `--geometry-guidance`：使用当前实例在更早帧中的世界点，投影成当前图像的 box 和
+  positive points，向 SAM3.1 发起第二个候选，并在候选通过面积、历史支撑和几何分数
+  门控后才替换 raw mask。提示只读历史帧，不修改 HorizonStream 的 depth、pose 或
+  SAM 的 persistent track ID；候选失败自动回退 raw mask。
+- `--map-write-gate`：为每个实例维护短期 observation memory 和长期高质量 anchor，
+  对首次出现、重入、面积突变、三维中心不一致或低置信度观测延迟/拒绝语义体素写入。
+  物体仍保留在 `object_tracks` 中，因此该门控只影响 semantic map，不会删除追踪结果。
+
+命令文件顶部的 `GEOMETRY_GUIDANCE=0` 和 `MAP_WRITE_GATE=0` 保证默认输出仍是 raw
+SAM + HorizonStream。启用任一模块时应使用新的 `OUTPUT_DIR`，并比较 `map_summary.json`
+中的 `segmentation_guidance_summary`、`object_memory`、`map_write_gate` 与 raw baseline。
+这两个模块目前是可审计的实验组件，不应在新的 scene-disjoint 验证通过前宣称为正式改进。

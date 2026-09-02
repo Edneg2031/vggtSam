@@ -7,6 +7,7 @@ future geometry model can replace StreamVGGT without changing map fusion.
 
 from .contracts import (
     GeometryFrame,
+    GeometryAwareSegmentationProvider,
     GeometryProvider,
     ObjectObservation,
     SegmentationFrame,
@@ -14,6 +15,7 @@ from .contracts import (
     StreamingGeometryProvider,
 )
 from .adapters import (
+    GeometryAwareSAM31SegmentationAdapter,
     HorizonStreamGeometryCacheAdapter,
     SAM31SegmentationAdapter,
     StreamVGGTGeometryAdapter,
@@ -22,6 +24,7 @@ from .adapters import (
 )
 from .export import export_semantic_map
 from .mapping import (
+    MapWriteGateConfig,
     MapUpdateStats,
     ObjectTrackMap,
     SemanticMapBuilder,
@@ -32,13 +35,16 @@ from .pipeline import SemanticMapPipeline
 
 __all__ = [
     "GeometryFrame",
+    "GeometryAwareSegmentationProvider",
     "GeometryProvider",
+    "GeometryAwareSAM31SegmentationAdapter",
     "HorizonStreamGeometryCacheAdapter",
     "SAM31SegmentationAdapter",
     "StreamVGGTGeometryAdapter",
     "V0CacheGeometryAdapter",
     "V0CacheSegmentationAdapter",
     "MapUpdateStats",
+    "MapWriteGateConfig",
     "ObjectObservation",
     "ObjectTrackMap",
     "SegmentationFrame",

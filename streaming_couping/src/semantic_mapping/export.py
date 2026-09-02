@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -235,6 +236,12 @@ def export_semantic_map(
         },
         "object_plys": object_plys,
         "objects": tracks_summary,
+        "map_write_gate": _json_safe(
+            result.metadata.get("map_write_gate", {})
+        ),
+        "object_memory": _json_safe(
+            result.metadata.get("object_memory", {})
+        ),
     }
     summary_path = directory / "map_summary.json"
     summary_path.write_text(
@@ -336,6 +343,8 @@ def _track_payload(tracks: Sequence[ObjectTrackMap]) -> list[dict[str, Any]]:
             "frame_indices": track.frame_indices.detach().long().cpu(),
             "observations": int(track.observations),
             "is_static": track.is_static,
+            "map_write_observations": int(track.map_write_observations),
+            "map_write_points": int(track.map_write_points),
         }
         for track in tracks
     ]
@@ -424,6 +433,8 @@ def _track_summary(track: ObjectTrackMap) -> dict[str, Any]:
         "bounds_min": bounds_min,
         "bounds_max": bounds_max,
         "frame_count": int(track.frame_indices.unique().numel()),
+        "map_write_observations": int(track.map_write_observations),
+        "map_write_points": int(track.map_write_points),
         "first_frame_id": (
             int(track.frame_indices.min()) if track.frame_indices.numel() else None
         ),
@@ -519,6 +530,15 @@ def _json_safe(value: Any) -> Any:
         return str(value)
     if isinstance(value, torch.Tensor):
         return value.detach().cpu().tolist()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.bool_):
+        return bool(value)
     if isinstance(value, (np.integer, np.floating)):
-        return value.item()
+        item = value.item()
+        if isinstance(item, float) and not math.isfinite(item):
+            return None
+        return item
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     return value

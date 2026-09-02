@@ -42,6 +42,33 @@ SAM_GROUNDING_BATCH_SIZE=1    # Raise to 2 or 4 only after a successful run.
 SAM_OFFLOAD_VIDEO_TO_CPU=1
 MAX_SCENE_VOXELS=1000000
 
+# Optional experimental layers.  Both are disabled for the reproducible raw
+# SAM + HorizonStream baseline.  Enable them explicitly for an ablation and
+# use a separate OUTPUT_DIR so baseline artifacts are not overwritten.
+GEOMETRY_GUIDANCE=0
+GEOMETRY_GUIDANCE_PROMPT_MODE="box_points"  # box_points | box_only | points_only
+GEOMETRY_GUIDANCE_MIN_HISTORY_POINTS=16
+GEOMETRY_GUIDANCE_MAX_HISTORY_POINTS=4096
+GEOMETRY_GUIDANCE_MAX_HISTORY_FRAMES=8
+GEOMETRY_GUIDANCE_MAX_HISTORY_GAP=30
+GEOMETRY_GUIDANCE_MAX_POSITIVE_POINTS=6
+GEOMETRY_GUIDANCE_MIN_CANDIDATE_SUPPORT=0.25
+GEOMETRY_GUIDANCE_RELIABLE_SUPPORT_MARGIN=0.10
+GEOMETRY_GUIDANCE_RELIABLE_SCORE_MARGIN=0.10
+GEOMETRY_GUIDANCE_MAX_AREA_RATIO=4.0
+
+MAP_WRITE_GATE=0
+MAP_WRITE_MIN_OBSERVATIONS=2
+MAP_WRITE_REENTRY_CONFIRMATION=2
+MAP_WRITE_REENTRY_GAP=3
+MAP_WRITE_MIN_MASK_PIXELS=32
+MAP_WRITE_MIN_OBSERVATION_POINTS=16
+MAP_WRITE_MIN_RELIABILITY=0.20
+MAP_WRITE_MIN_REPROJECTION_CONSISTENCY=0.20
+MAP_WRITE_MIN_AREA_RATIO=0.35
+MAP_WRITE_MAX_AREA_RATIO=2.85
+MAP_WRITE_SOFT_WEIGHT_FLOOR=0.25
+
 # Optional per-process GPU visibility. Device indices are remapped after this.
 HORIZON_CUDA_VISIBLE_DEVICES=""
 SAM_CUDA_VISIBLE_DEVICES=""
@@ -181,6 +208,36 @@ if (( SAM_OFFLOAD_VIDEO_TO_CPU )); then
   MAP_ARGS+=(--sam-offload-video-to-cpu)
 else
   MAP_ARGS+=(--no-sam-offload-video-to-cpu)
+fi
+if (( GEOMETRY_GUIDANCE )); then
+  MAP_ARGS+=(
+    --geometry-guidance
+    --geometry-guidance-prompt-mode "$GEOMETRY_GUIDANCE_PROMPT_MODE"
+    --geometry-guidance-min-history-points "$GEOMETRY_GUIDANCE_MIN_HISTORY_POINTS"
+    --geometry-guidance-max-history-points "$GEOMETRY_GUIDANCE_MAX_HISTORY_POINTS"
+    --geometry-guidance-max-history-frames "$GEOMETRY_GUIDANCE_MAX_HISTORY_FRAMES"
+    --geometry-guidance-max-history-gap "$GEOMETRY_GUIDANCE_MAX_HISTORY_GAP"
+    --geometry-guidance-max-positive-points "$GEOMETRY_GUIDANCE_MAX_POSITIVE_POINTS"
+    --geometry-guidance-min-candidate-support "$GEOMETRY_GUIDANCE_MIN_CANDIDATE_SUPPORT"
+    --geometry-guidance-reliable-support-margin "$GEOMETRY_GUIDANCE_RELIABLE_SUPPORT_MARGIN"
+    --geometry-guidance-reliable-score-margin "$GEOMETRY_GUIDANCE_RELIABLE_SCORE_MARGIN"
+    --geometry-guidance-max-area-ratio "$GEOMETRY_GUIDANCE_MAX_AREA_RATIO"
+  )
+fi
+if (( MAP_WRITE_GATE )); then
+  MAP_ARGS+=(
+    --map-write-gate
+    --map-write-min-observations "$MAP_WRITE_MIN_OBSERVATIONS"
+    --map-write-reentry-confirmation "$MAP_WRITE_REENTRY_CONFIRMATION"
+    --map-write-reentry-gap "$MAP_WRITE_REENTRY_GAP"
+    --map-write-min-mask-pixels "$MAP_WRITE_MIN_MASK_PIXELS"
+    --map-write-min-observation-points "$MAP_WRITE_MIN_OBSERVATION_POINTS"
+    --map-write-min-reliability "$MAP_WRITE_MIN_RELIABILITY"
+    --map-write-min-reprojection-consistency "$MAP_WRITE_MIN_REPROJECTION_CONSISTENCY"
+    --map-write-min-area-ratio "$MAP_WRITE_MIN_AREA_RATIO"
+    --map-write-max-area-ratio "$MAP_WRITE_MAX_AREA_RATIO"
+    --map-write-soft-weight-floor "$MAP_WRITE_SOFT_WEIGHT_FLOOR"
+  )
 fi
 [[ -n "$RECOVERY_CONFIG" ]] && MAP_ARGS+=(--recovery-config "$RECOVERY_CONFIG")
 if [[ -n "$SAM_DEVICE" ]]; then

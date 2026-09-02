@@ -45,12 +45,18 @@ class SemanticMapPipeline:
         if not paths:
             raise ValueError("SemanticMapPipeline requires at least one RGB frame.")
         geometry_frames = tuple(self.geometry.infer(paths))
-        segmentation_frames = tuple(self.segmentation.infer(paths, prompts))
         if len(geometry_frames) != len(paths):
             raise ValueError(
                 "Geometry provider returned a different number of frames: "
                 f"{len(geometry_frames)} vs {len(paths)}."
             )
+        infer_with_geometry = getattr(self.segmentation, "infer_with_geometry", None)
+        if callable(infer_with_geometry):
+            segmentation_frames = tuple(
+                infer_with_geometry(paths, geometry_frames, prompts)
+            )
+        else:
+            segmentation_frames = tuple(self.segmentation.infer(paths, prompts))
         if len(segmentation_frames) != len(paths):
             raise ValueError(
                 "Segmentation provider returned a different number of frames: "
@@ -86,6 +92,18 @@ class SemanticMapPipeline:
             [str(prompt) for prompt in prompts] if prompts is not None else [],
         )
         result_metadata.setdefault("causal_fusion", True)
+        guidance_summary = getattr(self.segmentation, "last_summary", None)
+        if guidance_summary is not None:
+            result_metadata.setdefault(
+                "segmentation_guidance_summary",
+                dict(guidance_summary),
+            )
+        guidance_diagnostics = getattr(self.segmentation, "last_diagnostics", None)
+        if guidance_diagnostics is not None:
+            result_metadata.setdefault(
+                "segmentation_guidance_diagnostics",
+                list(guidance_diagnostics),
+            )
         return self.finalize(result_metadata)
 
     def update(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -13,6 +14,15 @@ from PIL import Image
 from ..horizonstream_cache import validate_horizonstream_cache
 from ..types import GeometrySequence
 from .contracts import GeometryFrame, ObjectObservation, SegmentationFrame
+from .geometry_guidance import (
+    CausalObjectGeometryMemory,
+    GeometryGuidanceConfig,
+    build_geometry_prompt,
+    choose_geometry_candidate,
+    evaluate_geometry_mask,
+    gate_geometry_replacement,
+    summarize_diagnostics,
+)
 
 if TYPE_CHECKING:
     from ..backbones.sam3_wrapper import SAM3Wrapper
@@ -331,6 +341,280 @@ class SAM31SegmentationAdapter:
             )
             for frame_id in range(len(paths))
         )
+
+
+class GeometryAwareSAM31SegmentationAdapter(SAM31SegmentationAdapter):
+    """Add an opt-in causal geometry competition layer to SAM3.1.
+
+    ``infer`` remains exactly the raw baseline.  The pipeline calls
+    ``infer_with_geometry`` only when this adapter is explicitly selected.
+    Persistent IDs and raw tracking scores come from the baseline tracker;
+    geometry is allowed to replace a mask only after the candidate wins the
+    image-space gate.  All history is updated after the current decision, so a
+    frame never contributes geometry prompts to itself or an earlier frame.
+    """
+
+    backend_name = "sam3.1_forward_causal_geometry_gated"
+
+    def __init__(
+        self,
+        wrapper: SAM3Wrapper,
+        *,
+        output_size: tuple[int, int],
+        max_objects_per_prompt: int = 16,
+        max_total_objects: int = 16,
+        min_birth_pixels: int = 128,
+        duplicate_iou: float = 0.80,
+        geometry_config: GeometryGuidanceConfig | None = None,
+    ) -> None:
+        super().__init__(
+            wrapper,
+            output_size=output_size,
+            max_objects_per_prompt=max_objects_per_prompt,
+            max_total_objects=max_total_objects,
+            min_birth_pixels=min_birth_pixels,
+            duplicate_iou=duplicate_iou,
+        )
+        self.geometry_config = (
+            geometry_config or GeometryGuidanceConfig()
+        ).validate()
+        self.last_diagnostics: list[dict[str, object]] = []
+        self.last_summary: dict[str, object] = {
+            "enabled": True,
+            "observation_count": 0,
+        }
+
+    def infer_with_geometry(
+        self,
+        image_paths: Sequence[str | Path],
+        geometry_frames: Sequence[GeometryFrame],
+        prompts: Sequence[str] | None = None,
+    ) -> tuple[SegmentationFrame, ...]:
+        paths = tuple(Path(path) for path in image_paths)
+        geometry = tuple(geometry_frames)
+        raw_frames = tuple(self.infer(paths, prompts))
+        if len(geometry) != len(paths):
+            raise ValueError(
+                "Geometry-aware SAM received a different number of geometry "
+                f"frames: {len(geometry)} vs {len(paths)}."
+            )
+        if len(raw_frames) != len(geometry):
+            raise ValueError("Raw SAM and geometry frame counts do not match.")
+        geometry_by_id = {int(frame.frame_id): frame for frame in geometry}
+        if len(geometry_by_id) != len(geometry):
+            raise ValueError("Geometry-aware SAM received duplicate frame IDs.")
+        if {int(frame.frame_id) for frame in raw_frames} != set(geometry_by_id):
+            raise ValueError(
+                "Raw SAM and geometry frame IDs do not match for geometry guidance."
+            )
+
+        memory = CausalObjectGeometryMemory(self.geometry_config)
+        output_frames: list[SegmentationFrame] = []
+        diagnostics: list[dict[str, object]] = []
+        applied_count = 0
+        attempted_count = 0
+        for path, raw_frame in zip(paths, raw_frames):
+            frame_id = int(raw_frame.frame_id)
+            current_geometry = geometry_by_id[frame_id]
+            output_observations: list[ObjectObservation] = []
+            frame_applied = 0
+            frame_attempted = 0
+            for observation in raw_frame.observations:
+                raw_mask = observation.mask.detach().cpu().bool()
+                history = memory.get(
+                    observation.instance_id,
+                    current_frame_id=frame_id,
+                )
+                prompt = build_geometry_prompt(
+                    history,
+                    current_geometry,
+                    config=self.geometry_config,
+                    output_size=self.output_size,
+                )
+                row: dict[str, object] = {
+                    "frame_id": frame_id,
+                    "category": str(observation.category),
+                    "instance_id": int(observation.instance_id),
+                    "raw_mask_pixels": int(raw_mask.sum()),
+                    "history_available": int(history is not None),
+                    "history_point_count": (
+                        0 if history is None else int(history.points.shape[0])
+                    ),
+                    "history_last_frame_id": (
+                        None if history is None else int(history.last_frame_id)
+                    ),
+                    "history_source_frame_ids": (
+                        []
+                        if history is None
+                        else [int(value) for value in history.source_frame_ids]
+                    ),
+                    "prompt_available": int(prompt is not None),
+                    "prompt_attempted": 0,
+                    "correction_applied": 0,
+                    "candidate_mask_pixels": 0,
+                }
+                selected_mask = raw_mask
+                if prompt is None:
+                    row["reason"] = (
+                        "keep_raw:no_history"
+                        if history is None
+                        else "keep_raw:projection_unavailable"
+                    )
+                else:
+                    raw_row = evaluate_geometry_mask(
+                        raw_mask,
+                        score=float(observation.score),
+                        prompt=prompt,
+                        support_dilation=int(self.geometry_config.support_dilation),
+                    )
+                    row.update(
+                        {
+                            "raw_support_recall": float(raw_row["support_recall"]),
+                            "raw_box_precision": float(raw_row["box_precision"]),
+                            "raw_support_precision": float(
+                                raw_row["support_precision"]
+                            ),
+                            "raw_geometry_score": float(raw_row["geometry_score"]),
+                            "prompt_projected_points": int(prompt.projected_points),
+                            "prompt_source_point_count": int(
+                                prompt.source_point_count
+                            ),
+                        }
+                    )
+                    row["prompt_attempted"] = 1
+                    attempted_count += 1
+                    frame_attempted += 1
+                    try:
+                        candidates = self.wrapper.propose_geometry_prompted_masks(
+                            path,
+                            prompt=str(observation.category),
+                            output_size=self.output_size,
+                            geometry_prompt=prompt.box_mask,
+                            positive_prompt=prompt.positive_mask,
+                            max_positive_points=int(
+                                self.geometry_config.max_positive_points
+                            ),
+                            use_box=(
+                                str(self.geometry_config.prompt_mode).lower()
+                                in {"box_points", "box_only"}
+                            ),
+                            use_points=(
+                                str(self.geometry_config.prompt_mode).lower()
+                                in {"box_points", "points_only"}
+                            ),
+                        )
+                        candidate_row = choose_geometry_candidate(
+                            candidates,
+                            prompt=prompt,
+                            config=self.geometry_config,
+                        )
+                        selected, reason = gate_geometry_replacement(
+                            raw_row=raw_row,
+                            candidate_row=candidate_row,
+                            config=self.geometry_config,
+                        )
+                        if selected is not None:
+                            selected_mask = torch.as_tensor(
+                                selected["mask"]
+                            ).detach().cpu().bool()
+                            frame_applied += 1
+                            applied_count += 1
+                            row["correction_applied"] = 1
+                            row["candidate_mask_pixels"] = int(
+                                selected["mask_pixels"]
+                            )
+                            row.update(
+                                {
+                                    "candidate_score": float(selected["score"]),
+                                    "candidate_support_recall": float(
+                                        selected["support_recall"]
+                                    ),
+                                    "candidate_box_precision": float(
+                                        selected["box_precision"]
+                                    ),
+                                    "candidate_support_precision": float(
+                                        selected["support_precision"]
+                                    ),
+                                    "candidate_geometry_score": float(
+                                        selected["geometry_score"]
+                                    ),
+                                }
+                            )
+                        else:
+                            if candidate_row is not None:
+                                row["candidate_mask_pixels"] = int(
+                                    candidate_row["mask_pixels"]
+                                )
+                                row.update(
+                                    {
+                                        "candidate_score": float(
+                                            candidate_row["score"]
+                                        ),
+                                        "candidate_support_recall": float(
+                                            candidate_row["support_recall"]
+                                        ),
+                                        "candidate_box_precision": float(
+                                            candidate_row["box_precision"]
+                                        ),
+                                        "candidate_support_precision": float(
+                                            candidate_row["support_precision"]
+                                        ),
+                                        "candidate_geometry_score": float(
+                                            candidate_row["geometry_score"]
+                                        ),
+                                    }
+                                )
+                            row["reason"] = reason
+                    except Exception as exc:
+                        # A geometry prompt is an optional refinement.  A
+                        # backend failure must never remove the raw track.
+                        row["reason"] = "keep_raw:prompt_error"
+                        row["error_type"] = type(exc).__name__
+
+                memory_update = memory.update(
+                    observation.instance_id,
+                    current_geometry,
+                    selected_mask,
+                    frame_id=frame_id,
+                    score=float(observation.score),
+                )
+                row["memory_updated"] = int(bool(memory_update["updated"]))
+                row["memory_update_reason"] = str(memory_update["reason"])
+                row["memory_point_count"] = int(memory_update["point_count"])
+                row.setdefault("reason", "keep_raw:unknown")
+                row["geometry_guidance"] = True
+                metadata = dict(observation.metadata)
+                metadata["geometry_guidance"] = dict(row)
+                output_observations.append(
+                    replace(observation, mask=selected_mask, metadata=metadata)
+                )
+                diagnostics.append(row)
+            output_frames.append(
+                SegmentationFrame(
+                    frame_id=frame_id,
+                    image_size=raw_frame.image_size,
+                    observations=tuple(output_observations),
+                    backend=self.backend_name,
+                    metadata={
+                        **dict(raw_frame.metadata),
+                        "geometry_guidance": True,
+                        "geometry_guidance_attempted": int(frame_attempted),
+                        "geometry_guidance_applied": int(frame_applied),
+                    },
+                )
+            )
+        self.last_diagnostics = diagnostics
+        self.last_summary = {
+            "enabled": True,
+            "config": self.geometry_config.to_dict(),
+            "observation_count": int(len(diagnostics)),
+            "attempted_count": int(attempted_count),
+            "applied_count": int(applied_count),
+            "fallback_count": int(len(diagnostics) - applied_count),
+            "memory": memory.summary(),
+            **summarize_diagnostics(diagnostics),
+        }
+        return tuple(output_frames)
 
 
 class V0CacheGeometryAdapter:

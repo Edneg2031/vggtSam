@@ -206,6 +206,27 @@ class SegmentationProvider(Protocol):
 
 
 @runtime_checkable
+class GeometryAwareSegmentationProvider(Protocol):
+    """Optional segmentation interface that consumes frozen geometry.
+
+    This is intentionally a separate protocol instead of adding geometry to
+    :class:`SegmentationProvider`.  Existing SAM adapters therefore keep the
+    exact baseline API, while a future segmentation backend can opt into
+    causal geometry prompts without making the pipeline depend on it.
+    """
+
+    backend_name: str
+
+    def infer_with_geometry(
+        self,
+        image_paths: Sequence[str | Path],
+        geometry_frames: Sequence[GeometryFrame],
+        prompts: Sequence[str] | None = None,
+    ) -> Sequence[SegmentationFrame]:
+        ...
+
+
+@runtime_checkable
 class StreamingGeometryProvider(Protocol):
     """Optional frame-at-a-time interface for a native streaming backend."""
 

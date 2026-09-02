@@ -31,6 +31,7 @@ from streaming_couping.src.rgb_inputs import (
     selected_positions,
 )
 from streaming_couping.src.semantic_mapping.adapters import (
+    GeometryAwareSAM31SegmentationAdapter,
     HorizonStreamGeometryCacheAdapter,
     SAM31SegmentationAdapter,
     StreamVGGTGeometryAdapter,
@@ -39,6 +40,7 @@ from streaming_couping.src.semantic_mapping.adapters import (
 )
 from streaming_couping.src.semantic_mapping.export import export_semantic_map
 from streaming_couping.src.semantic_mapping.mapping import (
+    MapWriteGateConfig,
     SemanticMapBuilder,
     SemanticMapConfig,
 )
@@ -63,6 +65,21 @@ def main() -> None:
             max_points_per_track=args.max_points_per_track,
             max_voxels=args.max_voxels,
             max_scene_voxels=args.max_scene_voxels,
+            map_write_gate=MapWriteGateConfig(
+                enabled=args.map_write_gate,
+                min_observations_before_write=args.map_write_min_observations,
+                reentry_confirmation_frames=args.map_write_reentry_confirmation,
+                reentry_gap=args.map_write_reentry_gap,
+                min_mask_pixels=args.map_write_min_mask_pixels,
+                min_observation_points=args.map_write_min_observation_points,
+                min_reliability=args.map_write_min_reliability,
+                min_reprojection_consistency=(
+                    args.map_write_min_reprojection_consistency
+                ),
+                min_area_ratio=args.map_write_min_area_ratio,
+                max_area_ratio=args.map_write_max_area_ratio,
+                soft_weight_floor=args.map_write_soft_weight_floor,
+            ),
         )
     )
     if args.cache:
@@ -208,13 +225,20 @@ def _run_from_rgb(
         grounding_batch_size=args.sam_grounding_batch_size,
         offload_video_to_cpu=args.sam_offload_video_to_cpu,
     ).load()
-    segmentation = SAM31SegmentationAdapter(
-        sam,
-        output_size=segmentation_output_size,
-        max_objects_per_prompt=recovery.sam3_max_num_objects,
-        max_total_objects=args.max_objects,
-        min_birth_pixels=recovery.min_pixels,
-    )
+    segmentation_kwargs = {
+        "output_size": segmentation_output_size,
+        "max_objects_per_prompt": recovery.sam3_max_num_objects,
+        "max_total_objects": args.max_objects,
+        "min_birth_pixels": recovery.min_pixels,
+    }
+    if args.geometry_guidance:
+        segmentation = GeometryAwareSAM31SegmentationAdapter(
+            sam,
+            **segmentation_kwargs,
+            geometry_config=args.geometry_guidance_config,
+        )
+    else:
+        segmentation = SAM31SegmentationAdapter(sam, **segmentation_kwargs)
     pipeline = SemanticMapPipeline(
         geometry=geometry,
         segmentation=segmentation,
@@ -237,6 +261,8 @@ def _run_from_rgb(
             "stride": int(args.frame_stride),
             "count": int(args.frame_count),
         },
+        "geometry_guidance": bool(args.geometry_guidance),
+        "map_write_gate": bool(args.map_write_gate),
         **selection.metadata,
     }
     if geometry_payload is None:
@@ -362,7 +388,85 @@ def _parse_args() -> argparse.Namespace:
         default=1_000_000,
         help="Maximum full-scene voxels retained in exported artifacts.",
     )
+    parser.add_argument(
+        "--geometry-guidance",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use causal previous-world-point prompts to compete with raw SAM; "
+            "disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--geometry-guidance-prompt-mode",
+        choices=("box_points", "box_only", "points_only"),
+        default="box_points",
+    )
+    parser.add_argument("--geometry-guidance-min-history-points", type=int, default=16)
+    parser.add_argument("--geometry-guidance-max-history-points", type=int, default=4096)
+    parser.add_argument("--geometry-guidance-max-history-frames", type=int, default=8)
+    parser.add_argument("--geometry-guidance-max-history-gap", type=int, default=30)
+    parser.add_argument("--geometry-guidance-max-positive-points", type=int, default=6)
+    parser.add_argument(
+        "--geometry-guidance-min-candidate-support",
+        type=float,
+        default=0.25,
+    )
+    parser.add_argument(
+        "--geometry-guidance-reliable-support-margin",
+        type=float,
+        default=0.10,
+    )
+    parser.add_argument(
+        "--geometry-guidance-reliable-score-margin",
+        type=float,
+        default=0.10,
+    )
+    parser.add_argument(
+        "--geometry-guidance-max-area-ratio",
+        type=float,
+        default=4.0,
+    )
+    parser.add_argument(
+        "--map-write-gate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable causal short/long object memory for semantic voxel writes; "
+            "tracks remain available when a write is deferred."
+        ),
+    )
+    parser.add_argument("--map-write-min-observations", type=int, default=2)
+    parser.add_argument("--map-write-reentry-confirmation", type=int, default=2)
+    parser.add_argument("--map-write-reentry-gap", type=int, default=3)
+    parser.add_argument("--map-write-min-mask-pixels", type=int, default=32)
+    parser.add_argument("--map-write-min-observation-points", type=int, default=16)
+    parser.add_argument("--map-write-min-reliability", type=float, default=0.20)
+    parser.add_argument(
+        "--map-write-min-reprojection-consistency",
+        type=float,
+        default=0.20,
+    )
+    parser.add_argument("--map-write-min-area-ratio", type=float, default=0.35)
+    parser.add_argument("--map-write-max-area-ratio", type=float, default=2.85)
+    parser.add_argument("--map-write-soft-weight-floor", type=float, default=0.25)
     args = parser.parse_args()
+    from streaming_couping.src.semantic_mapping.geometry_guidance import (
+        GeometryGuidanceConfig,
+    )
+
+    args.geometry_guidance_config = GeometryGuidanceConfig(
+        min_history_points=args.geometry_guidance_min_history_points,
+        max_history_points=args.geometry_guidance_max_history_points,
+        max_history_frames=args.geometry_guidance_max_history_frames,
+        max_history_gap=args.geometry_guidance_max_history_gap,
+        prompt_mode=args.geometry_guidance_prompt_mode,
+        max_positive_points=args.geometry_guidance_max_positive_points,
+        min_candidate_support_recall=args.geometry_guidance_min_candidate_support,
+        reliable_support_margin=args.geometry_guidance_reliable_support_margin,
+        reliable_score_margin=args.geometry_guidance_reliable_score_margin,
+        max_area_ratio=args.geometry_guidance_max_area_ratio,
+    ).validate()
     if args.cache is not None and args.geometry_cache is not None:
         parser.error("--geometry-cache cannot be combined with the frozen V0 --cache.")
     return args

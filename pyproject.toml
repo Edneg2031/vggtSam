@@ -27,3 +27,6 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["streaming_couping*"]
+
+[tool.pytest.ini_options]
+testpaths = ["streaming_couping/tests"]
