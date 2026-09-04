@@ -1,0 +1,8 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# Memory-safe sampled version of the unchanged SAM3.1 + HorizonStream raw
+# baseline.  Every third source RGB frame is used by both stages.
+SCRIPT_DIR="${0:A:h}"
+FRAME_STRIDE=3 BASELINE_OUTPUT_TAG=stride3 \
+  exec zsh "$SCRIPT_DIR/commands_run_two_dataset_baseline.txt"

@@ -18,9 +18,18 @@ WUHAN_FRAMES="/home/bod/182Nas/share/BaZhuaYu/DemoData/xiaoyi/wuhan_A3/images"
 MEETING_ROOM_FRAMES="/home/bod/182Nas/share/BaZhuaYu/DemoData/xiaoyi/blind_data/meeting_room_a02/frames"
 
 # 0 means all images after FRAME_START, in deterministic directory order.
-FRAME_START=0
-FRAME_STRIDE=1
-FRAME_COUNT=0
+# These can be overridden by a small wrapper command for sampled runs.
+FRAME_START="${FRAME_START:-0}"
+FRAME_STRIDE="${FRAME_STRIDE:-1}"
+FRAME_COUNT="${FRAME_COUNT:-0}"
+
+if [[ -n "${BASELINE_OUTPUT_TAG:-}" ]]; then
+  RUN_TAG="$BASELINE_OUTPUT_TAG"
+elif [[ "$FRAME_START" == 0 && "$FRAME_STRIDE" == 1 && "$FRAME_COUNT" == 0 ]]; then
+  RUN_TAG="allf"
+else
+  RUN_TAG="sampled_s${FRAME_STRIDE}_start${FRAME_START}_count${FRAME_COUNT}"
+fi
 
 # Scene-relevant text prompts.  The mapping algorithm remains the raw
 # baseline; this list only controls which SAM3 categories are requested.
@@ -81,10 +90,21 @@ fi
 "$HORIZON_PYTHON" -c \
   'import iopath, ftfy, regex, huggingface_hub, timm, einops, pycocotools' >/dev/null
 
+print_sam_gpu_memory() {
+  local gpu_index="${SAM_DEVICE#cuda:}"
+  if (( $+commands[nvidia-smi] )); then
+    nvidia-smi --id="$gpu_index" \
+      --query-gpu=index,memory.used,memory.free,memory.total \
+      --format=csv,noheader,nounits || print "nvidia-smi query failed"
+  else
+    print "nvidia-smi unavailable"
+  fi
+}
+
 run_baseline() {
   local dataset_name="$1"
   local frames_dir="$2"
-  local run_output="$STORAGE_ROOT/outputs/${dataset_name}_horizonstream_sam3_baseline_allf"
+  local run_output="$STORAGE_ROOT/outputs/${dataset_name}_horizonstream_sam3_baseline_${RUN_TAG}"
   local geometry_cache="$run_output/horizonstream_geometry.pt"
 
   [[ -d "$frames_dir" ]] || {
@@ -113,6 +133,8 @@ run_baseline() {
     --reuse-if-valid
 
   print "===== ${dataset_name}: SAM3.1 semantic-map fusion ====="
+  print "SAM GPU memory before loading/tracking (MiB):"
+  print_sam_gpu_memory
   "$HORIZON_PYTHON" \
     -m streaming_couping.scripts.run_semantic_map \
     --frames "$frames_dir" \
@@ -133,7 +155,7 @@ run_baseline() {
   print "baseline output=${run_output}"
 }
 
-print "baseline=SAM3.1+HorizonStream policy=raw frames=all"
+print "baseline=SAM3.1+HorizonStream policy=raw frame_start=${FRAME_START} frame_stride=${FRAME_STRIDE} frame_count=${FRAME_COUNT} tag=${RUN_TAG}"
 print "horizon_device=${HORIZON_DEVICE} sam_device=${SAM_DEVICE} window=${HORIZON_WINDOW_SIZE} sliding=${HORIZON_SLIDING_SIZE}"
 print "prompts=${(j:,:)PROMPTS}"
 
@@ -141,5 +163,5 @@ run_baseline "wuhan_A3" "$WUHAN_FRAMES"
 run_baseline "meeting_room_a02" "$MEETING_ROOM_FRAMES"
 
 print "===== TWO-DATASET BASELINE COMPLETE ====="
-print "wuhan_output=$STORAGE_ROOT/outputs/wuhan_A3_horizonstream_sam3_baseline_allf"
-print "meeting_room_output=$STORAGE_ROOT/outputs/meeting_room_a02_horizonstream_sam3_baseline_allf"
+print "wuhan_output=$STORAGE_ROOT/outputs/wuhan_A3_horizonstream_sam3_baseline_${RUN_TAG}"
+print "meeting_room_output=$STORAGE_ROOT/outputs/meeting_room_a02_horizonstream_sam3_baseline_${RUN_TAG}"
