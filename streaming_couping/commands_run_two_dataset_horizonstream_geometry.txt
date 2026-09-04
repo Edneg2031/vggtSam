@@ -14,9 +14,10 @@ HORIZON_CHECKPOINT="${HORIZONSTREAM_CHECKPOINT:-/home/bod/86Nas/95_data_bak/Foun
 
 WUHAN_FRAMES="/home/bod/182Nas/share/BaZhuaYu/DemoData/xiaoyi/wuhan_A3/images"
 MEETING_ROOM_FRAMES="/home/bod/182Nas/share/BaZhuaYu/DemoData/xiaoyi/blind_data/meeting_room_a02/frames"
+MINGXIANG_FRAMES="/home/bod/163Nas/MapToolChain/Remy_project_v3_036/mingxiangshiquankaideng/images"
 
 FRAME_START="${FRAME_START:-0}"
-FRAME_STRIDE="${FRAME_STRIDE:-2}"
+FRAME_STRIDE="${FRAME_STRIDE:-1}"
 FRAME_COUNT="${FRAME_COUNT:-0}"
 HORIZON_WINDOW_SIZE="${HORIZONSTREAM_WINDOW_SIZE:-10}"
 HORIZON_SLIDING_SIZE="${HORIZONSTREAM_SLIDING_SIZE:-5}"
@@ -140,5 +141,6 @@ run_geometry() {
 
 run_geometry "wuhan_A3" "$WUHAN_FRAMES"
 run_geometry "meeting_room_a02" "$MEETING_ROOM_FRAMES"
+run_geometry "mingxiangshiquankaideng" "$MINGXIANG_FRAMES"
 
-print "===== TWO-DATASET HORIZONSTREAM GEOMETRY COMPLETE ====="
+print "===== THREE-DATASET HORIZONSTREAM GEOMETRY COMPLETE ====="
