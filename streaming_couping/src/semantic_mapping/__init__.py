@@ -52,6 +52,12 @@ from .object_pose_refinement import (
     weighted_rigid_transform,
     write_pose_refinement_debug,
 )
+from .object_pose_loss_refinement import (
+    ObjectCloudObservation,
+    ObjectLossEdge,
+    ObjectPoseLossRefinementConfig,
+    ObjectPoseLossRefiner,
+)
 from .evaluation import (
     ExportedMapMetricConfig,
     SimilarityAlignment,
@@ -123,4 +129,8 @@ __all__ = [
     "estimate_rigid_transform_ransac",
     "weighted_rigid_transform",
     "write_pose_refinement_debug",
+    "ObjectCloudObservation",
+    "ObjectLossEdge",
+    "ObjectPoseLossRefinementConfig",
+    "ObjectPoseLossRefiner",
 ]

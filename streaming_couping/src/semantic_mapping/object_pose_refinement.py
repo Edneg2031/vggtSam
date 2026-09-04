@@ -1124,6 +1124,12 @@ def apply_refined_camera_poses(
         )
     }
     output = []
+    refinement_source = str(
+        refinement.summary.get(
+            "method",
+            "sam_instance_object_edges",
+        )
+    )
     for frame in geometry_frames:
         frame_id = int(frame.frame_id)
         if frame_id not in pose_by_frame:
@@ -1134,7 +1140,7 @@ def apply_refined_camera_poses(
             {
                 "pose_variant": "object_pose_refined",
                 "pose_refinement_applied": True,
-                "pose_refinement_source": "sam_instance_object_edges",
+                "pose_refinement_source": refinement_source,
             }
         )
         if frame.depth is not None:

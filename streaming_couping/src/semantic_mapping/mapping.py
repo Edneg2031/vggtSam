@@ -37,6 +37,7 @@ class SemanticMapConfig:
     static_score_threshold: float = 0.20
     require_static_score: bool = False
     include_dynamic_tracks: bool = True
+    object_only: bool = False
     max_points_per_observation: int = 8_000
     max_points_per_track: int = 250_000
     max_voxels: int = 1_000_000
@@ -764,7 +765,7 @@ class SemanticMapBuilder:
         confidence = geometry_confidence_for_frame(geometry)
         valid = point_valid & (confidence >= self.config.min_geometry_confidence)
         rgb = rgb_for_frame(geometry)
-        if bool(valid.any()):
+        if bool(valid.any()) and not bool(self.config.object_only):
             self._add_scene_voxels(
                 points=points[valid],
                 weights=confidence[valid],
@@ -1112,6 +1113,7 @@ class SemanticMapBuilder:
         result_metadata.setdefault("coordinate_frame", "world")
         result_metadata.setdefault("map_pose_feedback", False)
         result_metadata.setdefault("pointmap_modified", False)
+        result_metadata.setdefault("object_only", bool(self.config.object_only))
         result_metadata.setdefault(
             "map_write_gate",
             {

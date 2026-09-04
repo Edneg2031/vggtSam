@@ -53,6 +53,10 @@ from streaming_couping.src.semantic_mapping.object_pose_refinement import (
     create_object_feature_matcher,
     write_pose_refinement_debug,
 )
+from streaming_couping.src.semantic_mapping.object_pose_loss_refinement import (
+    ObjectPoseLossRefinementConfig,
+    ObjectPoseLossRefiner,
+)
 from streaming_couping.src.semantic_mapping.pipeline import SemanticMapPipeline
 from streaming_couping.src.semantic_mapping.pipeline import (
     SemanticMapPoseRefinementRun,
@@ -76,6 +80,7 @@ def main() -> None:
             static_score_threshold=args.static_score_threshold,
             require_static_score=args.require_static_score,
             include_dynamic_tracks=not args.exclude_dynamic_tracks,
+            object_only=args.object_only,
             max_points_per_observation=args.max_points_per_observation,
             max_points_per_track=args.max_points_per_track,
             max_voxels=args.max_voxels,
@@ -136,9 +141,9 @@ def _run_from_cache(
     prompts: tuple[str, ...],
     mapper: SemanticMapBuilder,
 ):
-    if args.object_pose_refinement:
+    if args.object_pose_refinement or args.object_pose_loss_refinement:
         raise ValueError(
-            "--object-pose-refinement currently requires RGB mode with a "
+            "object pose refinement currently requires RGB mode with a "
             "geometry provider that exposes camera poses; frozen V0 cache "
             "replay has no canonical intrinsics/pose contract."
         )
@@ -249,7 +254,8 @@ def _run_from_rgb(
         f"sam_device={recovery.sam3_device} "
         f"sam_grounding_batch={args.sam_grounding_batch_size} "
         f"sam_video_cpu_offload={int(args.sam_offload_video_to_cpu)} "
-        f"object_pose_refinement={int(args.object_pose_refinement)}"
+        f"object_pose_refinement={int(args.object_pose_refinement or args.object_pose_loss_refinement)} "
+        f"object_pose_loss_refinement={int(args.object_pose_loss_refinement)}"
     )
     from streaming_couping.src.backbones.sam3_wrapper import SAM3Wrapper
 
@@ -281,7 +287,10 @@ def _run_from_rgb(
     else:
         segmentation = SAM31SegmentationAdapter(sam, **segmentation_kwargs)
     object_pose_refiner = None
-    if args.object_pose_refinement:
+    if args.object_pose_loss_refinement:
+        object_pose_config = _object_pose_loss_config(args)
+        object_pose_refiner = ObjectPoseLossRefiner(object_pose_config)
+    elif args.object_pose_refinement:
         object_pose_config = _object_pose_config(args)
         object_pose_refiner = ObjectPoseRefiner(
             object_pose_config,
@@ -666,6 +675,14 @@ def _parse_args() -> argparse.Namespace:
         help="Maximum full-scene voxels retained in exported artifacts.",
     )
     parser.add_argument(
+        "--object-only",
+        action="store_true",
+        help=(
+            "Do not accumulate the parallel full-scene voxel map; retain only "
+            "prompted object-level outputs."
+        ),
+    )
+    parser.add_argument(
         "--geometry-guidance",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -712,6 +729,41 @@ def _parse_args() -> argparse.Namespace:
             "exports raw and refined maps separately; default is unchanged."
         ),
     )
+    parser.add_argument(
+        "--object-pose-loss-refinement",
+        action="store_true",
+        help=(
+            "Opt in to causal SAM-instance object point-cloud alignment loss. "
+            "Only the current pose is optimized against earlier anchors; the "
+            "default baseline is unchanged."
+        ),
+    )
+    parser.add_argument("--object-pose-loss-anchor-frames", type=int, default=5)
+    parser.add_argument("--object-pose-loss-max-anchor-observations", type=int, default=3)
+    parser.add_argument("--object-pose-loss-max-history-observations", type=int, default=2)
+    parser.add_argument("--object-pose-loss-max-points-per-observation", type=int, default=256)
+    parser.add_argument("--object-pose-loss-min-points-per-observation", type=int, default=24)
+    parser.add_argument("--object-pose-loss-min-track-score", type=float, default=0.50)
+    parser.add_argument("--object-pose-loss-static-score-threshold", type=float, default=0.20)
+    parser.add_argument("--object-pose-loss-require-static-score", action="store_true")
+    parser.add_argument("--object-pose-loss-min-geometry-confidence", type=float, default=0.30)
+    parser.add_argument("--object-pose-loss-min-mask-pixels", type=int, default=32)
+    parser.add_argument("--object-pose-loss-max-mask-area-ratio", type=float, default=0.85)
+    parser.add_argument("--object-pose-loss-max-match-distance-m", type=float, default=0.25)
+    parser.add_argument("--object-pose-loss-trim-ratio", type=float, default=0.70)
+    parser.add_argument("--object-pose-loss-min-matches-per-pair", type=int, default=8)
+    parser.add_argument("--object-pose-loss-min-total-matches", type=int, default=16)
+    parser.add_argument("--object-pose-loss-outer-iterations", type=int, default=4)
+    parser.add_argument("--object-pose-loss-optimizer-steps", type=int, default=30)
+    parser.add_argument("--object-pose-loss-learning-rate", type=float, default=0.03)
+    parser.add_argument("--object-pose-loss-huber-delta-m", type=float, default=0.05)
+    parser.add_argument("--object-pose-loss-pose-prior-weight", type=float, default=0.02)
+    parser.add_argument("--object-pose-loss-anchor-reference-weight", type=float, default=1.0)
+    parser.add_argument("--object-pose-loss-local-reference-weight", type=float, default=0.50)
+    parser.add_argument("--object-pose-loss-max-correction-rotation-deg", type=float, default=10.0)
+    parser.add_argument("--object-pose-loss-max-correction-translation-m", type=float, default=0.25)
+    parser.add_argument("--object-pose-loss-min-relative-improvement", type=float, default=0.02)
+    parser.add_argument("--object-pose-loss-device", default="cpu")
     parser.add_argument("--object-pose-min-gap", type=int, default=10)
     parser.add_argument("--object-pose-min-track-score", type=float, default=0.50)
     parser.add_argument("--object-pose-min-mask-pixels", type=int, default=32)
@@ -908,6 +960,11 @@ def _parse_args() -> argparse.Namespace:
         help="Weight multiplier applied to retained novel points.",
     )
     args = parser.parse_args()
+    if args.object_pose_refinement and args.object_pose_loss_refinement:
+        parser.error(
+            "--object-pose-refinement and --object-pose-loss-refinement "
+            "are mutually exclusive."
+        )
     from streaming_couping.src.semantic_mapping.geometry_guidance import (
         GeometryGuidanceConfig,
     )
@@ -969,6 +1026,39 @@ def _object_pose_config(args: argparse.Namespace) -> ObjectPoseRefinementConfig:
         dinov3_variant=args.object_pose_dinov3_variant,
         dinov3_device=args.object_pose_dinov3_device,
         dinov3_dtype=args.object_pose_dinov3_dtype,
+    ).validate()
+
+
+def _object_pose_loss_config(
+    args: argparse.Namespace,
+) -> ObjectPoseLossRefinementConfig:
+    return ObjectPoseLossRefinementConfig(
+        anchor_frame_count=args.object_pose_loss_anchor_frames,
+        max_anchor_observations=args.object_pose_loss_max_anchor_observations,
+        max_history_observations=args.object_pose_loss_max_history_observations,
+        max_points_per_observation=args.object_pose_loss_max_points_per_observation,
+        min_points_per_observation=args.object_pose_loss_min_points_per_observation,
+        min_track_score=args.object_pose_loss_min_track_score,
+        static_score_threshold=args.object_pose_loss_static_score_threshold,
+        require_static_score=args.object_pose_loss_require_static_score,
+        min_geometry_confidence=args.object_pose_loss_min_geometry_confidence,
+        min_mask_pixels=args.object_pose_loss_min_mask_pixels,
+        max_mask_area_ratio=args.object_pose_loss_max_mask_area_ratio,
+        max_match_distance_m=args.object_pose_loss_max_match_distance_m,
+        trim_ratio=args.object_pose_loss_trim_ratio,
+        min_matches_per_pair=args.object_pose_loss_min_matches_per_pair,
+        min_total_matches=args.object_pose_loss_min_total_matches,
+        outer_iterations=args.object_pose_loss_outer_iterations,
+        optimizer_steps=args.object_pose_loss_optimizer_steps,
+        learning_rate=args.object_pose_loss_learning_rate,
+        huber_delta_m=args.object_pose_loss_huber_delta_m,
+        pose_prior_weight=args.object_pose_loss_pose_prior_weight,
+        anchor_reference_weight=args.object_pose_loss_anchor_reference_weight,
+        local_reference_weight=args.object_pose_loss_local_reference_weight,
+        max_correction_rotation_deg=args.object_pose_loss_max_correction_rotation_deg,
+        max_correction_translation_m=args.object_pose_loss_max_correction_translation_m,
+        min_relative_loss_improvement=args.object_pose_loss_min_relative_improvement,
+        device=args.object_pose_loss_device,
     ).validate()
 
 

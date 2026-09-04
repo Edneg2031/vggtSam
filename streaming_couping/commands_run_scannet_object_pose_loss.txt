@@ -1,0 +1,147 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# ScanNet++ object-only experiment:
+# frozen HorizonStream depth/pose + one causal SAM3.1 run +
+# SAM-instance object point-cloud alignment loss.  The raw_pose branch is the
+# unchanged object-map baseline; object_pose_refined optimizes only the
+# current camera pose against earlier object anchors.
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+HORIZON_PYTHON="${HORIZONSTREAM_PYTHON:-/home/huawei/miniconda3/envs/horizonstream/bin/python}"
+SAM_PYTHON="${STREAMING_COUPING_PYTHON:-$HORIZON_PYTHON}"
+HORIZON_REPO="$ROOT/externals/horizonstream"
+HORIZON_CHECKPOINT="${HORIZONSTREAM_CHECKPOINT:-/home/bod/86Nas/95_data_bak/FoundationModels/HorizonStream.pt}"
+HORIZON_DEVICE="${HORIZONSTREAM_DEVICE:-cuda:0}"
+SAM_DEVICE="${SAM_DEVICE:-cuda:2}"
+
+MANIFEST_PATH="$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json"
+SCENE_ID="00a231a370"
+FRAME_START=90
+FRAME_STRIDE=1
+FRAME_COUNT=50
+PROMPTS=("bed" "wardrobe" "chair" "rug" "dustbin")
+
+BASELINE_OUTPUT_DIR="$STORAGE_ROOT/outputs/semantic_map_50frames_horizonstream_consecutive"
+GEOMETRY_CACHE="${HORIZONSTREAM_GEOMETRY_CACHE:-$BASELINE_OUTPUT_DIR/horizonstream_geometry.pt}"
+OUTPUT_DIR="${OBJECT_POSE_LOSS_OUTPUT_DIR:-$STORAGE_ROOT/outputs/semantic_map_50frames_horizonstream_object_pose_loss}"
+RECOVERY_CONFIG="${RECOVERY_CONFIG_PATH:-$ROOT/streaming_couping/configs/recovery_dynamic_instance.yaml}"
+RUN_LOG="$OUTPUT_DIR/run.log"
+
+cd "$ROOT"
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+[[ -x "$HORIZON_PYTHON" ]] || { print -u2 "missing Python: $HORIZON_PYTHON"; exit 1; }
+[[ -x "$SAM_PYTHON" ]] || { print -u2 "missing Python: $SAM_PYTHON"; exit 1; }
+[[ -d "$HORIZON_REPO/horizonstream" ]] || { print -u2 "missing HorizonStream source: $HORIZON_REPO"; exit 1; }
+[[ -f "$HORIZON_CHECKPOINT" ]] || { print -u2 "missing HorizonStream checkpoint: $HORIZON_CHECKPOINT"; exit 1; }
+[[ -f "$MANIFEST_PATH" ]] || { print -u2 "missing ScanNet++ manifest: $MANIFEST_PATH"; exit 1; }
+[[ -f "$RECOVERY_CONFIG" ]] || { print -u2 "missing recovery config: $RECOVERY_CONFIG"; exit 1; }
+
+if ! "$SAM_PYTHON" -c 'import iopath, ftfy, regex, huggingface_hub, timm, einops, pycocotools' >/dev/null 2>&1; then
+  print -u2 "SAM3 runtime dependencies are missing; run the baseline dependency setup first."
+  exit 1
+fi
+
+mkdir -p "$OUTPUT_DIR"
+
+HORIZON_ARGS=(
+  --manifest "$MANIFEST_PATH"
+  --scene-id "$SCENE_ID"
+  --frame-start "$FRAME_START"
+  --frame-stride "$FRAME_STRIDE"
+  --frame-count "$FRAME_COUNT"
+  --repo-path "$HORIZON_REPO"
+  --checkpoint "$HORIZON_CHECKPOINT"
+  --output-cache "$GEOMETRY_CACHE"
+  --device "$HORIZON_DEVICE"
+  --window-size 10
+  --sliding-size 1
+  --image-size 518
+  --patch-size 14
+  --crop
+  --precision float16
+  --reuse-if-valid
+)
+
+print "===== OBJECT-LEVEL POSE LOSS REFINEMENT ====="
+print "scene=$SCENE_ID frames=$FRAME_COUNT frame_start=$FRAME_START frame_stride=$FRAME_STRIDE"
+print "horizon_device=$HORIZON_DEVICE sam_device=$SAM_DEVICE loss_device=cpu"
+print "geometry_cache=$GEOMETRY_CACHE"
+print "output=$OUTPUT_DIR"
+
+PYTHONPATH="$HORIZON_REPO:$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$HORIZON_PYTHON" -m streaming_couping.scripts.generate_horizonstream_geometry_cache \
+  "${HORIZON_ARGS[@]}"
+
+[[ -f "$GEOMETRY_CACHE" ]] || { print -u2 "missing geometry cache: $GEOMETRY_CACHE"; exit 1; }
+
+ARGS=(
+  --manifest "$MANIFEST_PATH"
+  --scene-id "$SCENE_ID"
+  --frame-start "$FRAME_START"
+  --frame-stride "$FRAME_STRIDE"
+  --frame-count "$FRAME_COUNT"
+  --prompts "${PROMPTS[@]}"
+  --geometry-cache "$GEOMETRY_CACHE"
+  --output-dir "$OUTPUT_DIR"
+  --fusion-policy raw
+  --recovery-config "$RECOVERY_CONFIG"
+  --sam-device "$SAM_DEVICE"
+  --sam-grounding-batch-size 1
+  --sam-offload-video-to-cpu
+  --object-only
+  --object-pose-loss-refinement
+  --object-pose-loss-anchor-frames 5
+  --object-pose-loss-max-anchor-observations 3
+  --object-pose-loss-max-history-observations 2
+  --object-pose-loss-max-points-per-observation 256
+  --object-pose-loss-min-points-per-observation 24
+  --object-pose-loss-min-track-score 0.50
+  --object-pose-loss-static-score-threshold 0.20
+  --object-pose-loss-min-geometry-confidence 0.30
+  --object-pose-loss-min-mask-pixels 32
+  --object-pose-loss-max-match-distance-m 0.25
+  --object-pose-loss-trim-ratio 0.70
+  --object-pose-loss-min-matches-per-pair 8
+  --object-pose-loss-min-total-matches 16
+  --object-pose-loss-outer-iterations 4
+  --object-pose-loss-optimizer-steps 30
+  --object-pose-loss-learning-rate 0.03
+  --object-pose-loss-huber-delta-m 0.05
+  --object-pose-loss-pose-prior-weight 0.02
+  --object-pose-loss-anchor-reference-weight 1.0
+  --object-pose-loss-local-reference-weight 0.50
+  --object-pose-loss-max-correction-rotation-deg 10.0
+  --object-pose-loss-max-correction-translation-m 0.25
+  --object-pose-loss-min-relative-improvement 0.02
+  --object-pose-loss-device cpu
+)
+
+print "running; full log will be saved to $RUN_LOG"
+set +e
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$SAM_PYTHON" -m streaming_couping.scripts.run_semantic_map \
+  "${ARGS[@]}" >"$RUN_LOG" 2>&1
+run_exit_code=$?
+set -e
+if (( run_exit_code != 0 )); then
+  print -u2 "object pose loss run failed status=$run_exit_code log=$RUN_LOG"
+  tail -n 50 "$RUN_LOG"
+  exit "$run_exit_code"
+fi
+
+SUMMARY_PATH="$OUTPUT_DIR/object_pose_refinement/pose_refinement_summary.json"
+COMPARISON_PATH="$OUTPUT_DIR/pose_refinement_comparison.json"
+[[ -f "$SUMMARY_PATH" && -f "$COMPARISON_PATH" ]] || {
+  print -u2 "run finished without expected summary files"
+  print -u2 "log=$RUN_LOG"
+  exit 1
+}
+
+print "===== OBJECT POSE LOSS SUMMARY ====="
+"$SAM_PYTHON" "$ROOT/streaming_couping/scripts/print_object_pose_loss_summary.py" \
+  "$SUMMARY_PATH" "$COMPARISON_PATH"
+print "full_log=$RUN_LOG"
