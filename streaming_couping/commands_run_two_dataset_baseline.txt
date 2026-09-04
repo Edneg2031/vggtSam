@@ -70,12 +70,16 @@ if ! "$HORIZON_PYTHON" -c 'import pkg_resources' >/dev/null 2>&1; then
     "setuptools==80.9.0"
   "$HORIZON_PYTHON" -c 'import pkg_resources' >/dev/null
 fi
-if ! "$HORIZON_PYTHON" -c 'import iopath' >/dev/null 2>&1; then
-  print "iopath missing; installing iopath>=0.1.10"
+if ! "$HORIZON_PYTHON" -c \
+  'import importlib.util; names=("iopath", "ftfy", "regex", "huggingface_hub", "timm", "einops"); raise SystemExit(any(importlib.util.find_spec(name) is None for name in names))' \
+  >/dev/null 2>&1; then
+  print "SAM3 runtime dependencies missing; installing compatible packages"
   "$HORIZON_PYTHON" -m pip install --disable-pip-version-check --no-input \
-    "iopath>=0.1.10"
-  "$HORIZON_PYTHON" -c 'import iopath' >/dev/null
+    "iopath>=0.1.10" "ftfy==6.1.1" "regex" \
+    "huggingface_hub" "timm>=1.0.17" "einops"
 fi
+"$HORIZON_PYTHON" -c \
+  'import iopath, ftfy, regex, huggingface_hub, timm, einops' >/dev/null
 
 run_baseline() {
   local dataset_name="$1"
