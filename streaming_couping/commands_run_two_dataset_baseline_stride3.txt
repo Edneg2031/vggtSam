@@ -2,10 +2,69 @@
 set -euo pipefail
 
 # Memory-safe sampled version of the unchanged SAM3.1 + HorizonStream raw
-# baseline. Every third source RGB frame is used by both stages. GPU0 may be
-# occupied by another job, so place HorizonStream on GPU1 and SAM3 on GPU2.
+# baseline. Every third source RGB frame is used by both stages. Select two
+# different GPUs with the most available memory; explicit environment values
+# still take precedence.
 SCRIPT_DIR="${0:A:h}"
-HORIZONSTREAM_DEVICE="${HORIZONSTREAM_DEVICE:-cuda:1}" \
-SAM3_DEVICE="${SAM3_DEVICE:-cuda:2}" \
+
+if [[ -z "${HORIZONSTREAM_DEVICE:-}" || -z "${SAM3_DEVICE:-}" ]]; then
+  (( $+commands[nvidia-smi] )) || {
+    print -u2 "nvidia-smi is required for automatic GPU selection"
+    exit 1
+  }
+
+  GPU_MEMORY_TABLE="$(nvidia-smi --query-gpu=index,memory.free,memory.total \
+    --format=csv,noheader,nounits)" || {
+    print -u2 "unable to query GPU memory with nvidia-smi"
+    exit 1
+  }
+  print "GPU memory at launch (index, free MiB, total MiB):"
+  print -r -- "$GPU_MEMORY_TABLE"
+
+  pick_gpu() {
+    local excluded="$1"
+    local minimum_free_mib="$2"
+    print -r -- "$GPU_MEMORY_TABLE" | awk -F, \
+      -v excluded="$excluded" -v minimum_free_mib="$minimum_free_mib" '
+      {
+        gsub(/[[:space:]]/, "", $1)
+        gsub(/[[:space:]]/, "", $2)
+        if ($1 == excluded || $2 < minimum_free_mib) next
+        if ($2 > best_free) {
+          best_free = $2
+          best_index = $1
+        }
+      }
+      END { if (best_index != "") print best_index }
+    '
+  }
+
+  if [[ -z "${SAM3_DEVICE:-}" ]]; then
+    # SAM3 is the tightest fit: prefer a nearly empty card.
+    SAM_EXCLUDED_INDEX=""
+    if [[ -n "${HORIZONSTREAM_DEVICE:-}" ]]; then
+      SAM_EXCLUDED_INDEX="${HORIZONSTREAM_DEVICE#cuda:}"
+    fi
+    SAM_GPU_INDEX="$(pick_gpu "$SAM_EXCLUDED_INDEX" 22000)"
+    [[ -n "$SAM_GPU_INDEX" ]] || {
+      print -u2 "no GPU has at least 22000 MiB free for SAM3"
+      exit 1
+    }
+    SAM3_DEVICE="cuda:${SAM_GPU_INDEX}"
+  fi
+
+  if [[ -z "${HORIZONSTREAM_DEVICE:-}" ]]; then
+    HORIZON_GPU_INDEX="$(pick_gpu "${SAM3_DEVICE#cuda:}" 10000)"
+    [[ -n "$HORIZON_GPU_INDEX" ]] || {
+      print -u2 "no second GPU has at least 10000 MiB free for HorizonStream"
+      exit 1
+    }
+    HORIZONSTREAM_DEVICE="cuda:${HORIZON_GPU_INDEX}"
+  fi
+fi
+
+print "selected horizon_device=${HORIZONSTREAM_DEVICE} sam_device=${SAM3_DEVICE}"
+HORIZONSTREAM_DEVICE="$HORIZONSTREAM_DEVICE" \
+SAM3_DEVICE="$SAM3_DEVICE" \
 FRAME_STRIDE=3 BASELINE_OUTPUT_TAG=stride3 \
   exec zsh "$SCRIPT_DIR/commands_run_two_dataset_baseline.txt"
