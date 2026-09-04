@@ -61,6 +61,7 @@ from .object_pose_loss_refinement import (
 from .evaluation import (
     ExportedMapMetricConfig,
     SimilarityAlignment,
+    evaluate_camera_trajectory,
     evaluate_exported_semantic_map,
     evaluate_pointmap_alignment,
     extract_exported_objects,
@@ -101,6 +102,7 @@ __all__ = [
     "StreamingGeometryProvider",
     "ExportedMapMetricConfig",
     "SimilarityAlignment",
+    "evaluate_camera_trajectory",
     "evaluate_exported_semantic_map",
     "evaluate_pointmap_alignment",
     "extract_exported_objects",

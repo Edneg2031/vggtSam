@@ -14,7 +14,10 @@ Typical use after ``commands_run_semantic_map.txt``::
 
 The manifest, scene, frame positions, and geometry cache are inferred from
 the exported metadata when possible.  They may be supplied explicitly when an
-artifact was moved to another machine.
+artifact was moved to another machine.  When a HorizonStream geometry cache is
+available, ScanNet++ ``frames[].world_to_camera`` is also used offline to
+report raw/refined ATE and adjacent-frame RPE.  The optional refined trajectory
+is discovered from ``object_pose_refinement/refined_camera_to_world.pt``.
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ from streaming_couping.src.semantic_mapping.adapters import (
 )
 from streaming_couping.src.semantic_mapping.evaluation import (
     ExportedMapMetricConfig,
+    evaluate_camera_trajectory,
     evaluate_exported_semantic_map,
     evaluate_pointmap_alignment,
     fit_reference_alignment,
@@ -49,7 +53,7 @@ from streaming_couping.src.semantic_tracking_metrics import (
 )
 
 
-REVISION = "exported_horizonstream_semantic_map_evaluation_r1"
+REVISION = "exported_horizonstream_semantic_map_evaluation_r2"
 
 
 def main() -> None:
@@ -124,6 +128,11 @@ def main() -> None:
         target_size=target_size,
         patch_size=patch_size,
     )
+    target_world_to_camera = _load_ground_truth_world_to_camera(
+        manifest,
+        scene_id=scene_id,
+        frame_indices=frame_positions,
+    )
 
     predicted_world_points = None
     confidence = None
@@ -179,6 +188,15 @@ def main() -> None:
             "reason": "geometry_cache_not_provided",
             "frames": [],
         }
+
+    pose_evaluation = _build_pose_evaluation(
+        input_source=args.input_dir or args.artifact,
+        geometry_payload=geometry_payload,
+        target_world_to_camera=target_world_to_camera,
+        frame_ids=frame_positions,
+        alignment=alignment,
+        refined_pose_path=args.refined_pose,
+    )
 
     metric_config = ExportedMapMetricConfig(
         object_metrics=SemanticMapMetricConfig(
@@ -240,6 +258,9 @@ def main() -> None:
             "object_count": len(result["object_rows"]),
             "duplicate_row_count": len(result["duplicate_rows"]),
         }
+        pose_branch = pose_evaluation.get("branches", {}).get(branch)
+        if isinstance(pose_branch, dict):
+            branch_summaries[branch]["pose"] = pose_branch.get("summary", {})
         map_summary_rows.append(summary)
         map_object_rows.extend(result["object_rows"])
         duplicate_rows.extend(result["duplicate_rows"])
@@ -258,6 +279,9 @@ def main() -> None:
         "map_source": args.map_source,
         "candidate_generation_gt_fields": 0,
         "evaluation_gt_fields": 1,
+        "pointmap_evaluation_gt_fields": 1,
+        "instance_evaluation_gt_fields": 1,
+        "pose_evaluation_gt_fields": 1,
         "geometry_cache": None if geometry_path is None else str(geometry_path),
         "alignment": (
             "reference_frame_sim3"
@@ -267,6 +291,10 @@ def main() -> None:
         "alignment_shared_across_branches": True,
         "pointmap_alignment": pointmap_alignment,
         "ground_truth": {
+            "pointmap_source": "manifest.frames[].pointmap",
+            "instance_mask_source": "manifest.frames[].instance_mask",
+            "object_metadata_source": "manifest.scenes[].objects",
+            "pose_source": "manifest.frames[].world_to_camera",
             "eligible_instance_ids": [int(value) for value in gt_info.instance_ids],
             "eligible_labels": [str(value) for value in gt_info.labels],
             "all_visible_instance_ids": [
@@ -274,11 +302,15 @@ def main() -> None:
             ],
             "prompts": list(prompts),
         },
+        "pose_evaluation": pose_evaluation,
         "branches": branch_summaries,
         "decision": "EVALUATION_ONLY; no runtime branch is promoted automatically",
         "outputs": {},
     }
     summary_path = output_dir / "summary.json"
+    pose_summary_rows = _pose_summary_rows(pose_evaluation, scene_id)
+    pose_frame_rows = _pose_frame_rows(pose_evaluation, scene_id)
+    pose_rpe_rows = _pose_rpe_rows(pose_evaluation, scene_id)
     outputs = {
         "summary": summary_path,
         "map_summary": _write_csv(output_dir / "map_summary.csv", map_summary_rows),
@@ -291,6 +323,18 @@ def main() -> None:
             output_dir / "pointmap_alignment_frames.csv",
             _pointmap_frame_rows(pointmap_alignment, scene_id),
         ),
+        "pose_summary": _write_csv(
+            output_dir / "pose_summary.csv",
+            pose_summary_rows,
+        ),
+        "pose_frames": _write_csv(
+            output_dir / "pose_frames.csv",
+            pose_frame_rows,
+        ),
+        "pose_rpe": _write_csv(
+            output_dir / "pose_rpe.csv",
+            pose_rpe_rows,
+        ),
     }
     summary["outputs"] = {name: str(path) for name, path in outputs.items()}
     summary_path.write_text(
@@ -299,8 +343,14 @@ def main() -> None:
         encoding="utf8",
     )
     copyable = output_dir / "copyable_result.txt"
-    _write_copyable(copyable, summary, map_summary_rows, pointmap_alignment)
-    _print_summary(summary, map_summary_rows, pointmap_alignment)
+    _write_copyable(
+        copyable,
+        summary,
+        map_summary_rows,
+        pointmap_alignment,
+        pose_evaluation,
+    )
+    _print_summary(summary, map_summary_rows, pointmap_alignment, pose_evaluation)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -320,6 +370,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, default=None)
     parser.add_argument("--scene-id", default=None)
     parser.add_argument("--geometry-cache", type=Path, default=None)
+    parser.add_argument(
+        "--refined-pose",
+        type=Path,
+        default=None,
+        help=(
+            "Optional refined_camera_to_world.pt. By default the evaluator "
+            "looks under input-dir/object_pose_refinement/."
+        ),
+    )
     parser.add_argument(
         "--frame-indices",
         nargs="+",
@@ -588,6 +647,260 @@ def _resolve_output_dir(args: argparse.Namespace, artifacts: dict[str, Path]) ->
     return common / "evaluation"
 
 
+def _load_ground_truth_world_to_camera(
+    manifest: Path,
+    *,
+    scene_id: str,
+    frame_indices: tuple[int, ...],
+) -> torch.Tensor:
+    """Load ScanNet++ camera-pose GT for evaluation only."""
+
+    with manifest.open("r", encoding="utf8") as handle:
+        payload = json.load(handle)
+    scene = next(
+        (
+            row
+            for row in payload.get("scenes", ())
+            if str(row.get("scene_id")) == str(scene_id)
+        ),
+        None,
+    )
+    if scene is None:
+        raise ValueError(f"Scene {scene_id!r} is absent from {manifest}.")
+    frames = scene.get("frames", ())
+    poses: list[torch.Tensor] = []
+    for frame_index in frame_indices:
+        frame = frames[int(frame_index)]
+        value = frame.get("world_to_camera")
+        if value is None:
+            raise ValueError(
+                f"ScanNet++ frame {int(frame_index)} has no world_to_camera GT."
+            )
+        poses.append(
+            _pose_batch(
+                torch.as_tensor(value, dtype=torch.float64),
+                name=f"GT world_to_camera frame {int(frame_index)}",
+            )[0]
+        )
+    return torch.stack(poses, dim=0)
+
+
+def _build_pose_evaluation(
+    *,
+    input_source: Path,
+    geometry_payload: dict[str, Any] | None,
+    target_world_to_camera: torch.Tensor,
+    frame_ids: tuple[int, ...],
+    alignment: Any,
+    refined_pose_path: Path | None,
+) -> dict[str, object]:
+    """Evaluate raw and optional refined trajectories under one shared gauge."""
+
+    output: dict[str, object] = {
+        "status": "skipped",
+        "gt_source": "manifest.frames[].world_to_camera",
+        "alignment": (
+            "shared_reference_pointmap_sim3" if alignment is not None else "none"
+        ),
+        "branches": {},
+    }
+    if geometry_payload is None:
+        output["reason"] = "geometry_cache_not_provided"
+        return output
+
+    raw_world_to_camera = _pose_batch(
+        torch.as_tensor(geometry_payload["world_to_camera"]),
+        name="HorizonStream world_to_camera",
+    )
+    raw_camera_to_world = torch.linalg.inv(raw_world_to_camera)
+    if raw_camera_to_world.shape[0] != len(frame_ids):
+        raise ValueError(
+            "Raw HorizonStream pose count differs from selected frame count: "
+            f"{raw_camera_to_world.shape[0]} vs {len(frame_ids)}."
+        )
+    raw_result = evaluate_camera_trajectory(
+        raw_camera_to_world,
+        target_world_to_camera,
+        alignment=alignment,
+        frame_ids=frame_ids,
+    )
+    branches: dict[str, object] = {
+        "raw_pose": {
+            "trajectory_source": "geometry_cache.world_to_camera",
+            **raw_result,
+        }
+    }
+
+    input_root = _pose_input_root(input_source)
+    default_refined_path = input_root / "object_pose_refinement" / "refined_camera_to_world.pt"
+    if refined_pose_path is None:
+        refined_path = default_refined_path if default_refined_path.is_file() else None
+    else:
+        refined_path = refined_pose_path.expanduser().resolve()
+        if not refined_path.is_file():
+            raise FileNotFoundError(f"Refined pose artifact does not exist: {refined_path}")
+
+    if refined_path is None:
+        output.update(
+            {
+                "status": "raw_only",
+                "reason": "refined_camera_to_world_not_found",
+                "refined_pose_path": str(default_refined_path),
+                "branches": branches,
+            }
+        )
+        return output
+
+    refined_payload = _load_torch_payload(refined_path)
+    refined_value = refined_payload.get("refined_camera_to_world")
+    if refined_value is None:
+        raise ValueError(
+            f"Refined pose artifact has no refined_camera_to_world: {refined_path}"
+        )
+    stored_frame_ids = tuple(
+        int(value) for value in refined_payload.get("frame_ids", ())
+    )
+    expected_sequence_ids = tuple(range(len(frame_ids)))
+    if stored_frame_ids and stored_frame_ids not in {
+        expected_sequence_ids,
+        tuple(frame_ids),
+    }:
+        raise ValueError(
+            "Refined pose frame_ids do not match the selected sequence: "
+            f"stored={stored_frame_ids[:5]}... expected={expected_sequence_ids[:5]}..."
+        )
+    refined_camera_to_world = _pose_batch(
+        torch.as_tensor(refined_value),
+        name="refined_camera_to_world",
+    )
+    if refined_camera_to_world.shape[0] != len(frame_ids):
+        raise ValueError(
+            "Refined pose count differs from selected frame count: "
+            f"{refined_camera_to_world.shape[0]} vs {len(frame_ids)}."
+        )
+    refined_result = evaluate_camera_trajectory(
+        refined_camera_to_world,
+        target_world_to_camera,
+        alignment=alignment,
+        frame_ids=frame_ids,
+    )
+    branches["object_pose_refined"] = {
+        "trajectory_source": str(refined_path),
+        **refined_result,
+    }
+    output.update(
+        {
+            "status": "ok",
+            "refined_pose_path": str(refined_path),
+            "branches": branches,
+        }
+    )
+    return output
+
+
+def _pose_input_root(source: Path) -> Path:
+    path = Path(source).expanduser().resolve()
+    if path.is_file():
+        return path.parent
+    if (path / "semantic_map.pt").is_file():
+        return path
+    return path
+
+
+def _load_torch_payload(path: Path) -> dict[str, Any]:
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected a dictionary pose artifact, got {type(payload)!r}.")
+    return payload
+
+
+def _pose_batch(value: torch.Tensor, *, name: str) -> torch.Tensor:
+    poses = torch.as_tensor(value).detach().double().cpu()
+    if poses.ndim == 2:
+        poses = poses.unsqueeze(0)
+    if poses.ndim != 3:
+        raise ValueError(f"{name} must have shape [S,3,4] or [S,4,4].")
+    if tuple(poses.shape[-2:]) == (3, 4):
+        homogeneous = torch.eye(4, dtype=poses.dtype).repeat(poses.shape[0], 1, 1)
+        homogeneous[:, :3] = poses
+        poses = homogeneous
+    elif tuple(poses.shape[-2:]) != (4, 4):
+        raise ValueError(f"{name} must have shape [S,3,4] or [S,4,4].")
+    if not bool(torch.isfinite(poses).all()):
+        raise ValueError(f"{name} contains non-finite values.")
+    return poses
+
+
+def _pose_summary_rows(
+    pose_evaluation: dict[str, object],
+    scene_id: str,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    branches = pose_evaluation.get("branches", {})
+    if not isinstance(branches, dict):
+        return rows
+    for branch, value in branches.items():
+        if not isinstance(value, dict):
+            continue
+        summary = value.get("summary", {})
+        if not isinstance(summary, dict):
+            continue
+        rows.append(
+            {
+                "scene_id": scene_id,
+                "branch": str(branch),
+                "trajectory_source": value.get("trajectory_source", ""),
+                **summary,
+            }
+        )
+    return rows
+
+
+def _pose_frame_rows(
+    pose_evaluation: dict[str, object],
+    scene_id: str,
+) -> list[dict[str, object]]:
+    return _pose_detail_rows(pose_evaluation, scene_id, detail_key="frames")
+
+
+def _pose_rpe_rows(
+    pose_evaluation: dict[str, object],
+    scene_id: str,
+) -> list[dict[str, object]]:
+    return _pose_detail_rows(pose_evaluation, scene_id, detail_key="rpe")
+
+
+def _pose_detail_rows(
+    pose_evaluation: dict[str, object],
+    scene_id: str,
+    *,
+    detail_key: str,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    branches = pose_evaluation.get("branches", {})
+    if not isinstance(branches, dict):
+        return rows
+    for branch, value in branches.items():
+        if not isinstance(value, dict):
+            continue
+        details = value.get(detail_key, ())
+        if not isinstance(details, list):
+            continue
+        for detail in details:
+            if isinstance(detail, dict):
+                rows.append(
+                    {
+                        "scene_id": scene_id,
+                        "branch": str(branch),
+                        **detail,
+                    }
+                )
+    return rows
+
+
 def _pointmap_frame_rows(
     pointmap_alignment: dict[str, object],
     scene_id: str,
@@ -623,6 +936,7 @@ def _write_copyable(
     summary: dict[str, object],
     rows: list[dict[str, object]],
     pointmap_alignment: dict[str, object],
+    pose_evaluation: dict[str, object],
 ) -> None:
     lines = [
         "===== EXPORTED_HORIZONSTREAM_SEMANTIC_MAP_EVALUATION_BEGIN =====",
@@ -662,6 +976,35 @@ def _write_copyable(
                 for key in ("rmse_m", "median_m", "p90_m", "fit_rmse_m", "scale")
             )
         )
+    lines.append(
+        "pose_gt_source=manifest.frames[].world_to_camera "
+        f"pose_evaluation_status={pose_evaluation.get('status')}"
+    )
+    pose_branches = pose_evaluation.get("branches", {})
+    if isinstance(pose_branches, dict):
+        for branch, value in pose_branches.items():
+            if not isinstance(value, dict):
+                continue
+            pose_summary = value.get("summary", {})
+            if not isinstance(pose_summary, dict):
+                continue
+            lines.append(
+                "pose_branch="
+                + str(branch)
+                + " "
+                + " ".join(
+                    f"{key}={pose_summary.get(key)}"
+                    for key in (
+                        "ate_rmse_m",
+                        "ate_mean_m",
+                        "ate_median_m",
+                        "rotation_error_mean_deg",
+                        "rpe_translation_rmse_m",
+                        "rpe_rotation_rmse_deg",
+                        "rpe_pair_count",
+                    )
+                )
+            )
     lines.append("===== EXPORTED_HORIZONSTREAM_SEMANTIC_MAP_EVALUATION_END =====")
     path.write_text("\n".join(lines) + "\n", encoding="utf8")
 
@@ -670,6 +1013,7 @@ def _print_summary(
     summary: dict[str, object],
     rows: list[dict[str, object]],
     pointmap_alignment: dict[str, object],
+    pose_evaluation: dict[str, object],
 ) -> None:
     print("EXPORTED HORIZONSTREAM SEMANTIC-MAP OFFLINE EVALUATION")
     print(f"scene={summary['scene_id']} frames={summary['frame_count']}")
@@ -692,6 +1036,25 @@ def _print_summary(
             f"median={_format(point_summary.get('median_m'))} "
             f"p90={_format(point_summary.get('p90_m'))}"
         )
+    print(
+        f"pose_gt=manifest.frames[].world_to_camera "
+        f"pose_status={pose_evaluation.get('status')}"
+    )
+    pose_branches = pose_evaluation.get("branches", {})
+    if isinstance(pose_branches, dict):
+        for branch, value in pose_branches.items():
+            if not isinstance(value, dict):
+                continue
+            pose_summary = value.get("summary", {})
+            if not isinstance(pose_summary, dict):
+                continue
+            print(
+                f"pose_branch={branch} "
+                f"ATE_RMSE={_format(pose_summary.get('ate_rmse_m'))} "
+                f"ATE_mean={_format(pose_summary.get('ate_mean_m'))} "
+                f"RPE_t_RMSE={_format(pose_summary.get('rpe_translation_rmse_m'))} "
+                f"RPE_r_RMSE={_format(pose_summary.get('rpe_rotation_rmse_deg'))}"
+            )
     print(f"summary={summary['outputs']['summary']}")
     print(f"copyable_result={Path(summary['outputs']['summary']).with_name('copyable_result.txt')}")
 

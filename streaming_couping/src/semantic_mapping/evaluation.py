@@ -78,6 +78,265 @@ class SimilarityAlignment:
         }
 
 
+def evaluate_camera_trajectory(
+    predicted_camera_to_world: torch.Tensor,
+    target_world_to_camera: torch.Tensor,
+    *,
+    alignment: SimilarityAlignment | None = None,
+    frame_ids: Sequence[int] | None = None,
+) -> dict[str, object]:
+    """Evaluate a predicted camera trajectory against manifest poses.
+
+    ``predicted_camera_to_world`` and ``target_world_to_camera`` deliberately
+    use explicit, different names so pose-convention mistakes are visible at
+    the call site.  A single pointmap-derived :class:`SimilarityAlignment` may
+    be supplied; it is applied to the predicted camera centers and rotations
+    before computing ATE/RPE.  The same alignment can therefore be reused for
+    raw and refined branches without giving either branch a separate gauge
+    fitting advantage.
+
+    The returned object contains a compact summary plus per-frame ATE rows and
+    adjacent-frame RPE rows.  This is evaluation-only and has no effect on
+    runtime mapping or pose refinement.
+    """
+
+    predicted = _pose_batch(
+        predicted_camera_to_world,
+        name="predicted_camera_to_world",
+    )
+    target = torch.linalg.inv(
+        _pose_batch(target_world_to_camera, name="target_world_to_camera")
+    )
+    if predicted.shape[0] != target.shape[0]:
+        raise ValueError(
+            "Predicted and GT trajectories must have the same frame count: "
+            f"{predicted.shape[0]} vs {target.shape[0]}."
+        )
+    frame_count = int(predicted.shape[0])
+    if frame_count < 1:
+        raise ValueError("Trajectory evaluation requires at least one frame.")
+    if frame_ids is None:
+        frame_ids = tuple(range(frame_count))
+    else:
+        frame_ids = tuple(int(value) for value in frame_ids)
+    if len(frame_ids) != frame_count:
+        raise ValueError(
+            "frame_ids must have one entry per predicted pose: "
+            f"{len(frame_ids)} vs {frame_count}."
+        )
+
+    predicted_rotation = torch.stack(
+        [_project_rotation(matrix[:3, :3]) for matrix in predicted]
+    )
+    target_rotation = torch.stack(
+        [_project_rotation(matrix[:3, :3]) for matrix in target]
+    )
+    predicted_centers = predicted[:, :3, 3]
+    target_centers = target[:, :3, 3]
+
+    if alignment is None:
+        aligned_rotation = predicted_rotation
+        aligned_centers = predicted_centers
+        alignment_name = "none"
+        alignment_scale = 1.0
+    else:
+        alignment_rotation = torch.as_tensor(
+            alignment.rotation,
+            dtype=torch.float64,
+            device=predicted.device,
+        )
+        alignment_translation = torch.as_tensor(
+            alignment.translation,
+            dtype=torch.float64,
+            device=predicted.device,
+        )
+        if tuple(alignment_rotation.shape) != (3, 3):
+            raise ValueError("Similarity alignment rotation must have shape [3,3].")
+        if tuple(alignment_translation.shape) != (3,):
+            raise ValueError(
+                "Similarity alignment translation must have shape [3]."
+            )
+        aligned_rotation = torch.einsum(
+            "ij,tjk->tik",
+            alignment_rotation,
+            predicted_rotation,
+        )
+        alignment_scale = float(alignment.scale)
+        aligned_centers = (
+            alignment_scale * (predicted_centers @ alignment_rotation.T)
+            + alignment_translation
+        )
+        alignment_name = "shared_reference_pointmap_sim3"
+
+    aligned_poses = _poses_from_rotation_and_centers(
+        aligned_rotation,
+        aligned_centers,
+    )
+    target_poses = _poses_from_rotation_and_centers(
+        target_rotation,
+        target_centers,
+    )
+    translation_errors = torch.linalg.vector_norm(
+        aligned_centers - target_centers,
+        dim=-1,
+    )
+    rotation_errors = torch.tensor(
+        [
+            _pose_rotation_error_degrees(
+                aligned_rotation[index],
+                target_rotation[index],
+            )
+            for index in range(frame_count)
+        ],
+        dtype=torch.float64,
+    )
+
+    frame_rows: list[dict[str, object]] = []
+    for index, frame_id in enumerate(frame_ids):
+        frame_rows.append(
+            {
+                "sequence_index": int(index),
+                "frame_id": int(frame_id),
+                "translation_error_m": float(translation_errors[index]),
+                "rotation_error_deg": float(rotation_errors[index]),
+                "is_reference": int(index == 0),
+                "predicted_center_aligned_x": float(aligned_centers[index, 0]),
+                "predicted_center_aligned_y": float(aligned_centers[index, 1]),
+                "predicted_center_aligned_z": float(aligned_centers[index, 2]),
+                "gt_center_x": float(target_centers[index, 0]),
+                "gt_center_y": float(target_centers[index, 1]),
+                "gt_center_z": float(target_centers[index, 2]),
+            }
+        )
+
+    rpe_rows: list[dict[str, object]] = []
+    for first in range(frame_count - 1):
+        second = first + 1
+        predicted_delta = (
+            torch.linalg.inv(aligned_poses[first]) @ aligned_poses[second]
+        )
+        target_delta = (
+            torch.linalg.inv(target_poses[first]) @ target_poses[second]
+        )
+        error = torch.linalg.inv(target_delta) @ predicted_delta
+        rpe_rows.append(
+            {
+                "first_sequence_index": int(first),
+                "second_sequence_index": int(second),
+                "first_frame_id": int(frame_ids[first]),
+                "second_frame_id": int(frame_ids[second]),
+                "source_frame_gap": int(abs(frame_ids[second] - frame_ids[first])),
+                "translation_error_m": float(
+                    torch.linalg.vector_norm(error[:3, 3])
+                ),
+                "rotation_error_deg": _rotation_angle_degrees(error[:3, :3]),
+                "predicted_motion_translation_m": float(
+                    torch.linalg.vector_norm(predicted_delta[:3, 3])
+                ),
+                "gt_motion_translation_m": float(
+                    torch.linalg.vector_norm(target_delta[:3, 3])
+                ),
+                "predicted_motion_rotation_deg": _rotation_angle_degrees(
+                    predicted_delta[:3, :3]
+                ),
+                "gt_motion_rotation_deg": _rotation_angle_degrees(
+                    target_delta[:3, :3]
+                ),
+            }
+        )
+
+    translation_stats = _scalar_statistics(translation_errors.tolist())
+    rotation_stats = _scalar_statistics(rotation_errors.tolist())
+    rpe_translation = [
+        float(row["translation_error_m"]) for row in rpe_rows
+    ]
+    rpe_rotation = [float(row["rotation_error_deg"]) for row in rpe_rows]
+    rpe_translation_stats = _scalar_statistics(rpe_translation)
+    rpe_rotation_stats = _scalar_statistics(rpe_rotation)
+    summary = {
+        "status": "ok",
+        "alignment": alignment_name,
+        "alignment_scale": float(alignment_scale),
+        "evaluated_frames": int(frame_count),
+        "ate_rmse_m": translation_stats["rmse"],
+        "ate_mean_m": translation_stats["mean"],
+        "ate_median_m": translation_stats["median"],
+        "ate_max_m": translation_stats["max"],
+        "rotation_error_rmse_deg": rotation_stats["rmse"],
+        "rotation_error_mean_deg": rotation_stats["mean"],
+        "rotation_error_median_deg": rotation_stats["median"],
+        "rotation_error_max_deg": rotation_stats["max"],
+        "rpe_pair_count": int(len(rpe_rows)),
+        "rpe_translation_rmse_m": rpe_translation_stats["rmse"],
+        "rpe_translation_mean_m": rpe_translation_stats["mean"],
+        "rpe_translation_median_m": rpe_translation_stats["median"],
+        "rpe_translation_max_m": rpe_translation_stats["max"],
+        "rpe_rotation_rmse_deg": rpe_rotation_stats["rmse"],
+        "rpe_rotation_mean_deg": rpe_rotation_stats["mean"],
+        "rpe_rotation_median_deg": rpe_rotation_stats["median"],
+        "rpe_rotation_max_deg": rpe_rotation_stats["max"],
+    }
+    return {
+        "summary": summary,
+        "frames": frame_rows,
+        "rpe": rpe_rows,
+    }
+
+
+def _pose_batch(value: torch.Tensor, *, name: str) -> torch.Tensor:
+    poses = torch.as_tensor(value).detach().double().cpu()
+    if poses.ndim == 2:
+        poses = poses.unsqueeze(0)
+    if poses.ndim != 3:
+        raise ValueError(f"{name} must have shape [S,3,4] or [S,4,4].")
+    if tuple(poses.shape[-2:]) == (3, 4):
+        homogeneous = torch.eye(4, dtype=poses.dtype).repeat(poses.shape[0], 1, 1)
+        homogeneous[:, :3] = poses
+        poses = homogeneous
+    elif tuple(poses.shape[-2:]) != (4, 4):
+        raise ValueError(f"{name} must have shape [S,3,4] or [S,4,4].")
+    if not bool(torch.isfinite(poses).all()):
+        raise ValueError(f"{name} contains non-finite values.")
+    return poses
+
+
+def _poses_from_rotation_and_centers(
+    rotations: torch.Tensor,
+    centers: torch.Tensor,
+) -> torch.Tensor:
+    poses = torch.eye(4, dtype=torch.float64, device=rotations.device).repeat(
+        rotations.shape[0], 1, 1
+    )
+    poses[:, :3, :3] = rotations
+    poses[:, :3, 3] = centers
+    return poses
+
+
+def _pose_rotation_error_degrees(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+) -> float:
+    return _rotation_angle_degrees(target.T @ predicted)
+
+
+def _rotation_angle_degrees(rotation: torch.Tensor) -> float:
+    cosine = ((torch.trace(rotation) - 1.0) * 0.5).clamp(-1.0, 1.0)
+    return float(torch.rad2deg(torch.acos(cosine)))
+
+
+def _scalar_statistics(values: Sequence[float]) -> dict[str, float | None]:
+    finite = [float(value) for value in values if math.isfinite(float(value))]
+    if not finite:
+        return {"rmse": None, "mean": None, "median": None, "max": None}
+    tensor = torch.tensor(finite, dtype=torch.float64)
+    return {
+        "rmse": float(torch.sqrt(tensor.square().mean())),
+        "mean": float(tensor.mean()),
+        "median": float(tensor.median()),
+        "max": float(tensor.max()),
+    }
+
+
 def fit_reference_alignment(
     predicted_world_points: torch.Tensor,
     target_world_points: torch.Tensor,

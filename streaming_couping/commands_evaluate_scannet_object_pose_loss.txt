@@ -4,6 +4,8 @@ setopt NULL_GLOB
 
 # Offline GT evaluation for the object-only pose-loss experiment.
 # GT is opened only here, after runtime inference/refinement has completed.
+# In addition to object-point metrics, this reports raw/refined ATE and RPE
+# from manifest.frames[].world_to_camera.
 ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PYTHON="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/horizonstream/bin/python}"
@@ -60,6 +62,9 @@ COMBINED="$EVAL_DIR/gt_comparison.txt"
   print ""
   print "raw_map_summary=$INPUT_DIR/raw_pose/map_summary.json"
   print "refined_map_summary=$INPUT_DIR/object_pose_refined/map_summary.json"
+  print "pose_summary=$EVAL_DIR/pose_summary.csv"
+  print "pose_frames=$EVAL_DIR/pose_frames.csv"
+  print "pose_rpe=$EVAL_DIR/pose_rpe.csv"
   print "evaluation_summary=$SUMMARY"
   print "evaluation_log=$EVAL_DIR/evaluator.log"
 } >"$COMBINED"
