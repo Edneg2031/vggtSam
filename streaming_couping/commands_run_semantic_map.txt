@@ -144,6 +144,16 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
   exit 1
 }
 
+# The vendored SAM3.1 model_builder still imports pkg_resources.  Recent
+# setuptools releases removed that compatibility module, so repair the
+# shared environment before loading SAM3.1.
+if ! "$SAM_PYTHON" -c 'import pkg_resources' >/dev/null 2>&1; then
+  print "pkg_resources missing; installing setuptools==80.9.0"
+  "$SAM_PYTHON" -m pip install --disable-pip-version-check --no-input \
+    "setuptools==80.9.0"
+  "$SAM_PYTHON" -c 'import pkg_resources' >/dev/null
+fi
+
 # Explicit CLI arguments are an advanced, map-stage-only escape hatch. They
 # must include --geometry-cache when HorizonStream geometry is desired.
 if (( $# > 0 )); then

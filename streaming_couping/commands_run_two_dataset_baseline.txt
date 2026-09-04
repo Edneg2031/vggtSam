@@ -61,6 +61,16 @@ export PYTHONPATH="$HORIZON_REPO:$ROOT${PYTHONPATH:+:$PYTHONPATH}"
   exit 1
 }
 
+# The vendored SAM3.1 model_builder still imports pkg_resources.  Recent
+# setuptools releases removed that compatibility module, so repair the
+# horizonstream environment once, before either model stage starts.
+if ! "$HORIZON_PYTHON" -c 'import pkg_resources' >/dev/null 2>&1; then
+  print "pkg_resources missing; installing setuptools==80.9.0"
+  "$HORIZON_PYTHON" -m pip install --disable-pip-version-check --no-input \
+    "setuptools==80.9.0"
+  "$HORIZON_PYTHON" -c 'import pkg_resources' >/dev/null
+fi
+
 run_baseline() {
   local dataset_name="$1"
   local frames_dir="$2"
