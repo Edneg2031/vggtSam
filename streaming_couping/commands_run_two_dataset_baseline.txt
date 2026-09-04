@@ -1,0 +1,125 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# Run the unchanged SAM3.1 + HorizonStream raw semantic-map baseline on two
+# external RGB directories.  This file is intentionally separate from
+# commands_run_semantic_map.txt, whose defaults target the original
+# ScanNet++ manifest scene.
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+HORIZON_PYTHON="${HORIZONSTREAM_PYTHON:-/home/huawei/miniconda3/envs/horizonstream/bin/python}"
+HORIZON_REPO="$ROOT/externals/horizonstream"
+HORIZON_CHECKPOINT="${HORIZONSTREAM_CHECKPOINT:-/home/bod/86Nas/95_data_bak/FoundationModels/HorizonStream.pt}"
+RECOVERY_CONFIG="$ROOT/streaming_couping/configs/recovery_dynamic_instance.yaml"
+
+# The two requested datasets.
+WUHAN_FRAMES="/home/bod/182Nas/share/BaZhuaYu/DemoData/xiaoyi/wuhan_A3/images"
+MEETING_ROOM_FRAMES="/home/bod/182Nas/share/BaZhuaYu/DemoData/xiaoyi/blind_data/meeting_room_a02/frames"
+
+# 0 means all images after FRAME_START, in deterministic directory order.
+FRAME_START=0
+FRAME_STRIDE=1
+FRAME_COUNT=0
+
+# Scene-relevant text prompts.  The mapping algorithm remains the raw
+# baseline; this list only controls which SAM3 categories are requested.
+PROMPTS=("chair" "table" "desk" "cabinet" "sofa" "trash can" "rug")
+
+HORIZON_DEVICE="${HORIZONSTREAM_DEVICE:-cuda:0}"
+SAM_DEVICE="${SAM3_DEVICE:-cuda:2}"
+HORIZON_WINDOW_SIZE=10
+HORIZON_SLIDING_SIZE=1
+HORIZON_IMAGE_SIZE=518
+HORIZON_PATCH_SIZE=14
+HORIZON_PRECISION="float16"
+SAM_GROUNDING_BATCH_SIZE=1
+SAM_OFFLOAD_VIDEO_TO_CPU=1
+MAX_SCENE_VOXELS=1000000
+MAX_OBJECTS=16
+
+cd "$ROOT"
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="$HORIZON_REPO:$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
+[[ -x "$HORIZON_PYTHON" ]] || {
+  print -u2 "missing HorizonStream Python: $HORIZON_PYTHON"
+  exit 1
+}
+[[ -d "$HORIZON_REPO/horizonstream" ]] || {
+  print -u2 "missing HorizonStream source: $HORIZON_REPO"
+  exit 1
+}
+[[ -f "$HORIZON_CHECKPOINT" ]] || {
+  print -u2 "missing HorizonStream checkpoint: $HORIZON_CHECKPOINT"
+  exit 1
+}
+[[ -f "$RECOVERY_CONFIG" ]] || {
+  print -u2 "missing SAM recovery config: $RECOVERY_CONFIG"
+  exit 1
+}
+
+run_baseline() {
+  local dataset_name="$1"
+  local frames_dir="$2"
+  local run_output="$STORAGE_ROOT/outputs/${dataset_name}_horizonstream_sam3_baseline_allf"
+  local geometry_cache="$run_output/horizonstream_geometry.pt"
+
+  [[ -d "$frames_dir" ]] || {
+    print -u2 "missing RGB directory for ${dataset_name}: $frames_dir"
+    return 1
+  }
+  mkdir -p "$run_output"
+
+  print "===== ${dataset_name}: HorizonStream geometry cache ====="
+  "$HORIZON_PYTHON" \
+    -m streaming_couping.scripts.generate_horizonstream_geometry_cache \
+    --frames "$frames_dir" \
+    --frame-start "$FRAME_START" \
+    --frame-stride "$FRAME_STRIDE" \
+    --frame-count "$FRAME_COUNT" \
+    --repo-path "$HORIZON_REPO" \
+    --checkpoint "$HORIZON_CHECKPOINT" \
+    --output-cache "$geometry_cache" \
+    --device "$HORIZON_DEVICE" \
+    --window-size "$HORIZON_WINDOW_SIZE" \
+    --sliding-size "$HORIZON_SLIDING_SIZE" \
+    --image-size "$HORIZON_IMAGE_SIZE" \
+    --patch-size "$HORIZON_PATCH_SIZE" \
+    --crop \
+    --precision "$HORIZON_PRECISION" \
+    --reuse-if-valid
+
+  print "===== ${dataset_name}: SAM3.1 semantic-map fusion ====="
+  "$HORIZON_PYTHON" \
+    -m streaming_couping.scripts.run_semantic_map \
+    --frames "$frames_dir" \
+    --frame-start "$FRAME_START" \
+    --frame-stride "$FRAME_STRIDE" \
+    --frame-count "$FRAME_COUNT" \
+    --prompts "${PROMPTS[@]}" \
+    --geometry-cache "$geometry_cache" \
+    --output-dir "$run_output" \
+    --fusion-policy raw \
+    --recovery-config "$RECOVERY_CONFIG" \
+    --sam-device "$SAM_DEVICE" \
+    --sam-grounding-batch-size "$SAM_GROUNDING_BATCH_SIZE" \
+    --sam-offload-video-to-cpu \
+    --max-objects "$MAX_OBJECTS" \
+    --max-scene-voxels "$MAX_SCENE_VOXELS"
+
+  print "baseline output=${run_output}"
+}
+
+print "baseline=SAM3.1+HorizonStream policy=raw frames=all"
+print "horizon_device=${HORIZON_DEVICE} sam_device=${SAM_DEVICE} window=${HORIZON_WINDOW_SIZE} sliding=${HORIZON_SLIDING_SIZE}"
+print "prompts=${(j:,:)PROMPTS}"
+
+run_baseline "wuhan_A3" "$WUHAN_FRAMES"
+run_baseline "meeting_room_a02" "$MEETING_ROOM_FRAMES"
+
+print "===== TWO-DATASET BASELINE COMPLETE ====="
+print "wuhan_output=$STORAGE_ROOT/outputs/wuhan_A3_horizonstream_sam3_baseline_allf"
+print "meeting_room_output=$STORAGE_ROOT/outputs/meeting_room_a02_horizonstream_sam3_baseline_allf"
