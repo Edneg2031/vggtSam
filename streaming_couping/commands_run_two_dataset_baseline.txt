@@ -90,8 +90,9 @@ fi
 "$HORIZON_PYTHON" -c \
   'import iopath, ftfy, regex, huggingface_hub, timm, einops, pycocotools' >/dev/null
 
-print_sam_gpu_memory() {
-  local gpu_index="${SAM_DEVICE#cuda:}"
+print_gpu_memory() {
+  local device="$1"
+  local gpu_index="${device#cuda:}"
   if (( $+commands[nvidia-smi] )); then
     nvidia-smi --id="$gpu_index" \
       --query-gpu=index,memory.used,memory.free,memory.total \
@@ -114,6 +115,8 @@ run_baseline() {
   mkdir -p "$run_output"
 
   print "===== ${dataset_name}: HorizonStream geometry cache ====="
+  print "HorizonStream GPU memory before loading (MiB):"
+  print_gpu_memory "$HORIZON_DEVICE"
   "$HORIZON_PYTHON" \
     -m streaming_couping.scripts.generate_horizonstream_geometry_cache \
     --frames "$frames_dir" \
@@ -134,7 +137,7 @@ run_baseline() {
 
   print "===== ${dataset_name}: SAM3.1 semantic-map fusion ====="
   print "SAM GPU memory before loading/tracking (MiB):"
-  print_sam_gpu_memory
+  print_gpu_memory "$SAM_DEVICE"
   "$HORIZON_PYTHON" \
     -m streaming_couping.scripts.run_semantic_map \
     --frames "$frames_dir" \

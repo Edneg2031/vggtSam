@@ -2,7 +2,10 @@
 set -euo pipefail
 
 # Memory-safe sampled version of the unchanged SAM3.1 + HorizonStream raw
-# baseline.  Every third source RGB frame is used by both stages.
+# baseline. Every third source RGB frame is used by both stages. GPU0 may be
+# occupied by another job, so place HorizonStream on GPU1 and SAM3 on GPU2.
 SCRIPT_DIR="${0:A:h}"
+HORIZONSTREAM_DEVICE="${HORIZONSTREAM_DEVICE:-cuda:1}" \
+SAM3_DEVICE="${SAM3_DEVICE:-cuda:2}" \
 FRAME_STRIDE=3 BASELINE_OUTPUT_TAG=stride3 \
   exec zsh "$SCRIPT_DIR/commands_run_two_dataset_baseline.txt"
