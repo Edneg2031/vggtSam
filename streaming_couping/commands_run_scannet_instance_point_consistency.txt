@@ -1,0 +1,246 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# ScanNet++ ablation: frozen HorizonStream geometry + one shared SAM3.1 run.
+# The raw branch is the baseline.  The second branch only filters/downweights
+# semantic object-map points using the same persistent instance ID; it never
+# changes the scene geometry, camera pose, depth, or SAM masks.
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+HORIZON_PYTHON="${HORIZONSTREAM_PYTHON:-/home/huawei/miniconda3/envs/horizonstream/bin/python}"
+SAM_PYTHON="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/horizonstream/bin/python}"
+HORIZON_REPO="$ROOT/externals/horizonstream"
+HORIZON_CHECKPOINT="${HORIZONSTREAM_CHECKPOINT:-/home/bod/86Nas/95_data_bak/FoundationModels/HorizonStream.pt}"
+HORIZON_DEVICE="${HORIZONSTREAM_DEVICE:-cuda:0}"
+HORIZON_WINDOW_SIZE="${HORIZONSTREAM_WINDOW_SIZE:-10}"
+HORIZON_SLIDING_SIZE="${HORIZONSTREAM_SLIDING_SIZE:-1}"
+HORIZON_IMAGE_SIZE="${HORIZONSTREAM_IMAGE_SIZE:-518}"
+HORIZON_PATCH_SIZE="${HORIZONSTREAM_PATCH_SIZE:-14}"
+HORIZON_PRECISION="${HORIZONSTREAM_PRECISION:-float16}"
+HORIZON_REUSE_CACHE="${HORIZONSTREAM_REUSE_CACHE:-1}"
+
+MANIFEST_PATH="$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json"
+SCENE_ID="00a231a370"
+FRAME_START=90
+FRAME_STRIDE=1
+FRAME_COUNT=50
+PROMPTS=("bed" "wardrobe" "chair" "rug" "dustbin")
+
+# The cache is automatically generated when missing and reused only when its
+# image order and HorizonStream request match this experiment.
+BASELINE_OUTPUT_DIR="$STORAGE_ROOT/outputs/semantic_map_50frames_horizonstream_consecutive"
+GEOMETRY_CACHE="${HORIZONSTREAM_GEOMETRY_CACHE:-$BASELINE_OUTPUT_DIR/horizonstream_geometry.pt}"
+OUTPUT_DIR="${INSTANCE_CONSISTENCY_OUTPUT_DIR:-$STORAGE_ROOT/outputs/semantic_map_50frames_horizonstream_instance_point_consistency}"
+RECOVERY_CONFIG="${RECOVERY_CONFIG_PATH:-streaming_couping/configs/recovery_dynamic_instance.yaml}"
+RUN_LOG="$OUTPUT_DIR/run.log"
+
+SAM_DEVICE="${SAM_DEVICE:-cuda:2}"
+SAM_GROUNDING_BATCH_SIZE="${SAM_GROUNDING_BATCH_SIZE:-1}"
+
+# Conservative map-only settings.  They are deliberately explicit in the
+# command so the experiment is reproducible and easy to change one factor at a time.
+CONSISTENCY_HISTORY_FRAMES="${INSTANCE_CONSISTENCY_HISTORY_FRAMES:-12}"
+CONSISTENCY_MAX_HISTORY_POINTS="${INSTANCE_CONSISTENCY_MAX_HISTORY_POINTS:-4096}"
+CONSISTENCY_MIN_HISTORY_POINTS="${INSTANCE_CONSISTENCY_MIN_HISTORY_POINTS:-16}"
+CONSISTENCY_SUPPORT_RADIUS_M="${INSTANCE_CONSISTENCY_SUPPORT_RADIUS_M:-0.10}"
+CONSISTENCY_MIN_SUPPORT_POINTS="${INSTANCE_CONSISTENCY_MIN_SUPPORT_POINTS:-8}"
+CONSISTENCY_MIN_SUPPORT_RATIO="${INSTANCE_CONSISTENCY_MIN_SUPPORT_RATIO:-0.15}"
+CONSISTENCY_BOUNDS_MARGIN_M="${INSTANCE_CONSISTENCY_BOUNDS_MARGIN_M:-0.20}"
+CONSISTENCY_MAX_NOVEL_POINTS="${INSTANCE_CONSISTENCY_MAX_NOVEL_POINTS:-512}"
+CONSISTENCY_NOVEL_WEIGHT="${INSTANCE_CONSISTENCY_NOVEL_WEIGHT:-0.25}"
+
+cd "$ROOT"
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+[[ -x "$SAM_PYTHON" ]] || {
+  print -u2 "missing Python: $SAM_PYTHON"
+  exit 1
+}
+[[ -x "$HORIZON_PYTHON" ]] || {
+  print -u2 "missing HorizonStream Python: $HORIZON_PYTHON"
+  exit 1
+}
+[[ -d "$HORIZON_REPO/horizonstream" ]] || {
+  print -u2 "missing HorizonStream source: $HORIZON_REPO"
+  exit 1
+}
+[[ -f "$HORIZON_CHECKPOINT" ]] || {
+  print -u2 "missing HorizonStream checkpoint: $HORIZON_CHECKPOINT"
+  exit 1
+}
+[[ -f "$MANIFEST_PATH" ]] || {
+  print -u2 "missing manifest: $MANIFEST_PATH"
+  exit 1
+}
+[[ -f "$RECOVERY_CONFIG" ]] || {
+  print -u2 "missing recovery config: $RECOVERY_CONFIG"
+  exit 1
+}
+
+# The vendored SAM3.1 model imports these packages at module import time.
+# Repair/check them here so this standalone experiment does not depend on
+# having run the older baseline command first.
+if ! "$SAM_PYTHON" -c 'import pkg_resources' >/dev/null 2>&1; then
+  print "pkg_resources missing; installing setuptools==80.9.0"
+  "$SAM_PYTHON" -m pip install --disable-pip-version-check --no-input \
+    "setuptools==80.9.0"
+fi
+if ! "$SAM_PYTHON" -c \
+  'import importlib.util; names=("iopath", "ftfy", "regex", "huggingface_hub", "timm", "einops", "pycocotools"); raise SystemExit(any(importlib.util.find_spec(name) is None for name in names))' \
+  >/dev/null 2>&1; then
+  print "SAM3 runtime dependencies missing; installing compatible packages"
+  "$SAM_PYTHON" -m pip install --disable-pip-version-check --no-input \
+    "iopath>=0.1.10" "ftfy==6.1.1" "regex" \
+    "huggingface_hub" "timm>=1.0.17" "einops" "pycocotools"
+fi
+"$SAM_PYTHON" -c \
+  'import iopath, ftfy, regex, huggingface_hub, timm, einops, pycocotools' >/dev/null
+
+mkdir -p "$OUTPUT_DIR"
+
+HORIZON_ARGS=(
+  --manifest "$MANIFEST_PATH"
+  --scene-id "$SCENE_ID"
+  --frame-start "$FRAME_START"
+  --frame-stride "$FRAME_STRIDE"
+  --frame-count "$FRAME_COUNT"
+  --repo-path "$HORIZON_REPO"
+  --checkpoint "$HORIZON_CHECKPOINT"
+  --output-cache "$GEOMETRY_CACHE"
+  --device "$HORIZON_DEVICE"
+  --window-size "$HORIZON_WINDOW_SIZE"
+  --sliding-size "$HORIZON_SLIDING_SIZE"
+  --image-size "$HORIZON_IMAGE_SIZE"
+  --patch-size "$HORIZON_PATCH_SIZE"
+  --crop
+  --precision "$HORIZON_PRECISION"
+)
+if (( HORIZON_REUSE_CACHE )); then
+  HORIZON_ARGS+=(--reuse-if-valid)
+else
+  HORIZON_ARGS+=(--no-reuse-if-valid)
+fi
+
+print "===== HORIZONSTREAM GEOMETRY CACHE ====="
+print "horizon_device=$HORIZON_DEVICE window=$HORIZON_WINDOW_SIZE sliding=$HORIZON_SLIDING_SIZE precision=$HORIZON_PRECISION"
+print "geometry_cache=$GEOMETRY_CACHE"
+PYTHONPATH="$HORIZON_REPO:$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$HORIZON_PYTHON" -m streaming_couping.scripts.generate_horizonstream_geometry_cache \
+  "${HORIZON_ARGS[@]}"
+
+[[ -f "$GEOMETRY_CACHE" ]] || {
+  print -u2 "HorizonStream stage finished without cache: $GEOMETRY_CACHE"
+  exit 1
+}
+
+ARGS=(
+  --manifest "$MANIFEST_PATH"
+  --scene-id "$SCENE_ID"
+  --frame-start "$FRAME_START"
+  --frame-stride "$FRAME_STRIDE"
+  --frame-count "$FRAME_COUNT"
+  --prompts "${PROMPTS[@]}"
+  --geometry-cache "$GEOMETRY_CACHE"
+  --output-dir "$OUTPUT_DIR"
+  --fusion-policy raw
+  --recovery-config "$RECOVERY_CONFIG"
+  --sam-device "$SAM_DEVICE"
+  --sam-grounding-batch-size "$SAM_GROUNDING_BATCH_SIZE"
+  --sam-offload-video-to-cpu
+  --instance-point-consistency
+  --instance-point-consistency-history-frames "$CONSISTENCY_HISTORY_FRAMES"
+  --instance-point-consistency-max-history-points "$CONSISTENCY_MAX_HISTORY_POINTS"
+  --instance-point-consistency-min-history-points "$CONSISTENCY_MIN_HISTORY_POINTS"
+  --instance-point-consistency-support-radius-m "$CONSISTENCY_SUPPORT_RADIUS_M"
+  --instance-point-consistency-min-support-points "$CONSISTENCY_MIN_SUPPORT_POINTS"
+  --instance-point-consistency-min-support-ratio "$CONSISTENCY_MIN_SUPPORT_RATIO"
+  --instance-point-consistency-bounds-margin-m "$CONSISTENCY_BOUNDS_MARGIN_M"
+  --instance-point-consistency-max-novel-points "$CONSISTENCY_MAX_NOVEL_POINTS"
+  --instance-point-consistency-novel-weight "$CONSISTENCY_NOVEL_WEIGHT"
+)
+
+print "instance_point_consistency=true"
+print "frames=$FRAME_COUNT frame_start=$FRAME_START frame_stride=$FRAME_STRIDE"
+print "geometry_cache=$GEOMETRY_CACHE"
+print "sam_device=$SAM_DEVICE grounding_batch=$SAM_GROUNDING_BATCH_SIZE"
+print "output=$OUTPUT_DIR"
+print "running; full log will be saved to $RUN_LOG"
+
+set +e
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$SAM_PYTHON" -m streaming_couping.scripts.run_semantic_map "${ARGS[@]}" \
+  >"$RUN_LOG" 2>&1
+run_exit_code=$?
+set -e
+if (( run_exit_code != 0 )); then
+  print -u2 "instance consistency run failed status=$run_exit_code log=$RUN_LOG"
+  tail -n 40 "$RUN_LOG"
+  exit "$run_exit_code"
+fi
+
+COMPARISON_PATH="$OUTPUT_DIR/comparison.json"
+[[ -f "$COMPARISON_PATH" ]] || {
+  print -u2 "run finished without expected comparison: $COMPARISON_PATH"
+  exit 1
+}
+
+print "===== INSTANCE POINT CONSISTENCY SUMMARY ====="
+"$SAM_PYTHON" - "$COMPARISON_PATH" "$OUTPUT_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+comparison_path, output_dir = map(Path, sys.argv[1:])
+comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
+branches = comparison["branches"]
+raw = branches["raw"]
+consistent = branches["instance_point_consistency"]
+raw_map = json.loads(
+    (output_dir / "raw" / "map_summary.json").read_text(encoding="utf-8")
+)
+consistent_map = json.loads(
+    (output_dir / "instance_point_consistency" / "map_summary.json").read_text(
+        encoding="utf-8"
+    )
+)
+raw_meta = raw_map.get("metadata", {})
+consistent_meta = consistent_map.get("metadata", {})
+consistency = consistent_meta.get("instance_point_consistency", {})
+raw_track_points = sum(int(row.get("point_count", 0)) for row in raw_map.get("objects", []))
+consistent_track_points = sum(
+    int(row.get("point_count", 0)) for row in consistent_map.get("objects", [])
+)
+print(
+    "frames={0} tracked_instances={1} raw_scene_voxels={2} "
+    "consistent_scene_voxels={3}".format(
+        raw_meta.get("frame_count"),
+        raw.get("instance_count"),
+        raw.get("scene_voxel_count"),
+        consistent.get("scene_voxel_count"),
+    )
+)
+print(
+    "raw_semantic_voxels={0} consistent_semantic_voxels={1} "
+    "raw_track_points={2} consistent_track_points={3}".format(
+        raw.get("voxel_count"),
+        consistent.get("voxel_count"),
+        raw_track_points,
+        consistent_track_points,
+    )
+)
+print(
+    "filtered_points={0} downweighted_points={1} filtered_ratio={2:.6f} "
+    "downweighted_ratio={3:.6f}".format(
+        consistency.get("filtered_points", 0),
+        consistency.get("downweighted_points", 0),
+        float(consistency.get("filtered_point_ratio", 0.0)),
+        float(consistency.get("downweighted_point_ratio", 0.0)),
+    )
+)
+print("raw_semantic_ply=" + str(raw.get("semantic_ply")))
+print("consistent_semantic_ply=" + str(consistent.get("semantic_ply")))
+print("comparison=" + str(comparison_path))
+print("full_log=" + str(output_dir / "run.log"))
+PY

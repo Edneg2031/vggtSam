@@ -44,6 +44,9 @@ from streaming_couping.src.semantic_mapping.mapping import (
     SemanticMapBuilder,
     SemanticMapConfig,
 )
+from streaming_couping.src.semantic_mapping.instance_point_consistency import (
+    InstancePointConsistencyConfig,
+)
 from streaming_couping.src.semantic_mapping.object_pose_refinement import (
     ObjectPoseRefinementConfig,
     ObjectPoseRefiner,
@@ -101,6 +104,18 @@ def main() -> None:
                 min_support_ratio=args.temporal_consensus_min_support_ratio,
                 max_novel_points=args.temporal_consensus_max_novel_points,
                 novel_weight=args.temporal_consensus_novel_weight,
+            ),
+            instance_point_consistency=InstancePointConsistencyConfig(
+                enabled=bool(args.instance_point_consistency),
+                history_frames=args.instance_consistency_history_frames,
+                max_history_points=args.instance_consistency_max_history_points,
+                min_history_points=args.instance_consistency_min_history_points,
+                support_radius_m=args.instance_consistency_support_radius_m,
+                min_support_points=args.instance_consistency_min_support_points,
+                min_support_ratio=args.instance_consistency_min_support_ratio,
+                bounds_margin_m=args.instance_consistency_bounds_margin_m,
+                max_novel_points=args.instance_consistency_max_novel_points,
+                novel_weight=args.instance_consistency_novel_weight,
             ),
         )
     )
@@ -166,6 +181,7 @@ def _run_from_cache(
             },
         },
         fusion_policy=args.fusion_policy,
+        instance_point_consistency=args.instance_point_consistency,
     )
 
 
@@ -295,6 +311,9 @@ def _run_from_rgb(
         },
         "geometry_guidance": bool(args.geometry_guidance),
         "map_write_gate": bool(args.map_write_gate),
+        "instance_point_consistency_requested": bool(
+            args.instance_point_consistency
+        ),
         **selection.metadata,
     }
     if geometry_payload is None:
@@ -305,6 +324,7 @@ def _run_from_rgb(
             metadata=metadata,
             fusion_policy=args.fusion_policy,
             object_pose_refiner=object_pose_refiner,
+            instance_point_consistency=args.instance_point_consistency,
         )
 
     # SAM must see the exact center-cropped pixels used for cached geometry.
@@ -317,6 +337,7 @@ def _run_from_rgb(
             metadata=metadata,
             fusion_policy=args.fusion_policy,
             object_pose_refiner=object_pose_refiner,
+            instance_point_consistency=args.instance_point_consistency,
         )
 
 
@@ -328,7 +349,25 @@ def _execute_pipeline(
     metadata: dict[str, Any],
     fusion_policy: str,
     object_pose_refiner: ObjectPoseRefiner | None = None,
+    instance_point_consistency: bool = False,
 ):
+    if instance_point_consistency:
+        if object_pose_refiner is not None:
+            raise ValueError(
+                "--instance-point-consistency cannot be combined with "
+                "--object-pose-refinement in the first map-only experiment."
+            )
+        if fusion_policy != "raw":
+            raise ValueError(
+                "--instance-point-consistency requires --fusion-policy raw; "
+                "it automatically exports raw and instance-consistency branches."
+            )
+        return pipeline.run_branches(
+            image_paths,
+            prompts=prompts,
+            metadata=metadata,
+            policies=("raw", "instance_point_consistency"),
+        )
     if object_pose_refiner is not None:
         policies = (
             ("raw", "temporal_consensus")
@@ -379,10 +418,7 @@ def _export_branch_results(
     root = Path(output_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     summaries: dict[str, dict[str, Any]] = {}
-    for policy in ("raw", "temporal_consensus"):
-        result = results.get(policy)
-        if result is None:
-            continue
+    for policy, result in results.items():
         summaries[policy] = export_semantic_map(
             result,
             root / policy,
@@ -391,7 +427,7 @@ def _export_branch_results(
         _print_export_summary(summaries[policy])
     comparison = {
         "schema": 1,
-        "fusion_policy": "both",
+        "fusion_policy": list(summaries),
         "shared_model_inference": True,
         "gt_evaluation": "not_run_at_runtime",
         "branches": {
@@ -500,6 +536,9 @@ def _branch_comparison_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "instance_count": int(summary["instance_count"]),
         "static_instance_count": int(summary["static_instance_count"]),
         "temporal_consensus": metadata.get("temporal_consensus", {}),
+        "instance_point_consistency": metadata.get(
+            "instance_point_consistency", {}
+        ),
     }
 
 
@@ -800,6 +839,73 @@ def _parse_args() -> argparse.Namespace:
         "--temporal-consensus-novel-weight",
         type=float,
         default=0.20,
+    )
+    parser.add_argument(
+        "--instance-point-consistency",
+        action="store_true",
+        help=(
+            "Opt in to causal persistent-instance point consistency. This "
+            "exports raw and instance_point_consistency branches from one "
+            "shared HorizonStream/SAM inference."
+        ),
+    )
+    parser.add_argument(
+        "--instance-point-consistency-history-frames",
+        dest="instance_consistency_history_frames",
+        type=int,
+        default=12,
+        help="Number of previous observations retained per persistent instance.",
+    )
+    parser.add_argument(
+        "--instance-point-consistency-max-history-points",
+        dest="instance_consistency_max_history_points",
+        type=int,
+        default=4096,
+    )
+    parser.add_argument(
+        "--instance-point-consistency-min-history-points",
+        dest="instance_consistency_min_history_points",
+        type=int,
+        default=16,
+    )
+    parser.add_argument(
+        "--instance-point-consistency-support-radius-m",
+        dest="instance_consistency_support_radius_m",
+        type=float,
+        default=0.10,
+        help="Historical 3D support radius in meters.",
+    )
+    parser.add_argument(
+        "--instance-point-consistency-min-support-points",
+        dest="instance_consistency_min_support_points",
+        type=int,
+        default=8,
+    )
+    parser.add_argument(
+        "--instance-point-consistency-min-support-ratio",
+        dest="instance_consistency_min_support_ratio",
+        type=float,
+        default=0.15,
+    )
+    parser.add_argument(
+        "--instance-point-consistency-bounds-margin-m",
+        dest="instance_consistency_bounds_margin_m",
+        type=float,
+        default=0.20,
+        help="Margin around the historical object extent for new surfaces.",
+    )
+    parser.add_argument(
+        "--instance-point-consistency-max-novel-points",
+        dest="instance_consistency_max_novel_points",
+        type=int,
+        default=512,
+    )
+    parser.add_argument(
+        "--instance-point-consistency-novel-weight",
+        dest="instance_consistency_novel_weight",
+        type=float,
+        default=0.25,
+        help="Weight multiplier applied to retained novel points.",
     )
     args = parser.parse_args()
     from streaming_couping.src.semantic_mapping.geometry_guidance import (

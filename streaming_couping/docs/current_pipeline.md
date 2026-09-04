@@ -66,6 +66,28 @@ output               /data184/open_source/vggtSam/outputs/semantic_map_50frames_
 不是图像文件名。当前场景从 795 帧中取连续 50 帧。没有写入 prompt 的类别不会被
 赋予语义实例标签；当前 prompt 使用的是 `rug` 和 `dustbin`，不是 `mat`。
 
+## 持久实例点云一致性实验（默认关闭）
+
+当前主线 baseline 仍然是 `raw`：HorizonStream 的深度、位姿和完整场景点云不变，
+SAM3.1 的 mask 与 persistent instance ID 只参与语义实例写入。新增的
+`instance_point_consistency` 是一个 map-only ablation，不修改 HorizonStream 网络、
+相机位姿、深度、SAM tracking 或 `object_tracks`。
+
+它按 persistent instance ID 保存有限的历史世界坐标点。后续同一实例的点若落在历史
+支持半径内则保留；落在历史包围盒 margin 内但没有支持的少量新表面会降权；明显超出
+历史范围的点会过滤。raw 与实验分支共享同一次几何/SAM 推理，便于直接比较。
+
+ScanNet++ `00a231a370` 的可复制命令是：
+
+```bash
+zsh streaming_couping/commands_run_scannet_instance_point_consistency.txt
+```
+
+它会自动生成或复用此前 50 帧的 `horizonstream_geometry.pt`，输出到
+`/data184/open_source/vggtSam/outputs/semantic_map_50frames_horizonstream_instance_point_consistency`，
+并只打印 raw/实验分支的体素、轨迹点数、过滤/降权统计。完整 provenance 在各分支的
+`map_summary.json` 和根目录 `comparison.json` 中。
+
 ## 3. 两阶段执行方式
 
 两个模型按顺序运行。当前命令文件默认让两个阶段共用

@@ -99,7 +99,11 @@ class SemanticMapPipeline:
         unsupported = [
             policy
             for policy in normalized
-            if policy not in {"raw", "temporal_consensus"}
+            if policy not in {
+                "raw",
+                "temporal_consensus",
+                "instance_point_consistency",
+            }
         ]
         if unsupported:
             raise ValueError(
@@ -118,12 +122,33 @@ class SemanticMapPipeline:
         )
         results: dict[str, SemanticMapResult] = {}
         for policy in normalized:
+            if policy == "instance_point_consistency":
+                branch_config = replace(
+                    self.mapper.config,
+                    fusion_policy="instance_point_consistency",
+                    instance_point_consistency=replace(
+                        self.mapper.config.instance_point_consistency,
+                        enabled=True,
+                    ),
+                )
+            else:
+                branch_config = replace(
+                    self.mapper.config,
+                    fusion_policy=policy,
+                    instance_point_consistency=replace(
+                        self.mapper.config.instance_point_consistency,
+                        enabled=False,
+                    ),
+                )
             branch_mapper = SemanticMapBuilder(
-                replace(self.mapper.config, fusion_policy=policy)
+                branch_config
             )
             branch_metadata = dict(metadata or {})
             branch_metadata["fusion_policy"] = policy
             branch_metadata["branch_shared_model_inference"] = True
+            branch_metadata["instance_point_consistency_requested"] = (
+                policy == "instance_point_consistency"
+            )
             results[policy] = self._fuse(
                 geometry_frames,
                 segmentation_frames,
@@ -362,7 +387,11 @@ def _validate_policies(policies: Sequence[str]) -> tuple[str, ...]:
     unsupported = [
         policy
         for policy in normalized
-        if policy not in {"raw", "temporal_consensus"}
+        if policy not in {
+            "raw",
+            "temporal_consensus",
+            "instance_point_consistency",
+        }
     ]
     if unsupported:
         raise ValueError(f"Unsupported semantic-map policy/policies: {unsupported!r}.")

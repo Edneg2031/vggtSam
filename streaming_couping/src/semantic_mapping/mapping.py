@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 from typing import Any
 
@@ -15,6 +15,10 @@ from .geometry import (
     resize_bool_mask,
     rgb_for_frame,
     world_points_for_frame,
+)
+from .instance_point_consistency import (
+    InstancePointConsistencyConfig,
+    InstancePointConsistencyMemory,
 )
 from .temporal_consensus import (
     TemporalConsensusConfig,
@@ -43,14 +47,19 @@ class SemanticMapConfig:
     temporal_consensus: TemporalConsensusConfig = field(
         default_factory=lambda: TemporalConsensusConfig()
     )
+    instance_point_consistency: InstancePointConsistencyConfig = field(
+        default_factory=lambda: InstancePointConsistencyConfig()
+    )
 
     def validate(self) -> "SemanticMapConfig":
         if str(self.fusion_policy).strip().lower() not in {
             "raw",
             "temporal_consensus",
+            "instance_point_consistency",
         }:
             raise ValueError(
-                "fusion_policy must be 'raw' or 'temporal_consensus'."
+                "fusion_policy must be 'raw', 'temporal_consensus', or "
+                "'instance_point_consistency'."
             )
         if float(self.voxel_size_m) <= 0.0:
             raise ValueError("voxel_size_m must be positive.")
@@ -71,6 +80,7 @@ class SemanticMapConfig:
                 raise ValueError(f"{name} must be positive.")
         self.map_write_gate.validate()
         self.temporal_consensus.validate()
+        self.instance_point_consistency.validate()
         return self
 
 
@@ -181,6 +191,8 @@ class MapUpdateStats:
     map_written_point_count: int = 0
     consensus_filtered_point_count: int = 0
     consensus_downweighted_point_count: int = 0
+    instance_consistency_filtered_point_count: int = 0
+    instance_consistency_downweighted_point_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -268,6 +280,7 @@ class _TrackEvidence:
         is_static: bool,
         max_points: int,
         map_written: bool = False,
+        map_write_point_count: int | None = None,
     ) -> None:
         self.label_weights[label] = self.label_weights.get(label, 0.0) + float(
             weights.sum()
@@ -288,7 +301,11 @@ class _TrackEvidence:
             self.dynamic_observations += 1
         if map_written:
             self.map_write_observations += 1
-            self.map_write_points += int(points.shape[0])
+            self.map_write_points += int(
+                points.shape[0]
+                if map_write_point_count is None
+                else map_write_point_count
+            )
         self._compact(max_points)
 
     def _compact(self, max_points: int) -> None:
@@ -707,6 +724,14 @@ class SemanticMapBuilder:
             if self.config.fusion_policy == "temporal_consensus"
             else None
         )
+        consistency_config = self.config.instance_point_consistency
+        if self.config.fusion_policy == "instance_point_consistency":
+            consistency_config = replace(consistency_config, enabled=True)
+        self._instance_point_consistency = (
+            InstancePointConsistencyMemory(consistency_config)
+            if consistency_config.enabled
+            else None
+        )
         self._last_frame_id: int | None = None
         self._frame_count = 0
         self._last_stats: MapUpdateStats | None = None
@@ -757,6 +782,8 @@ class SemanticMapBuilder:
         map_written_point_count = 0
         consensus_filtered_point_count = 0
         consensus_downweighted_point_count = 0
+        instance_consistency_filtered_point_count = 0
+        instance_consistency_downweighted_point_count = 0
         for observation in segmentation.observations:
             if float(observation.score) < self.config.min_track_score:
                 continue
@@ -801,6 +828,62 @@ class SemanticMapBuilder:
             map_points = selected_points
             map_weights = selected_weights
             map_rgb = selected_rgb
+            consistency_event: dict[str, object] = {
+                "enabled": False,
+                "reason": "disabled:instance_point_consistency",
+                "raw_points": int(selected_points.shape[0]),
+                "output_points": int(selected_points.shape[0]),
+                "filtered_points": 0,
+                "downweighted_points": 0,
+            }
+            if is_static and self._instance_point_consistency is not None:
+                consistency_decision = self._instance_point_consistency.decide(
+                    int(observation.instance_id),
+                    selected_points,
+                    selected_weights,
+                    frame_id=frame_id,
+                )
+                map_points = selected_points[consistency_decision.keep_mask]
+                map_weights = selected_weights[
+                    consistency_decision.keep_mask
+                ] * consistency_decision.weight_multipliers[
+                    consistency_decision.keep_mask
+                ]
+                map_rgb = (
+                    None
+                    if selected_rgb is None
+                    else selected_rgb[consistency_decision.keep_mask]
+                )
+                consistency_event = {
+                    "enabled": True,
+                    **consistency_decision.to_dict(),
+                    "raw_points": int(selected_points.shape[0]),
+                    "output_points": int(map_points.shape[0]),
+                    "filtered_points": int(
+                        selected_points.shape[0] - map_points.shape[0]
+                    ),
+                    "downweighted_points": int(
+                        (
+                            consistency_decision.weight_multipliers[
+                                consistency_decision.keep_mask
+                            ]
+                            < 1.0
+                        ).sum()
+                    ),
+                }
+                self._instance_point_consistency.update(
+                    int(observation.instance_id),
+                    selected_points,
+                    selected_weights,
+                    frame_id=frame_id,
+                    decision=consistency_decision,
+                )
+                instance_consistency_filtered_point_count += int(
+                    consistency_event["filtered_points"]
+                )
+                instance_consistency_downweighted_point_count += int(
+                    consistency_event["downweighted_points"]
+                )
             consensus_event: dict[str, object] = {
                 "enabled": False,
                 "reason": "disabled:raw_fusion_policy",
@@ -868,6 +951,8 @@ class SemanticMapBuilder:
                 config=self.config.map_write_gate,
             )
             semantic_map_write = bool(is_static and gate_decision.map_write)
+            if self._instance_point_consistency is not None:
+                semantic_map_write = bool(semantic_map_write and map_points.numel())
             memory_state.observe(
                 frame_id=frame_id,
                 category=str(observation.category),
@@ -891,6 +976,7 @@ class SemanticMapBuilder:
                 "geometry_confidence": float(geometry_score),
                 "static_observation": int(is_static),
                 "fusion_policy": str(self.config.fusion_policy),
+                "instance_point_consistency": consistency_event,
                 "temporal_consensus": consensus_event,
                 **gate_decision.to_dict(),
                 "semantic_map_write": int(semantic_map_write),
@@ -910,7 +996,7 @@ class SemanticMapBuilder:
                         rgb=map_rgb,
                         frame_id=frame_id,
                     )
-                else:
+                elif not gate_decision.map_write:
                     map_gate_rejected += 1
             else:
                 dynamic_observations += 1
@@ -927,6 +1013,7 @@ class SemanticMapBuilder:
                     is_static=is_static,
                     max_points=self.config.max_points_per_track,
                     map_written=semantic_map_write,
+                    map_write_point_count=int(map_points.shape[0]),
                 )
 
         self._last_frame_id = frame_id
@@ -947,6 +1034,12 @@ class SemanticMapBuilder:
             map_written_point_count=map_written_point_count,
             consensus_filtered_point_count=consensus_filtered_point_count,
             consensus_downweighted_point_count=consensus_downweighted_point_count,
+            instance_consistency_filtered_point_count=(
+                instance_consistency_filtered_point_count
+            ),
+            instance_consistency_downweighted_point_count=(
+                instance_consistency_downweighted_point_count
+            ),
         )
         self._last_stats = stats
         return stats
@@ -1073,6 +1166,18 @@ class SemanticMapBuilder:
                     "enabled": False,
                     "config": self.config.temporal_consensus.to_dict(),
                     "reason": "fusion_policy_raw",
+                }
+            ),
+        )
+        result_metadata.setdefault(
+            "instance_point_consistency",
+            (
+                self._instance_point_consistency.summary()
+                if self._instance_point_consistency is not None
+                else {
+                    "enabled": False,
+                    "config": self.config.instance_point_consistency.to_dict(),
+                    "reason": "disabled",
                 }
             ),
         )

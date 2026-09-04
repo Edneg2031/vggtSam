@@ -65,6 +65,11 @@ from .temporal_consensus import (
     TemporalConsensusDecision,
     TemporalConsensusMemory,
 )
+from .instance_point_consistency import (
+    InstancePointConsistencyConfig,
+    InstancePointConsistencyDecision,
+    InstancePointConsistencyMemory,
+)
 
 __all__ = [
     "GeometryFrame",
@@ -97,6 +102,9 @@ __all__ = [
     "TemporalConsensusConfig",
     "TemporalConsensusDecision",
     "TemporalConsensusMemory",
+    "InstancePointConsistencyConfig",
+    "InstancePointConsistencyDecision",
+    "InstancePointConsistencyMemory",
     "export_semantic_map",
     "DinoV3PatchFeatureMatcher",
     "FeatureMatch",
