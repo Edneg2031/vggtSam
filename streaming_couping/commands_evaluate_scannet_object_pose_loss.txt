@@ -1,0 +1,68 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+setopt NULL_GLOB
+
+# Offline GT evaluation for the object-only pose-loss experiment.
+# GT is opened only here, after runtime inference/refinement has completed.
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/horizonstream/bin/python}"
+
+INPUT_DIR="${OBJECT_POSE_LOSS_OUTPUT_DIR:-$STORAGE_ROOT/outputs/semantic_map_50frames_horizonstream_object_pose_loss}"
+EVAL_DIR="${OBJECT_POSE_LOSS_EVAL_DIR:-$INPUT_DIR/gt_evaluation}"
+MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
+SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
+GEOMETRY_CACHE="${HORIZONSTREAM_GEOMETRY_CACHE:-$STORAGE_ROOT/outputs/semantic_map_50frames_horizonstream_consecutive/horizonstream_geometry.pt}"
+MAP_SOURCE="${OBJECT_POSE_LOSS_MAP_SOURCE:-semantic}"
+
+cd "$ROOT"
+[[ -x "$PYTHON" ]] || { print -u2 "missing Python: $PYTHON"; exit 1; }
+[[ -d "$INPUT_DIR" ]] || { print -u2 "missing input: $INPUT_DIR"; exit 1; }
+[[ -f "$MANIFEST_PATH" ]] || { print -u2 "missing manifest: $MANIFEST_PATH"; exit 1; }
+[[ -f "$GEOMETRY_CACHE" ]] || { print -u2 "missing geometry cache: $GEOMETRY_CACHE"; exit 1; }
+
+mkdir -p "$EVAL_DIR"
+
+PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m streaming_couping.scripts.evaluate_exported_semantic_map \
+  --input-dir "$INPUT_DIR" \
+  --output-dir "$EVAL_DIR" \
+  --manifest "$MANIFEST_PATH" \
+  --scene-id "$SCENE_ID" \
+  --geometry-cache "$GEOMETRY_CACHE" \
+  --map-source "$MAP_SOURCE" \
+  --alignment reference \
+  >"$EVAL_DIR/evaluator.log" 2>&1
+
+SUMMARY="$EVAL_DIR/summary.json"
+COPYABLE="$EVAL_DIR/copyable_result.txt"
+COMBINED="$EVAL_DIR/gt_comparison.txt"
+[[ -f "$SUMMARY" && -f "$COPYABLE" ]] || {
+  print -u2 "GT evaluation did not produce expected files"
+  tail -n 50 "$EVAL_DIR/evaluator.log"
+  exit 1
+}
+
+{
+  print "===== SCANNET OBJECT POSE LOSS GT COMPARISON ====="
+  print "input=$INPUT_DIR"
+  print "map_source=$MAP_SOURCE"
+  print ""
+  cat "$COPYABLE"
+  print ""
+  print "===== PLY VERTEX COUNTS ====="
+  for ply in "$INPUT_DIR"/raw_pose/*.ply "$INPUT_DIR"/raw_pose/objects/*.ply \
+      "$INPUT_DIR"/object_pose_refined/*.ply "$INPUT_DIR"/object_pose_refined/objects/*.ply; do
+    [[ -f "$ply" ]] || continue
+    vertex_count="$(sed -n 's/^element vertex //p' "$ply" | head -n 1)"
+    print "$(basename "$ply")=$vertex_count path=$ply"
+  done
+  print ""
+  print "raw_map_summary=$INPUT_DIR/raw_pose/map_summary.json"
+  print "refined_map_summary=$INPUT_DIR/object_pose_refined/map_summary.json"
+  print "evaluation_summary=$SUMMARY"
+  print "evaluation_log=$EVAL_DIR/evaluator.log"
+} >"$COMBINED"
+
+cat "$COMBINED"
+print "result_file=$COMBINED"
