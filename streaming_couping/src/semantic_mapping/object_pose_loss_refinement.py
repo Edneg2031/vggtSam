@@ -389,14 +389,14 @@ class ObjectPoseLossRefiner:
             translation_changes.append(float(torch.linalg.vector_norm(delta[:3, 3])))
 
         initial_losses = [
-            float(row["initial_loss_m"])
-            for row in accepted_edges
-            if math.isfinite(float(row.initial_loss_m))
+            float(edge.initial_loss_m)
+            for edge in accepted_edges
+            if math.isfinite(float(edge.initial_loss_m))
         ]
         final_losses = [
-            float(row["final_loss_m"])
-            for row in accepted_edges
-            if math.isfinite(float(row.final_loss_m))
+            float(edge.final_loss_m)
+            for edge in accepted_edges
+            if math.isfinite(float(edge.final_loss_m))
         ]
         reasons = Counter(str(row.get("reason", "unknown")) for row in rejected_edges)
         optimizer_frames = [
