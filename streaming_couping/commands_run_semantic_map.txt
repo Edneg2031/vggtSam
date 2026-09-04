@@ -153,6 +153,12 @@ if ! "$SAM_PYTHON" -c 'import pkg_resources' >/dev/null 2>&1; then
     "setuptools==80.9.0"
   "$SAM_PYTHON" -c 'import pkg_resources' >/dev/null
 fi
+if ! "$SAM_PYTHON" -c 'import iopath' >/dev/null 2>&1; then
+  print "iopath missing; installing iopath>=0.1.10"
+  "$SAM_PYTHON" -m pip install --disable-pip-version-check --no-input \
+    "iopath>=0.1.10"
+  "$SAM_PYTHON" -c 'import iopath' >/dev/null
+fi
 
 # Explicit CLI arguments are an advanced, map-stage-only escape hatch. They
 # must include --geometry-cache when HorizonStream geometry is desired.
