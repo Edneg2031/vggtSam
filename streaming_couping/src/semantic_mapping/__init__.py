@@ -58,6 +58,10 @@ from .object_pose_loss_refinement import (
     ObjectPoseLossRefinementConfig,
     ObjectPoseLossRefiner,
 )
+from .online_object_pose_loop import (
+    OnlineObjectPoseLoopConfig,
+    OnlineObjectPoseLoopRefiner,
+)
 from .evaluation import (
     ExportedMapMetricConfig,
     SimilarityAlignment,
@@ -135,4 +139,6 @@ __all__ = [
     "ObjectLossEdge",
     "ObjectPoseLossRefinementConfig",
     "ObjectPoseLossRefiner",
+    "OnlineObjectPoseLoopConfig",
+    "OnlineObjectPoseLoopRefiner",
 ]

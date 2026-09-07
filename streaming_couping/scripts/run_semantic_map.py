@@ -57,6 +57,10 @@ from streaming_couping.src.semantic_mapping.object_pose_loss_refinement import (
     ObjectPoseLossRefinementConfig,
     ObjectPoseLossRefiner,
 )
+from streaming_couping.src.semantic_mapping.online_object_pose_loop import (
+    OnlineObjectPoseLoopConfig,
+    OnlineObjectPoseLoopRefiner,
+)
 from streaming_couping.src.semantic_mapping.pipeline import SemanticMapPipeline
 from streaming_couping.src.semantic_mapping.pipeline import (
     SemanticMapPoseRefinementRun,
@@ -141,7 +145,11 @@ def _run_from_cache(
     prompts: tuple[str, ...],
     mapper: SemanticMapBuilder,
 ):
-    if args.object_pose_refinement or args.object_pose_loss_refinement:
+    if (
+        args.object_pose_refinement
+        or args.object_pose_loss_refinement
+        or args.object_pose_online_loop
+    ):
         raise ValueError(
             "object pose refinement currently requires RGB mode with a "
             "geometry provider that exposes camera poses; frozen V0 cache "
@@ -254,8 +262,9 @@ def _run_from_rgb(
         f"sam_device={recovery.sam3_device} "
         f"sam_grounding_batch={args.sam_grounding_batch_size} "
         f"sam_video_cpu_offload={int(args.sam_offload_video_to_cpu)} "
-        f"object_pose_refinement={int(args.object_pose_refinement or args.object_pose_loss_refinement)} "
-        f"object_pose_loss_refinement={int(args.object_pose_loss_refinement)}"
+        f"object_pose_refinement={int(args.object_pose_refinement or args.object_pose_loss_refinement or args.object_pose_online_loop)} "
+        f"object_pose_loss_refinement={int(args.object_pose_loss_refinement)} "
+        f"object_pose_online_loop={int(args.object_pose_online_loop)}"
     )
     from streaming_couping.src.backbones.sam3_wrapper import SAM3Wrapper
 
@@ -287,7 +296,16 @@ def _run_from_rgb(
     else:
         segmentation = SAM31SegmentationAdapter(sam, **segmentation_kwargs)
     object_pose_refiner = None
-    if args.object_pose_loss_refinement:
+    online_object_pose_loop = False
+    if args.object_pose_online_loop:
+        object_pose_config = _object_pose_loss_config(args)
+        online_config = _online_object_pose_loop_config(
+            args,
+            observation_config=object_pose_config,
+        )
+        object_pose_refiner = OnlineObjectPoseLoopRefiner(online_config)
+        online_object_pose_loop = True
+    elif args.object_pose_loss_refinement:
         object_pose_config = _object_pose_loss_config(args)
         object_pose_refiner = ObjectPoseLossRefiner(object_pose_config)
     elif args.object_pose_refinement:
@@ -333,6 +351,7 @@ def _run_from_rgb(
             metadata=metadata,
             fusion_policy=args.fusion_policy,
             object_pose_refiner=object_pose_refiner,
+            online_object_pose_loop=online_object_pose_loop,
             instance_point_consistency=args.instance_point_consistency,
         )
 
@@ -346,6 +365,7 @@ def _run_from_rgb(
             metadata=metadata,
             fusion_policy=args.fusion_policy,
             object_pose_refiner=object_pose_refiner,
+            online_object_pose_loop=online_object_pose_loop,
             instance_point_consistency=args.instance_point_consistency,
         )
 
@@ -358,6 +378,7 @@ def _execute_pipeline(
     metadata: dict[str, Any],
     fusion_policy: str,
     object_pose_refiner: ObjectPoseRefiner | None = None,
+    online_object_pose_loop: bool = False,
     instance_point_consistency: bool = False,
 ):
     if instance_point_consistency:
@@ -383,7 +404,12 @@ def _execute_pipeline(
             if fusion_policy == "both"
             else (fusion_policy,)
         )
-        return pipeline.run_with_object_pose_refinement(
+        run_method = (
+            pipeline.run_with_online_object_pose_loop
+            if online_object_pose_loop
+            else pipeline.run_with_object_pose_refinement
+        )
+        return run_method(
             image_paths,
             refiner=object_pose_refiner,
             prompts=prompts,
@@ -738,6 +764,15 @@ def _parse_args() -> argparse.Namespace:
             "default baseline is unchanged."
         ),
     )
+    parser.add_argument(
+        "--object-pose-online-loop",
+        action="store_true",
+        help=(
+            "Run the conservative external SAM/HorizonStream loop: carry the "
+            "corrected world pose forward and optimize a recent sliding window. "
+            "HorizonStream latent/cache state is not mutated."
+        ),
+    )
     parser.add_argument("--object-pose-loss-anchor-frames", type=int, default=5)
     parser.add_argument("--object-pose-loss-max-anchor-observations", type=int, default=3)
     parser.add_argument("--object-pose-loss-max-history-observations", type=int, default=2)
@@ -772,6 +807,25 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--object-pose-loss-device", default="cpu")
+    parser.add_argument("--object-pose-online-window-size", type=int, default=10)
+    parser.add_argument("--object-pose-online-max-reference-frames", type=int, default=5)
+    parser.add_argument("--object-pose-online-max-reference-gap", type=int, default=10)
+    parser.add_argument("--object-pose-online-anchor-frames", type=int, default=3)
+    parser.add_argument("--object-pose-online-min-independent-instances", type=int, default=2)
+    parser.add_argument("--object-pose-online-min-matches-per-instance", type=int, default=15)
+    parser.add_argument("--object-pose-online-min-total-matches", type=int, default=48)
+    parser.add_argument("--object-pose-online-rematch-iterations", type=int, default=2)
+    parser.add_argument("--object-pose-online-optimizer-steps", type=int, default=50)
+    parser.add_argument("--object-pose-online-learning-rate", type=float, default=0.01)
+    parser.add_argument("--object-pose-online-huber-delta-m", type=float, default=0.05)
+    parser.add_argument("--object-pose-online-pose-prior-weight", type=float, default=1.0)
+    parser.add_argument("--object-pose-online-temporal-edge-weight", type=float, default=1.0)
+    parser.add_argument("--object-pose-online-correction-smoothness-weight", type=float, default=0.25)
+    parser.add_argument("--object-pose-online-rotation-residual-scale-m", type=float, default=0.50)
+    parser.add_argument("--object-pose-online-max-local-correction-rotation-deg", type=float, default=1.0)
+    parser.add_argument("--object-pose-online-max-local-correction-translation-m", type=float, default=0.03)
+    parser.add_argument("--object-pose-online-min-relative-improvement", type=float, default=0.10)
+    parser.add_argument("--object-pose-online-max-validation-residual-m", type=float, default=0.10)
     parser.add_argument("--object-pose-min-gap", type=int, default=10)
     parser.add_argument("--object-pose-min-track-score", type=float, default=0.50)
     parser.add_argument("--object-pose-min-mask-pixels", type=int, default=32)
@@ -968,10 +1022,17 @@ def _parse_args() -> argparse.Namespace:
         help="Weight multiplier applied to retained novel points.",
     )
     args = parser.parse_args()
-    if args.object_pose_refinement and args.object_pose_loss_refinement:
+    if sum(
+        bool(value)
+        for value in (
+            args.object_pose_refinement,
+            args.object_pose_loss_refinement,
+            args.object_pose_online_loop,
+        )
+    ) > 1:
         parser.error(
-            "--object-pose-refinement and --object-pose-loss-refinement "
-            "are mutually exclusive."
+            "--object-pose-refinement, --object-pose-loss-refinement, and "
+            "--object-pose-online-loop are mutually exclusive."
         )
     from streaming_couping.src.semantic_mapping.geometry_guidance import (
         GeometryGuidanceConfig,
@@ -1068,6 +1129,43 @@ def _object_pose_loss_config(
         min_relative_loss_improvement=args.object_pose_loss_min_relative_improvement,
         trace_optimization=args.object_pose_loss_trace,
         device=args.object_pose_loss_device,
+    ).validate()
+
+
+def _online_object_pose_loop_config(
+    args: argparse.Namespace,
+    *,
+    observation_config: ObjectPoseLossRefinementConfig,
+) -> OnlineObjectPoseLoopConfig:
+    return OnlineObjectPoseLoopConfig(
+        observation_config=observation_config,
+        window_size=args.object_pose_online_window_size,
+        max_reference_frames=args.object_pose_online_max_reference_frames,
+        max_reference_gap=args.object_pose_online_max_reference_gap,
+        anchor_frame_count=args.object_pose_online_anchor_frames,
+        min_independent_instances=args.object_pose_online_min_independent_instances,
+        min_matches_per_instance=args.object_pose_online_min_matches_per_instance,
+        min_total_matches=args.object_pose_online_min_total_matches,
+        rematch_iterations=args.object_pose_online_rematch_iterations,
+        optimizer_steps=args.object_pose_online_optimizer_steps,
+        learning_rate=args.object_pose_online_learning_rate,
+        huber_delta_m=args.object_pose_online_huber_delta_m,
+        pose_prior_weight=args.object_pose_online_pose_prior_weight,
+        temporal_edge_weight=args.object_pose_online_temporal_edge_weight,
+        correction_smoothness_weight=(
+            args.object_pose_online_correction_smoothness_weight
+        ),
+        rotation_residual_scale_m=args.object_pose_online_rotation_residual_scale_m,
+        max_local_correction_rotation_deg=(
+            args.object_pose_online_max_local_correction_rotation_deg
+        ),
+        max_local_correction_translation_m=(
+            args.object_pose_online_max_local_correction_translation_m
+        ),
+        min_relative_loss_improvement=args.object_pose_online_min_relative_improvement,
+        max_validation_residual_m=args.object_pose_online_max_validation_residual_m,
+        device=args.object_pose_loss_device,
+        trace_optimization=args.object_pose_loss_trace,
     ).validate()
 
 

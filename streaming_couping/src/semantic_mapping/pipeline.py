@@ -19,6 +19,7 @@ from .object_pose_refinement import (
     PoseRefinementResult,
     apply_refined_camera_poses,
 )
+from .online_object_pose_loop import OnlineObjectPoseLoopRefiner
 
 
 @dataclass(frozen=True)
@@ -196,6 +197,13 @@ class SemanticMapPipeline:
             geometry_frames,
             refinement,
         )
+        refined_pose_variant = (
+            "object_pose_online_loop"
+            if str(getattr(refiner, "method_name", "")).startswith(
+                "sam_instance_guided_external_online"
+            )
+            else "object_pose_refined"
+        )
         refinement_metadata = {
             "enabled": True,
             "candidate_generation_gt_fields": 0,
@@ -224,7 +232,7 @@ class SemanticMapPipeline:
             refined_metadata.update(
                 {
                     "fusion_policy": policy,
-                    "pose_variant": "object_pose_refined",
+                    "pose_variant": refined_pose_variant,
                     "object_pose_refinement": refinement_metadata,
                 }
             )
@@ -249,6 +257,35 @@ class SemanticMapPipeline:
             refined_results=refined_results,
             refinement=refinement,
         )
+
+    def run_with_online_object_pose_loop(
+        self,
+        image_paths: Sequence[str | Path],
+        *,
+        refiner: OnlineObjectPoseLoopRefiner,
+        prompts: Sequence[str] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        policies: Sequence[str] = ("raw",),
+    ) -> SemanticMapPoseRefinementRun:
+        """Run the causal external SAM pose-correction loop.
+
+        Geometry and SAM providers are evaluated once, then the refiner
+        consumes their canonical frames in increasing frame order.  Unlike
+        the legacy offline refiner, it predicts the next pose from the
+        previously corrected external pose, optimizes a recent sliding
+        window, and returns the corrected trajectory for downstream fusion.
+        HorizonStream's internal latent/cache state is intentionally not
+        mutated; this is the external-feedback ablation.
+        """
+
+        run = self.run_with_object_pose_refinement(
+            image_paths,
+            refiner=refiner,  # type: ignore[arg-type]
+            prompts=prompts,
+            metadata=metadata,
+            policies=policies,
+        )
+        return run
 
     def update(
         self,
