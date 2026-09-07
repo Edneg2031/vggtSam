@@ -23,7 +23,7 @@ PROMPTS=("bed" "wardrobe" "chair" "rug" "dustbin")
 
 BASELINE_OUTPUT_DIR="$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_consecutive"
 GEOMETRY_CACHE="${HORIZONSTREAM_GEOMETRY_CACHE:-$BASELINE_OUTPUT_DIR/horizonstream_geometry.pt}"
-OUTPUT_DIR="${OBJECT_POSE_LOSS_OUTPUT_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_loss}"
+OUTPUT_DIR="${OBJECT_POSE_LOSS_OUTPUT_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_loss_trace}"
 EVAL_DIR="$OUTPUT_DIR/gt_evaluation"
 RECOVERY_CONFIG="${RECOVERY_CONFIG_PATH:-$ROOT/streaming_couping/configs/recovery_dynamic_instance.yaml}"
 GEOMETRY_LOG="$OUTPUT_DIR/horizonstream_geometry.log"
@@ -110,10 +110,9 @@ ARGS=(
   --object-pose-loss-device cpu
 )
 
-TRACE_ARGS=()
-if [[ "${OBJECT_POSE_LOSS_TRACE:-0}" == "1" ]]; then
-  TRACE_ARGS+=(--object-pose-loss-trace)
-fi
+# This diagnostic run always records the per-frame outer-iteration trace so it
+# can be launched directly without extra environment variables.
+TRACE_ARGS=(--object-pose-loss-trace)
 
 print "===== SCANNET OBJECT POSE LOSS 100F ====="
 print "scene=$SCENE_ID frames=$FRAME_COUNT frame_start=$FRAME_START frame_stride=$FRAME_STRIDE"
@@ -165,8 +164,6 @@ PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   "$SUMMARY_PATH" "$EVAL_SUMMARY"
 print "run_log=$RUN_LOG"
 print "evaluation_log=$EVAL_LOG"
-if [[ "${OBJECT_POSE_LOSS_PRINT_TRACE:-0}" == "1" ]]; then
-  PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-    "$SAM_PYTHON" "$ROOT/streaming_couping/scripts/print_object_pose_loss_trace.py" \
-    "$SUMMARY_PATH" "$EVAL_SUMMARY"
-fi
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$SAM_PYTHON" "$ROOT/streaming_couping/scripts/print_object_pose_loss_trace.py" \
+  "$SUMMARY_PATH" "$EVAL_SUMMARY"
