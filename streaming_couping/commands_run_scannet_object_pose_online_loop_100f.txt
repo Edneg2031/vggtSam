@@ -1,11 +1,12 @@
 #!/usr/bin/env zsh
 set -euo pipefail
 
-# 100-frame external SAM/HorizonStream pose-correction loop.
+# 100-frame V2 conservative external SAM/HorizonStream pose-correction loop.
 # HorizonStream is run once to produce the geometry cache.  The semantic-map
 # stage then processes frames causally with a corrected external pose state and
-# a conservative sliding-window object constraint optimizer.  HorizonStream's
-# latent/cache state is deliberately not mutated in this experiment.
+# a current-frame-only object constraint optimizer with a deterministic
+# correspondence holdout.  HorizonStream's latent/cache state is deliberately
+# not mutated in this experiment.
 
 ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
@@ -25,7 +26,7 @@ PROMPTS=("bed" "wardrobe" "chair" "rug" "dustbin")
 
 BASELINE_OUTPUT_DIR="$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_consecutive"
 GEOMETRY_CACHE="${HORIZONSTREAM_GEOMETRY_CACHE:-$BASELINE_OUTPUT_DIR/horizonstream_geometry.pt}"
-OUTPUT_DIR="${OBJECT_POSE_ONLINE_OUTPUT_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_online_loop}"
+OUTPUT_DIR="${OBJECT_POSE_ONLINE_OUTPUT_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_online_loop_v2}"
 EVAL_DIR="$OUTPUT_DIR/gt_evaluation"
 RECOVERY_CONFIG="${RECOVERY_CONFIG_PATH:-$ROOT/streaming_couping/configs/recovery_dynamic_instance.yaml}"
 GEOMETRY_LOG="$OUTPUT_DIR/horizonstream_geometry.log"
@@ -99,13 +100,15 @@ ARGS=(
   --object-pose-loss-trim-ratio 0.70
   --object-pose-loss-min-matches-per-pair 8
   --object-pose-loss-device cpu
-  --object-pose-online-window-size 10
-  --object-pose-online-max-reference-frames 5
+  --object-pose-online-window-size 1
+  --object-pose-online-max-reference-frames 2
   --object-pose-online-max-reference-gap 10
   --object-pose-online-anchor-frames 3
+  --object-pose-online-always-include-anchor-reference
+  --object-pose-online-no-carry-rejected-correction
   --object-pose-online-min-independent-instances 2
   --object-pose-online-min-matches-per-instance 15
-  --object-pose-online-min-total-matches 48
+  --object-pose-online-min-total-matches 40
   --object-pose-online-rematch-iterations 2
   --object-pose-online-optimizer-steps 50
   --object-pose-online-learning-rate 0.01
@@ -113,10 +116,13 @@ ARGS=(
   --object-pose-online-pose-prior-weight 1.0
   --object-pose-online-temporal-edge-weight 1.0
   --object-pose-online-correction-smoothness-weight 0.25
-  --object-pose-online-max-local-correction-rotation-deg 1.0
-  --object-pose-online-max-local-correction-translation-m 0.03
+  --object-pose-online-max-local-correction-rotation-deg 0.3
+  --object-pose-online-max-local-correction-translation-m 0.01
   --object-pose-online-min-relative-improvement 0.10
   --object-pose-online-max-validation-residual-m 0.10
+  --object-pose-online-validation-fraction 0.25
+  --object-pose-online-min-validation-matches-per-instance 2
+  --object-pose-online-min-validation-relative-improvement 0.05
   --object-pose-loss-trace
 )
 

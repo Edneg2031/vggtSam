@@ -811,6 +811,25 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--object-pose-online-max-reference-frames", type=int, default=5)
     parser.add_argument("--object-pose-online-max-reference-gap", type=int, default=10)
     parser.add_argument("--object-pose-online-anchor-frames", type=int, default=3)
+    parser.add_argument(
+        "--object-pose-online-always-include-anchor-reference",
+        action="store_true",
+        help="Reserve one reference slot for the newest eligible anchor.",
+    )
+    carry_group = parser.add_mutually_exclusive_group()
+    carry_group.add_argument(
+        "--object-pose-online-carry-rejected-correction",
+        dest="object_pose_online_carry_rejected_correction",
+        action="store_true",
+        help="Keep the previous external correction after a rejected frame.",
+    )
+    carry_group.add_argument(
+        "--object-pose-online-no-carry-rejected-correction",
+        dest="object_pose_online_carry_rejected_correction",
+        action="store_false",
+        help="Fall back to the raw pose after a rejected/no-evidence frame.",
+    )
+    parser.set_defaults(object_pose_online_carry_rejected_correction=True)
     parser.add_argument("--object-pose-online-min-independent-instances", type=int, default=2)
     parser.add_argument("--object-pose-online-min-matches-per-instance", type=int, default=15)
     parser.add_argument("--object-pose-online-min-total-matches", type=int, default=48)
@@ -826,6 +845,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--object-pose-online-max-local-correction-translation-m", type=float, default=0.03)
     parser.add_argument("--object-pose-online-min-relative-improvement", type=float, default=0.10)
     parser.add_argument("--object-pose-online-max-validation-residual-m", type=float, default=0.10)
+    parser.add_argument(
+        "--object-pose-online-validation-fraction",
+        type=float,
+        default=0.0,
+        help="Deterministic per-pair correspondence holdout fraction; 0 disables it.",
+    )
+    parser.add_argument(
+        "--object-pose-online-min-validation-matches-per-instance",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--object-pose-online-min-validation-relative-improvement",
+        type=float,
+        default=0.05,
+    )
     parser.add_argument("--object-pose-min-gap", type=int, default=10)
     parser.add_argument("--object-pose-min-track-score", type=float, default=0.50)
     parser.add_argument("--object-pose-min-mask-pixels", type=int, default=32)
@@ -1143,6 +1178,12 @@ def _online_object_pose_loop_config(
         max_reference_frames=args.object_pose_online_max_reference_frames,
         max_reference_gap=args.object_pose_online_max_reference_gap,
         anchor_frame_count=args.object_pose_online_anchor_frames,
+        always_include_anchor_reference=(
+            args.object_pose_online_always_include_anchor_reference
+        ),
+        carry_rejected_correction=(
+            args.object_pose_online_carry_rejected_correction
+        ),
         min_independent_instances=args.object_pose_online_min_independent_instances,
         min_matches_per_instance=args.object_pose_online_min_matches_per_instance,
         min_total_matches=args.object_pose_online_min_total_matches,
@@ -1164,6 +1205,13 @@ def _online_object_pose_loop_config(
         ),
         min_relative_loss_improvement=args.object_pose_online_min_relative_improvement,
         max_validation_residual_m=args.object_pose_online_max_validation_residual_m,
+        validation_fraction=args.object_pose_online_validation_fraction,
+        min_validation_matches_per_instance=(
+            args.object_pose_online_min_validation_matches_per_instance
+        ),
+        min_validation_relative_loss_improvement=(
+            args.object_pose_online_min_validation_relative_improvement
+        ),
         device=args.object_pose_loss_device,
         trace_optimization=args.object_pose_loss_trace,
     ).validate()

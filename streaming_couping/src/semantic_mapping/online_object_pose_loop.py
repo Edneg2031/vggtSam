@@ -61,6 +61,8 @@ class OnlineObjectPoseLoopConfig:
     max_reference_frames: int = 5
     max_reference_gap: int = 10
     anchor_frame_count: int = 3
+    always_include_anchor_reference: bool = False
+    carry_rejected_correction: bool = True
 
     min_independent_instances: int = 2
     min_matches_per_instance: int = 15
@@ -74,6 +76,12 @@ class OnlineObjectPoseLoopConfig:
     temporal_edge_weight: float = 1.0
     correction_smoothness_weight: float = 0.25
     rotation_residual_scale_m: float = 0.50
+
+    # Optional independent correspondence holdout.  A zero fraction keeps
+    # the original V1 behavior; the V2 experiment enables this explicitly.
+    validation_fraction: float = 0.0
+    min_validation_matches_per_instance: int = 2
+    min_validation_relative_loss_improvement: float = 0.05
 
     max_local_correction_rotation_deg: float = 1.0
     max_local_correction_translation_m: float = 0.03
@@ -90,6 +98,10 @@ class OnlineObjectPoseLoopConfig:
             ("max_reference_frames", self.max_reference_frames),
             ("max_reference_gap", self.max_reference_gap),
             ("anchor_frame_count", self.anchor_frame_count),
+            (
+                "min_validation_matches_per_instance",
+                self.min_validation_matches_per_instance,
+            ),
             ("min_independent_instances", self.min_independent_instances),
             ("min_matches_per_instance", self.min_matches_per_instance),
             ("min_total_matches", self.min_total_matches),
@@ -124,6 +136,22 @@ class OnlineObjectPoseLoopConfig:
             raise ValueError(
                 "online_object_pose.min_relative_loss_improvement must be in [0,1]."
             )
+        if not 0.0 <= float(self.validation_fraction) < 1.0:
+            raise ValueError(
+                "online_object_pose.validation_fraction must be in [0,1)."
+            )
+        if not 0.0 <= float(self.min_validation_relative_loss_improvement) <= 1.0:
+            raise ValueError(
+                "online_object_pose.min_validation_relative_loss_improvement "
+                "must be in [0,1]."
+            )
+        if float(self.validation_fraction) > 0.0 and int(
+            self.min_validation_matches_per_instance
+        ) < 1:
+            raise ValueError(
+                "online_object_pose.min_validation_matches_per_instance must "
+                "be positive when validation is enabled."
+            )
         if not str(self.device).strip():
             raise ValueError("online_object_pose.device must not be empty.")
         return self
@@ -135,6 +163,10 @@ class OnlineObjectPoseLoopConfig:
             "max_reference_frames": int(self.max_reference_frames),
             "max_reference_gap": int(self.max_reference_gap),
             "anchor_frame_count": int(self.anchor_frame_count),
+            "always_include_anchor_reference": bool(
+                self.always_include_anchor_reference
+            ),
+            "carry_rejected_correction": bool(self.carry_rejected_correction),
             "min_independent_instances": int(self.min_independent_instances),
             "min_matches_per_instance": int(self.min_matches_per_instance),
             "min_total_matches": int(self.min_total_matches),
@@ -146,6 +178,13 @@ class OnlineObjectPoseLoopConfig:
             "temporal_edge_weight": float(self.temporal_edge_weight),
             "correction_smoothness_weight": float(self.correction_smoothness_weight),
             "rotation_residual_scale_m": float(self.rotation_residual_scale_m),
+            "validation_fraction": float(self.validation_fraction),
+            "min_validation_matches_per_instance": int(
+                self.min_validation_matches_per_instance
+            ),
+            "min_validation_relative_loss_improvement": float(
+                self.min_validation_relative_loss_improvement
+            ),
             "max_local_correction_rotation_deg": float(
                 self.max_local_correction_rotation_deg
             ),
@@ -172,6 +211,9 @@ class _ObjectConstraint:
     current_indices: torch.Tensor
     reference_indices: torch.Tensor
     weights: torch.Tensor
+    validation_current_indices: torch.Tensor
+    validation_reference_indices: torch.Tensor
+    validation_weights: torch.Tensor
     pair_weight: float
     reference_role: str
 
@@ -185,7 +227,7 @@ class OnlineObjectPoseLoopRefiner:
     can later call the same state machine one frame at a time.
     """
 
-    method_name = "sam_instance_guided_external_online_sliding_window_pose_graph"
+    method_name = "sam_instance_guided_external_online_pose_graph"
 
     def __init__(
         self,
@@ -302,7 +344,9 @@ class OnlineObjectPoseLoopRefiner:
             working_poses.update(base_poses)
 
             if not reference_ids:
-                corrected_poses[frame_id] = predicted_pose
+                corrected_poses[frame_id] = self._fallback_pose(
+                    raw_pose, predicted_pose
+                )
                 reason = "no_recent_instance_reference"
                 frame_diagnostics.append(
                     self._frame_diagnostic(
@@ -392,6 +436,18 @@ class OnlineObjectPoseLoopRefiner:
                 fixed_loss = self._object_loss(candidate_poses, constraints)
                 candidate_loss = self._object_loss(candidate_poses, candidate_constraints)
                 common_loss = self._object_loss(candidate_poses, initial_constraints)
+                if iteration == 0:
+                    initial_validation_loss = self._object_loss(
+                        current_iteration_poses,
+                        initial_constraints,
+                        validation=True,
+                    )
+                validation_loss = self._object_loss(
+                    candidate_poses,
+                    initial_constraints,
+                    validation=True,
+                )
+                validation_stats = self._validation_stats(initial_constraints)
                 correction = _invert_pose(predicted_pose) @ candidate_poses[frame_id]
                 trace.update(
                     {
@@ -405,6 +461,11 @@ class OnlineObjectPoseLoopRefiner:
                         "common_initial_correspondence_loss_m": _finite_or_none(
                             common_loss
                         ),
+                        "validation_loss_m": _finite_or_none(validation_loss),
+                        "validation_match_count": validation_stats["total_matches"],
+                        "validation_independent_instance_count": validation_stats[
+                            "instance_count"
+                        ],
                         "delta_rotation_deg": _rotation_angle_deg(correction[:3, :3]),
                         "delta_translation_m": float(
                             torch.linalg.vector_norm(correction[:3, 3])
@@ -417,6 +478,13 @@ class OnlineObjectPoseLoopRefiner:
                 # iterations would allow a change in correspondence to look
                 # like geometric improvement by itself.
                 improvement = _relative_improvement(initial_loss, common_loss)
+                validation_improvement = _relative_improvement(
+                    initial_validation_loss,
+                    validation_loss,
+                )
+                trace["validation_relative_improvement"] = _finite_or_none(
+                    validation_improvement
+                )
                 valid = self._passes_candidate_gate(
                     candidate_stats,
                     candidate_poses,
@@ -424,6 +492,8 @@ class OnlineObjectPoseLoopRefiner:
                     predicted_pose,
                     improvement,
                     candidate_constraints,
+                    validation_improvement=validation_improvement,
+                    validation_constraints=initial_constraints,
                 )
                 if valid and common_loss < best_loss:
                     best_loss = common_loss
@@ -444,6 +514,8 @@ class OnlineObjectPoseLoopRefiner:
                             frame_id,
                             predicted_pose,
                             candidate_constraints,
+                            validation_improvement=validation_improvement,
+                            validation_constraints=initial_constraints,
                         )
                 trace["best_loss_m_after"] = _finite_or_none(best_loss)
                 trace_rows.append(trace)
@@ -491,7 +563,9 @@ class OnlineObjectPoseLoopRefiner:
                     initial_poses=working_poses,
                 )
             else:
-                corrected_poses[frame_id] = predicted_pose
+                corrected_poses[frame_id] = self._fallback_pose(
+                    raw_pose, predicted_pose
+                )
                 final_constraints = self._build_constraints(
                     frame_id,
                     current_observations,
@@ -599,7 +673,7 @@ class OnlineObjectPoseLoopRefiner:
         )
         summary = {
             "schema": 1,
-            "revision": "sam_instance_guided_external_online_sliding_window_pose_graph_r1",
+            "revision": "sam_instance_guided_external_online_pose_graph_r2_holdout",
             "method": self.method_name,
             "enabled": True,
             "causal": True,
@@ -650,7 +724,7 @@ class OnlineObjectPoseLoopRefiner:
             "optimization_trace_enabled": bool(self.config.trace_optimization),
             "optimization_trace": optimization_trace,
             "optimizer": {
-                "backend": "torch_adam_external_sliding_window_fixed_correspondence",
+                "backend": "torch_adam_external_fixed_train_holdout_correspondence",
                 "attempted": bool(attempted_frames),
                 "success": bool(accepted_frames),
                 "attempted_frame_count": int(attempted_frames),
@@ -686,6 +760,17 @@ class OnlineObjectPoseLoopRefiner:
         alignment = corrected_previous @ _invert_pose(raw_previous)
         return alignment @ raw_poses[frame_id]
 
+    def _fallback_pose(
+        self,
+        raw_pose: torch.Tensor,
+        predicted_pose: torch.Tensor,
+    ) -> torch.Tensor:
+        """Choose the pose committed after a rejected/no-evidence update."""
+
+        if self.config.carry_rejected_correction:
+            return predicted_pose
+        return raw_pose
+
     def _reference_ids(
         self,
         frame_id: int,
@@ -696,35 +781,52 @@ class OnlineObjectPoseLoopRefiner:
         frame_positions: Mapping[int, int],
     ) -> tuple[int, ...]:
         current_instances = {int(observation.instance_id) for observation in current}
-        candidates: list[int] = []
-        for reference_id in reversed(processed_ids):
-            gap = int(frame_id - reference_id)
-            if gap < 1 or gap > int(self.config.max_reference_gap):
-                continue
+
+        def overlaps(reference_id: int) -> bool:
             reference_instances = {
                 int(observation.instance_id)
                 for observation in observations_by_frame.get(reference_id, ())
             }
-            if not current_instances.intersection(reference_instances):
+            return bool(current_instances.intersection(reference_instances))
+
+        def within_gap(reference_id: int) -> bool:
+            gap = int(frame_id - reference_id)
+            return 1 <= gap <= int(self.config.max_reference_gap)
+
+        candidates: list[int] = []
+        if self.config.always_include_anchor_reference:
+            # Reserve one slot for the newest eligible anchor.  The explicit
+            # temporal gap limit still prevents an old anchor from affecting
+            # the stream forever.
+            for reference_id in sorted(
+                anchors,
+                key=lambda value: frame_positions[value],
+                reverse=True,
+            ):
+                if within_gap(reference_id) and overlaps(reference_id):
+                    candidates.append(int(reference_id))
+                    break
+
+        for reference_id in reversed(processed_ids):
+            if not within_gap(reference_id) or not overlaps(reference_id):
+                continue
+            if reference_id in candidates:
                 continue
             candidates.append(int(reference_id))
             if len(candidates) >= int(self.config.max_reference_frames):
                 break
-        # If a recent window has no overlap, allow a reliable early anchor only
-        # within the same explicit temporal gap.  This prevents frame 0 from
-        # influencing frame 99 indefinitely.
-        for reference_id in sorted(anchors, key=lambda value: frame_positions[value], reverse=True):
+
+        # Legacy mode fills any unused slot with a recent eligible anchor.
+        for reference_id in sorted(
+            anchors,
+            key=lambda value: frame_positions[value],
+            reverse=True,
+        ):
             if reference_id in candidates:
                 continue
-            gap = int(frame_id - reference_id)
-            if gap < 1 or gap > int(self.config.max_reference_gap):
+            if not within_gap(reference_id) or not overlaps(reference_id):
                 continue
-            reference_instances = {
-                int(observation.instance_id)
-                for observation in observations_by_frame.get(reference_id, ())
-            }
-            if current_instances.intersection(reference_instances):
-                candidates.append(int(reference_id))
+            candidates.append(int(reference_id))
             if len(candidates) >= int(self.config.max_reference_frames):
                 break
         return tuple(candidates)
@@ -807,6 +909,32 @@ class OnlineObjectPoseLoopRefiner:
                     self.config.min_matches_per_instance
                 ):
                     continue
+                (
+                    train_positions,
+                    validation_positions,
+                ) = self._split_match_positions(int(current_indices.numel()))
+                if int(train_positions.numel()) < int(
+                    self.config.min_matches_per_instance
+                ):
+                    continue
+                train_current_indices = current_indices.index_select(
+                    0, train_positions.to(current_indices.device)
+                )
+                train_reference_indices = reference_indices.index_select(
+                    0, train_positions.to(reference_indices.device)
+                )
+                train_weights = weights.index_select(
+                    0, train_positions.to(weights.device)
+                )
+                validation_current_indices = current_indices.index_select(
+                    0, validation_positions.to(current_indices.device)
+                )
+                validation_reference_indices = reference_indices.index_select(
+                    0, validation_positions.to(reference_indices.device)
+                )
+                validation_weights = weights.index_select(
+                    0, validation_positions.to(weights.device)
+                )
                 constraints.append(
                     _ObjectConstraint(
                         frame_i=int(reference_id),
@@ -815,9 +943,16 @@ class OnlineObjectPoseLoopRefiner:
                         category=str(current_observation.category),
                         reference=reference_observation,
                         current=current_observation,
-                        current_indices=current_indices.detach().cpu(),
-                        reference_indices=reference_indices.detach().cpu(),
-                        weights=weights.detach().cpu(),
+                        current_indices=train_current_indices.detach().cpu(),
+                        reference_indices=train_reference_indices.detach().cpu(),
+                        weights=train_weights.detach().cpu(),
+                        validation_current_indices=(
+                            validation_current_indices.detach().cpu()
+                        ),
+                        validation_reference_indices=(
+                            validation_reference_indices.detach().cpu()
+                        ),
+                        validation_weights=validation_weights.detach().cpu(),
                         pair_weight=pair_weight,
                         reference_role=(
                             "anchor"
@@ -828,6 +963,47 @@ class OnlineObjectPoseLoopRefiner:
                     )
                 )
         return tuple(constraints)
+
+    def _split_match_positions(
+        self,
+        match_count: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return deterministic train/holdout positions for one match set."""
+
+        all_positions = torch.arange(match_count, dtype=torch.long)
+        if float(self.config.validation_fraction) <= 0.0:
+            return all_positions, torch.empty((0,), dtype=torch.long)
+
+        validation_count = max(
+            int(self.config.min_validation_matches_per_instance),
+            int(round(match_count * float(self.config.validation_fraction))),
+        )
+        max_validation_count = match_count - int(self.config.min_matches_per_instance)
+        if validation_count > max_validation_count:
+            return torch.empty((0,), dtype=torch.long), torch.empty(
+                (0,), dtype=torch.long
+            )
+
+        # Evenly spaced positions avoid putting the complete holdout at one
+        # end of the distance-sorted mutual-match list.  Integer arithmetic
+        # keeps the split deterministic across devices.
+        validation_set = {
+            min((index * match_count) // validation_count, match_count - 1)
+            for index in range(validation_count)
+        }
+        validation_positions = torch.tensor(
+            sorted(validation_set), dtype=torch.long
+        )
+        train_mask = torch.ones(match_count, dtype=torch.bool)
+        train_mask[validation_positions] = False
+        train_positions = torch.nonzero(train_mask, as_tuple=False).flatten()
+        if int(validation_positions.numel()) < int(
+            self.config.min_validation_matches_per_instance
+        ):
+            return torch.empty((0,), dtype=torch.long), torch.empty(
+                (0,), dtype=torch.long
+            )
+        return train_positions, validation_positions
 
     def _optimize_window(
         self,
@@ -990,17 +1166,39 @@ class OnlineObjectPoseLoopRefiner:
             "matches_per_instance": {str(k): int(v) for k, v in per_instance.items()},
         }
 
+    def _validation_stats(
+        self,
+        constraints: Sequence[_ObjectConstraint],
+    ) -> dict[str, Any]:
+        per_instance: Counter[int] = Counter()
+        for constraint in constraints:
+            per_instance[int(constraint.instance_id)] += int(
+                constraint.validation_current_indices.numel()
+            )
+        return {
+            "pair_count": int(len(constraints)),
+            "total_matches": int(sum(per_instance.values())),
+            "instance_count": int(len(per_instance)),
+            "matches_per_instance": {str(k): int(v) for k, v in per_instance.items()},
+        }
+
     def _object_loss(
         self,
         poses: Mapping[int, torch.Tensor],
         constraints: Sequence[_ObjectConstraint],
+        *,
+        validation: bool = False,
     ) -> float:
         """Average robust loss per object constraint, not per raw point."""
 
         if not constraints:
             return float("inf")
         values = [
-            self._single_constraint_loss(poses, constraint)
+            self._single_constraint_loss(
+                poses,
+                constraint,
+                validation=validation,
+            )
             for constraint in constraints
         ]
         finite = [value for value in values if math.isfinite(float(value))]
@@ -1024,6 +1222,9 @@ class OnlineObjectPoseLoopRefiner:
         base_pose: torch.Tensor,
         improvement: float,
         constraints: Sequence[_ObjectConstraint],
+        *,
+        validation_improvement: float = 0.0,
+        validation_constraints: Sequence[_ObjectConstraint] = (),
     ) -> bool:
         if not self._passes_match_gate(stats):
             return False
@@ -1040,17 +1241,47 @@ class OnlineObjectPoseLoopRefiner:
             self.config.max_local_correction_translation_m
         ):
             return False
-        residuals = self._constraint_residuals(candidate_poses, constraints)
+        if float(self.config.validation_fraction) > 0.0:
+            validation_stats = self._validation_stats(validation_constraints)
+            if not self._passes_validation_match_gate(validation_stats):
+                return False
+            if validation_improvement < float(
+                self.config.min_validation_relative_loss_improvement
+            ):
+                return False
+            residuals = self._constraint_residuals(
+                candidate_poses,
+                validation_constraints,
+                validation=True,
+            )
+            if not residuals:
+                return False
+        else:
+            residuals = self._constraint_residuals(candidate_poses, constraints)
         if residuals and float(torch.tensor(residuals).median()) > float(
             self.config.max_validation_residual_m
         ):
             return False
         return True
 
+    def _passes_validation_match_gate(self, stats: Mapping[str, Any]) -> bool:
+        if int(stats["instance_count"]) < int(self.config.min_independent_instances):
+            return False
+        if int(stats["total_matches"]) < int(
+            self.config.min_validation_matches_per_instance
+        ) * int(self.config.min_independent_instances):
+            return False
+        return all(
+            int(value) >= int(self.config.min_validation_matches_per_instance)
+            for value in stats["matches_per_instance"].values()
+        )
+
     def _constraint_residuals(
         self,
         poses: Mapping[int, torch.Tensor],
         constraints: Sequence[_ObjectConstraint],
+        *,
+        validation: bool = False,
     ) -> list[float]:
         values: list[float] = []
         for constraint in constraints:
@@ -1059,15 +1290,27 @@ class OnlineObjectPoseLoopRefiner:
                 or int(constraint.frame_j) not in poses
             ):
                 continue
+            current_indices = (
+                constraint.validation_current_indices
+                if validation
+                else constraint.current_indices
+            )
+            reference_indices = (
+                constraint.validation_reference_indices
+                if validation
+                else constraint.reference_indices
+            )
+            if int(current_indices.numel()) == 0:
+                continue
             current = _transform_points(
                 constraint.current.points_camera,
                 poses[int(constraint.frame_j)],
-            ).index_select(0, constraint.current_indices)
+            ).index_select(0, current_indices)
             reference = _transform_points(
                 constraint.reference.points_camera,
                 poses[int(constraint.frame_i)],
             ).index_select(
-                0, constraint.reference_indices
+                0, reference_indices
             )
             values.extend(
                 torch.linalg.vector_norm(current - reference, dim=-1).tolist()
@@ -1157,19 +1400,34 @@ class OnlineObjectPoseLoopRefiner:
         self,
         poses: Mapping[int, torch.Tensor],
         constraint: _ObjectConstraint,
+        *,
+        validation: bool = False,
     ) -> float:
         if int(constraint.frame_i) not in poses or int(constraint.frame_j) not in poses:
+            return float("inf")
+        current_indices = (
+            constraint.validation_current_indices
+            if validation
+            else constraint.current_indices
+        )
+        reference_indices = (
+            constraint.validation_reference_indices
+            if validation
+            else constraint.reference_indices
+        )
+        weights = constraint.validation_weights if validation else constraint.weights
+        if int(current_indices.numel()) == 0:
             return float("inf")
         current = _transform_points(
             constraint.current.points_camera,
             poses[int(constraint.frame_j)],
-        ).index_select(0, constraint.current_indices)
+        ).index_select(0, current_indices)
         reference = _transform_points(
             constraint.reference.points_camera,
             poses[int(constraint.frame_i)],
-        ).index_select(0, constraint.reference_indices)
+        ).index_select(0, reference_indices)
         residual = torch.linalg.vector_norm(current - reference, dim=-1)
-        weights = constraint.weights.clamp_min(1e-6)
+        weights = weights.clamp_min(1e-6)
         return float(
             (weights * _huber_distance(residual, self.config.huber_delta_m)).sum()
             / weights.sum()
@@ -1196,6 +1454,9 @@ class OnlineObjectPoseLoopRefiner:
             "edge_weight": float(constraint.pair_weight),
             "num_matches_initial": int(initial_matches),
             "num_matches_final": int(final_matches),
+            "num_validation_matches": int(
+                constraint.validation_current_indices.numel()
+            ),
             "initial_loss_m": float(initial_loss),
             "final_loss_m": float(final_loss),
             "relative_loss_improvement": _relative_improvement(initial_loss, final_loss),
@@ -1213,6 +1474,9 @@ class OnlineObjectPoseLoopRefiner:
         frame_id: int,
         base_pose: torch.Tensor,
         constraints: Sequence[_ObjectConstraint],
+        *,
+        validation_improvement: float = 0.0,
+        validation_constraints: Sequence[_ObjectConstraint] = (),
     ) -> str:
         if int(stats["instance_count"]) < int(self.config.min_independent_instances):
             return "too_few_independent_instances"
@@ -1229,7 +1493,24 @@ class OnlineObjectPoseLoopRefiner:
             self.config.max_local_correction_translation_m
         ):
             return "local_translation_correction_too_large"
-        residuals = self._constraint_residuals(candidate_poses, constraints)
+        if float(self.config.validation_fraction) > 0.0:
+            validation_constraints = tuple(validation_constraints or constraints)
+            validation_stats = self._validation_stats(validation_constraints)
+            if not self._passes_validation_match_gate(validation_stats):
+                return "too_few_validation_matches"
+            if validation_improvement < float(
+                self.config.min_validation_relative_loss_improvement
+            ):
+                return "insufficient_validation_loss_improvement"
+            residuals = self._constraint_residuals(
+                candidate_poses,
+                validation_constraints,
+                validation=True,
+            )
+            if not residuals:
+                return "no_validation_matches"
+        else:
+            residuals = self._constraint_residuals(candidate_poses, constraints)
         if residuals and float(torch.tensor(residuals).median()) > float(
             self.config.max_validation_residual_m
         ):
