@@ -110,6 +110,11 @@ ARGS=(
   --object-pose-loss-device cpu
 )
 
+TRACE_ARGS=()
+if [[ "${OBJECT_POSE_LOSS_TRACE:-0}" == "1" ]]; then
+  TRACE_ARGS+=(--object-pose-loss-trace)
+fi
+
 print "===== SCANNET OBJECT POSE LOSS 100F ====="
 print "scene=$SCENE_ID frames=$FRAME_COUNT frame_start=$FRAME_START frame_stride=$FRAME_STRIDE"
 print "horizon_device=$HORIZON_DEVICE sam_device=$SAM_DEVICE loss_device=cpu"
@@ -124,7 +129,7 @@ PYTHONPATH="$HORIZON_REPO:$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
 
 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   "$SAM_PYTHON" -m streaming_couping.scripts.run_semantic_map \
-  "${ARGS[@]}" >"$RUN_LOG" 2>&1
+  "${ARGS[@]}" "${TRACE_ARGS[@]}" >"$RUN_LOG" 2>&1
 
 SUMMARY_PATH="$OUTPUT_DIR/object_pose_refinement/pose_refinement_summary.json"
 [[ -f "$SUMMARY_PATH" ]] || {
@@ -160,3 +165,8 @@ PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   "$SUMMARY_PATH" "$EVAL_SUMMARY"
 print "run_log=$RUN_LOG"
 print "evaluation_log=$EVAL_LOG"
+if [[ "${OBJECT_POSE_LOSS_PRINT_TRACE:-0}" == "1" ]]; then
+  PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "$SAM_PYTHON" "$ROOT/streaming_couping/scripts/print_object_pose_loss_trace.py" \
+    "$SUMMARY_PATH" "$EVAL_SUMMARY"
+fi

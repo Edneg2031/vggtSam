@@ -62,6 +62,7 @@ class ObjectPoseLossRefinementConfig:
     max_correction_rotation_deg: float = 10.0
     max_correction_translation_m: float = 0.25
     min_relative_loss_improvement: float = 0.02
+    trace_optimization: bool = False
     device: str = "cpu"
 
     def validate(self) -> "ObjectPoseLossRefinementConfig":
@@ -141,6 +142,7 @@ class ObjectPoseLossRefinementConfig:
             "max_correction_rotation_deg": float(self.max_correction_rotation_deg),
             "max_correction_translation_m": float(self.max_correction_translation_m),
             "min_relative_loss_improvement": float(self.min_relative_loss_improvement),
+            "trace_optimization": bool(self.trace_optimization),
             "device": str(self.device),
         }
 
@@ -297,12 +299,26 @@ class ObjectPoseLossRefiner:
         accepted_edges: list[ObjectLossEdge] = []
         rejected_edges: list[dict[str, Any]] = []
         frame_diagnostics: list[dict[str, Any]] = []
+        optimization_trace: list[dict[str, Any]] = []
 
         for sequence_index, (frame_id, raw_pose) in enumerate(zip(frame_ids, raw_poses)):
             current = observations_by_frame.get(int(frame_id), ())
             is_anchor_frame = sequence_index < int(self.config.anchor_frame_count)
             if is_anchor_frame:
                 refined_pose = raw_pose
+                if self.config.trace_optimization:
+                    optimization_trace.append(
+                        {
+                            "frame_id": int(frame_id),
+                            "phase": "frame",
+                            "outer_iteration": None,
+                            "observation_count": int(len(current)),
+                            "candidate_pair_count": 0,
+                            "reference_gap_min": None,
+                            "reference_gap_max": None,
+                            "status": "anchor",
+                        }
+                    )
                 frame_diagnostics.append(
                     {
                         "frame_id": int(frame_id),
@@ -348,9 +364,23 @@ class ObjectPoseLossRefiner:
                     candidates.extend(outcome["candidates"])
                     accepted_edges.extend(outcome["accepted_edges"])
                     rejected_edges.extend(outcome["rejected_edges"])
+                    optimization_trace.extend(outcome.get("optimization_trace", ()))
                     frame_diagnostics.append(outcome["frame_diagnostic"])
                 else:
                     refined_pose = raw_pose
+                    if self.config.trace_optimization:
+                        optimization_trace.append(
+                            {
+                                "frame_id": int(frame_id),
+                                "phase": "frame",
+                                "outer_iteration": None,
+                                "observation_count": int(len(current)),
+                                "candidate_pair_count": 0,
+                                "reference_gap_min": None,
+                                "reference_gap_max": None,
+                                "status": "no_historical_instance_reference",
+                            }
+                        )
                     frame_diagnostics.append(
                         {
                             "frame_id": int(frame_id),
@@ -448,6 +478,8 @@ class ObjectPoseLossRefiner:
                 str(key): int(value) for key, value in filter_stats.items()
             },
             "frame_diagnostics": frame_diagnostics,
+            "optimization_trace_enabled": bool(self.config.trace_optimization),
+            "optimization_trace": optimization_trace,
             "optimizer": {
                 "backend": "torch_adam_fixed_match_loss",
                 "attempted": bool(optimizer_frames),
@@ -487,9 +519,46 @@ class ObjectPoseLossRefiner:
         delta = torch.nn.Parameter(
             torch.zeros(6, dtype=torch.float32, device=self.device)
         )
+        frame_id = int(pair_specs[0].current.frame_id)
+        reference_gaps = [
+            int(pair.current.frame_id - pair.reference.frame_id)
+            for pair in pair_specs
+        ]
+        trace_rows: list[dict[str, Any]] = []
+        trace_context = {
+            "frame_id": frame_id,
+            "observation_count": int(
+                len({int(pair.current.instance_id) for pair in pair_specs})
+            ),
+            "candidate_pair_count": int(len(pair_specs)),
+            "instance_count": int(
+                len({int(pair.current.instance_id) for pair in pair_specs})
+            ),
+            "reference_gap_min": min(reference_gaps, default=None),
+            "reference_gap_max": max(reference_gaps, default=None),
+            "reference_gap_mean": (
+                None
+                if not reference_gaps
+                else float(sum(reference_gaps) / len(reference_gaps))
+            ),
+        }
         initial_sets = self._collect_match_sets(raw_device, pairs)
         initial_count = sum(int(match.current_indices.numel()) for match in initial_sets)
         if initial_count < int(self.config.min_total_matches):
+            if self.config.trace_optimization:
+                trace_rows.append(
+                    {
+                        **trace_context,
+                        "phase": "initial",
+                        "outer_iteration": -1,
+                        "match_pair_count": int(len(initial_sets)),
+                        "match_count": int(initial_count),
+                        "loss_m": None,
+                        "delta_rotation_deg": 0.0,
+                        "delta_translation_m": 0.0,
+                        "status": "reject:too_few_initial_matches",
+                    }
+                )
             candidates, rejected = self._rows_for_rejection(
                 pair_specs,
                 initial_sets,
@@ -516,6 +585,7 @@ class ObjectPoseLossRefiner:
                     "initial_match_count": int(initial_count),
                     "final_match_count": int(initial_count),
                 },
+                "optimization_trace": trace_rows,
             }
 
         initial_loss = self._loss_from_matches(
@@ -529,13 +599,52 @@ class ObjectPoseLossRefiner:
         best_loss = float(initial_loss)
         optimizer = torch.optim.Adam([delta], lr=float(self.config.learning_rate))
 
-        for _ in range(int(self.config.outer_iterations)):
-            match_sets = self._collect_match_sets(
-                self._left_updated_pose(delta.detach(), raw_device),
-                pairs,
+        if self.config.trace_optimization:
+            trace_rows.append(
+                {
+                    **trace_context,
+                    "phase": "initial",
+                    "outer_iteration": -1,
+                    "match_pair_count": int(len(initial_sets)),
+                    "match_count": int(initial_count),
+                    "loss_m": float(initial_loss),
+                    "delta_rotation_deg": 0.0,
+                    "delta_translation_m": 0.0,
+                    "status": "initial",
+                }
             )
+
+        for outer_iteration in range(int(self.config.outer_iterations)):
+            start_pose = self._left_updated_pose(delta.detach(), raw_device)
+            match_sets = self._collect_match_sets(start_pose, pairs)
             match_count = sum(int(match.current_indices.numel()) for match in match_sets)
+            start_loss = self._loss_from_matches(
+                start_pose,
+                raw_device,
+                pairs,
+                match_sets,
+                include_prior=False,
+            )
+            trace_row: dict[str, Any] = {
+                **trace_context,
+                "phase": "outer_iteration",
+                "outer_iteration": int(outer_iteration),
+                "match_pair_count": int(len(match_sets)),
+                "match_count": int(match_count),
+                "start_loss_m": float(start_loss),
+                "candidate_match_pair_count": None,
+                "candidate_match_count": None,
+                "candidate_loss_m": None,
+                "best_loss_m_before": float(best_loss),
+                "best_loss_m_after": float(best_loss),
+                "delta_rotation_deg": 0.0,
+                "delta_translation_m": 0.0,
+                "status": "not_run",
+            }
             if match_count < int(self.config.min_total_matches):
+                trace_row["status"] = "break:too_few_matches"
+                if self.config.trace_optimization:
+                    trace_rows.append(trace_row)
                 break
             for _ in range(int(self.config.optimizer_steps)):
                 optimizer.zero_grad(set_to_none=True)
@@ -557,8 +666,6 @@ class ObjectPoseLossRefiner:
             candidate_count = sum(
                 int(match.current_indices.numel()) for match in candidate_sets
             )
-            if candidate_count < int(self.config.min_total_matches):
-                continue
             candidate_loss = self._loss_from_matches(
                 candidate_pose,
                 raw_device,
@@ -567,9 +674,32 @@ class ObjectPoseLossRefiner:
                 include_prior=False,
             )
             candidate_loss_value = float(candidate_loss)
+            pose_delta = _invert_pose(raw_device) @ candidate_pose
+            trace_row.update(
+                {
+                    "candidate_match_pair_count": int(len(candidate_sets)),
+                    "candidate_match_count": int(candidate_count),
+                    "candidate_loss_m": candidate_loss_value,
+                    "delta_rotation_deg": _rotation_angle_deg(pose_delta[:3, :3]),
+                    "delta_translation_m": float(
+                        torch.linalg.vector_norm(pose_delta[:3, 3])
+                    ),
+                }
+            )
+            if candidate_count < int(self.config.min_total_matches):
+                trace_row["status"] = "reject:candidate_too_few_matches"
+                if self.config.trace_optimization:
+                    trace_rows.append(trace_row)
+                continue
             if math.isfinite(candidate_loss_value) and candidate_loss_value < best_loss:
                 best_loss = candidate_loss_value
                 best_delta = delta.detach().clone()
+                trace_row["status"] = "best_updated"
+            else:
+                trace_row["status"] = "no_improvement"
+            trace_row["best_loss_m_after"] = float(best_loss)
+            if self.config.trace_optimization:
+                trace_rows.append(trace_row)
 
         best_pose = self._left_updated_pose(best_delta, raw_device)
         final_sets = self._collect_match_sets(best_pose, pairs)
@@ -583,7 +713,6 @@ class ObjectPoseLossRefiner:
             and final_pair_fraction >= 0.50
             and improvement >= float(self.config.min_relative_loss_improvement)
         )
-        frame_id = int(pair_specs[0].current.frame_id)
         if not accepted:
             candidates, rejected = self._rows_for_rejection(
                 pair_specs,
@@ -616,6 +745,29 @@ class ObjectPoseLossRefiner:
                     "final_loss_m": float(best_loss),
                     "relative_loss_improvement": float(improvement),
                 },
+                "optimization_trace": trace_rows + (
+                    [
+                        {
+                            **trace_context,
+                            "phase": "final",
+                            "outer_iteration": int(self.config.outer_iterations),
+                            "match_pair_count": int(len(final_sets)),
+                            "match_count": int(final_count),
+                            "loss_m": float(best_loss),
+                            "delta_rotation_deg": _rotation_angle_deg(
+                                (_invert_pose(raw_device) @ best_pose)[:3, :3]
+                            ),
+                            "delta_translation_m": float(
+                                torch.linalg.vector_norm(
+                                    (_invert_pose(raw_device) @ best_pose)[:3, 3]
+                                )
+                            ),
+                            "status": "rejected",
+                        }
+                    ]
+                    if self.config.trace_optimization
+                    else []
+                ),
             }
 
         candidates: list[dict[str, Any]] = []
@@ -698,6 +850,29 @@ class ObjectPoseLossRefiner:
                 "final_loss_m": float(best_loss),
                 "relative_loss_improvement": float(improvement),
             },
+            "optimization_trace": trace_rows + (
+                [
+                    {
+                        **trace_context,
+                        "phase": "final",
+                        "outer_iteration": int(self.config.outer_iterations),
+                        "match_pair_count": int(len(final_sets)),
+                        "match_count": int(final_count),
+                        "loss_m": float(best_loss),
+                        "delta_rotation_deg": _rotation_angle_deg(
+                            (_invert_pose(raw_device) @ best_pose)[:3, :3]
+                        ),
+                        "delta_translation_m": float(
+                            torch.linalg.vector_norm(
+                                (_invert_pose(raw_device) @ best_pose)[:3, 3]
+                            )
+                        ),
+                        "status": "accepted",
+                    }
+                ]
+                if self.config.trace_optimization
+                else []
+            ),
         }
 
     def _left_updated_pose(

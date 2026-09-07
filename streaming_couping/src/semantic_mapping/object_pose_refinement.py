@@ -1198,6 +1198,7 @@ def write_pose_refinement_debug(
         "candidate_edges": directory / "candidate_edges.json",
         "accepted_edges": directory / "accepted_edges.json",
         "rejected_edges": directory / "rejected_edges.json",
+        "optimization_trace": directory / "optimization_trace.json",
         "raw_trajectory": directory / "raw_trajectory.txt",
         "refined_trajectory": directory / "refined_trajectory.txt",
         "refined_camera_to_world": directory / "refined_camera_to_world.pt",
@@ -1206,6 +1207,10 @@ def write_pose_refinement_debug(
     _write_json(paths["candidate_edges"], list(result.candidates))
     _write_json(paths["accepted_edges"], [edge.to_dict() for edge in result.accepted_edges])
     _write_json(paths["rejected_edges"], list(result.rejected_edges))
+    _write_json(
+        paths["optimization_trace"],
+        result.summary.get("optimization_trace", []),
+    )
     _write_trajectory(paths["raw_trajectory"], result.frame_ids, result.raw_camera_to_world)
     _write_trajectory(
         paths["refined_trajectory"], result.frame_ids, result.refined_camera_to_world

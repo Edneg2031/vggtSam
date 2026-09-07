@@ -763,6 +763,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--object-pose-loss-max-correction-rotation-deg", type=float, default=10.0)
     parser.add_argument("--object-pose-loss-max-correction-translation-m", type=float, default=0.25)
     parser.add_argument("--object-pose-loss-min-relative-improvement", type=float, default=0.02)
+    parser.add_argument(
+        "--object-pose-loss-trace",
+        action="store_true",
+        help=(
+            "Record per-frame, per-outer-iteration object-loss diagnostics. "
+            "Inner Adam steps are summarized, not printed individually."
+        ),
+    )
     parser.add_argument("--object-pose-loss-device", default="cpu")
     parser.add_argument("--object-pose-min-gap", type=int, default=10)
     parser.add_argument("--object-pose-min-track-score", type=float, default=0.50)
@@ -1058,6 +1066,7 @@ def _object_pose_loss_config(
         max_correction_rotation_deg=args.object_pose_loss_max_correction_rotation_deg,
         max_correction_translation_m=args.object_pose_loss_max_correction_translation_m,
         min_relative_loss_improvement=args.object_pose_loss_min_relative_improvement,
+        trace_optimization=args.object_pose_loss_trace,
         device=args.object_pose_loss_device,
     ).validate()
 
