@@ -170,6 +170,15 @@ def main() -> None:
                 confidence_threshold=args.confidence_threshold,
                 frame_ids=frame_positions,
             )
+            # ``evaluate_pointmap_alignment`` returns the summary/frames
+            # payload; normalize the outer status here for the CLI and the
+            # copyable report.
+            pointmap_summary = pointmap_alignment.get("summary", {})
+            pointmap_alignment["status"] = str(
+                pointmap_summary.get("status", "ok")
+                if isinstance(pointmap_summary, dict)
+                else "ok"
+            )
             pointmap_alignment["alignment"] = alignment.to_dict()
         else:
             pointmap_alignment = {
