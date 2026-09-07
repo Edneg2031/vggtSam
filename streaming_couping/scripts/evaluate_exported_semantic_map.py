@@ -34,6 +34,7 @@ import torch
 from streaming_couping.src.horizonstream_cache import load_horizonstream_cache
 from streaming_couping.src.semantic_map_metrics import (
     SemanticMapMetricConfig,
+    deterministic_limit_points,
     load_ground_truth_stream_masks,
 )
 from streaming_couping.src.semantic_mapping.adapters import (
@@ -43,8 +44,13 @@ from streaming_couping.src.semantic_mapping.evaluation import (
     ExportedMapMetricConfig,
     evaluate_camera_trajectory,
     evaluate_exported_semantic_map,
+    extract_exported_objects,
     evaluate_pointmap_alignment,
     fit_reference_alignment,
+)
+from streaming_couping.src.semantic_mapping.export import (
+    INSTANCE_PALETTE_RGB8,
+    _write_ply,
 )
 from streaming_couping.src.semantic_mapping.geometry import world_points_for_frame
 from streaming_couping.src.pointmap_alignment import load_ground_truth_pointmaps
@@ -275,6 +281,18 @@ def main() -> None:
         duplicate_rows.extend(result["duplicate_rows"])
         scene_rows.append(scene_row)
 
+    object_ply_comparison = _export_object_ply_comparison(
+        artifacts,
+        output_dir=output_dir,
+        target_world_points=target_world_points,
+        gt_masks=gt_masks,
+        gt_instance_ids=gt_info.instance_ids,
+        gt_labels=gt_info.labels,
+        alignment=alignment,
+        map_source=args.map_source,
+        max_points_per_object=args.max_points_per_object,
+    )
+
     summary = {
         "schema": 1,
         "revision": REVISION,
@@ -312,6 +330,7 @@ def main() -> None:
             "prompts": list(prompts),
         },
         "pose_evaluation": pose_evaluation,
+        "object_ply_comparison": object_ply_comparison,
         "branches": branch_summaries,
         "decision": "EVALUATION_ONLY; no runtime branch is promoted automatically",
         "outputs": {},
@@ -343,6 +362,9 @@ def main() -> None:
         "pose_rpe": _write_csv(
             output_dir / "pose_rpe.csv",
             pose_rpe_rows,
+        ),
+        "object_ply_comparison": Path(
+            object_ply_comparison["manifest"]
         ),
     }
     summary["outputs"] = {name: str(path) for name, path in outputs.items()}
@@ -910,6 +932,128 @@ def _pose_detail_rows(
     return rows
 
 
+def _export_object_ply_comparison(
+    artifacts: dict[str, Path],
+    *,
+    output_dir: Path,
+    target_world_points: torch.Tensor,
+    gt_masks: torch.Tensor,
+    gt_instance_ids: tuple[int, ...] | list[int],
+    gt_labels: tuple[str, ...] | list[str],
+    alignment: Any,
+    map_source: str,
+    max_points_per_object: int,
+) -> dict[str, object]:
+    """Export GT/raw/refined object clouds in one comparable coordinate frame."""
+
+    root = output_dir / "object_ply_comparison"
+    gt_dir = root / "gt"
+    gt_dir.mkdir(parents=True, exist_ok=True)
+    target = torch.as_tensor(target_world_points).detach().float().cpu()
+    masks = torch.as_tensor(gt_masks).detach().bool().cpu()
+    finite = torch.isfinite(target).all(dim=-1)
+    gt_files: list[str] = []
+    for index, (instance_id, label) in enumerate(
+        zip(gt_instance_ids, gt_labels)
+    ):
+        points = target[masks[:, index] & finite]
+        points = deterministic_limit_points(points, int(max_points_per_object))
+        if not points.numel():
+            continue
+        path = gt_dir / f"{_ply_name_component(label)}_gt_{int(instance_id)}.ply"
+        _write_object_ply(path, points, int(instance_id))
+        gt_files.append(str(path))
+
+    branch_dirs: dict[str, str] = {}
+    branch_files: dict[str, list[str]] = {}
+    for branch, artifact_path in artifacts.items():
+        branch_dir = root / str(branch)
+        branch_dir.mkdir(parents=True, exist_ok=True)
+        branch_dirs[str(branch)] = str(branch_dir)
+        payload = _load_artifact(artifact_path)
+        objects = extract_exported_objects(payload, source=map_source)
+        files: list[str] = []
+        for instance_id, row in sorted(objects.items()):
+            points = torch.as_tensor(row["points"]).detach().float().cpu()
+            points = deterministic_limit_points(
+                points,
+                int(max_points_per_object),
+            )
+            if alignment is not None:
+                points = alignment.apply(points)
+            if not points.numel():
+                continue
+            category = str(row.get("category", "object"))
+            path = branch_dir / (
+                f"{_ply_name_component(category)}_{int(instance_id)}.ply"
+            )
+            _write_object_ply(path, points, int(instance_id))
+            files.append(str(path))
+        branch_files[str(branch)] = files
+
+    manifest = root / "object_ply_manifest.json"
+    manifest_payload = {
+        "coordinate_frame": (
+            "GT metric frame after shared reference Sim(3)"
+            if alignment is not None
+            else "native prediction/GT frame"
+        ),
+        "map_source": str(map_source),
+        "gt": {"directory": str(gt_dir), "files": gt_files},
+        "branches": {
+            branch: {"directory": branch_dirs[branch], "files": files}
+            for branch, files in branch_files.items()
+        },
+    }
+    manifest.write_text(
+        json.dumps(manifest_payload, indent=2, sort_keys=True, ensure_ascii=False)
+        + "\n",
+        encoding="utf8",
+    )
+    return {
+        "root": str(root),
+        "gt_directory": str(gt_dir),
+        "branch_directories": branch_dirs,
+        "manifest": str(manifest),
+        "gt_file_count": int(len(gt_files)),
+        "branch_file_counts": {
+            branch: int(len(files)) for branch, files in branch_files.items()
+        },
+    }
+
+
+def _write_object_ply(path: Path, points: torch.Tensor, instance_id: int) -> None:
+    points = torch.as_tensor(points).detach().float().cpu().reshape(-1, 3)
+    color = torch.tensor(
+        INSTANCE_PALETTE_RGB8[int(instance_id) % len(INSTANCE_PALETTE_RGB8)],
+        dtype=torch.float32,
+    ) / 255.0
+    count = int(points.shape[0])
+    _write_ply(
+        path,
+        points=points,
+        colors=color.expand(count, 3),
+        category_ids=torch.zeros(count, dtype=torch.long),
+        instance_ids=torch.full((count,), int(instance_id), dtype=torch.long),
+        weights=torch.ones(count, dtype=torch.float32),
+        observations=torch.ones(count, dtype=torch.long),
+    )
+
+
+def _ply_name_component(value: str) -> str:
+    output: list[str] = []
+    pending_separator = False
+    for character in str(value).strip().lower():
+        if character.isascii() and character.isalnum():
+            if pending_separator and output:
+                output.append("_")
+            output.append(character)
+            pending_separator = False
+        else:
+            pending_separator = True
+    return "".join(output).strip("_") or "object"
+
+
 def _pointmap_frame_rows(
     pointmap_alignment: dict[str, object],
     scene_id: str,
@@ -989,6 +1133,18 @@ def _write_copyable(
         "pose_gt_source=manifest.frames[].world_to_camera "
         f"pose_evaluation_status={pose_evaluation.get('status')}"
     )
+    object_plys = summary.get("object_ply_comparison", {})
+    if isinstance(object_plys, dict):
+        lines.append(
+            "object_ply_root=" + str(object_plys.get("root", ""))
+        )
+        lines.append(
+            "object_ply_gt=" + str(object_plys.get("gt_directory", ""))
+        )
+        branch_dirs = object_plys.get("branch_directories", {})
+        if isinstance(branch_dirs, dict):
+            for branch, directory in branch_dirs.items():
+                lines.append(f"object_ply_{branch}={directory}")
     pose_branches = pose_evaluation.get("branches", {})
     if isinstance(pose_branches, dict):
         for branch, value in pose_branches.items():
@@ -1049,6 +1205,9 @@ def _print_summary(
         f"pose_gt=manifest.frames[].world_to_camera "
         f"pose_status={pose_evaluation.get('status')}"
     )
+    object_plys = summary.get("object_ply_comparison", {})
+    if isinstance(object_plys, dict):
+        print(f"object_ply_root={object_plys.get('root', '')}")
     pose_branches = pose_evaluation.get("branches", {})
     if isinstance(pose_branches, dict):
         for branch, value in pose_branches.items():
