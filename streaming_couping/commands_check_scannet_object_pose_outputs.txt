@@ -1,0 +1,301 @@
+#!/usr/bin/env zsh
+set -uo pipefail
+
+# Read-only integrity check for the online object-pose experiment.
+# Run with:
+#   zsh streaming_couping/commands_check_scannet_object_pose_outputs.txt
+#
+# Override the output directory when needed:
+#   OBJECT_POSE_ONLINE_OUTPUT_DIR=/path/to/run \
+#     zsh streaming_couping/commands_check_scannet_object_pose_outputs.txt
+
+PROJECT_ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+CHECK_PYTHON="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/horizonstream/bin/python}"
+OUTPUT_DIR="${OBJECT_POSE_ONLINE_OUTPUT_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_online_loop_v2}"
+EVAL_DIR="${OBJECT_POSE_LOSS_EVAL_DIR:-$OUTPUT_DIR/gt_evaluation}"
+
+print "===== SCANNET OBJECT POSE OUTPUT INTEGRITY CHECK ====="
+print "project=$PROJECT_ROOT"
+print "output=$OUTPUT_DIR"
+print "evaluation=$EVAL_DIR"
+print "python=$CHECK_PYTHON"
+print ""
+
+if [[ ! -d "$OUTPUT_DIR" ]]; then
+  print -u2 "ERROR: output directory does not exist: $OUTPUT_DIR"
+  exit 2
+fi
+if [[ ! -x "$CHECK_PYTHON" ]]; then
+  print -u2 "ERROR: Python executable does not exist or is not executable: $CHECK_PYTHON"
+  exit 2
+fi
+
+if [[ -d "$PROJECT_ROOT/.git" ]]; then
+  print "===== CODE VERSION ====="
+  (cd "$PROJECT_ROOT" && git rev-parse --short HEAD 2>/dev/null || true)
+  (cd "$PROJECT_ROOT" && git status --short 2>/dev/null || true)
+  print ""
+fi
+
+PYTHONPATH="$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$CHECK_PYTHON" - "$OUTPUT_DIR" "$EVAL_DIR" <<'PY'
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import re
+import sys
+
+try:
+    import torch
+except Exception as exc:  # pragma: no cover - diagnostic fallback
+    torch = None
+    print(f"WARN: torch import failed: {exc}")
+
+
+output_root = Path(sys.argv[1]).expanduser().resolve()
+evaluation_root = Path(sys.argv[2]).expanduser().resolve()
+issues: list[str] = []
+warnings: list[str] = []
+
+
+def load_json(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf8"))
+    except Exception as exc:
+        issues.append(f"cannot read JSON {path}: {exc}")
+        return None
+
+
+def ply_info(path: Path) -> tuple[int | None, int, str]:
+    """Return (vertex_count, byte_count, status) without loading binary data."""
+    if not path.is_file():
+        return None, 0, "MISSING"
+    try:
+        byte_count = int(path.stat().st_size)
+        with path.open("rb") as handle:
+            header = handle.read(128 * 1024)
+        match = re.search(rb"(?:^|\n)element vertex\s+(\d+)", header)
+        if match is None:
+            return None, byte_count, "NO_VERTEX_HEADER"
+        count = int(match.group(1))
+        return count, byte_count, "OK" if count > 0 else "ZERO_VERTICES"
+    except Exception as exc:
+        return None, 0, f"READ_ERROR:{exc}"
+
+
+def shape(value) -> str:
+    if torch is not None and torch.is_tensor(value):
+        return str(tuple(int(x) for x in value.shape))
+    try:
+        return str(tuple(int(x) for x in value.shape))
+    except Exception:
+        return "?"
+
+
+def payload_track_points(payload) -> int:
+    total = 0
+    for row in payload.get("object_tracks", ()):
+        if not isinstance(row, dict):
+            continue
+        points = row.get("points", ())
+        if torch is not None and torch.is_tensor(points):
+            total += int(points.reshape(-1, 3).shape[0]) if points.numel() else 0
+        else:
+            try:
+                total += len(points)
+            except Exception:
+                pass
+    return total
+
+
+def print_ply(label: str, path: Path, *, error_if_zero: bool = False) -> int | None:
+    count, byte_count, status = ply_info(path)
+    print(
+        f"{label}: status={status} bytes={byte_count} "
+        f"vertices={count if count is not None else 'NA'} path={path}"
+    )
+    if status == "MISSING":
+        issues.append(f"missing PLY: {path}")
+    elif error_if_zero and (count is None or count <= 0):
+        issues.append(f"zero/invalid PLY where points are expected: {path}")
+    return count
+
+
+print("===== RUNTIME BRANCHES =====")
+branch_data: dict[str, dict[str, int | Path]] = {}
+for branch in ("raw_pose", "object_pose_refined"):
+    branch_root = output_root / branch
+    summary_path = branch_root / "map_summary.json"
+    artifact_path = branch_root / "semantic_map.pt"
+    print(f"\n--- {branch} ---")
+    if not branch_root.is_dir():
+        issues.append(f"missing runtime branch directory: {branch_root}")
+        print(f"ERROR: missing directory: {branch_root}")
+        continue
+
+    summary = load_json(summary_path)
+    if not isinstance(summary, dict):
+        continue
+    objects = summary.get("objects", ())
+    summary_track_points = sum(
+        int(row.get("point_count", 0))
+        for row in objects
+        if isinstance(row, dict)
+    )
+    print(
+        "summary: "
+        f"instances={summary.get('instance_count')} "
+        f"voxels={summary.get('voxel_count')} "
+        f"labeled_voxels={summary.get('labeled_voxel_count')} "
+        f"objects_track_points={summary_track_points}"
+    )
+    print(f"summary_artifact={summary.get('outputs', {}).get('artifact')}")
+    track_ply = Path(summary.get("outputs", {}).get("object_tracks_ply", branch_root / "object_tracks.ply"))
+    track_json = Path(summary.get("outputs", {}).get("object_tracks_json", branch_root / "object_tracks.json"))
+    track_vertices = print_ply(
+        "object_tracks.ply",
+        track_ply,
+        error_if_zero=summary_track_points > 0,
+    )
+    if track_vertices is not None and track_vertices != summary_track_points:
+        issues.append(
+            f"{branch} object_tracks vertex mismatch: "
+            f"map_summary={summary_track_points}, ply={track_vertices}"
+        )
+
+    tracks_payload = load_json(track_json)
+    if isinstance(tracks_payload, list):
+        json_track_points = sum(
+            int(row.get("point_count", 0))
+            for row in tracks_payload
+            if isinstance(row, dict)
+        )
+        print(f"object_tracks.json: instances={len(tracks_payload)} point_count={json_track_points} path={track_json}")
+        if json_track_points != summary_track_points:
+            issues.append(
+                f"{branch} object_tracks.json mismatch: "
+                f"map_summary={summary_track_points}, json={json_track_points}"
+            )
+    else:
+        issues.append(f"invalid/missing object_tracks.json: {track_json}")
+
+    if not artifact_path.is_file():
+        issues.append(f"missing semantic map artifact: {artifact_path}")
+    elif torch is not None:
+        try:
+            try:
+                payload = torch.load(artifact_path, map_location="cpu", weights_only=False)
+            except TypeError:
+                payload = torch.load(artifact_path, map_location="cpu")
+            ids = payload.get("instance_ids", ())
+            labeled = int((ids >= 0).sum()) if torch.is_tensor(ids) else -1
+            payload_points = payload_track_points(payload)
+            print(
+                "semantic_map.pt: "
+                f"voxel_points={shape(payload.get('voxel_points', ()))}, "
+                f"instance_ids={shape(ids)}, labeled_voxels={labeled}, "
+                f"track_points={payload_points} path={artifact_path}"
+            )
+            if payload_points != summary_track_points:
+                issues.append(
+                    f"{branch} semantic_map.pt/object track mismatch: "
+                    f"summary={summary_track_points}, payload={payload_points}"
+                )
+        except Exception as exc:
+            issues.append(f"cannot inspect {artifact_path}: {exc}")
+
+    object_dir = branch_root / "objects"
+    object_files = sorted(object_dir.glob("*.ply")) if object_dir.is_dir() else []
+    object_vertices = 0
+    for path in object_files:
+        count, _, status = ply_info(path)
+        if count is not None:
+            object_vertices += count
+        if status != "OK":
+            warnings.append(f"{branch} object PLY {status}: {path}")
+    print(
+        f"objects/: files={len(object_files)} vertices={object_vertices} "
+        f"summary_object_plys={len(summary.get('object_plys', ())) if isinstance(summary.get('object_plys', ()), list) else 'NA'} "
+        f"path={object_dir}"
+    )
+    branch_data[branch] = {
+        "track_vertices": int(track_vertices or 0),
+        "summary_track_points": int(summary_track_points),
+    }
+
+
+if {"raw_pose", "object_pose_refined"}.issubset(branch_data):
+    raw = branch_data["raw_pose"]
+    refined = branch_data["object_pose_refined"]
+    if raw["track_vertices"] == 0 and refined["track_vertices"] > 0:
+        issues.append(
+            "raw object_tracks.ply is empty while refined is non-empty; "
+            "this is not expected from pose-only refinement"
+        )
+    elif raw["track_vertices"] != refined["track_vertices"]:
+        warnings.append(
+            "raw/refined object_tracks vertex counts differ: "
+            f"{raw['track_vertices']} vs {refined['track_vertices']}"
+        )
+
+
+print("\n===== EVALUATION PLY COMPARISON =====")
+manifest_path = evaluation_root / "object_ply_comparison" / "object_ply_manifest.json"
+manifest = load_json(manifest_path) if manifest_path.is_file() else None
+if not manifest_path.is_file():
+    warnings.append(f"evaluation object PLY manifest is missing: {manifest_path}")
+else:
+    print(f"manifest={manifest_path}")
+    gt_files = manifest.get("gt", {}).get("files", ())
+    branches = manifest.get("branches", {})
+    print(f"manifest gt_files={len(gt_files)}")
+    for branch, data in branches.items():
+        files = data.get("files", ()) if isinstance(data, dict) else ()
+        print(f"manifest {branch}_files={len(files)}")
+        for file_name in files:
+            path = Path(file_name)
+            print_ply(f"comparison/{branch}", path, error_if_zero=True)
+    for file_name in gt_files:
+        print_ply("comparison/gt", Path(file_name), error_if_zero=True)
+    if isinstance(branches.get("raw_pose"), dict) and branch_data.get("raw_pose", {}).get("track_vertices", 0) > 0:
+        raw_files = branches["raw_pose"].get("files", ())
+        if not raw_files:
+            issues.append(
+                "evaluation manifest has zero raw_pose object files even though "
+                "runtime raw_pose/object_tracks.ply has points"
+            )
+
+evaluation_summary_path = evaluation_root / "summary.json"
+evaluation_summary = load_json(evaluation_summary_path) if evaluation_summary_path.is_file() else None
+if isinstance(evaluation_summary, dict):
+    print(f"evaluation map_source={evaluation_summary.get('map_source')}")
+    for branch, data in evaluation_summary.get("branches", {}).items():
+        if not isinstance(data, dict):
+            continue
+        row = data.get("summary", {})
+        if isinstance(row, dict):
+            print(
+                f"evaluation {branch}: "
+                f"matched_objects={row.get('matched_objects')} "
+                f"predicted_instance_count={row.get('predicted_instance_count')} "
+                f"artifact={row.get('artifact')}"
+            )
+else:
+    warnings.append(f"evaluation summary is missing: {evaluation_summary_path}")
+
+
+print("\n===== RESULT =====")
+if warnings:
+    print("WARNINGS:")
+    for item in warnings:
+        print(f"- {item}")
+if issues:
+    print("ERRORS:")
+    for item in issues:
+        print(f"- {item}")
+    print("RESULT=FAIL")
+    raise SystemExit(1)
+print("RESULT=PASS" if not warnings else "RESULT=PASS_WITH_WARNINGS")
+PY
