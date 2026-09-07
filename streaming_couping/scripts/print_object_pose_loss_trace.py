@@ -95,6 +95,9 @@ def _load_pose_errors(path: Path) -> dict[int, dict[str, float]]:
     payload = json.loads(path.read_text(encoding="utf8"))
     pose = payload.get("pose_evaluation", {})
     branches = pose.get("branches", {}) if isinstance(pose, dict) else {}
+    source_positions = tuple(
+        int(value) for value in payload.get("frame_indices", ())
+    )
     output: dict[int, dict[str, float]] = {}
     for branch_name in ("raw_pose", "object_pose_refined"):
         branch = branches.get(branch_name, {})
@@ -102,12 +105,26 @@ def _load_pose_errors(path: Path) -> dict[int, dict[str, float]]:
         for row in rows:
             if not isinstance(row, dict) or "frame_id" not in row:
                 continue
-            frame_id = int(row["frame_id"])
+            # Runtime refinement uses local contiguous IDs 0..N-1, while
+            # offline evaluation labels rows with the original manifest
+            # positions (e.g. 90..189). Prefer sequence_index so the two
+            # coordinate systems are not accidentally mixed.
+            if "sequence_index" in row:
+                sequence_index = int(row["sequence_index"])
+            elif source_positions:
+                try:
+                    sequence_index = source_positions.index(int(row["frame_id"]))
+                except ValueError:
+                    continue
+            else:
+                sequence_index = int(row["frame_id"])
             prefix = "raw" if branch_name == "raw_pose" else "refined"
-            output.setdefault(frame_id, {})[f"{prefix}_t"] = float(
+            values = output.setdefault(sequence_index, {})
+            values["source_frame_id"] = int(row["frame_id"])
+            values[f"{prefix}_t"] = float(
                 row.get("translation_error_m", float("nan"))
             )
-            output.setdefault(frame_id, {})[f"{prefix}_r"] = float(
+            values[f"{prefix}_r"] = float(
                 row.get("rotation_error_deg", float("nan"))
             )
     return output
@@ -117,7 +134,8 @@ def _format_gt_errors(row: dict[str, float] | None) -> str:
     if not row:
         return ""
     return (
-        " gt_t={0}->{1} gt_r={2}->{3}".format(
+        " src={0} gt_t={1}->{2} gt_r={3}->{4}".format(
+            row.get("source_frame_id"),
             row.get("raw_t"),
             row.get("refined_t"),
             row.get("raw_r"),
