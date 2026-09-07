@@ -319,6 +319,18 @@ def _pose_rotation_error_degrees(
     return _rotation_angle_degrees(target.T @ predicted)
 
 
+def _project_rotation(rotation: torch.Tensor) -> torch.Tensor:
+    """Project a numerically noisy 3x3 pose block onto SO(3)."""
+
+    left, _, right_t = torch.linalg.svd(rotation)
+    projected = left @ right_t
+    if float(torch.det(projected)) < 0.0:
+        left = left.clone()
+        left[:, -1] *= -1.0
+        projected = left @ right_t
+    return projected
+
+
 def _rotation_angle_degrees(rotation: torch.Tensor) -> float:
     cosine = ((torch.trace(rotation) - 1.0) * 0.5).clamp(-1.0, 1.0)
     return float(torch.rad2deg(torch.acos(cosine)))
