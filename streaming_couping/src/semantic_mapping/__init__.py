@@ -81,6 +81,12 @@ from .instance_point_consistency import (
     InstancePointConsistencyDecision,
     InstancePointConsistencyMemory,
 )
+from .instance_point_alignment import (
+    InstancePointAlignmentConfig,
+    InstancePointAlignmentDecision,
+    InstancePointAlignmentMemory,
+    apply_point_alignment,
+)
 
 __all__ = [
     "GeometryFrame",
@@ -117,6 +123,10 @@ __all__ = [
     "InstancePointConsistencyConfig",
     "InstancePointConsistencyDecision",
     "InstancePointConsistencyMemory",
+    "InstancePointAlignmentConfig",
+    "InstancePointAlignmentDecision",
+    "InstancePointAlignmentMemory",
+    "apply_point_alignment",
     "export_semantic_map",
     "DinoV3PatchFeatureMatcher",
     "FeatureMatch",

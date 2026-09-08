@@ -104,6 +104,7 @@ class SemanticMapPipeline:
                 "raw",
                 "temporal_consensus",
                 "instance_point_consistency",
+                "instance_point_alignment",
             }
         ]
         if unsupported:
@@ -131,6 +132,23 @@ class SemanticMapPipeline:
                         self.mapper.config.instance_point_consistency,
                         enabled=True,
                     ),
+                    instance_point_alignment=replace(
+                        self.mapper.config.instance_point_alignment,
+                        enabled=False,
+                    ),
+                )
+            elif policy == "instance_point_alignment":
+                branch_config = replace(
+                    self.mapper.config,
+                    fusion_policy="instance_point_alignment",
+                    instance_point_consistency=replace(
+                        self.mapper.config.instance_point_consistency,
+                        enabled=False,
+                    ),
+                    instance_point_alignment=replace(
+                        self.mapper.config.instance_point_alignment,
+                        enabled=True,
+                    ),
                 )
             else:
                 branch_config = replace(
@@ -138,6 +156,10 @@ class SemanticMapPipeline:
                     fusion_policy=policy,
                     instance_point_consistency=replace(
                         self.mapper.config.instance_point_consistency,
+                        enabled=False,
+                    ),
+                    instance_point_alignment=replace(
+                        self.mapper.config.instance_point_alignment,
                         enabled=False,
                     ),
                 )
@@ -149,6 +171,9 @@ class SemanticMapPipeline:
             branch_metadata["branch_shared_model_inference"] = True
             branch_metadata["instance_point_consistency_requested"] = (
                 policy == "instance_point_consistency"
+            )
+            branch_metadata["instance_point_alignment_requested"] = (
+                policy == "instance_point_alignment"
             )
             results[policy] = self._fuse(
                 geometry_frames,
@@ -428,6 +453,7 @@ def _validate_policies(policies: Sequence[str]) -> tuple[str, ...]:
             "raw",
             "temporal_consensus",
             "instance_point_consistency",
+            "instance_point_alignment",
         }
     ]
     if unsupported:

@@ -1,0 +1,160 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# ScanNet++ V3 ablation:
+# frozen HorizonStream geometry + one shared SAM3.1 run + causal local rigid
+# alignment of persistent-instance object point clouds.  Camera poses,
+# HorizonStream world points, and full-scene geometry are not modified.
+# The runtime exports raw/ and instance_point_alignment/ branches separately.
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+HORIZON_PYTHON="${HORIZONSTREAM_PYTHON:-/home/huawei/miniconda3/envs/horizonstream/bin/python}"
+SAM_PYTHON="${STREAMING_COUPING_PYTHON:-$HORIZON_PYTHON}"
+HORIZON_REPO="$ROOT/externals/horizonstream"
+HORIZON_CHECKPOINT="${HORIZONSTREAM_CHECKPOINT:-/home/bod/86Nas/95_data_bak/FoundationModels/HorizonStream.pt}"
+HORIZON_DEVICE="${HORIZONSTREAM_DEVICE:-cuda:0}"
+SAM_DEVICE="${SAM_DEVICE:-cuda:2}"
+
+MANIFEST_PATH="$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json"
+SCENE_ID="00a231a370"
+FRAME_START=90
+FRAME_STRIDE=1
+FRAME_COUNT=100
+PROMPTS=("bed" "wardrobe" "chair" "rug" "dustbin")
+
+BASELINE_OUTPUT_DIR="$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_consecutive"
+GEOMETRY_CACHE="${HORIZONSTREAM_GEOMETRY_CACHE:-$BASELINE_OUTPUT_DIR/horizonstream_geometry.pt}"
+OUTPUT_DIR="${OBJECT_POINT_ALIGNMENT_OUTPUT_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_point_alignment_v3}"
+EVAL_DIR="$OUTPUT_DIR/gt_evaluation"
+RECOVERY_CONFIG="${RECOVERY_CONFIG_PATH:-$ROOT/streaming_couping/configs/recovery_dynamic_instance.yaml}"
+GEOMETRY_LOG="$OUTPUT_DIR/horizonstream_geometry.log"
+RUN_LOG="$OUTPUT_DIR/run.log"
+EVAL_LOG="$EVAL_DIR/evaluator.log"
+
+cd "$ROOT"
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+[[ -x "$HORIZON_PYTHON" ]] || { print -u2 "missing Python: $HORIZON_PYTHON"; exit 1; }
+[[ -x "$SAM_PYTHON" ]] || { print -u2 "missing Python: $SAM_PYTHON"; exit 1; }
+[[ -d "$HORIZON_REPO/horizonstream" ]] || { print -u2 "missing HorizonStream source: $HORIZON_REPO"; exit 1; }
+[[ -f "$HORIZON_CHECKPOINT" ]] || { print -u2 "missing HorizonStream checkpoint: $HORIZON_CHECKPOINT"; exit 1; }
+[[ -f "$MANIFEST_PATH" ]] || { print -u2 "missing ScanNet++ manifest: $MANIFEST_PATH"; exit 1; }
+[[ -f "$RECOVERY_CONFIG" ]] || { print -u2 "missing recovery config: $RECOVERY_CONFIG"; exit 1; }
+
+if ! "$SAM_PYTHON" -c 'import iopath, ftfy, regex, huggingface_hub, timm, einops, pycocotools' >/dev/null 2>&1; then
+  print -u2 "SAM3 runtime dependencies are missing"
+  exit 1
+fi
+
+mkdir -p "$OUTPUT_DIR" "$EVAL_DIR"
+
+HORIZON_ARGS=(
+  --manifest "$MANIFEST_PATH"
+  --scene-id "$SCENE_ID"
+  --frame-start "$FRAME_START"
+  --frame-stride "$FRAME_STRIDE"
+  --frame-count "$FRAME_COUNT"
+  --repo-path "$HORIZON_REPO"
+  --checkpoint "$HORIZON_CHECKPOINT"
+  --output-cache "$GEOMETRY_CACHE"
+  --device "$HORIZON_DEVICE"
+  --window-size 10
+  --sliding-size 1
+  --image-size 518
+  --patch-size 14
+  --crop
+  --precision float16
+  --reuse-if-valid
+)
+
+ARGS=(
+  --manifest "$MANIFEST_PATH"
+  --scene-id "$SCENE_ID"
+  --frame-start "$FRAME_START"
+  --frame-stride "$FRAME_STRIDE"
+  --frame-count "$FRAME_COUNT"
+  --prompts "${PROMPTS[@]}"
+  --geometry-cache "$GEOMETRY_CACHE"
+  --output-dir "$OUTPUT_DIR"
+  --fusion-policy raw
+  --recovery-config "$RECOVERY_CONFIG"
+  --sam-device "$SAM_DEVICE"
+  --sam-grounding-batch-size 1
+  --sam-offload-video-to-cpu
+  --object-only
+  --instance-point-alignment
+  --instance-point-alignment-history-frames 8
+  --instance-point-alignment-max-history-points 2048
+  --instance-point-alignment-min-history-points 32
+  --instance-point-alignment-max-registration-points 512
+  --instance-point-alignment-max-match-distance-m 0.15
+  --instance-point-alignment-min-matches 16
+  --instance-point-alignment-trim-ratio 0.80
+  --instance-point-alignment-max-iterations 4
+  --instance-point-alignment-min-relative-improvement 0.05
+  --instance-point-alignment-max-rotation-deg 5.0
+  --instance-point-alignment-max-translation-m 0.10
+)
+
+print "===== SCANNET OBJECT POINT ALIGNMENT V3 100F ====="
+print "scene=$SCENE_ID frames=$FRAME_COUNT frame_start=$FRAME_START frame_stride=$FRAME_STRIDE"
+print "horizon_device=$HORIZON_DEVICE sam_device=$SAM_DEVICE alignment_device=cpu"
+print "output=$OUTPUT_DIR"
+print "raw_camera_pose=unchanged aligned_camera_pose=raw_horizonstream"
+
+PYTHONPATH="$HORIZON_REPO:$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$HORIZON_PYTHON" -m streaming_couping.scripts.generate_horizonstream_geometry_cache \
+  "${HORIZON_ARGS[@]}" >"$GEOMETRY_LOG" 2>&1
+
+[[ -f "$GEOMETRY_CACHE" ]] || { print -u2 "missing geometry cache: $GEOMETRY_CACHE"; exit 1; }
+
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$SAM_PYTHON" -m streaming_couping.scripts.run_semantic_map \
+  "${ARGS[@]}" >"$RUN_LOG" 2>&1
+
+for branch in raw instance_point_alignment; do
+  [[ -f "$OUTPUT_DIR/$branch/semantic_map.pt" ]] || {
+    print -u2 "missing branch artifact: $OUTPUT_DIR/$branch/semantic_map.pt"
+    tail -n 80 "$RUN_LOG"
+    exit 1
+  }
+done
+
+set +e
+VGGT_SAM_ROOT="$ROOT" \
+VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT" \
+SEMANTIC_MAP_MANIFEST="$MANIFEST_PATH" \
+SEMANTIC_MAP_SCENE_ID="$SCENE_ID" \
+HORIZONSTREAM_GEOMETRY_CACHE="$GEOMETRY_CACHE" \
+OBJECT_POINT_ALIGNMENT_OUTPUT_DIR="$OUTPUT_DIR" \
+OBJECT_POINT_ALIGNMENT_EVAL_DIR="$EVAL_DIR" \
+STREAMING_COUPING_PYTHON="$SAM_PYTHON" \
+  zsh "$ROOT/streaming_couping/commands_evaluate_scannet_object_point_alignment.txt" \
+  >"$EVAL_LOG" 2>&1
+eval_exit_code=$?
+set -e
+if (( eval_exit_code != 0 )); then
+  print -u2 "GT evaluation failed status=$eval_exit_code log=$EVAL_LOG"
+  tail -n 80 "$EVAL_LOG"
+  exit "$eval_exit_code"
+fi
+
+EVAL_SUMMARY="$EVAL_DIR/summary.json"
+[[ -f "$EVAL_SUMMARY" ]] || { print -u2 "missing evaluation summary: $EVAL_SUMMARY"; exit 1; }
+
+TRACK_PLY_DIR="$EVAL_DIR/object_ply_comparison/object_tracks"
+for ply in raw_object_tracks.ply instance_point_alignment_object_tracks.ply gt_object_tracks.ply; do
+  [[ -s "$TRACK_PLY_DIR/$ply" ]] || {
+    print -u2 "missing or empty aggregate PLY: $TRACK_PLY_DIR/$ply"
+    exit 1
+  }
+done
+
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$SAM_PYTHON" "$ROOT/streaming_couping/scripts/print_instance_point_alignment_summary.py" \
+  "$OUTPUT_DIR" "$EVAL_SUMMARY"
+print "run_log=$RUN_LOG"
+print "evaluation_log=$EVAL_LOG"

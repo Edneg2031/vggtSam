@@ -1,0 +1,39 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# Offline GT evaluation for V3.  This reads raw/ and
+# instance_point_alignment/ semantic-map artifacts and never changes runtime
+# outputs.  No refined camera trajectory is expected because V3 is map-only.
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/horizonstream/bin/python}"
+
+INPUT_DIR="${OBJECT_POINT_ALIGNMENT_OUTPUT_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_point_alignment_v3}"
+OUTPUT_DIR="${OBJECT_POINT_ALIGNMENT_EVAL_DIR:-$INPUT_DIR/gt_evaluation}"
+MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
+SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
+GEOMETRY_CACHE="${HORIZONSTREAM_GEOMETRY_CACHE:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_consecutive/horizonstream_geometry.pt}"
+PROMPTS=("bed" "wardrobe" "chair" "rug" "dustbin")
+
+cd "$ROOT"
+[[ -x "$PYTHON" ]] || { print -u2 "missing Python: $PYTHON"; exit 1; }
+[[ -d "$INPUT_DIR" || -f "$INPUT_DIR" ]] || { print -u2 "missing input: $INPUT_DIR"; exit 1; }
+[[ -f "$MANIFEST_PATH" ]] || { print -u2 "missing manifest: $MANIFEST_PATH"; exit 1; }
+[[ -f "$GEOMETRY_CACHE" ]] || { print -u2 "missing geometry cache: $GEOMETRY_CACHE"; exit 1; }
+
+ARGS=(
+  --input-dir "$INPUT_DIR"
+  --output-dir "$OUTPUT_DIR"
+  --manifest "$MANIFEST_PATH"
+  --scene-id "$SCENE_ID"
+  --geometry-cache "$GEOMETRY_CACHE"
+  --prompts "${PROMPTS[@]}"
+  --map-source semantic
+  --alignment reference
+  --alignment-reference 0
+)
+
+PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m streaming_couping.scripts.evaluate_exported_semantic_map \
+  "${ARGS[@]}"

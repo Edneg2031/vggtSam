@@ -47,6 +47,9 @@ from streaming_couping.src.semantic_mapping.mapping import (
 from streaming_couping.src.semantic_mapping.instance_point_consistency import (
     InstancePointConsistencyConfig,
 )
+from streaming_couping.src.semantic_mapping.instance_point_alignment import (
+    InstancePointAlignmentConfig,
+)
 from streaming_couping.src.semantic_mapping.object_pose_refinement import (
     ObjectPoseRefinementConfig,
     ObjectPoseRefiner,
@@ -126,6 +129,20 @@ def main() -> None:
                 max_novel_points=args.instance_consistency_max_novel_points,
                 novel_weight=args.instance_consistency_novel_weight,
             ),
+            instance_point_alignment=InstancePointAlignmentConfig(
+                enabled=bool(args.instance_point_alignment),
+                history_frames=args.instance_alignment_history_frames,
+                max_history_points=args.instance_alignment_max_history_points,
+                min_history_points=args.instance_alignment_min_history_points,
+                max_registration_points=args.instance_alignment_max_registration_points,
+                max_match_distance_m=args.instance_alignment_max_match_distance_m,
+                min_matches=args.instance_alignment_min_matches,
+                trim_ratio=args.instance_alignment_trim_ratio,
+                max_iterations=args.instance_alignment_max_iterations,
+                min_relative_improvement=args.instance_alignment_min_relative_improvement,
+                max_rotation_deg=args.instance_alignment_max_rotation_deg,
+                max_translation_m=args.instance_alignment_max_translation_m,
+            ),
         )
     )
     if args.cache:
@@ -195,6 +212,7 @@ def _run_from_cache(
         },
         fusion_policy=args.fusion_policy,
         instance_point_consistency=args.instance_point_consistency,
+        instance_point_alignment=args.instance_point_alignment,
     )
 
 
@@ -264,7 +282,8 @@ def _run_from_rgb(
         f"sam_video_cpu_offload={int(args.sam_offload_video_to_cpu)} "
         f"object_pose_refinement={int(args.object_pose_refinement or args.object_pose_loss_refinement or args.object_pose_online_loop)} "
         f"object_pose_loss_refinement={int(args.object_pose_loss_refinement)} "
-        f"object_pose_online_loop={int(args.object_pose_online_loop)}"
+        f"object_pose_online_loop={int(args.object_pose_online_loop)} "
+        f"instance_point_alignment={int(args.instance_point_alignment)}"
     )
     from streaming_couping.src.backbones.sam3_wrapper import SAM3Wrapper
 
@@ -341,6 +360,9 @@ def _run_from_rgb(
         "instance_point_consistency_requested": bool(
             args.instance_point_consistency
         ),
+        "instance_point_alignment_requested": bool(
+            args.instance_point_alignment
+        ),
         **selection.metadata,
     }
     if geometry_payload is None:
@@ -353,6 +375,7 @@ def _run_from_rgb(
             object_pose_refiner=object_pose_refiner,
             online_object_pose_loop=online_object_pose_loop,
             instance_point_consistency=args.instance_point_consistency,
+            instance_point_alignment=args.instance_point_alignment,
         )
 
     # SAM must see the exact center-cropped pixels used for cached geometry.
@@ -367,6 +390,7 @@ def _run_from_rgb(
             object_pose_refiner=object_pose_refiner,
             online_object_pose_loop=online_object_pose_loop,
             instance_point_consistency=args.instance_point_consistency,
+            instance_point_alignment=args.instance_point_alignment,
         )
 
 
@@ -380,7 +404,29 @@ def _execute_pipeline(
     object_pose_refiner: ObjectPoseRefiner | None = None,
     online_object_pose_loop: bool = False,
     instance_point_consistency: bool = False,
+    instance_point_alignment: bool = False,
 ):
+    if instance_point_consistency and instance_point_alignment:
+        raise ValueError(
+            "instance point consistency and alignment cannot be enabled together."
+        )
+    if instance_point_alignment:
+        if object_pose_refiner is not None:
+            raise ValueError(
+                "--instance-point-alignment cannot be combined with camera "
+                "pose refinement."
+            )
+        if fusion_policy != "raw":
+            raise ValueError(
+                "--instance-point-alignment requires --fusion-policy raw; "
+                "it automatically exports raw and aligned branches."
+            )
+        return pipeline.run_branches(
+            image_paths,
+            prompts=prompts,
+            metadata=metadata,
+            policies=("raw", "instance_point_alignment"),
+        )
     if instance_point_consistency:
         if object_pose_refiner is not None:
             raise ValueError(
@@ -574,6 +620,14 @@ def _branch_comparison_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "instance_point_consistency": metadata.get(
             "instance_point_consistency", {}
         ),
+        "instance_point_alignment": metadata.get(
+            "instance_point_alignment", {}
+        ),
+        "camera_pose_modified": bool(metadata.get("camera_pose_modified", False)),
+        "full_scene_geometry_modified": bool(
+            metadata.get("full_scene_geometry_modified", False)
+        ),
+        "pointmap_modified": bool(metadata.get("pointmap_modified", False)),
     }
 
 
@@ -999,6 +1053,81 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--instance-point-alignment",
+        action="store_true",
+        help=(
+            "Opt in to causal local rigid alignment of persistent-instance "
+            "point clouds. Camera poses and full-scene geometry are unchanged; "
+            "raw and aligned branches are exported separately."
+        ),
+    )
+    parser.add_argument(
+        "--instance-point-alignment-history-frames",
+        dest="instance_alignment_history_frames",
+        type=int,
+        default=8,
+    )
+    parser.add_argument(
+        "--instance-point-alignment-max-history-points",
+        dest="instance_alignment_max_history_points",
+        type=int,
+        default=2048,
+    )
+    parser.add_argument(
+        "--instance-point-alignment-min-history-points",
+        dest="instance_alignment_min_history_points",
+        type=int,
+        default=32,
+    )
+    parser.add_argument(
+        "--instance-point-alignment-max-registration-points",
+        dest="instance_alignment_max_registration_points",
+        type=int,
+        default=512,
+    )
+    parser.add_argument(
+        "--instance-point-alignment-max-match-distance-m",
+        dest="instance_alignment_max_match_distance_m",
+        type=float,
+        default=0.15,
+    )
+    parser.add_argument(
+        "--instance-point-alignment-min-matches",
+        dest="instance_alignment_min_matches",
+        type=int,
+        default=16,
+    )
+    parser.add_argument(
+        "--instance-point-alignment-trim-ratio",
+        dest="instance_alignment_trim_ratio",
+        type=float,
+        default=0.80,
+    )
+    parser.add_argument(
+        "--instance-point-alignment-max-iterations",
+        dest="instance_alignment_max_iterations",
+        type=int,
+        default=4,
+    )
+    parser.add_argument(
+        "--instance-point-alignment-min-relative-improvement",
+        dest="instance_alignment_min_relative_improvement",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument(
+        "--instance-point-alignment-max-rotation-deg",
+        dest="instance_alignment_max_rotation_deg",
+        type=float,
+        default=5.0,
+    )
+    parser.add_argument(
+        "--instance-point-alignment-max-translation-m",
+        dest="instance_alignment_max_translation_m",
+        type=float,
+        default=0.10,
+    )
+    parser.add_argument(
         "--instance-point-consistency-history-frames",
         dest="instance_consistency_history_frames",
         type=int,
@@ -1068,6 +1197,22 @@ def _parse_args() -> argparse.Namespace:
         parser.error(
             "--object-pose-refinement, --object-pose-loss-refinement, and "
             "--object-pose-online-loop are mutually exclusive."
+        )
+    if args.instance_point_consistency and args.instance_point_alignment:
+        parser.error(
+            "--instance-point-consistency and --instance-point-alignment "
+            "are mutually exclusive in this ablation."
+        )
+    if args.instance_point_alignment and any(
+        (
+            args.object_pose_refinement,
+            args.object_pose_loss_refinement,
+            args.object_pose_online_loop,
+        )
+    ):
+        parser.error(
+            "--instance-point-alignment is map-only and cannot be combined "
+            "with camera pose refinement."
         )
     from streaming_couping.src.semantic_mapping.geometry_guidance import (
         GeometryGuidanceConfig,

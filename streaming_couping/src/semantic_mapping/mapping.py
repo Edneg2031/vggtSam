@@ -20,6 +20,11 @@ from .instance_point_consistency import (
     InstancePointConsistencyConfig,
     InstancePointConsistencyMemory,
 )
+from .instance_point_alignment import (
+    InstancePointAlignmentConfig,
+    InstancePointAlignmentMemory,
+    apply_point_alignment,
+)
 from .temporal_consensus import (
     TemporalConsensusConfig,
     TemporalConsensusMemory,
@@ -51,16 +56,20 @@ class SemanticMapConfig:
     instance_point_consistency: InstancePointConsistencyConfig = field(
         default_factory=lambda: InstancePointConsistencyConfig()
     )
+    instance_point_alignment: InstancePointAlignmentConfig = field(
+        default_factory=lambda: InstancePointAlignmentConfig()
+    )
 
     def validate(self) -> "SemanticMapConfig":
         if str(self.fusion_policy).strip().lower() not in {
             "raw",
             "temporal_consensus",
             "instance_point_consistency",
+            "instance_point_alignment",
         }:
             raise ValueError(
-                "fusion_policy must be 'raw', 'temporal_consensus', or "
-                "'instance_point_consistency'."
+                "fusion_policy must be 'raw', 'temporal_consensus', "
+                "'instance_point_consistency', or 'instance_point_alignment'."
             )
         if float(self.voxel_size_m) <= 0.0:
             raise ValueError("voxel_size_m must be positive.")
@@ -82,6 +91,15 @@ class SemanticMapConfig:
         self.map_write_gate.validate()
         self.temporal_consensus.validate()
         self.instance_point_consistency.validate()
+        self.instance_point_alignment.validate()
+        if (
+            self.instance_point_consistency.enabled
+            and self.instance_point_alignment.enabled
+        ):
+            raise ValueError(
+                "instance_point_consistency and instance_point_alignment "
+                "cannot both be enabled in one map branch."
+            )
         return self
 
 
@@ -733,6 +751,14 @@ class SemanticMapBuilder:
             if consistency_config.enabled
             else None
         )
+        alignment_config = self.config.instance_point_alignment
+        if self.config.fusion_policy == "instance_point_alignment":
+            alignment_config = replace(alignment_config, enabled=True)
+        self._instance_point_alignment = (
+            InstancePointAlignmentMemory(alignment_config)
+            if alignment_config.enabled
+            else None
+        )
         self._last_frame_id: int | None = None
         self._frame_count = 0
         self._last_stats: MapUpdateStats | None = None
@@ -829,6 +855,39 @@ class SemanticMapBuilder:
             map_points = selected_points
             map_weights = selected_weights
             map_rgb = selected_rgb
+            track_points = selected_points
+            alignment_event: dict[str, object] = {
+                "enabled": False,
+                "reason": "disabled:instance_point_alignment",
+                "raw_points": int(selected_points.shape[0]),
+                "output_points": int(selected_points.shape[0]),
+            }
+            if is_static and self._instance_point_alignment is not None:
+                alignment_decision = self._instance_point_alignment.decide(
+                    int(observation.instance_id),
+                    selected_points,
+                    selected_weights,
+                    frame_id=frame_id,
+                )
+                aligned_points = apply_point_alignment(
+                    alignment_decision.transform,
+                    selected_points,
+                )
+                map_points = aligned_points
+                track_points = aligned_points
+                alignment_event = {
+                    "enabled": True,
+                    **alignment_decision.to_dict(),
+                    "raw_points": int(selected_points.shape[0]),
+                    "output_points": int(aligned_points.shape[0]),
+                }
+                self._instance_point_alignment.update(
+                    int(observation.instance_id),
+                    aligned_points,
+                    selected_weights,
+                    frame_id=frame_id,
+                    decision=alignment_decision,
+                )
             consistency_event: dict[str, object] = {
                 "enabled": False,
                 "reason": "disabled:instance_point_consistency",
@@ -977,6 +1036,7 @@ class SemanticMapBuilder:
                 "geometry_confidence": float(geometry_score),
                 "static_observation": int(is_static),
                 "fusion_policy": str(self.config.fusion_policy),
+                "instance_point_alignment": alignment_event,
                 "instance_point_consistency": consistency_event,
                 "temporal_consensus": consensus_event,
                 **gate_decision.to_dict(),
@@ -1008,7 +1068,7 @@ class SemanticMapBuilder:
                 )
                 track.add(
                     label=str(observation.category),
-                    points=selected_points,
+                    points=track_points,
                     weights=selected_weights,
                     frame_id=frame_id,
                     is_static=is_static,
@@ -1112,7 +1172,20 @@ class SemanticMapBuilder:
         result_metadata.setdefault("last_frame_id", self._last_frame_id)
         result_metadata.setdefault("coordinate_frame", "world")
         result_metadata.setdefault("map_pose_feedback", False)
-        result_metadata.setdefault("pointmap_modified", False)
+        result_metadata.setdefault("camera_pose_modified", False)
+        result_metadata.setdefault("full_scene_geometry_modified", False)
+        result_metadata.setdefault(
+            "pointmap_modified",
+            bool(self._instance_point_alignment is not None),
+        )
+        result_metadata.setdefault(
+            "pointmap_modified_scope",
+            (
+                "object_points_only"
+                if self._instance_point_alignment is not None
+                else "none"
+            ),
+        )
         result_metadata.setdefault("object_only", bool(self.config.object_only))
         result_metadata.setdefault(
             "map_write_gate",
@@ -1179,6 +1252,18 @@ class SemanticMapBuilder:
                 else {
                     "enabled": False,
                     "config": self.config.instance_point_consistency.to_dict(),
+                    "reason": "disabled",
+                }
+            ),
+        )
+        result_metadata.setdefault(
+            "instance_point_alignment",
+            (
+                self._instance_point_alignment.summary()
+                if self._instance_point_alignment is not None
+                else {
+                    "enabled": False,
+                    "config": self.config.instance_point_alignment.to_dict(),
                     "reason": "disabled",
                 }
             ),
