@@ -1,0 +1,79 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# Check whether the V1 pose artifact actually contains a non-identity pose
+# correction before using it for object-only point alignment.
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/horizonstream/bin/python}"
+ARTIFACT="${V1_POSE_ARTIFACT:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_refinement_v1/object_pose_refinement/refined_camera_to_world.pt}"
+SUMMARY="${V1_POSE_SUMMARY:-${ARTIFACT%/refined_camera_to_world.pt}/pose_refinement_summary.json}"
+
+cd "$ROOT"
+[[ -x "$PYTHON" ]] || { print -u2 "missing Python: $PYTHON"; exit 1; }
+[[ -s "$ARTIFACT" ]] || { print -u2 "missing artifact: $ARTIFACT"; exit 1; }
+
+print "===== SCANNET V1 POSE ARTIFACT CHECK ====="
+print "artifact=$ARTIFACT"
+print "summary=$SUMMARY"
+
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" - "$ARTIFACT" "$SUMMARY" <<'PY'
+import json
+import math
+import sys
+from pathlib import Path
+
+import torch
+
+artifact_path = Path(sys.argv[1]).expanduser().resolve()
+summary_path = Path(sys.argv[2]).expanduser().resolve()
+try:
+    payload = torch.load(artifact_path, map_location="cpu", weights_only=False)
+except TypeError:
+    payload = torch.load(artifact_path, map_location="cpu")
+
+raw = torch.as_tensor(payload["raw_camera_to_world"]).float()
+refined = torch.as_tensor(payload["refined_camera_to_world"]).float()
+if raw.ndim == 2:
+    raw = raw.unsqueeze(0)
+if refined.ndim == 2:
+    refined = refined.unsqueeze(0)
+if raw.shape != refined.shape or raw.ndim != 3 or tuple(raw.shape[-2:]) != (4, 4):
+    raise SystemExit(
+        f"invalid pose shapes raw={tuple(raw.shape)} refined={tuple(refined.shape)}"
+    )
+
+delta = refined @ torch.linalg.inv(raw)
+translation = torch.linalg.vector_norm(delta[:, :3, 3], dim=-1)
+rotation = delta[:, :3, :3]
+cosine = ((rotation.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) * 0.5).clamp(-1.0, 1.0)
+rotation_deg = torch.rad2deg(torch.acos(cosine))
+pose_diff = (refined - raw).abs()
+non_identity = (translation > 1e-6) | (rotation_deg > 1e-4)
+
+print(f"frames={raw.shape[0]}")
+print(f"frame_ids={payload.get('frame_ids')}")
+print(f"raw_refined_max_abs_diff={float(pose_diff.max()):.9g}")
+print(f"non_identity_frames={int(non_identity.sum())}")
+print(f"mean_rotation_correction_deg={float(rotation_deg.mean()):.9g}")
+print(f"max_rotation_correction_deg={float(rotation_deg.max()):.9g}")
+print(f"mean_translation_correction_m={float(translation.mean()):.9g}")
+print(f"max_translation_correction_m={float(translation.max()):.9g}")
+
+if summary_path.is_file():
+    summary = json.loads(summary_path.read_text(encoding="utf8"))
+    change = summary.get("raw_vs_refined_pose_change", {})
+    optimizer = summary.get("optimizer", {})
+    print(f"candidate_pair_count={summary.get('candidate_pair_count')}")
+    print(f"accepted_edge_count={summary.get('accepted_edge_count')}")
+    print(f"rejected_edge_count={summary.get('rejected_edge_count')}")
+    print(f"summary_pose_correction_mean_deg={change.get('mean_rotation_correction_deg')}")
+    print(f"summary_translation_correction_mean_m={change.get('mean_translation_correction_m')}")
+    print(f"optimizer_attempted={optimizer.get('attempted')}")
+    print(f"optimizer_success={optimizer.get('success')}")
+else:
+    print("summary_status=missing")
+
+print("RESULT=NONTRIVIAL" if bool(non_identity.any()) else "RESULT=IDENTITY")
+PY
