@@ -292,6 +292,15 @@ def main() -> None:
         map_source=args.map_source,
         max_points_per_object=args.max_points_per_object,
     )
+    object_track_ply_comparison = _export_object_track_ply_comparison(
+        artifacts,
+        output_dir=output_dir,
+        target_world_points=target_world_points,
+        gt_masks=gt_masks,
+        gt_instance_ids=gt_info.instance_ids,
+        alignment=alignment,
+        max_points_per_object=args.max_points_per_object,
+    )
 
     summary = {
         "schema": 1,
@@ -331,6 +340,7 @@ def main() -> None:
         },
         "pose_evaluation": pose_evaluation,
         "object_ply_comparison": object_ply_comparison,
+        "object_track_ply_comparison": object_track_ply_comparison,
         "branches": branch_summaries,
         "decision": "EVALUATION_ONLY; no runtime branch is promoted automatically",
         "outputs": {},
@@ -365,6 +375,9 @@ def main() -> None:
         ),
         "object_ply_comparison": Path(
             object_ply_comparison["manifest"]
+        ),
+        "object_track_plys": Path(
+            object_track_ply_comparison["directory"]
         ),
     }
     summary["outputs"] = {name: str(path) for name, path in outputs.items()}
@@ -1022,6 +1035,228 @@ def _export_object_ply_comparison(
     }
 
 
+def _export_object_track_ply_comparison(
+    artifacts: dict[str, Path],
+    *,
+    output_dir: Path,
+    target_world_points: torch.Tensor,
+    gt_masks: torch.Tensor,
+    gt_instance_ids: tuple[int, ...] | list[int],
+    alignment: Any,
+) -> dict[str, object]:
+    """Export exactly three aggregate object-track clouds for easy download.
+
+    The prediction clouds are read from each artifact's ``object_tracks``
+    payload, rather than from the policy-dependent voxel map.  A single
+    evaluation alignment is applied to both prediction branches; GT already
+    lives in the target metric frame.  The three files therefore remain
+    directly comparable while preserving the full track observations.
+    """
+
+    directory = output_dir / "object_ply_comparison" / "object_tracks"
+    directory.mkdir(parents=True, exist_ok=True)
+
+    files: dict[str, str] = {}
+    point_counts: dict[str, int] = {}
+
+    for branch, artifact_path in artifacts.items():
+        payload = _load_artifact(artifact_path)
+        (
+            points,
+            colors,
+            category_ids,
+            instance_ids,
+            weights,
+            observations,
+            frame_ids,
+        ) = _flatten_exported_object_tracks(payload)
+        if alignment is not None and points.numel():
+            points = alignment.apply(points)
+        path = directory / f"{_ply_name_component(branch)}_object_tracks.ply"
+        _write_ply(
+            path,
+            points=points,
+            colors=colors,
+            category_ids=category_ids,
+            instance_ids=instance_ids,
+            weights=weights,
+            observations=observations,
+            frame_ids=frame_ids,
+        )
+        files[str(branch)] = str(path)
+        point_counts[str(branch)] = int(points.shape[0])
+
+    target = torch.as_tensor(target_world_points).detach().float().cpu()
+    masks = torch.as_tensor(gt_masks).detach().bool().cpu()
+    if target.ndim != 4 or target.shape[-1] != 3:
+        raise ValueError(
+            "target_world_points must have shape [S,H,W,3] for aggregate "
+            f"object-track export, got {tuple(target.shape)}."
+        )
+    if masks.ndim != 4 or tuple(masks.shape[0:1] + masks.shape[2:]) != tuple(
+        target.shape[:3]
+    ):
+        raise ValueError(
+            "GT masks and target pointmaps do not share [S,H,W] for "
+            "aggregate object-track export."
+        )
+    if masks.shape[1] != len(gt_instance_ids):
+        raise ValueError(
+            "GT instance IDs and masks disagree for aggregate object-track "
+            f"export: {len(gt_instance_ids)} vs {masks.shape[1]}."
+        )
+
+    finite = torch.isfinite(target).all(dim=-1)
+    frame_grid = torch.arange(target.shape[0], dtype=torch.long).view(-1, 1, 1)
+    frame_grid = frame_grid.expand(target.shape[0], target.shape[1], target.shape[2])
+    gt_points: list[torch.Tensor] = []
+    gt_colors: list[torch.Tensor] = []
+    gt_category_ids: list[torch.Tensor] = []
+    gt_instance_id_values: list[torch.Tensor] = []
+    gt_weights: list[torch.Tensor] = []
+    gt_observations: list[torch.Tensor] = []
+    gt_frame_ids: list[torch.Tensor] = []
+    for instance_index, instance_id in enumerate(gt_instance_ids):
+        selected = masks[:, int(instance_index)] & finite
+        points = target[selected]
+        if not points.numel():
+            continue
+        count = int(points.shape[0])
+        color = torch.tensor(
+            INSTANCE_PALETTE_RGB8[int(instance_id) % len(INSTANCE_PALETTE_RGB8)],
+            dtype=torch.float32,
+        ) / 255.0
+        gt_points.append(points)
+        gt_colors.append(color.expand(count, 3))
+        gt_category_ids.append(torch.zeros(count, dtype=torch.long))
+        gt_instance_id_values.append(
+            torch.full((count,), int(instance_id), dtype=torch.long)
+        )
+        gt_weights.append(torch.ones(count, dtype=torch.float32))
+        gt_observations.append(torch.ones(count, dtype=torch.long))
+        gt_frame_ids.append(frame_grid[selected])
+
+    if gt_points:
+        gt_points_value = torch.cat(gt_points, dim=0)
+        gt_colors_value = torch.cat(gt_colors, dim=0)
+        gt_category_ids_value = torch.cat(gt_category_ids, dim=0)
+        gt_instance_ids_value = torch.cat(gt_instance_id_values, dim=0)
+        gt_weights_value = torch.cat(gt_weights, dim=0)
+        gt_observations_value = torch.cat(gt_observations, dim=0)
+        gt_frame_ids_value = torch.cat(gt_frame_ids, dim=0)
+    else:
+        gt_points_value = torch.empty(0, 3, dtype=torch.float32)
+        gt_colors_value = torch.empty(0, 3, dtype=torch.float32)
+        gt_category_ids_value = torch.empty(0, dtype=torch.long)
+        gt_instance_ids_value = torch.empty(0, dtype=torch.long)
+        gt_weights_value = torch.empty(0, dtype=torch.float32)
+        gt_observations_value = torch.empty(0, dtype=torch.long)
+        gt_frame_ids_value = torch.empty(0, dtype=torch.long)
+
+    gt_path = directory / "gt_object_tracks.ply"
+    _write_ply(
+        gt_path,
+        points=gt_points_value,
+        colors=gt_colors_value,
+        category_ids=gt_category_ids_value,
+        instance_ids=gt_instance_ids_value,
+        weights=gt_weights_value,
+        observations=gt_observations_value,
+        frame_ids=gt_frame_ids_value,
+    )
+    files["gt"] = str(gt_path)
+    point_counts["gt"] = int(gt_points_value.shape[0])
+
+    return {
+        "directory": str(directory),
+        "files": files,
+        "point_counts": point_counts,
+        "coordinate_frame": (
+            "GT metric frame after shared reference Sim(3)"
+            if alignment is not None
+            else "native prediction/GT frame"
+        ),
+    }
+
+
+def _flatten_exported_object_tracks(
+    payload: dict[str, Any],
+) -> tuple[torch.Tensor, ...]:
+    """Flatten artifact object tracks while retaining weights and frame IDs."""
+
+    point_chunks: list[torch.Tensor] = []
+    color_chunks: list[torch.Tensor] = []
+    category_chunks: list[torch.Tensor] = []
+    instance_chunks: list[torch.Tensor] = []
+    weight_chunks: list[torch.Tensor] = []
+    observation_chunks: list[torch.Tensor] = []
+    frame_chunks: list[torch.Tensor] = []
+    tracks = payload.get("object_tracks", ())
+    if not isinstance(tracks, (list, tuple)):
+        raise ValueError("Export object_tracks must be a sequence.")
+
+    for row in tracks:
+        if not isinstance(row, dict):
+            raise ValueError("Export object_tracks rows must be mappings.")
+        instance_id = int(row["instance_id"])
+        points = torch.as_tensor(row.get("points", ())).detach().float().cpu()
+        if points.numel() == 0:
+            continue
+        if points.ndim != 2 or points.shape[-1] != 3:
+            raise ValueError(
+                f"object track {instance_id} points must have shape [N,3]."
+            )
+        count = int(points.shape[0])
+        weights = torch.as_tensor(
+            row.get("weights", torch.ones(count))
+        ).detach().float().cpu().reshape(-1)
+        frame_ids = torch.as_tensor(
+            row.get("frame_indices", torch.full((count,), -1))
+        ).detach().long().cpu().reshape(-1)
+        if weights.shape[0] != count or frame_ids.shape[0] != count:
+            raise ValueError(
+                f"object track {instance_id} fields do not have {count} rows."
+            )
+        valid = torch.isfinite(points).all(dim=1) & torch.isfinite(weights)
+        if not bool(valid.any()):
+            continue
+        points = points[valid]
+        weights = weights[valid]
+        frame_ids = frame_ids[valid]
+        count = int(points.shape[0])
+        color = torch.tensor(
+            INSTANCE_PALETTE_RGB8[instance_id % len(INSTANCE_PALETTE_RGB8)],
+            dtype=torch.float32,
+        ) / 255.0
+        point_chunks.append(points)
+        color_chunks.append(color.expand(count, 3))
+        category_chunks.append(torch.zeros(count, dtype=torch.long))
+        instance_chunks.append(torch.full((count,), instance_id, dtype=torch.long))
+        weight_chunks.append(weights)
+        observation_chunks.append(torch.ones(count, dtype=torch.long))
+        frame_chunks.append(frame_ids)
+
+    if not point_chunks:
+        return (
+            torch.empty(0, 3, dtype=torch.float32),
+            torch.empty(0, 3, dtype=torch.float32),
+            torch.empty(0, dtype=torch.long),
+            torch.empty(0, dtype=torch.long),
+            torch.empty(0, dtype=torch.float32),
+            torch.empty(0, dtype=torch.long),
+            torch.empty(0, dtype=torch.long),
+        )
+    return (
+        torch.cat(point_chunks, dim=0),
+        torch.cat(color_chunks, dim=0),
+        torch.cat(category_chunks, dim=0),
+        torch.cat(instance_chunks, dim=0),
+        torch.cat(weight_chunks, dim=0),
+        torch.cat(observation_chunks, dim=0),
+        torch.cat(frame_chunks, dim=0),
+    )
+
+
 def _write_object_ply(path: Path, points: torch.Tensor, instance_id: int) -> None:
     points = torch.as_tensor(points).detach().float().cpu().reshape(-1, 3)
     color = torch.tensor(
@@ -1145,6 +1380,16 @@ def _write_copyable(
         if isinstance(branch_dirs, dict):
             for branch, directory in branch_dirs.items():
                 lines.append(f"object_ply_{branch}={directory}")
+    object_track_plys = summary.get("object_track_ply_comparison", {})
+    if isinstance(object_track_plys, dict):
+        lines.append(
+            "object_track_ply_directory="
+            + str(object_track_plys.get("directory", ""))
+        )
+        files = object_track_plys.get("files", {})
+        if isinstance(files, dict):
+            for name, path in files.items():
+                lines.append(f"object_track_ply_{name}={path}")
     pose_branches = pose_evaluation.get("branches", {})
     if isinstance(pose_branches, dict):
         for branch, value in pose_branches.items():
@@ -1208,6 +1453,16 @@ def _print_summary(
     object_plys = summary.get("object_ply_comparison", {})
     if isinstance(object_plys, dict):
         print(f"object_ply_root={object_plys.get('root', '')}")
+    object_track_plys = summary.get("object_track_ply_comparison", {})
+    if isinstance(object_track_plys, dict):
+        print(
+            "object_track_ply_directory="
+            f"{object_track_plys.get('directory', '')}"
+        )
+        files = object_track_plys.get("files", {})
+        if isinstance(files, dict):
+            for name, path in files.items():
+                print(f"object_track_ply_{name}={path}")
     pose_branches = pose_evaluation.get("branches", {})
     if isinstance(pose_branches, dict):
         for branch, value in pose_branches.items():
