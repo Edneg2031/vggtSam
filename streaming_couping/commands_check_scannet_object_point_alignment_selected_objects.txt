@@ -1,0 +1,23 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# Evaluate only the SAM instances that received at least one accepted V3
+# object-point alignment decision.  This reuses an existing V3 run.
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/horizonstream/bin/python}"
+OUTPUT_DIR="${OBJECT_POINT_ALIGNMENT_OUTPUT_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_point_alignment_v3}"
+EVAL_SUMMARY="${OBJECT_POINT_ALIGNMENT_EVAL_DIR:-$OUTPUT_DIR/gt_evaluation}/summary.json"
+
+cd "$ROOT"
+[[ -x "$PYTHON" ]] || { print -u2 "missing Python: $PYTHON"; exit 1; }
+[[ -s "$OUTPUT_DIR/comparison.json" ]] || { print -u2 "missing comparison: $OUTPUT_DIR/comparison.json"; exit 1; }
+[[ -s "$EVAL_SUMMARY" ]] || { print -u2 "missing evaluation summary: $EVAL_SUMMARY"; exit 1; }
+[[ -s "${EVAL_SUMMARY:h}/map_objects.csv" ]] || {
+  print -u2 "missing object metrics: ${EVAL_SUMMARY:h}/map_objects.csv"
+  exit 1
+}
+
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" "$ROOT/streaming_couping/scripts/print_instance_point_alignment_selected_metrics.py" \
+  "$OUTPUT_DIR" "$EVAL_SUMMARY"
