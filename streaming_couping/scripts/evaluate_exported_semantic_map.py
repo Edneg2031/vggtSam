@@ -299,7 +299,6 @@ def main() -> None:
         gt_masks=gt_masks,
         gt_instance_ids=gt_info.instance_ids,
         alignment=alignment,
-        max_points_per_object=args.max_points_per_object,
     )
 
     summary = {
