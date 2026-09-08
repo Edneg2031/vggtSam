@@ -1387,8 +1387,8 @@ def _write_copyable(
         )
         files = object_track_plys.get("files", {})
         if isinstance(files, dict):
-            for name, path in files.items():
-                lines.append(f"object_track_ply_{name}={path}")
+            for name, file_path in files.items():
+                lines.append(f"object_track_ply_{name}={file_path}")
     pose_branches = pose_evaluation.get("branches", {})
     if isinstance(pose_branches, dict):
         for branch, value in pose_branches.items():
