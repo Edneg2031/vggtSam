@@ -1,12 +1,12 @@
 #!/usr/bin/env zsh
 set -euo pipefail
 
-# 100-frame V2 conservative external SAM/HorizonStream pose-correction loop.
+# 100-frame V2.1 continuity-restored external SAM/HorizonStream pose-correction loop.
 # HorizonStream is run once to produce the geometry cache.  The semantic-map
 # stage then processes frames causally with a corrected external pose state and
-# a current-frame-only object constraint optimizer with a deterministic
+# a short sliding-window object constraint optimizer with a deterministic
 # correspondence holdout.  HorizonStream's latent/cache state is deliberately
-# not mutated in this experiment.
+# not mutated in this experiment.  The previous V2 output is preserved.
 
 ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
@@ -26,7 +26,7 @@ PROMPTS=("bed" "wardrobe" "chair" "rug" "dustbin")
 
 BASELINE_OUTPUT_DIR="$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_consecutive"
 GEOMETRY_CACHE="${HORIZONSTREAM_GEOMETRY_CACHE:-$BASELINE_OUTPUT_DIR/horizonstream_geometry.pt}"
-OUTPUT_DIR="${OBJECT_POSE_ONLINE_OUTPUT_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_online_loop_v2}"
+OUTPUT_DIR="${OBJECT_POSE_ONLINE_OUTPUT_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_online_loop_v2_1}"
 EVAL_DIR="$OUTPUT_DIR/gt_evaluation"
 RECOVERY_CONFIG="${RECOVERY_CONFIG_PATH:-$ROOT/streaming_couping/configs/recovery_dynamic_instance.yaml}"
 GEOMETRY_LOG="$OUTPUT_DIR/horizonstream_geometry.log"
@@ -100,12 +100,12 @@ ARGS=(
   --object-pose-loss-trim-ratio 0.70
   --object-pose-loss-min-matches-per-pair 8
   --object-pose-loss-device cpu
-  --object-pose-online-window-size 1
-  --object-pose-online-max-reference-frames 2
+  --object-pose-online-window-size 5
+  --object-pose-online-max-reference-frames 3
   --object-pose-online-max-reference-gap 10
   --object-pose-online-anchor-frames 3
   --object-pose-online-always-include-anchor-reference
-  --object-pose-online-no-carry-rejected-correction
+  --object-pose-online-carry-rejected-correction
   --object-pose-online-min-independent-instances 2
   --object-pose-online-min-matches-per-instance 15
   --object-pose-online-min-total-matches 40
