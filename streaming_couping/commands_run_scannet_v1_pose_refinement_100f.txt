@@ -1,0 +1,151 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# Generate the V1 pose artifact used by
+# commands_run_scannet_v1_object_point_alignment_100f.txt.
+# This is the original V1 camera-pose refinement on the same 100-frame
+# HorizonStream sequence; V4 later reuses only its per-frame correction.
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+HORIZON_PYTHON="${HORIZONSTREAM_PYTHON:-/home/huawei/miniconda3/envs/horizonstream/bin/python}"
+SAM_PYTHON="${STREAMING_COUPING_PYTHON:-$HORIZON_PYTHON}"
+HORIZON_REPO="$ROOT/externals/horizonstream"
+HORIZON_CHECKPOINT="${HORIZONSTREAM_CHECKPOINT:-/home/bod/86Nas/95_data_bak/FoundationModels/HorizonStream.pt}"
+HORIZON_DEVICE="${HORIZONSTREAM_DEVICE:-cuda:0}"
+SAM_DEVICE="${SAM_DEVICE:-cuda:2}"
+
+MANIFEST_PATH="$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json"
+SCENE_ID="00a231a370"
+FRAME_START=90
+FRAME_STRIDE=1
+FRAME_COUNT=100
+PROMPTS=("bed" "wardrobe" "chair" "rug" "dustbin")
+
+OUTPUT_DIR="${V1_POSE_REFINEMENT_OUTPUT_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_refinement_v1}"
+GEOMETRY_CACHE="${HORIZONSTREAM_GEOMETRY_CACHE:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_consecutive/horizonstream_geometry.pt}"
+RECOVERY_CONFIG="${RECOVERY_CONFIG_PATH:-$ROOT/streaming_couping/configs/recovery_dynamic_instance.yaml}"
+GEOMETRY_LOG="$OUTPUT_DIR/horizonstream_geometry.log"
+RUN_LOG="$OUTPUT_DIR/run.log"
+
+cd "$ROOT"
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+[[ -x "$HORIZON_PYTHON" ]] || { print -u2 "missing Python: $HORIZON_PYTHON"; exit 1; }
+[[ -x "$SAM_PYTHON" ]] || { print -u2 "missing Python: $SAM_PYTHON"; exit 1; }
+[[ -d "$HORIZON_REPO/horizonstream" ]] || { print -u2 "missing HorizonStream source: $HORIZON_REPO"; exit 1; }
+[[ -f "$HORIZON_CHECKPOINT" ]] || { print -u2 "missing HorizonStream checkpoint: $HORIZON_CHECKPOINT"; exit 1; }
+[[ -f "$MANIFEST_PATH" ]] || { print -u2 "missing ScanNet++ manifest: $MANIFEST_PATH"; exit 1; }
+[[ -f "$RECOVERY_CONFIG" ]] || { print -u2 "missing recovery config: $RECOVERY_CONFIG"; exit 1; }
+if ! "$SAM_PYTHON" -c 'import iopath, ftfy, regex, huggingface_hub, timm, einops, pycocotools' >/dev/null 2>&1; then
+  print -u2 "SAM3 runtime dependencies are missing"
+  exit 1
+fi
+
+mkdir -p "$OUTPUT_DIR"
+
+HORIZON_ARGS=(
+  --manifest "$MANIFEST_PATH"
+  --scene-id "$SCENE_ID"
+  --frame-start "$FRAME_START"
+  --frame-stride "$FRAME_STRIDE"
+  --frame-count "$FRAME_COUNT"
+  --repo-path "$HORIZON_REPO"
+  --checkpoint "$HORIZON_CHECKPOINT"
+  --output-cache "$GEOMETRY_CACHE"
+  --device "$HORIZON_DEVICE"
+  --window-size 10
+  --sliding-size 1
+  --image-size 518
+  --patch-size 14
+  --crop
+  --precision float16
+  --reuse-if-valid
+)
+
+OBJECT_POSE_FEATURE_BACKEND="${OBJECT_POSE_FEATURE_BACKEND:-dinov3}"
+OBJECT_POSE_DINOV3_CHECKPOINT="${OBJECT_POSE_DINOV3_CHECKPOINT:-}"
+OBJECT_POSE_DINOV3_ROOT="${OBJECT_POSE_DINOV3_ROOT:-/home/bod/86Nas/95_data_bak/FoundationModels/dinov3}"
+OBJECT_POSE_DINOV3_VARIANT="${OBJECT_POSE_DINOV3_VARIANT:-dinov3-vitl16}"
+OBJECT_POSE_DINOV3_DEVICE="${OBJECT_POSE_DINOV3_DEVICE:-cuda:0}"
+OBJECT_POSE_DINOV3_DTYPE="${OBJECT_POSE_DINOV3_DTYPE:-bfloat16}"
+
+ARGS=(
+  --manifest "$MANIFEST_PATH"
+  --scene-id "$SCENE_ID"
+  --frame-start "$FRAME_START"
+  --frame-stride "$FRAME_STRIDE"
+  --frame-count "$FRAME_COUNT"
+  --prompts "${PROMPTS[@]}"
+  --geometry-cache "$GEOMETRY_CACHE"
+  --output-dir "$OUTPUT_DIR"
+  --fusion-policy raw
+  --recovery-config "$RECOVERY_CONFIG"
+  --sam-device "$SAM_DEVICE"
+  --sam-grounding-batch-size 1
+  --sam-offload-video-to-cpu
+  --object-only
+  --object-pose-refinement
+  --object-pose-min-gap 10
+  --object-pose-min-track-score 0.50
+  --object-pose-min-mask-pixels 32
+  --object-pose-min-geometry-points 24
+  --object-pose-min-geometry-confidence 0.30
+  --object-pose-max-pairs-per-instance 8
+  --object-pose-max-total-candidate-pairs 256
+  --object-pose-feature-backend "$OBJECT_POSE_FEATURE_BACKEND"
+  --object-pose-feature-patch-size 8
+  --object-pose-feature-max-points 1024
+  --object-pose-feature-cosine-threshold 0.65
+  --object-pose-feature-ratio-margin 0.02
+  --object-pose-max-feature-matches 256
+  --object-pose-ransac-iterations 256
+  --object-pose-ransac-inlier-threshold 0.10
+  --object-pose-min-matches 12
+  --object-pose-min-inliers 6
+  --object-pose-min-inlier-ratio 0.30
+  --object-pose-max-registration-rmse 0.12
+  --object-pose-max-rotation-disagreement 60.0
+  --object-pose-max-translation-disagreement 1.0
+  --object-pose-reject-extreme-disagreement-multiplier 2.0
+  --object-pose-low-consistency-weight 0.25
+  --object-pose-weight 1.0
+  --object-pose-sequential-weight 10.0
+  --object-pose-huber-delta 0.10
+  --object-pose-rotation-residual-scale 1.0
+  --object-pose-max-pose-correction-rotation 45.0
+  --object-pose-max-pose-correction-translation 1.0
+  --object-pose-optimizer-max-nfev 100
+  --object-pose-dinov3-root "$OBJECT_POSE_DINOV3_ROOT"
+  --object-pose-dinov3-variant "$OBJECT_POSE_DINOV3_VARIANT"
+  --object-pose-dinov3-device "$OBJECT_POSE_DINOV3_DEVICE"
+  --object-pose-dinov3-dtype "$OBJECT_POSE_DINOV3_DTYPE"
+)
+if [[ -n "$OBJECT_POSE_DINOV3_CHECKPOINT" ]]; then
+  ARGS+=(--object-pose-dinov3-checkpoint "$OBJECT_POSE_DINOV3_CHECKPOINT")
+fi
+
+print "===== SCANNET V1 OBJECT POSE REFINEMENT 100F ====="
+print "scene=$SCENE_ID frames=$FRAME_COUNT frame_start=$FRAME_START frame_stride=$FRAME_STRIDE"
+print "horizon_device=$HORIZON_DEVICE sam_device=$SAM_DEVICE feature_backend=$OBJECT_POSE_FEATURE_BACKEND"
+print "output=$OUTPUT_DIR"
+
+PYTHONPATH="$HORIZON_REPO:$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$HORIZON_PYTHON" -m streaming_couping.scripts.generate_horizonstream_geometry_cache \
+  "${HORIZON_ARGS[@]}" >"$GEOMETRY_LOG" 2>&1
+[[ -s "$GEOMETRY_CACHE" ]] || { print -u2 "missing geometry cache: $GEOMETRY_CACHE"; exit 1; }
+
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$SAM_PYTHON" -m streaming_couping.scripts.run_semantic_map \
+  "${ARGS[@]}" >"$RUN_LOG" 2>&1
+
+ARTIFACT="$OUTPUT_DIR/object_pose_refinement/refined_camera_to_world.pt"
+SUMMARY="$OUTPUT_DIR/object_pose_refinement/pose_refinement_summary.json"
+[[ -s "$ARTIFACT" ]] || { print -u2 "missing V1 pose artifact: $ARTIFACT"; tail -n 80 "$RUN_LOG"; exit 1; }
+[[ -s "$SUMMARY" ]] || { print -u2 "missing V1 pose summary: $SUMMARY"; tail -n 80 "$RUN_LOG"; exit 1; }
+
+print "v1_pose_artifact=$ARTIFACT"
+print "v1_pose_summary=$SUMMARY"
+print "run_log=$RUN_LOG"

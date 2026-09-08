@@ -25,6 +25,7 @@ from .instance_point_alignment import (
     InstancePointAlignmentMemory,
     apply_point_alignment,
 )
+from .v1_object_point_alignment import apply_object_point_pose_transform
 from .temporal_consensus import (
     TemporalConsensusConfig,
     TemporalConsensusMemory,
@@ -738,6 +739,7 @@ class SemanticMapBuilder:
         self._tracks: dict[int, _TrackEvidence] = {}
         self._object_memory: dict[int, _ObjectMemoryState] = {}
         self._object_memory_events: list[dict[str, object]] = []
+        self._v1_object_point_alignment_frames: set[int] = set()
         self._temporal_consensus = (
             TemporalConsensusMemory(self.config.temporal_consensus)
             if self.config.fusion_policy == "temporal_consensus"
@@ -833,6 +835,7 @@ class SemanticMapBuilder:
             )
             if not selected_points.numel():
                 continue
+            raw_object_point_count = int(selected_points.shape[0])
             accepted_observations += 1
             accepted_points += int(selected_points.shape[0])
             is_static = _is_static_observation(
@@ -840,6 +843,12 @@ class SemanticMapBuilder:
                 threshold=self.config.static_score_threshold,
                 require_score=self.config.require_static_score,
             )
+            if is_static and geometry.object_point_transform is not None:
+                selected_points = apply_object_point_pose_transform(
+                    geometry.object_point_transform,
+                    selected_points,
+                )
+                self._v1_object_point_alignment_frames.add(frame_id)
             memory_state = self._object_memory.setdefault(
                 int(observation.instance_id),
                 _ObjectMemoryState(
@@ -856,6 +865,18 @@ class SemanticMapBuilder:
             map_weights = selected_weights
             map_rgb = selected_rgb
             track_points = selected_points
+            object_point_pose_event: dict[str, object] = {
+                "enabled": bool(
+                    is_static and geometry.object_point_transform is not None
+                ),
+                "application_scope": (
+                    "static_sam_object_points_only"
+                    if is_static and geometry.object_point_transform is not None
+                    else "none"
+                ),
+                "raw_points": raw_object_point_count,
+                "output_points": int(selected_points.shape[0]),
+            }
             alignment_event: dict[str, object] = {
                 "enabled": False,
                 "reason": "disabled:instance_point_alignment",
@@ -888,6 +909,8 @@ class SemanticMapBuilder:
                     frame_id=frame_id,
                     decision=alignment_decision,
                 )
+            if object_point_pose_event["enabled"]:
+                object_point_pose_event["transform_applied"] = True
             consistency_event: dict[str, object] = {
                 "enabled": False,
                 "reason": "disabled:instance_point_consistency",
@@ -1036,6 +1059,7 @@ class SemanticMapBuilder:
                 "geometry_confidence": float(geometry_score),
                 "static_observation": int(is_static),
                 "fusion_policy": str(self.config.fusion_policy),
+                "v1_object_point_alignment": object_point_pose_event,
                 "instance_point_alignment": alignment_event,
                 "instance_point_consistency": consistency_event,
                 "temporal_consensus": consensus_event,
@@ -1176,15 +1200,24 @@ class SemanticMapBuilder:
         result_metadata.setdefault("full_scene_geometry_modified", False)
         result_metadata.setdefault(
             "pointmap_modified",
-            bool(self._instance_point_alignment is not None),
+            bool(
+                self._instance_point_alignment is not None
+                or self._v1_object_point_alignment_frames
+            ),
         )
         result_metadata.setdefault(
             "pointmap_modified_scope",
             (
                 "object_points_only"
                 if self._instance_point_alignment is not None
+                else "static_sam_object_points_only"
+                if self._v1_object_point_alignment_frames
                 else "none"
             ),
+        )
+        result_metadata.setdefault(
+            "v1_object_point_alignment_frames",
+            [int(value) for value in sorted(self._v1_object_point_alignment_frames)],
         )
         result_metadata.setdefault("object_only", bool(self.config.object_only))
         result_metadata.setdefault(

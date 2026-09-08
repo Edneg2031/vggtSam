@@ -20,6 +20,7 @@ from .object_pose_refinement import (
     apply_refined_camera_poses,
 )
 from .online_object_pose_loop import OnlineObjectPoseLoopRefiner
+from .v1_object_point_alignment import V1ObjectPointPoseAlignment
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,14 @@ class SemanticMapPoseRefinementRun:
     raw_results: Mapping[str, SemanticMapResult]
     refined_results: Mapping[str, SemanticMapResult]
     refinement: PoseRefinementResult
+
+
+@dataclass(frozen=True)
+class SemanticMapV1ObjectPointAlignmentRun:
+    """Raw and V1-corrected object-point maps from shared inference."""
+
+    results: Mapping[str, SemanticMapResult]
+    alignment: V1ObjectPointPoseAlignment
 
 
 class SemanticMapPipeline:
@@ -184,6 +193,117 @@ class SemanticMapPipeline:
                 mapper=branch_mapper,
             )
         return results
+
+    def run_with_v1_object_point_alignment(
+        self,
+        image_paths: Sequence[str | Path],
+        *,
+        pose_artifact: str | Path,
+        raw_pose_tolerance: float = 1e-3,
+        prompts: Sequence[str] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> SemanticMapV1ObjectPointAlignmentRun:
+        """Reuse V1 pose corrections only for static SAM object points.
+
+        Both branches fuse the original geometry frames, so their camera poses
+        and full-scene pointmaps remain HorizonStream's raw outputs.  The
+        aligned branch carries a per-frame transform through the geometry
+        contract; the mapper applies it only after selecting a static SAM
+        instance mask.
+        """
+
+        paths = tuple(Path(path).expanduser() for path in image_paths)
+        if not paths:
+            raise ValueError("SemanticMapPipeline requires at least one RGB frame.")
+        geometry_frames, segmentation_frames, ordered_ids = self._infer(
+            paths,
+            prompts,
+        )
+        alignment = V1ObjectPointPoseAlignment.from_artifact(
+            pose_artifact,
+            geometry_frames,
+            raw_pose_tolerance=float(raw_pose_tolerance),
+        )
+
+        base_config = replace(
+            self.mapper.config,
+            fusion_policy="raw",
+            instance_point_consistency=replace(
+                self.mapper.config.instance_point_consistency,
+                enabled=False,
+            ),
+            instance_point_alignment=replace(
+                self.mapper.config.instance_point_alignment,
+                enabled=False,
+            ),
+        )
+        raw_mapper = SemanticMapBuilder(base_config)
+        aligned_mapper = SemanticMapBuilder(base_config)
+        aligned_geometry_frames = tuple(
+            replace(
+                frame,
+                object_point_transform=alignment.correction_by_frame[
+                    int(frame.frame_id)
+                ],
+            )
+            for frame in geometry_frames
+        )
+
+        alignment_metadata = alignment.to_dict()
+        raw_metadata = dict(metadata or {})
+        raw_metadata.update(
+            {
+                "fusion_policy": "raw",
+                "pose_variant": "raw_horizonstream",
+                "branch_shared_model_inference": True,
+                "camera_pose_modified": False,
+                "full_scene_geometry_modified": False,
+                "pointmap_modified": False,
+                "pointmap_modified_scope": "none",
+                "v1_object_point_alignment": {
+                    **alignment_metadata,
+                    "applied": False,
+                },
+            }
+        )
+        aligned_metadata = dict(metadata or {})
+        aligned_metadata.update(
+            {
+                "fusion_policy": "raw",
+                "pose_variant": "raw_horizonstream",
+                "branch_shared_model_inference": True,
+                "camera_pose_modified": False,
+                "full_scene_geometry_modified": False,
+                "pointmap_modified": True,
+                "pointmap_modified_scope": "static_sam_object_points_only",
+                "v1_object_point_alignment": {
+                    **alignment_metadata,
+                    "applied": True,
+                },
+            }
+        )
+        results = {
+            "raw": self._fuse(
+                geometry_frames,
+                segmentation_frames,
+                ordered_ids=ordered_ids,
+                metadata=raw_metadata,
+                prompts=prompts,
+                mapper=raw_mapper,
+            ),
+            "v1_object_point_alignment": self._fuse(
+                aligned_geometry_frames,
+                segmentation_frames,
+                ordered_ids=ordered_ids,
+                metadata=aligned_metadata,
+                prompts=prompts,
+                mapper=aligned_mapper,
+            ),
+        }
+        return SemanticMapV1ObjectPointAlignmentRun(
+            results=results,
+            alignment=alignment,
+        )
 
     def run_with_object_pose_refinement(
         self,

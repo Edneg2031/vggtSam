@@ -33,6 +33,7 @@ from .mapping import (
 )
 from .pipeline import SemanticMapPipeline
 from .pipeline import SemanticMapPoseRefinementRun
+from .pipeline import SemanticMapV1ObjectPointAlignmentRun
 from .object_pose_refinement import (
     DinoV3PatchFeatureMatcher,
     FeatureMatch,
@@ -87,6 +88,10 @@ from .instance_point_alignment import (
     InstancePointAlignmentMemory,
     apply_point_alignment,
 )
+from .v1_object_point_alignment import (
+    V1ObjectPointPoseAlignment,
+    apply_object_point_pose_transform,
+)
 
 __all__ = [
     "GeometryFrame",
@@ -108,6 +113,7 @@ __all__ = [
     "SemanticMapConfig",
     "SemanticMapPipeline",
     "SemanticMapPoseRefinementRun",
+    "SemanticMapV1ObjectPointAlignmentRun",
     "SemanticMapResult",
     "StreamingGeometryProvider",
     "ExportedMapMetricConfig",
@@ -127,6 +133,8 @@ __all__ = [
     "InstancePointAlignmentDecision",
     "InstancePointAlignmentMemory",
     "apply_point_alignment",
+    "V1ObjectPointPoseAlignment",
+    "apply_object_point_pose_transform",
     "export_semantic_map",
     "DinoV3PatchFeatureMatcher",
     "FeatureMatch",

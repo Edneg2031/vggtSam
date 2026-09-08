@@ -41,6 +41,7 @@ class GeometryFrame:
     scale_type: str = "metric"
     backend: str = "unknown"
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    object_point_transform: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         self.validate()
@@ -90,6 +91,12 @@ class GeometryFrame:
                 _require_shape(value, (height, width), name)
         if self.rgb is not None:
             _require_shape(self.rgb, (height, width, 3), "rgb")
+        if self.object_point_transform is not None:
+            _require_shape(
+                self.object_point_transform,
+                (4, 4),
+                "object_point_transform",
+            )
         return self
 
     def cpu(self) -> "GeometryFrame":
@@ -111,6 +118,7 @@ class GeometryFrame:
                 else self.valid.detach().bool().cpu()
             ),
             rgb=_cpu(self.rgb),
+            object_point_transform=_cpu(self.object_point_transform),
         )
 
 

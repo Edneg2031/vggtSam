@@ -67,6 +67,7 @@ from streaming_couping.src.semantic_mapping.online_object_pose_loop import (
 from streaming_couping.src.semantic_mapping.pipeline import SemanticMapPipeline
 from streaming_couping.src.semantic_mapping.pipeline import (
     SemanticMapPoseRefinementRun,
+    SemanticMapV1ObjectPointAlignmentRun,
 )
 from streaming_couping.src.semantic_mapping.temporal_consensus import (
     TemporalConsensusConfig,
@@ -151,6 +152,8 @@ def main() -> None:
         result = _run_from_rgb(args, prompts, mapper)
     if isinstance(result, SemanticMapPoseRefinementRun):
         _export_pose_refinement_run(result, args.output_dir)
+    elif isinstance(result, SemanticMapV1ObjectPointAlignmentRun):
+        _export_v1_object_point_alignment_run(result, args.output_dir)
     elif isinstance(result, dict):
         _export_branch_results(result, args.output_dir)
     else:
@@ -166,6 +169,7 @@ def _run_from_cache(
         args.object_pose_refinement
         or args.object_pose_loss_refinement
         or args.object_pose_online_loop
+        or args.v1_pose_artifact is not None
     ):
         raise ValueError(
             "object pose refinement currently requires RGB mode with a "
@@ -213,6 +217,8 @@ def _run_from_cache(
         fusion_policy=args.fusion_policy,
         instance_point_consistency=args.instance_point_consistency,
         instance_point_alignment=args.instance_point_alignment,
+        v1_pose_artifact=args.v1_pose_artifact,
+        v1_pose_raw_tolerance=args.v1_pose_raw_tolerance,
     )
 
 
@@ -283,7 +289,8 @@ def _run_from_rgb(
         f"object_pose_refinement={int(args.object_pose_refinement or args.object_pose_loss_refinement or args.object_pose_online_loop)} "
         f"object_pose_loss_refinement={int(args.object_pose_loss_refinement)} "
         f"object_pose_online_loop={int(args.object_pose_online_loop)} "
-        f"instance_point_alignment={int(args.instance_point_alignment)}"
+        f"instance_point_alignment={int(args.instance_point_alignment)} "
+        f"v1_object_point_alignment={int(args.v1_pose_artifact is not None)}"
     )
     from streaming_couping.src.backbones.sam3_wrapper import SAM3Wrapper
 
@@ -376,6 +383,8 @@ def _run_from_rgb(
             online_object_pose_loop=online_object_pose_loop,
             instance_point_consistency=args.instance_point_consistency,
             instance_point_alignment=args.instance_point_alignment,
+            v1_pose_artifact=args.v1_pose_artifact,
+            v1_pose_raw_tolerance=args.v1_pose_raw_tolerance,
         )
 
     # SAM must see the exact center-cropped pixels used for cached geometry.
@@ -391,6 +400,8 @@ def _run_from_rgb(
             online_object_pose_loop=online_object_pose_loop,
             instance_point_consistency=args.instance_point_consistency,
             instance_point_alignment=args.instance_point_alignment,
+            v1_pose_artifact=args.v1_pose_artifact,
+            v1_pose_raw_tolerance=args.v1_pose_raw_tolerance,
         )
 
 
@@ -405,7 +416,33 @@ def _execute_pipeline(
     online_object_pose_loop: bool = False,
     instance_point_consistency: bool = False,
     instance_point_alignment: bool = False,
+    v1_pose_artifact: Path | None = None,
+    v1_pose_raw_tolerance: float = 1e-3,
 ):
+    if v1_pose_artifact is not None:
+        if any(
+            (
+                object_pose_refiner is not None,
+                instance_point_consistency,
+                instance_point_alignment,
+            )
+        ):
+            raise ValueError(
+                "--v1-pose-artifact cannot be combined with another pose or "
+                "instance-point refinement mode."
+            )
+        if fusion_policy != "raw":
+            raise ValueError(
+                "--v1-pose-artifact requires --fusion-policy raw; it exports "
+                "raw and v1_object_point_alignment branches."
+            )
+        return pipeline.run_with_v1_object_point_alignment(
+            image_paths,
+            pose_artifact=v1_pose_artifact,
+            raw_pose_tolerance=v1_pose_raw_tolerance,
+            prompts=prompts,
+            metadata=metadata,
+        )
     if instance_point_consistency and instance_point_alignment:
         raise ValueError(
             "instance point consistency and alignment cannot be enabled together."
@@ -531,6 +568,63 @@ def _export_branch_results(
     print(f"semantic map branch comparison={comparison_path}")
 
 
+def _export_v1_object_point_alignment_run(
+    run: SemanticMapV1ObjectPointAlignmentRun,
+    output_dir: Path,
+) -> None:
+    """Export raw and V1-corrected object-point branches with provenance."""
+
+    root = Path(output_dir).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    summaries: dict[str, dict[str, Any]] = {}
+    for branch, result in run.results.items():
+        summaries[branch] = export_semantic_map(
+            result,
+            root / branch,
+            revision=(
+                "semantic_mapping_raw_horizonstream_v1_object_point_alignment_r1"
+                if branch == "v1_object_point_alignment"
+                else "semantic_mapping_raw_horizonstream_baseline_r1"
+            ),
+        )
+        print(f"[{branch}]")
+        _print_export_summary(summaries[branch])
+
+    comparison = {
+        "schema": 1,
+        "revision": "v1_pose_correction_object_point_alignment_r1",
+        "raw_pose_unchanged": True,
+        "camera_pose_modified": False,
+        "full_scene_geometry_modified": False,
+        "shared_model_inference": True,
+        "gt_used_for_runtime_alignment": False,
+        "v1_object_point_alignment": run.alignment.to_dict(),
+        "branches": {
+            branch: _branch_comparison_summary(summary)
+            for branch, summary in summaries.items()
+        },
+        "outputs": {
+            "branch_directories": {
+                branch: str(root / branch) for branch in summaries
+            },
+            "comparison": str(root / "comparison.json"),
+        },
+    }
+    comparison_path = root / "comparison.json"
+    comparison_path.write_text(
+        json.dumps(comparison, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    print(
+        "v1 object-point alignment "
+        f"frames={len(run.alignment.frame_ids)} "
+        f"mean_rotation_deg={run.alignment.to_dict()['mean_correction_rotation_deg']} "
+        f"mean_translation_m={run.alignment.to_dict()['mean_correction_translation_m']}"
+    )
+    print(f"v1_object_point_alignment_artifact={run.alignment.artifact_path}")
+    print(f"semantic map branch comparison={comparison_path}")
+
+
 def _export_pose_refinement_run(
     run: SemanticMapPoseRefinementRun,
     output_dir: Path,
@@ -622,6 +716,9 @@ def _branch_comparison_summary(summary: dict[str, Any]) -> dict[str, Any]:
         ),
         "instance_point_alignment": metadata.get(
             "instance_point_alignment", {}
+        ),
+        "v1_object_point_alignment": metadata.get(
+            "v1_object_point_alignment", {}
         ),
         "camera_pose_modified": bool(metadata.get("camera_pose_modified", False)),
         "full_scene_geometry_modified": bool(
@@ -826,6 +923,22 @@ def _parse_args() -> argparse.Namespace:
             "corrected world pose forward and optimize a recent sliding window. "
             "HorizonStream latent/cache state is not mutated."
         ),
+    )
+    parser.add_argument(
+        "--v1-pose-artifact",
+        type=Path,
+        default=None,
+        help=(
+            "Reuse a V1 refined_camera_to_world.pt as an object-only point "
+            "transform. Camera poses and full-scene geometry remain raw "
+            "HorizonStream outputs."
+        ),
+    )
+    parser.add_argument(
+        "--v1-pose-raw-tolerance",
+        type=float,
+        default=1e-3,
+        help="Maximum absolute matrix difference allowed for V1/raw pose agreement.",
     )
     parser.add_argument("--object-pose-loss-anchor-frames", type=int, default=5)
     parser.add_argument("--object-pose-loss-max-anchor-observations", type=int, default=3)
@@ -1192,11 +1305,12 @@ def _parse_args() -> argparse.Namespace:
             args.object_pose_refinement,
             args.object_pose_loss_refinement,
             args.object_pose_online_loop,
+            args.v1_pose_artifact is not None,
         )
     ) > 1:
         parser.error(
             "--object-pose-refinement, --object-pose-loss-refinement, and "
-            "--object-pose-online-loop are mutually exclusive."
+            "--object-pose-online-loop, and --v1-pose-artifact are mutually exclusive."
         )
     if args.instance_point_consistency and args.instance_point_alignment:
         parser.error(
@@ -1208,12 +1322,15 @@ def _parse_args() -> argparse.Namespace:
             args.object_pose_refinement,
             args.object_pose_loss_refinement,
             args.object_pose_online_loop,
+            args.v1_pose_artifact is not None,
         )
     ):
         parser.error(
             "--instance-point-alignment is map-only and cannot be combined "
-            "with camera pose refinement."
+            "with camera pose refinement or V1 object-point alignment."
         )
+    if args.v1_pose_raw_tolerance <= 0.0:
+        parser.error("--v1-pose-raw-tolerance must be positive.")
     from streaming_couping.src.semantic_mapping.geometry_guidance import (
         GeometryGuidanceConfig,
     )
