@@ -20,6 +20,7 @@ from .object_pose_refinement import (
     apply_refined_camera_poses,
 )
 from .online_object_pose_loop import OnlineObjectPoseLoopRefiner
+from .object_point_pose_alignment import ObjectPointPoseAlignment
 from .v1_object_point_alignment import V1ObjectPointPoseAlignment
 
 
@@ -30,6 +31,7 @@ class SemanticMapPoseRefinementRun:
     raw_results: Mapping[str, SemanticMapResult]
     refined_results: Mapping[str, SemanticMapResult]
     refinement: PoseRefinementResult
+    object_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -313,6 +315,7 @@ class SemanticMapPipeline:
         prompts: Sequence[str] | None = None,
         metadata: Mapping[str, Any] | None = None,
         policies: Sequence[str] = ("raw",),
+        object_only: bool = False,
     ) -> SemanticMapPoseRefinementRun:
         """Run raw and SAM-object pose-refined maps from shared frozen outputs.
 
@@ -338,16 +341,37 @@ class SemanticMapPipeline:
             segmentation_frames,
             paths,
         )
-        refined_geometry_frames = apply_refined_camera_poses(
-            geometry_frames,
-            refinement,
-        )
-        refined_pose_variant = (
-            "object_pose_online_loop"
-            if str(getattr(refiner, "method_name", "")).startswith(
-                "sam_instance_guided_external_online"
+        object_point_alignment = None
+        if object_only:
+            object_point_alignment = ObjectPointPoseAlignment.from_refinement(
+                refinement,
+                geometry_frames,
+                source=str(getattr(refiner, "method_name", type(refiner).__name__)),
             )
-            else "object_pose_refined"
+            refined_geometry_frames = tuple(
+                replace(
+                    frame,
+                    object_point_transform=object_point_alignment.correction_by_frame[
+                        int(frame.frame_id)
+                    ],
+                )
+                for frame in geometry_frames
+            )
+        else:
+            refined_geometry_frames = apply_refined_camera_poses(
+                geometry_frames,
+                refinement,
+            )
+        refined_pose_variant = (
+            "raw_horizonstream_object_only"
+            if object_only
+            else (
+                "object_pose_online_loop"
+                if str(getattr(refiner, "method_name", "")).startswith(
+                    "sam_instance_guided_external_online"
+                )
+                else "object_pose_refined"
+            )
         )
         refinement_metadata = {
             "enabled": True,
@@ -355,6 +379,7 @@ class SemanticMapPipeline:
             "evaluation_gt_fields": 0,
             "raw_pose_unchanged": True,
             "summary": dict(refinement.summary),
+            "object_only": bool(object_only),
         }
         raw_results: dict[str, SemanticMapResult] = {}
         refined_results: dict[str, SemanticMapResult] = {}
@@ -381,6 +406,34 @@ class SemanticMapPipeline:
                     "object_pose_refinement": refinement_metadata,
                 }
             )
+            if object_only:
+                alignment_metadata = object_point_alignment.to_dict()
+                raw_metadata.update(
+                    {
+                        "camera_pose_modified": False,
+                        "full_scene_geometry_modified": False,
+                        "pointmap_modified": False,
+                        "pointmap_modified_scope": "none",
+                        "object_pose_refinement_object_only": True,
+                        "object_point_pose_alignment": {
+                            **alignment_metadata,
+                            "applied": False,
+                        },
+                    }
+                )
+                refined_metadata.update(
+                    {
+                        "camera_pose_modified": False,
+                        "full_scene_geometry_modified": False,
+                        "pointmap_modified": True,
+                        "pointmap_modified_scope": "static_sam_object_points_only",
+                        "object_pose_refinement_object_only": True,
+                        "object_point_pose_alignment": {
+                            **alignment_metadata,
+                            "applied": True,
+                        },
+                    }
+                )
             raw_results[policy] = self._fuse(
                 geometry_frames,
                 segmentation_frames,
@@ -401,6 +454,7 @@ class SemanticMapPipeline:
             raw_results=raw_results,
             refined_results=refined_results,
             refinement=refinement,
+            object_only=bool(object_only),
         )
 
     def run_with_online_object_pose_loop(
@@ -411,6 +465,7 @@ class SemanticMapPipeline:
         prompts: Sequence[str] | None = None,
         metadata: Mapping[str, Any] | None = None,
         policies: Sequence[str] = ("raw",),
+        object_only: bool = False,
     ) -> SemanticMapPoseRefinementRun:
         """Run the causal external SAM pose-correction loop.
 
@@ -429,6 +484,7 @@ class SemanticMapPipeline:
             prompts=prompts,
             metadata=metadata,
             policies=policies,
+            object_only=object_only,
         )
         return run
 

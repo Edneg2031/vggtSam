@@ -211,6 +211,7 @@ def main() -> None:
         frame_ids=frame_positions,
         alignment=alignment,
         refined_pose_path=args.refined_pose,
+        object_only_pose=bool(args.object_only_pose),
     )
 
     metric_config = ExportedMapMetricConfig(
@@ -420,6 +421,15 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Optional refined_camera_to_world.pt. By default the evaluator "
             "looks under input-dir/object_pose_refinement/."
+        ),
+    )
+    parser.add_argument(
+        "--object-only-pose",
+        action="store_true",
+        help=(
+            "Evaluate only the raw HorizonStream camera trajectory. The "
+            "refined_camera_to_world.pt artifact is a diagnostic correction "
+            "for object points and is not treated as a camera-pose branch."
         ),
     )
     parser.add_argument(
@@ -736,6 +746,7 @@ def _build_pose_evaluation(
     frame_ids: tuple[int, ...],
     alignment: Any,
     refined_pose_path: Path | None,
+    object_only_pose: bool,
 ) -> dict[str, object]:
     """Evaluate raw and optional refined trajectories under one shared gauge."""
 
@@ -773,6 +784,20 @@ def _build_pose_evaluation(
             **raw_result,
         }
     }
+
+    if object_only_pose:
+        output.update(
+            {
+                "status": "raw_only_object_only",
+                "reason": (
+                    "object-only correction is applied to SAM-selected object "
+                    "points; refined_camera_to_world is not a camera trajectory"
+                ),
+                "object_only_pose": True,
+                "branches": branches,
+            }
+        )
+        return output
 
     input_root = _pose_input_root(input_source)
     default_refined_path = input_root / "object_pose_refinement" / "refined_camera_to_world.pt"

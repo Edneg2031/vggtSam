@@ -92,6 +92,7 @@ from .v1_object_point_alignment import (
     V1ObjectPointPoseAlignment,
     apply_object_point_pose_transform,
 )
+from .object_point_pose_alignment import ObjectPointPoseAlignment
 
 __all__ = [
     "GeometryFrame",
@@ -134,6 +135,7 @@ __all__ = [
     "InstancePointAlignmentMemory",
     "apply_point_alignment",
     "V1ObjectPointPoseAlignment",
+    "ObjectPointPoseAlignment",
     "apply_object_point_pose_transform",
     "export_semantic_map",
     "DinoV3PatchFeatureMatcher",

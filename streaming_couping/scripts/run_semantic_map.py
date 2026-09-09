@@ -168,6 +168,7 @@ def _run_from_cache(
     if (
         args.object_pose_refinement
         or args.object_pose_loss_refinement
+        or args.object_pose_object_only
         or args.object_pose_online_loop
         or args.v1_pose_artifact is not None
     ):
@@ -286,9 +287,10 @@ def _run_from_rgb(
         f"sam_device={recovery.sam3_device} "
         f"sam_grounding_batch={args.sam_grounding_batch_size} "
         f"sam_video_cpu_offload={int(args.sam_offload_video_to_cpu)} "
-        f"object_pose_refinement={int(args.object_pose_refinement or args.object_pose_loss_refinement or args.object_pose_online_loop)} "
+        f"object_pose_refinement={int(args.object_pose_refinement or args.object_pose_loss_refinement or args.object_pose_online_loop or args.object_pose_object_only)} "
         f"object_pose_loss_refinement={int(args.object_pose_loss_refinement)} "
         f"object_pose_online_loop={int(args.object_pose_online_loop)} "
+        f"object_pose_object_only={int(args.object_pose_object_only)} "
         f"instance_point_alignment={int(args.instance_point_alignment)} "
         f"v1_object_point_alignment={int(args.v1_pose_artifact is not None)}"
     )
@@ -331,7 +333,7 @@ def _run_from_rgb(
         )
         object_pose_refiner = OnlineObjectPoseLoopRefiner(online_config)
         online_object_pose_loop = True
-    elif args.object_pose_loss_refinement:
+    elif args.object_pose_loss_refinement or args.object_pose_object_only:
         object_pose_config = _object_pose_loss_config(args)
         object_pose_refiner = ObjectPoseLossRefiner(object_pose_config)
     elif args.object_pose_refinement:
@@ -381,6 +383,7 @@ def _run_from_rgb(
             fusion_policy=args.fusion_policy,
             object_pose_refiner=object_pose_refiner,
             online_object_pose_loop=online_object_pose_loop,
+            object_pose_object_only=args.object_pose_object_only,
             instance_point_consistency=args.instance_point_consistency,
             instance_point_alignment=args.instance_point_alignment,
             v1_pose_artifact=args.v1_pose_artifact,
@@ -398,6 +401,7 @@ def _run_from_rgb(
             fusion_policy=args.fusion_policy,
             object_pose_refiner=object_pose_refiner,
             online_object_pose_loop=online_object_pose_loop,
+            object_pose_object_only=args.object_pose_object_only,
             instance_point_consistency=args.instance_point_consistency,
             instance_point_alignment=args.instance_point_alignment,
             v1_pose_artifact=args.v1_pose_artifact,
@@ -414,12 +418,18 @@ def _execute_pipeline(
     fusion_policy: str,
     object_pose_refiner: ObjectPoseRefiner | None = None,
     online_object_pose_loop: bool = False,
+    object_pose_object_only: bool = False,
     instance_point_consistency: bool = False,
     instance_point_alignment: bool = False,
     v1_pose_artifact: Path | None = None,
     v1_pose_raw_tolerance: float = 1e-3,
 ):
     if v1_pose_artifact is not None:
+        if object_pose_object_only:
+            raise ValueError(
+                "--object-pose-loss-object-only is already implied by "
+                "--v1-pose-artifact and cannot be combined with it."
+            )
         if any(
             (
                 object_pose_refiner is not None,
@@ -498,6 +508,12 @@ def _execute_pipeline(
             prompts=prompts,
             metadata=metadata,
             policies=policies,
+            object_only=object_pose_object_only,
+        )
+    if object_pose_object_only:
+        raise ValueError(
+            "--object-pose-object-only requires one of the object pose "
+            "refinement modes."
         )
     if fusion_policy == "both":
         return pipeline.run_branches(
@@ -643,9 +659,17 @@ def _export_pose_refinement_run(
         refined_result = run.refined_results[policy]
         raw_name = "raw_pose" if single_policy else f"{policy}_raw_pose"
         refined_name = (
-            "object_pose_refined"
-            if single_policy
-            else f"{policy}_object_pose_refined"
+            "object_pose_object_only"
+            if run.object_only and single_policy
+            else (
+                f"{policy}_object_pose_object_only"
+                if run.object_only
+                else (
+                    "object_pose_refined"
+                    if single_policy
+                    else f"{policy}_object_pose_refined"
+                )
+            )
         )
         raw_summary = export_semantic_map(
             raw_result,
@@ -655,7 +679,11 @@ def _export_pose_refinement_run(
         refined_summary = export_semantic_map(
             refined_result,
             root / refined_name,
-            revision=f"semantic_mapping_{policy}_sam_object_pose_refined_r1",
+            revision=(
+                f"semantic_mapping_{policy}_sam_object_pose_object_only_r1"
+                if run.object_only
+                else f"semantic_mapping_{policy}_sam_object_pose_refined_r1"
+            ),
         )
         map_summaries[raw_name] = raw_summary
         map_summaries[refined_name] = refined_summary
@@ -665,7 +693,14 @@ def _export_pose_refinement_run(
         _print_export_summary(refined_summary)
     comparison = {
         "schema": 1,
-        "revision": "sam_instance_guided_horizonstream_pose_refinement_ablation_r1",
+        "revision": (
+            "sam_instance_guided_horizonstream_object_only_pose_loss_ablation_r1"
+            if run.object_only
+            else "sam_instance_guided_horizonstream_pose_refinement_ablation_r1"
+        ),
+        "object_only": bool(run.object_only),
+        "camera_pose_modified": False if run.object_only else True,
+        "full_scene_geometry_modified": False if run.object_only else True,
         "raw_pose_map_is_baseline": True,
         "shared_geometry_segmentation_inference": True,
         "gt_used_for_candidate_generation_or_optimization": False,
@@ -913,6 +948,15 @@ def _parse_args() -> argparse.Namespace:
             "Opt in to causal SAM-instance object point-cloud alignment loss. "
             "Only the current pose is optimized against earlier anchors; the "
             "default baseline is unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--object-pose-loss-object-only",
+        dest="object_pose_object_only",
+        action="store_true",
+        help=(
+            "Use the loss-refined 6DoF correction only on static SAM-mask "
+            "object points. Camera pose and background geometry stay raw."
         ),
     )
     parser.add_argument(
@@ -1322,6 +1366,7 @@ def _parse_args() -> argparse.Namespace:
             args.object_pose_refinement,
             args.object_pose_loss_refinement,
             args.object_pose_online_loop,
+            args.object_pose_object_only,
             args.v1_pose_artifact is not None,
         )
     ):
@@ -1329,8 +1374,22 @@ def _parse_args() -> argparse.Namespace:
             "--instance-point-alignment is map-only and cannot be combined "
             "with camera pose refinement or V1 object-point alignment."
         )
+    if args.object_pose_object_only and (
+        args.object_pose_refinement
+        or args.object_pose_online_loop
+        or args.v1_pose_artifact is not None
+    ):
+        parser.error(
+            "--object-pose-loss-object-only can only be used with "
+            "--object-pose-loss-refinement."
+        )
     if args.v1_pose_raw_tolerance <= 0.0:
         parser.error("--v1-pose-raw-tolerance must be positive.")
+    if args.object_pose_object_only and not args.object_pose_loss_refinement:
+        parser.error(
+            "--object-pose-loss-object-only requires "
+            "--object-pose-loss-refinement."
+        )
     from streaming_couping.src.semantic_mapping.geometry_guidance import (
         GeometryGuidanceConfig,
     )

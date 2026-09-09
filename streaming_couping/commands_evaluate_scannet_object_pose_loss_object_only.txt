@@ -1,0 +1,65 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+setopt NULL_GLOB
+
+# Offline evaluation for the object-only pose-loss branch.  The track source
+# is intentional: it scores the points selected by the SAM masks directly,
+# before semantic voxel fusion.  The refined pose artifact is not evaluated as
+# a camera trajectory because it is used only as an object-point transform.
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/horizonstream/bin/python}"
+
+INPUT_DIR="${OBJECT_POSE_LOSS_OBJECT_ONLY_OUTPUT_DIR:-${OBJECT_POSE_LOSS_OUTPUT_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_loss_object_only_v1}}"
+EVAL_DIR="${OBJECT_POSE_LOSS_OBJECT_ONLY_EVAL_DIR:-$INPUT_DIR/gt_evaluation}"
+MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
+SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
+GEOMETRY_CACHE="${HORIZONSTREAM_GEOMETRY_CACHE:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_consecutive/horizonstream_geometry.pt}"
+
+cd "$ROOT"
+[[ -x "$PYTHON" ]] || { print -u2 "missing Python: $PYTHON"; exit 1; }
+[[ -d "$INPUT_DIR" ]] || { print -u2 "missing input: $INPUT_DIR"; exit 1; }
+[[ -f "$MANIFEST_PATH" ]] || { print -u2 "missing manifest: $MANIFEST_PATH"; exit 1; }
+[[ -f "$GEOMETRY_CACHE" ]] || { print -u2 "missing geometry cache: $GEOMETRY_CACHE"; exit 1; }
+
+mkdir -p "$EVAL_DIR"
+
+PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m streaming_couping.scripts.evaluate_exported_semantic_map \
+  --input-dir "$INPUT_DIR" \
+  --output-dir "$EVAL_DIR" \
+  --manifest "$MANIFEST_PATH" \
+  --scene-id "$SCENE_ID" \
+  --geometry-cache "$GEOMETRY_CACHE" \
+  --map-source tracks \
+  --alignment reference \
+  --object-only-pose \
+  >"$EVAL_DIR/evaluator.log" 2>&1
+
+SUMMARY="$EVAL_DIR/summary.json"
+COPYABLE="$EVAL_DIR/copyable_result.txt"
+TRACK_DIR="$EVAL_DIR/object_ply_comparison/object_tracks"
+[[ -f "$SUMMARY" && -f "$COPYABLE" ]] || {
+  print -u2 "GT evaluation did not produce expected files"
+  tail -n 80 "$EVAL_DIR/evaluator.log"
+  exit 1
+}
+
+for ply in \
+  raw_pose_object_tracks.ply \
+  object_pose_object_only_object_tracks.ply \
+  gt_object_tracks.ply; do
+  [[ -s "$TRACK_DIR/$ply" ]] || {
+    print -u2 "missing or empty aggregate PLY: $TRACK_DIR/$ply"
+    exit 1
+  }
+done
+
+print "===== SCANNET OBJECT POSE LOSS OBJECT-ONLY EVALUATION ====="
+print "input=$INPUT_DIR"
+print "map_source=tracks"
+print "camera_pose_branch=raw_pose_only"
+print "object_track_plys=$TRACK_DIR"
+cat "$COPYABLE"
+print "evaluation_summary=$SUMMARY"
+print "evaluation_log=$EVAL_DIR/evaluator.log"

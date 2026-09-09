@@ -216,3 +216,48 @@ def test_loss_refinement_pipeline_keeps_object_only_raw_and_refined_maps() -> No
     assert refined.metadata["pose_variant"] == "object_pose_refined"
     assert refined.metadata["object_pose_refinement"]["enabled"] is True
 
+
+def test_loss_refinement_object_only_preserves_camera_and_scene_geometry() -> None:
+    shift = torch.tensor([0.08, 0.0, 0.0])
+    geometry = (
+        _geometry(0, _world_points()),
+        _geometry(1, _world_points(shift)),
+    )
+    segmentation = (_segmentation(0), _segmentation(1))
+    pipeline = SemanticMapPipeline(
+        geometry=_StaticGeometryProvider(geometry),
+        segmentation=_StaticSegmentationProvider(segmentation),
+        mapper=SemanticMapBuilder(
+            SemanticMapConfig(
+                fusion_policy="raw",
+                object_only=True,
+                voxel_size_m=0.02,
+                max_points_per_observation=64,
+            )
+        ),
+    )
+
+    run = pipeline.run_with_object_pose_refinement(
+        ("frame_0.jpg", "frame_1.jpg"),
+        refiner=ObjectPoseLossRefiner(_config()),
+        prompts=("chair",),
+        object_only=True,
+    )
+
+    raw = run.raw_results["raw"]
+    aligned = run.refined_results["raw"]
+    assert run.object_only is True
+    assert torch.equal(raw.scene_voxel_points, aligned.scene_voxel_points)
+    assert torch.equal(raw.scene_instance_ids, aligned.scene_instance_ids)
+    assert raw.metadata["camera_pose_modified"] is False
+    assert aligned.metadata["camera_pose_modified"] is False
+    assert aligned.metadata["full_scene_geometry_modified"] is False
+    assert aligned.metadata["pointmap_modified_scope"] == (
+        "static_sam_object_points_only"
+    )
+    assert aligned.metadata["pose_variant"] == "raw_horizonstream_object_only"
+    assert aligned.metadata["object_point_pose_alignment"]["applied"] is True
+    assert not torch.allclose(
+        raw.object_tracks[0].points,
+        aligned.object_tracks[0].points,
+    )
