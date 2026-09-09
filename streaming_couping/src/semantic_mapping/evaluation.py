@@ -28,6 +28,12 @@ from ..semantic_map_metrics import (
 from ..semantic_tracking_metrics import maximum_weight_assignment, prompt_matches_label
 
 
+# torch.quantile has a practical input-size limit on the target runtime. The
+# pointmap RMSE/count remain exact; only the diagnostic median and p90 use a
+# deterministic bounded sample so long clips do not fail during evaluation.
+_RESIDUAL_QUANTILE_SAMPLE_LIMIT = 100_000
+
+
 @dataclass(frozen=True)
 class ExportedMapMetricConfig:
     """Limits and thresholds for evaluating a fused export."""
@@ -429,7 +435,13 @@ def evaluate_pointmap_alignment(
         raise ValueError("frame_ids does not match pointmap sequence length.")
 
     frame_rows: list[dict[str, object]] = []
-    all_residuals: list[torch.Tensor] = []
+    combined_valid_points = 0
+    combined_squared_sum = 0.0
+    combined_quantile_samples: list[torch.Tensor] = []
+    per_frame_sample_limit = max(
+        1,
+        int(_RESIDUAL_QUANTILE_SAMPLE_LIMIT) // max(int(predicted.shape[0]), 1),
+    )
     for index in range(predicted.shape[0]):
         source = aligned[index]
         destination = target[index]
@@ -441,7 +453,15 @@ def evaluate_pointmap_alignment(
         )
         residual = torch.linalg.vector_norm(source - destination, dim=-1)[valid]
         if residual.numel():
-            all_residuals.append(residual)
+            finite_residual = residual[torch.isfinite(residual)]
+            combined_valid_points += int(finite_residual.numel())
+            combined_squared_sum += float(finite_residual.square().sum())
+            combined_quantile_samples.append(
+                _deterministic_limit_1d(
+                    finite_residual,
+                    per_frame_sample_limit,
+                )
+            )
             row = _residual_summary(residual)
         else:
             row = {
@@ -457,11 +477,21 @@ def evaluate_pointmap_alignment(
             }
         )
         frame_rows.append(row)
-    combined = torch.cat(all_residuals) if all_residuals else torch.empty(0)
-    summary = _residual_summary(combined)
+    combined_sample = (
+        torch.cat(combined_quantile_samples)
+        if combined_quantile_samples
+        else torch.empty(0, dtype=torch.float32)
+    )
+    summary = _residual_summary_from_stats(
+        valid_points=combined_valid_points,
+        squared_sum=combined_squared_sum,
+        quantile_values=combined_sample,
+    )
     summary.update(
         {
-            "status": "ok" if combined.numel() else "no_valid_pairs",
+            "status": (
+                "ok" if combined_valid_points else "no_valid_pairs"
+            ),
             "reference_frame_index": int(alignment.reference_frame_index),
             "fit_inliers": int(alignment.fit_inliers),
             "fit_rmse_m": float(alignment.fit_rmse_m),
@@ -853,12 +883,54 @@ def _residual_summary(residual: torch.Tensor) -> dict[str, object]:
             "median_m": float("nan"),
             "p90_m": float("nan"),
         }
+
+    return _residual_summary_from_stats(
+        valid_points=int(residual.shape[0]),
+        squared_sum=float(residual.square().sum()),
+        quantile_values=_deterministic_limit_1d(
+            residual,
+            int(_RESIDUAL_QUANTILE_SAMPLE_LIMIT),
+        ),
+    )
+
+
+def _residual_summary_from_stats(
+    *,
+    valid_points: int,
+    squared_sum: float,
+    quantile_values: torch.Tensor,
+) -> dict[str, object]:
+    values = torch.as_tensor(quantile_values).detach().float().cpu().reshape(-1)
+    values = values[torch.isfinite(values)]
+    if int(valid_points) <= 0 or not values.numel():
+        return {
+            "valid_points": 0,
+            "rmse_m": float("nan"),
+            "median_m": float("nan"),
+            "p90_m": float("nan"),
+        }
     return {
-        "valid_points": int(residual.shape[0]),
-        "rmse_m": float(torch.sqrt(residual.square().mean())),
-        "median_m": float(torch.quantile(residual, 0.50)),
-        "p90_m": float(torch.quantile(residual, 0.90)),
+        "valid_points": int(valid_points),
+        "rmse_m": math.sqrt(float(squared_sum) / float(valid_points)),
+        "median_m": float(torch.quantile(values, 0.50)),
+        "p90_m": float(torch.quantile(values, 0.90)),
     }
+
+
+def _deterministic_limit_1d(values: torch.Tensor, limit: int) -> torch.Tensor:
+    """Keep a deterministic evenly spaced sample of a 1-D tensor."""
+
+    values = torch.as_tensor(values).detach().float().cpu().reshape(-1)
+    values = values[torch.isfinite(values)]
+    limit = max(1, int(limit))
+    if values.shape[0] <= limit:
+        return values
+    indices = torch.linspace(
+        0,
+        values.shape[0] - 1,
+        steps=limit,
+    ).round().long()
+    return values.index_select(0, indices)
 
 
 def _paired_limit(

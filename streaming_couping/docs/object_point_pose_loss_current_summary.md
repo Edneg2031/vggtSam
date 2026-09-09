@@ -186,6 +186,9 @@ static SAM-selected object points of this instance
 
 日志中的多物体汇总是“匹配物体的 macro mean”，不是整场景点云指标；背景点云没有进入这个 object-only 汇总。`ATE/RPE` 只是额外确认 raw HorizonStream 相机位姿，没有被当前物体修正改变。
 
+长序列的 dense pointmap evaluation 中，RMSE 和有效点数保持精确统计；为避免
+`torch.quantile` 的大张量限制，整体 residual 的 median/p90 使用最多 100,000 个确定性均匀采样点计算。
+
 评估器对预测 object 和 GT object 使用类别兼容性加 voxel IoU 的一对一 Hungarian assignment。因而：
 
 - 同一 GT 物体不能被多个预测 object 同时正式匹配；
@@ -413,6 +416,7 @@ per-instance 版本去掉了这个隐式正则，理论自由度更合理，但�
 |---|---|
 | shared object-only 100 帧 | `streaming_couping/commands_run_scannet_object_pose_loss_object_only_100f.txt` |
 | per-instance 100 帧，90–189 | `streaming_couping/commands_run_scannet_object_pose_loss_object_per_instance_100f.txt` |
+| per-instance 200 帧，0–199 | `streaming_couping/commands_run_scannet_object_pose_loss_object_per_instance_200f_start0.txt` |
 | per-instance 200 帧，90–289 | `streaming_couping/commands_run_scannet_object_pose_loss_object_per_instance_200f.txt` |
 | per-instance 全部帧 | `streaming_couping/commands_run_scannet_object_pose_loss_object_per_instance_allf.txt` |
 | 当前 per-instance 评估摘要 | `gt_evaluation/object_pose_loss_object_per_instance_metrics.txt` |
