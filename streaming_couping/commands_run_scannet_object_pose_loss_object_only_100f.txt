@@ -29,6 +29,8 @@ RECOVERY_CONFIG="${RECOVERY_CONFIG_PATH:-$ROOT/streaming_couping/configs/recover
 GEOMETRY_LOG="$OUTPUT_DIR/horizonstream_geometry.log"
 RUN_LOG="$OUTPUT_DIR/run.log"
 EVAL_LOG="$EVAL_DIR/evaluator.log"
+INDEPENDENT_INSTANCE_POSES="${OBJECT_POSE_LOSS_OBJECT_ONLY_INDEPENDENT_INSTANCES:-0}"
+ALIGNED_BRANCH="${OBJECT_POSE_ALIGNED_BRANCH:-object_pose_object_only}"
 
 cd "$ROOT"
 export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
@@ -112,7 +114,16 @@ ARGS=(
   --object-pose-loss-trace
 )
 
-print "===== SCANNET OBJECT POSE LOSS OBJECT-ONLY 100F ====="
+if [[ "$INDEPENDENT_INSTANCE_POSES" == "1" ]]; then
+  ARGS+=(--object-pose-loss-independent-instances)
+  ALIGNED_BRANCH="object_pose_object_only_per_instance"
+fi
+RUN_TITLE="OBJECT-ONLY"
+if [[ "$INDEPENDENT_INSTANCE_POSES" == "1" ]]; then
+  RUN_TITLE="OBJECT-ONLY PER-INSTANCE"
+fi
+
+print "===== SCANNET OBJECT POSE LOSS $RUN_TITLE 100F ====="
 print "scene=$SCENE_ID frames=$FRAME_COUNT frame_start=$FRAME_START frame_stride=$FRAME_STRIDE"
 print "horizon_device=$HORIZON_DEVICE sam_device=$SAM_DEVICE loss_device=cpu"
 print "output=$OUTPUT_DIR"
@@ -135,7 +146,7 @@ if (( run_exit_code != 0 )); then
   exit "$run_exit_code"
 fi
 
-for branch in raw_pose object_pose_object_only; do
+for branch in raw_pose "$ALIGNED_BRANCH"; do
   [[ -s "$OUTPUT_DIR/$branch/semantic_map.pt" ]] || {
     print -u2 "missing branch artifact: $OUTPUT_DIR/$branch/semantic_map.pt"
     exit 1
@@ -154,6 +165,7 @@ SEMANTIC_MAP_SCENE_ID="$SCENE_ID" \
 HORIZONSTREAM_GEOMETRY_CACHE="$GEOMETRY_CACHE" \
 OBJECT_POSE_LOSS_OBJECT_ONLY_OUTPUT_DIR="$OUTPUT_DIR" \
 OBJECT_POSE_LOSS_OBJECT_ONLY_EVAL_DIR="$EVAL_DIR" \
+OBJECT_POSE_ALIGNED_BRANCH="$ALIGNED_BRANCH" \
 STREAMING_COUPING_PYTHON="$SAM_PYTHON" \
   zsh "$ROOT/streaming_couping/commands_evaluate_scannet_object_pose_loss_object_only.txt" \
   >"$EVAL_LOG" 2>&1
@@ -174,6 +186,6 @@ EVAL_SUMMARY="$EVAL_DIR/summary.json"
 
 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   "$SAM_PYTHON" "$ROOT/streaming_couping/scripts/print_object_pose_loss_object_only_metrics.py" \
-  "$SUMMARY_PATH" "$EVAL_SUMMARY"
+  "$SUMMARY_PATH" "$EVAL_SUMMARY" "$ALIGNED_BRANCH"
 print "run_log=$RUN_LOG"
 print "evaluation_log=$EVAL_LOG"

@@ -348,22 +348,42 @@ class SemanticMapPipeline:
                 geometry_frames,
                 source=str(getattr(refiner, "method_name", type(refiner).__name__)),
             )
-            refined_geometry_frames = tuple(
-                replace(
-                    frame,
-                    object_point_transform=object_point_alignment.correction_by_frame[
-                        int(frame.frame_id)
-                    ],
+            if object_point_alignment.correction_by_frame_instance is not None:
+                refined_geometry_frames = tuple(
+                    replace(
+                        frame,
+                        object_point_transform=None,
+                        object_point_transforms=(
+                            object_point_alignment.correction_by_frame_instance.get(
+                                int(frame.frame_id),
+                                {},
+                            )
+                        ),
+                    )
+                    for frame in geometry_frames
                 )
-                for frame in geometry_frames
-            )
+            else:
+                refined_geometry_frames = tuple(
+                    replace(
+                        frame,
+                        object_point_transform=object_point_alignment.correction_by_frame[
+                            int(frame.frame_id)
+                        ],
+                        object_point_transforms=None,
+                    )
+                    for frame in geometry_frames
+                )
         else:
             refined_geometry_frames = apply_refined_camera_poses(
                 geometry_frames,
                 refinement,
             )
         refined_pose_variant = (
-            "raw_horizonstream_object_only"
+            "raw_horizonstream_object_only_per_instance"
+            if object_only
+            and object_point_alignment is not None
+            and object_point_alignment.correction_by_frame_instance is not None
+            else "raw_horizonstream_object_only"
             if object_only
             else (
                 "object_pose_online_loop"
@@ -425,8 +445,14 @@ class SemanticMapPipeline:
                     {
                         "camera_pose_modified": False,
                         "full_scene_geometry_modified": False,
-                        "pointmap_modified": True,
-                        "pointmap_modified_scope": "static_sam_object_points_only",
+                        "pointmap_modified": (
+                            bool(alignment_metadata["per_instance_correction_count"])
+                            if alignment_metadata.get("per_instance", False)
+                            else True
+                        ),
+                        "pointmap_modified_scope": alignment_metadata[
+                            "application_scope"
+                        ],
                         "object_pose_refinement_object_only": True,
                         "object_point_pose_alignment": {
                             **alignment_metadata,

@@ -42,6 +42,7 @@ class GeometryFrame:
     backend: str = "unknown"
     metadata: Mapping[str, Any] = field(default_factory=dict)
     object_point_transform: torch.Tensor | None = None
+    object_point_transforms: Mapping[int, torch.Tensor] | None = None
 
     def __post_init__(self) -> None:
         self.validate()
@@ -97,6 +98,25 @@ class GeometryFrame:
                 (4, 4),
                 "object_point_transform",
             )
+        if self.object_point_transforms is not None:
+            if not isinstance(self.object_point_transforms, Mapping):
+                raise ValueError("object_point_transforms must be a mapping.")
+            for instance_id, transform in self.object_point_transforms.items():
+                try:
+                    normalized_instance_id = int(instance_id)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "object_point_transforms keys must be integer instance IDs."
+                    ) from exc
+                if normalized_instance_id < 0:
+                    raise ValueError(
+                        "object_point_transforms instance IDs must be non-negative."
+                    )
+                _require_shape(
+                    transform,
+                    (4, 4),
+                    f"object_point_transforms[{normalized_instance_id}]",
+                )
         return self
 
     def cpu(self) -> "GeometryFrame":
@@ -119,6 +139,14 @@ class GeometryFrame:
             ),
             rgb=_cpu(self.rgb),
             object_point_transform=_cpu(self.object_point_transform),
+            object_point_transforms=(
+                None
+                if self.object_point_transforms is None
+                else {
+                    int(instance_id): _cpu(transform)
+                    for instance_id, transform in self.object_point_transforms.items()
+                }
+            ),
         )
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import math
 from pathlib import Path
@@ -25,6 +25,7 @@ class ObjectPointPoseAlignment:
     correction_by_frame: dict[int, torch.Tensor]
     raw_pose_max_abs_error: float
     artifact_path: Path | None = None
+    correction_by_frame_instance: dict[int, dict[int, torch.Tensor]] | None = None
 
     @classmethod
     def from_refinement(
@@ -63,12 +64,47 @@ class ObjectPointPoseAlignment:
                 f"tolerance={float(raw_pose_tolerance):.6g}."
             )
 
-        corrections = {
-            int(frame_id): refined[index] @ torch.linalg.inv(raw[index])
-            for index, frame_id in enumerate(expected_ids)
-        }
+        per_instance_payload = getattr(refinement, "object_point_corrections", None)
+        if per_instance_payload is not None:
+            correction_by_frame_instance: dict[int, dict[int, torch.Tensor]] = {}
+            for frame_id in expected_ids:
+                raw_frame = per_instance_payload.get(int(frame_id), {})
+                if not isinstance(raw_frame, Mapping):
+                    raise ValueError(
+                        "Per-instance object-point corrections must be mappings."
+                    )
+                correction_by_frame_instance[int(frame_id)] = {
+                    int(instance_id): torch.as_tensor(transform)
+                    .detach()
+                    .float()
+                    .cpu()
+                    for instance_id, transform in raw_frame.items()
+                }
+            corrections = {
+                int(frame_id): torch.eye(4, dtype=torch.float32)
+                for frame_id in expected_ids
+            }
+        else:
+            correction_by_frame_instance = None
+            corrections = {
+                int(frame_id): refined[index] @ torch.linalg.inv(raw[index])
+                for index, frame_id in enumerate(expected_ids)
+            }
         if not all(bool(torch.isfinite(value).all()) for value in corrections.values()):
             raise ValueError("Object-point pose correction contains non-finite values.")
+        if correction_by_frame_instance is not None:
+            for frame_map in correction_by_frame_instance.values():
+                for instance_id, transform in frame_map.items():
+                    if int(instance_id) < 0 or tuple(transform.shape) != (4, 4):
+                        raise ValueError(
+                            "Per-instance object-point corrections must map "
+                            "non-negative IDs to [4,4] transforms."
+                        )
+                    if not bool(torch.isfinite(transform).all()):
+                        raise ValueError(
+                            "Per-instance object-point correction contains "
+                            "non-finite values."
+                        )
         return cls(
             source=str(source),
             frame_ids=expected_ids,
@@ -79,15 +115,24 @@ class ObjectPointPoseAlignment:
                 for frame_id, value in corrections.items()
             },
             raw_pose_max_abs_error=float(raw_error),
+            correction_by_frame_instance=correction_by_frame_instance,
         )
 
     def to_dict(self) -> dict[str, Any]:
         rotations: list[float] = []
         translations: list[float] = []
-        for frame_id in self.frame_ids:
-            transform = self.correction_by_frame[int(frame_id)]
-            rotations.append(_rotation_angle_deg(transform[:3, :3]))
-            translations.append(float(torch.linalg.vector_norm(transform[:3, 3])))
+        if self.correction_by_frame_instance is not None:
+            for frame_map in self.correction_by_frame_instance.values():
+                for transform in frame_map.values():
+                    rotations.append(_rotation_angle_deg(transform[:3, :3]))
+                    translations.append(
+                        float(torch.linalg.vector_norm(transform[:3, 3]))
+                    )
+        else:
+            for frame_id in self.frame_ids:
+                transform = self.correction_by_frame[int(frame_id)]
+                rotations.append(_rotation_angle_deg(transform[:3, :3]))
+                translations.append(float(torch.linalg.vector_norm(transform[:3, 3])))
         return {
             "enabled": True,
             "source": str(self.source),
@@ -101,7 +146,39 @@ class ObjectPointPoseAlignment:
             "max_correction_rotation_deg": max(rotations, default=0.0),
             "mean_correction_translation_m": _mean(translations),
             "max_correction_translation_m": max(translations, default=0.0),
-            "application_scope": "static_sam_object_points_only",
+            "application_scope": (
+                "static_sam_object_points_per_instance_only"
+                if self.correction_by_frame_instance is not None
+                else "static_sam_object_points_only"
+            ),
+            "per_instance": self.correction_by_frame_instance is not None,
+            "per_instance_frame_count": (
+                0
+                if self.correction_by_frame_instance is None
+                else sum(
+                    bool(value)
+                    for value in self.correction_by_frame_instance.values()
+                )
+            ),
+            "per_instance_correction_count": (
+                0
+                if self.correction_by_frame_instance is None
+                else sum(
+                    len(value)
+                    for value in self.correction_by_frame_instance.values()
+                )
+            ),
+            "per_instance_ids": (
+                []
+                if self.correction_by_frame_instance is None
+                else sorted(
+                    {
+                        int(instance_id)
+                        for frame_map in self.correction_by_frame_instance.values()
+                        for instance_id in frame_map
+                    }
+                )
+            ),
             "camera_pose_modified": False,
             "full_scene_geometry_modified": False,
         }

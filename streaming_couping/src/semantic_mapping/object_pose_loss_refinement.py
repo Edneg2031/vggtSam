@@ -64,6 +64,7 @@ class ObjectPoseLossRefinementConfig:
     min_relative_loss_improvement: float = 0.02
     trace_optimization: bool = False
     device: str = "cpu"
+    independent_instance_poses: bool = False
 
     def validate(self) -> "ObjectPoseLossRefinementConfig":
         for name, value in (
@@ -143,6 +144,7 @@ class ObjectPoseLossRefinementConfig:
             "max_correction_translation_m": float(self.max_correction_translation_m),
             "min_relative_loss_improvement": float(self.min_relative_loss_improvement),
             "trace_optimization": bool(self.trace_optimization),
+            "independent_instance_poses": bool(self.independent_instance_poses),
             "device": str(self.device),
         }
 
@@ -300,12 +302,22 @@ class ObjectPoseLossRefiner:
         rejected_edges: list[dict[str, Any]] = []
         frame_diagnostics: list[dict[str, Any]] = []
         optimization_trace: list[dict[str, Any]] = []
+        object_point_corrections: dict[int, dict[int, torch.Tensor]] = {}
+        independent_instance_poses = bool(self.config.independent_instance_poses)
 
         for sequence_index, (frame_id, raw_pose) in enumerate(zip(frame_ids, raw_poses)):
             current = observations_by_frame.get(int(frame_id), ())
             is_anchor_frame = sequence_index < int(self.config.anchor_frame_count)
+            refined_pose = raw_pose
+            instance_poses: dict[int, torch.Tensor] = {}
+            accepted_instance_ids: set[int] = set()
             if is_anchor_frame:
                 refined_pose = raw_pose
+                if independent_instance_poses:
+                    instance_poses = {
+                        int(observation.instance_id): raw_pose
+                        for observation in current
+                    }
                 if self.config.trace_optimization:
                     optimization_trace.append(
                         {
@@ -332,84 +344,191 @@ class ObjectPoseLossRefiner:
                     }
                 )
             else:
-                pair_specs = []
-                for observation in current:
-                    references = _select_references(
-                        int(observation.instance_id),
-                        anchors,
-                        history,
-                        config=self.config,
-                    )
-                    for reference in references:
-                        quality = math.sqrt(
-                            max(0.0, float(observation.track_score))
-                            * max(0.0, float(observation.geometry_confidence))
-                            * max(0.0, float(reference.quality))
+                if independent_instance_poses:
+                    outcomes: dict[int, dict[str, Any]] = {}
+                    for instance_id in sorted(
+                        {
+                            int(observation.instance_id)
+                            for observation in current
+                        }
+                    ):
+                        instance_observations = tuple(
+                            observation
+                            for observation in current
+                            if int(observation.instance_id) == instance_id
                         )
-                        role_weight = (
-                            self.config.anchor_reference_weight
-                            if reference.role == "anchor"
-                            else self.config.local_reference_weight
+                        pair_specs = self._pair_specs(
+                            instance_observations,
+                            anchors,
+                            history,
                         )
-                        pair_specs.append(
-                            _PairSpec(
-                                current=observation,
-                                reference=reference,
-                                weight=max(1e-6, float(role_weight) * quality),
+                        if pair_specs:
+                            outcome = self._optimize_current_pose(
+                                raw_pose,
+                                pair_specs,
                             )
-                        )
-                if pair_specs:
-                    outcome = self._optimize_current_pose(raw_pose, pair_specs)
-                    refined_pose = outcome["pose"]
-                    candidates.extend(outcome["candidates"])
-                    accepted_edges.extend(outcome["accepted_edges"])
-                    rejected_edges.extend(outcome["rejected_edges"])
-                    optimization_trace.extend(outcome.get("optimization_trace", ()))
-                    frame_diagnostics.append(outcome["frame_diagnostic"])
-                else:
-                    refined_pose = raw_pose
-                    if self.config.trace_optimization:
-                        optimization_trace.append(
-                            {
-                                "frame_id": int(frame_id),
-                                "phase": "frame",
-                                "outer_iteration": None,
-                                "observation_count": int(len(current)),
-                                "candidate_pair_count": 0,
-                                "reference_gap_min": None,
-                                "reference_gap_max": None,
-                                "status": "no_historical_instance_reference",
+                            outcomes[instance_id] = outcome
+                            instance_poses[instance_id] = (
+                                outcome["pose"]
+                                if bool(
+                                    outcome["frame_diagnostic"].get("accepted")
+                                )
+                                else raw_pose
+                            )
+                            if bool(
+                                outcome["frame_diagnostic"].get("accepted")
+                            ):
+                                accepted_instance_ids.add(instance_id)
+                            candidates.extend(outcome["candidates"])
+                            accepted_edges.extend(outcome["accepted_edges"])
+                            rejected_edges.extend(outcome["rejected_edges"])
+                            optimization_trace.extend(
+                                outcome.get("optimization_trace", ())
+                            )
+                        else:
+                            instance_poses[instance_id] = raw_pose
+                            if self.config.trace_optimization:
+                                optimization_trace.append(
+                                    {
+                                        "frame_id": int(frame_id),
+                                        "instance_id": int(instance_id),
+                                        "phase": "frame",
+                                        "outer_iteration": None,
+                                        "observation_count": 1,
+                                        "candidate_pair_count": 0,
+                                        "reference_gap_min": None,
+                                        "reference_gap_max": None,
+                                        "status": (
+                                            "no_historical_instance_reference"
+                                        ),
+                                    }
+                                )
+                            outcomes[instance_id] = {
+                                "frame_diagnostic": {
+                                    "frame_id": int(frame_id),
+                                    "instance_id": int(instance_id),
+                                    "role": "online",
+                                    "optimization_attempted": False,
+                                    "accepted": False,
+                                    "reason": "no_historical_instance_reference",
+                                    "observation_count": 1,
+                                    "candidate_pair_count": 0,
+                                    "accepted_edge_count": 0,
+                                }
                             }
-                        )
+                    instance_diagnostics = {
+                        str(instance_id): outcome["frame_diagnostic"]
+                        for instance_id, outcome in outcomes.items()
+                    }
+                    attempted_count = sum(
+                        bool(row.get("optimization_attempted"))
+                        for row in instance_diagnostics.values()
+                    )
+                    accepted_count = sum(
+                        bool(row.get("accepted"))
+                        for row in instance_diagnostics.values()
+                    )
                     frame_diagnostics.append(
                         {
                             "frame_id": int(frame_id),
                             "role": "online",
-                            "optimization_attempted": False,
-                            "accepted": False,
-                            "reason": "no_historical_instance_reference",
+                            "independent_instance_poses": True,
+                            "optimization_attempted": bool(attempted_count),
+                            "accepted": bool(accepted_count),
+                            "reason": (
+                                "independent_instance_object_loss_accepted"
+                                if accepted_count
+                                else (
+                                    "no_historical_instance_reference"
+                                    if not attempted_count
+                                    else "no_independent_instance_loss_accepted"
+                                )
+                            ),
                             "observation_count": int(len(current)),
-                            "candidate_pair_count": 0,
-                            "accepted_edge_count": 0,
+                            "candidate_pair_count": int(
+                                sum(
+                                    int(row.get("candidate_pair_count", 0))
+                                    for row in instance_diagnostics.values()
+                                )
+                            ),
+                            "accepted_edge_count": int(
+                                sum(
+                                    int(row.get("accepted_edge_count", 0))
+                                    for row in instance_diagnostics.values()
+                                )
+                            ),
+                            "attempted_instance_count": int(attempted_count),
+                            "accepted_instance_count": int(accepted_count),
+                            "instance_diagnostics": instance_diagnostics,
                         }
                     )
+                else:
+                    pair_specs = self._pair_specs(current, anchors, history)
+                    if pair_specs:
+                        outcome = self._optimize_current_pose(raw_pose, pair_specs)
+                        refined_pose = outcome["pose"]
+                        candidates.extend(outcome["candidates"])
+                        accepted_edges.extend(outcome["accepted_edges"])
+                        rejected_edges.extend(outcome["rejected_edges"])
+                        optimization_trace.extend(
+                            outcome.get("optimization_trace", ())
+                        )
+                        frame_diagnostics.append(outcome["frame_diagnostic"])
+                    else:
+                        refined_pose = raw_pose
+                        if self.config.trace_optimization:
+                            optimization_trace.append(
+                                {
+                                    "frame_id": int(frame_id),
+                                    "phase": "frame",
+                                    "outer_iteration": None,
+                                    "observation_count": int(len(current)),
+                                    "candidate_pair_count": 0,
+                                    "reference_gap_min": None,
+                                    "reference_gap_max": None,
+                                    "status": "no_historical_instance_reference",
+                                }
+                            )
+                        frame_diagnostics.append(
+                            {
+                                "frame_id": int(frame_id),
+                                "role": "online",
+                                "optimization_attempted": False,
+                                "accepted": False,
+                                "reason": "no_historical_instance_reference",
+                                "observation_count": int(len(current)),
+                                "candidate_pair_count": 0,
+                                "accepted_edge_count": 0,
+                            }
+                        )
 
-            refined_poses.append(refined_pose)
+            refined_poses.append(raw_pose if independent_instance_poses else refined_pose)
             for observation in current:
+                instance_id = int(observation.instance_id)
+                storage_pose = (
+                    instance_poses.get(instance_id, refined_pose)
+                    if independent_instance_poses
+                    else refined_pose
+                )
                 stored = _stored_cloud(
                     observation,
-                    refined_pose,
+                    storage_pose,
                     role="anchor" if is_anchor_frame else "history",
                 )
-                history.setdefault(int(observation.instance_id), []).append(stored)
-                history[int(observation.instance_id)] = history[
-                    int(observation.instance_id)
+                history.setdefault(instance_id, []).append(stored)
+                history[instance_id] = history[
+                    instance_id
                 ][-int(self.config.max_history_observations) :]
                 if is_anchor_frame:
-                    anchors.setdefault(int(observation.instance_id), []).append(stored)
-                    anchors[int(observation.instance_id)] = anchors[
-                        int(observation.instance_id)
+                    anchors.setdefault(instance_id, []).append(stored)
+                    anchors[instance_id] = anchors[
+                        instance_id
                     ][: int(self.config.max_anchor_observations)]
+                if independent_instance_poses and instance_id in accepted_instance_ids:
+                    correction = storage_pose @ torch.linalg.inv(raw_pose)
+                    object_point_corrections.setdefault(int(frame_id), {})[
+                        instance_id
+                    ] = correction.detach().float().cpu()
 
         rotation_changes: list[float] = []
         translation_changes: list[float] = []
@@ -433,11 +552,26 @@ class ObjectPoseLossRefiner:
             row for row in frame_diagnostics if bool(row.get("optimization_attempted"))
         ]
         accepted_frames = [row for row in optimizer_frames if bool(row.get("accepted"))]
+        correction_rotations = [
+            _rotation_angle_deg(transform[:3, :3])
+            for frame_map in object_point_corrections.values()
+            for transform in frame_map.values()
+        ]
+        correction_translations = [
+            float(torch.linalg.vector_norm(transform[:3, 3]))
+            for frame_map in object_point_corrections.values()
+            for transform in frame_map.values()
+        ]
         summary = {
             "schema": 1,
-            "revision": "sam_instance_guided_horizonstream_object_alignment_loss_r1",
+            "revision": (
+                "sam_instance_guided_horizonstream_object_alignment_loss_per_instance_r1"
+                if independent_instance_poses
+                else "sam_instance_guided_horizonstream_object_alignment_loss_r1"
+            ),
             "method": self.method_name,
             "enabled": True,
+            "independent_instance_poses": independent_instance_poses,
             "config": self.config.to_dict(),
             "frame_count": int(len(frame_ids)),
             "frame_ids": [int(value) for value in frame_ids],
@@ -474,6 +608,29 @@ class ObjectPoseLossRefiner:
                 "mean_translation_correction_m": _mean_or_zero(translation_changes),
                 "max_translation_correction_m": max(translation_changes, default=0.0),
             },
+            "object_point_correction": {
+                "application_scope": (
+                    "static_sam_object_points_per_instance_only"
+                    if independent_instance_poses
+                    else "static_sam_object_points_only"
+                ),
+                "frame_count": int(len(object_point_corrections)),
+                "instance_correction_count": int(
+                    sum(len(value) for value in object_point_corrections.values())
+                ),
+                "mean_rotation_correction_deg": _mean_or_zero(
+                    correction_rotations
+                ),
+                "max_rotation_correction_deg": max(
+                    correction_rotations, default=0.0
+                ),
+                "mean_translation_correction_m": _mean_or_zero(
+                    correction_translations
+                ),
+                "max_translation_correction_m": max(
+                    correction_translations, default=0.0
+                ),
+            },
             "observation_filter_reasons": {
                 str(key): int(value) for key, value in filter_stats.items()
             },
@@ -498,7 +655,52 @@ class ObjectPoseLossRefiner:
             accepted_edges=tuple(accepted_edges),  # type: ignore[arg-type]
             rejected_edges=tuple(rejected_edges),
             summary=summary,
+            object_point_corrections=(
+                {
+                    int(frame_id): {
+                        int(instance_id): transform.detach().float().cpu()
+                        for instance_id, transform in frame_map.items()
+                    }
+                    for frame_id, frame_map in object_point_corrections.items()
+                }
+                if independent_instance_poses
+                else None
+            ),
         )
+
+    def _pair_specs(
+        self,
+        observations: Sequence[ObjectCloudObservation],
+        anchors: Mapping[int, Sequence[_StoredObjectCloud]],
+        history: Mapping[int, Sequence[_StoredObjectCloud]],
+    ) -> list[_PairSpec]:
+        pair_specs: list[_PairSpec] = []
+        for observation in observations:
+            references = _select_references(
+                int(observation.instance_id),
+                anchors,
+                history,
+                config=self.config,
+            )
+            for reference in references:
+                quality = math.sqrt(
+                    max(0.0, float(observation.track_score))
+                    * max(0.0, float(observation.geometry_confidence))
+                    * max(0.0, float(reference.quality))
+                )
+                role_weight = (
+                    self.config.anchor_reference_weight
+                    if reference.role == "anchor"
+                    else self.config.local_reference_weight
+                )
+                pair_specs.append(
+                    _PairSpec(
+                        current=observation,
+                        reference=reference,
+                        weight=max(1e-6, float(role_weight) * quality),
+                    )
+                )
+        return pair_specs
 
     def _optimize_current_pose(
         self,
@@ -525,15 +727,20 @@ class ObjectPoseLossRefiner:
             for pair in pair_specs
         ]
         trace_rows: list[dict[str, Any]] = []
+        trace_instance_ids = sorted(
+            {int(pair.current.instance_id) for pair in pair_specs}
+        )
         trace_context = {
             "frame_id": frame_id,
             "observation_count": int(
-                len({int(pair.current.instance_id) for pair in pair_specs})
+                len(trace_instance_ids)
             ),
             "candidate_pair_count": int(len(pair_specs)),
-            "instance_count": int(
-                len({int(pair.current.instance_id) for pair in pair_specs})
+            "instance_count": int(len(trace_instance_ids)),
+            "instance_id": (
+                trace_instance_ids[0] if len(trace_instance_ids) == 1 else None
             ),
+            "instance_ids": trace_instance_ids,
             "reference_gap_min": min(reference_gaps, default=None),
             "reference_gap_max": max(reference_gaps, default=None),
             "reference_gap_mean": (

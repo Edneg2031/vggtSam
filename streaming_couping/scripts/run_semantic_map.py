@@ -291,6 +291,7 @@ def _run_from_rgb(
         f"object_pose_loss_refinement={int(args.object_pose_loss_refinement)} "
         f"object_pose_online_loop={int(args.object_pose_online_loop)} "
         f"object_pose_object_only={int(args.object_pose_object_only)} "
+        f"object_pose_loss_independent_instances={int(args.object_pose_loss_independent_instances)} "
         f"instance_point_alignment={int(args.instance_point_alignment)} "
         f"v1_object_point_alignment={int(args.v1_pose_artifact is not None)}"
     )
@@ -654,20 +655,32 @@ def _export_pose_refinement_run(
     map_summaries: dict[str, dict[str, Any]] = {}
     policy_names = tuple(run.raw_results.keys())
     single_policy = len(policy_names) == 1
+    independent_instance_poses = bool(
+        run.object_only
+        and run.refinement.summary.get("independent_instance_poses", False)
+    )
     for policy in policy_names:
         raw_result = run.raw_results[policy]
         refined_result = run.refined_results[policy]
         raw_name = "raw_pose" if single_policy else f"{policy}_raw_pose"
         refined_name = (
-            "object_pose_object_only"
-            if run.object_only and single_policy
+            "object_pose_object_only_per_instance"
+            if independent_instance_poses and single_policy
             else (
-                f"{policy}_object_pose_object_only"
-                if run.object_only
+                f"{policy}_object_pose_object_only_per_instance"
+                if independent_instance_poses
                 else (
-                    "object_pose_refined"
-                    if single_policy
-                    else f"{policy}_object_pose_refined"
+                    "object_pose_object_only"
+                    if run.object_only and single_policy
+                    else (
+                        f"{policy}_object_pose_object_only"
+                        if run.object_only
+                        else (
+                            "object_pose_refined"
+                            if single_policy
+                            else f"{policy}_object_pose_refined"
+                        )
+                    )
                 )
             )
         )
@@ -680,9 +693,13 @@ def _export_pose_refinement_run(
             refined_result,
             root / refined_name,
             revision=(
-                f"semantic_mapping_{policy}_sam_object_pose_object_only_r1"
-                if run.object_only
-                else f"semantic_mapping_{policy}_sam_object_pose_refined_r1"
+                f"semantic_mapping_{policy}_sam_object_pose_object_only_per_instance_r1"
+                if independent_instance_poses
+                else (
+                    f"semantic_mapping_{policy}_sam_object_pose_object_only_r1"
+                    if run.object_only
+                    else f"semantic_mapping_{policy}_sam_object_pose_refined_r1"
+                )
             ),
         )
         map_summaries[raw_name] = raw_summary
@@ -694,11 +711,16 @@ def _export_pose_refinement_run(
     comparison = {
         "schema": 1,
         "revision": (
-            "sam_instance_guided_horizonstream_object_only_pose_loss_ablation_r1"
-            if run.object_only
-            else "sam_instance_guided_horizonstream_pose_refinement_ablation_r1"
+            "sam_instance_guided_horizonstream_object_only_per_instance_pose_loss_ablation_r1"
+            if independent_instance_poses
+            else (
+                "sam_instance_guided_horizonstream_object_only_pose_loss_ablation_r1"
+                if run.object_only
+                else "sam_instance_guided_horizonstream_pose_refinement_ablation_r1"
+            )
         ),
         "object_only": bool(run.object_only),
+        "independent_instance_poses": independent_instance_poses,
         "camera_pose_modified": False if run.object_only else True,
         "full_scene_geometry_modified": False if run.object_only else True,
         "raw_pose_map_is_baseline": True,
@@ -729,6 +751,17 @@ def _export_pose_refinement_run(
         f"accepted_edges={run.refinement.summary['accepted_edge_count']} "
         f"rejected_edges={run.refinement.summary['rejected_edge_count']}"
     )
+    if independent_instance_poses:
+        correction_summary = run.refinement.summary.get(
+            "object_point_correction",
+            {},
+        )
+        print(
+            "object point corrections "
+            f"frames={correction_summary.get('frame_count', 0)} "
+            f"instances={correction_summary.get('instance_correction_count', 0)} "
+            f"scope={correction_summary.get('application_scope')}"
+        )
     print(f"pose_refinement_summary={debug_paths['summary']}")
     print(f"pose_refinement_comparison={comparison_path}")
 
@@ -957,6 +990,16 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Use the loss-refined 6DoF correction only on static SAM-mask "
             "object points. Camera pose and background geometry stay raw."
+        ),
+    )
+    parser.add_argument(
+        "--object-pose-loss-independent-instances",
+        dest="object_pose_loss_independent_instances",
+        action="store_true",
+        help=(
+            "In object-only loss refinement, optimize a separate 6DoF "
+            "correction for each persistent SAM instance in each frame. "
+            "Camera pose and background geometry stay raw."
         ),
     )
     parser.add_argument(
@@ -1390,6 +1433,14 @@ def _parse_args() -> argparse.Namespace:
             "--object-pose-loss-object-only requires "
             "--object-pose-loss-refinement."
         )
+    if args.object_pose_loss_independent_instances and not (
+        args.object_pose_loss_refinement and args.object_pose_object_only
+    ):
+        parser.error(
+            "--object-pose-loss-independent-instances requires both "
+            "--object-pose-loss-refinement and "
+            "--object-pose-loss-object-only."
+        )
     from streaming_couping.src.semantic_mapping.geometry_guidance import (
         GeometryGuidanceConfig,
     )
@@ -1484,6 +1535,7 @@ def _object_pose_loss_config(
         max_correction_translation_m=args.object_pose_loss_max_correction_translation_m,
         min_relative_loss_improvement=args.object_pose_loss_min_relative_improvement,
         trace_optimization=args.object_pose_loss_trace,
+        independent_instance_poses=args.object_pose_loss_independent_instances,
         device=args.object_pose_loss_device,
     ).validate()
 

@@ -654,6 +654,9 @@ class PoseRefinementResult:
     accepted_edges: tuple[ObjectPoseEdge, ...]
     rejected_edges: tuple[Mapping[str, Any], ...]
     summary: Mapping[str, Any]
+    object_point_corrections: Mapping[
+        int, Mapping[int, torch.Tensor]
+    ] | None = None
 
     def pose_by_frame(self) -> dict[int, torch.Tensor]:
         return {
@@ -1204,6 +1207,10 @@ def write_pose_refinement_debug(
         "refined_camera_to_world": directory / "refined_camera_to_world.pt",
         "summary": directory / "pose_refinement_summary.json",
     }
+    if result.object_point_corrections is not None:
+        paths["object_point_corrections"] = (
+            directory / "object_point_corrections.pt"
+        )
     _write_json(paths["candidate_edges"], list(result.candidates))
     _write_json(paths["accepted_edges"], [edge.to_dict() for edge in result.accepted_edges])
     _write_json(paths["rejected_edges"], list(result.rejected_edges))
@@ -1225,6 +1232,20 @@ def write_pose_refinement_debug(
         },
         paths["refined_camera_to_world"],
     )
+    if result.object_point_corrections is not None:
+        torch.save(
+            {
+                "frame_ids": list(result.frame_ids),
+                "object_point_corrections": {
+                    int(frame_id): {
+                        int(instance_id): transform.detach().float().cpu()
+                        for instance_id, transform in frame_map.items()
+                    }
+                    for frame_id, frame_map in result.object_point_corrections.items()
+                },
+            },
+            paths["object_point_corrections"],
+        )
     _write_json(paths["summary"], dict(result.summary))
     return {key: str(value) for key, value in paths.items()}
 

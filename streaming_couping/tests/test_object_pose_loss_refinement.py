@@ -17,6 +17,9 @@ from streaming_couping.src.semantic_mapping.object_pose_loss_refinement import (
     ObjectPoseLossRefinementConfig,
     ObjectPoseLossRefiner,
 )
+from streaming_couping.src.semantic_mapping.v1_object_point_alignment import (
+    apply_object_point_pose_transform,
+)
 from streaming_couping.src.semantic_mapping.pipeline import SemanticMapPipeline
 
 
@@ -62,6 +65,52 @@ def _segmentation(frame_id: int, instance_id: int = 7) -> SegmentationFrame:
                 category="chair",
                 instance_id=instance_id,
                 mask=_object_mask(),
+                score=0.95,
+                static_score=1.0,
+            ),
+        ),
+        backend="synthetic_sam3",
+    )
+
+
+def _two_object_masks() -> tuple[torch.Tensor, torch.Tensor]:
+    left = torch.zeros((6, 6), dtype=torch.bool)
+    right = torch.zeros((6, 6), dtype=torch.bool)
+    left[1:5, 0:2] = True
+    right[1:5, 4:6] = True
+    return left, right
+
+
+def _two_object_world_points(
+    left_shift: torch.Tensor | None = None,
+    right_shift: torch.Tensor | None = None,
+) -> torch.Tensor:
+    points = _world_points()
+    left_mask, right_mask = _two_object_masks()
+    if left_shift is not None:
+        points[left_mask] += left_shift
+    if right_shift is not None:
+        points[right_mask] += right_shift
+    return points
+
+
+def _two_object_segmentation(frame_id: int) -> SegmentationFrame:
+    left_mask, right_mask = _two_object_masks()
+    return SegmentationFrame(
+        frame_id=frame_id,
+        image_size=(6, 6),
+        observations=(
+            ObjectObservation(
+                category="bed",
+                instance_id=7,
+                mask=left_mask,
+                score=0.95,
+                static_score=1.0,
+            ),
+            ObjectObservation(
+                category="chair",
+                instance_id=8,
+                mask=right_mask,
                 score=0.95,
                 static_score=1.0,
             ),
@@ -153,6 +202,108 @@ def test_loss_refiner_keeps_pose_when_instance_has_no_history() -> None:
         result.summary["frame_diagnostics"][-1]["reason"]
         == "no_historical_instance_reference"
     )
+
+
+def test_loss_refiner_optimizes_each_instance_independently() -> None:
+    left_shift = torch.tensor([0.08, -0.04, 0.02])
+    right_shift = torch.tensor([-0.06, 0.05, -0.03])
+    geometry = (
+        _geometry(0, _two_object_world_points()),
+        _geometry(1, _two_object_world_points(left_shift, right_shift)),
+    )
+    segmentation = (_two_object_segmentation(0), _two_object_segmentation(1))
+
+    result = ObjectPoseLossRefiner(
+        _config(independent_instance_poses=True)
+    ).refine(
+        geometry,
+        segmentation,
+        image_paths=("unused_0.jpg", "unused_1.jpg"),
+    )
+
+    assert result.summary["independent_instance_poses"] is True
+    assert result.object_point_corrections is not None
+    assert set(result.object_point_corrections[1]) == {7, 8}
+    assert torch.equal(
+        result.refined_camera_to_world[1],
+        result.raw_camera_to_world[1],
+    )
+    left_correction = result.object_point_corrections[1][7]
+    right_correction = result.object_point_corrections[1][8]
+    assert torch.allclose(
+        left_correction[:3, 3],
+        -left_shift,
+        atol=2e-2,
+    )
+    assert torch.allclose(
+        right_correction[:3, 3],
+        -right_shift,
+        atol=2e-2,
+    )
+    assert not torch.allclose(left_correction, right_correction)
+
+    left_mask, right_mask = _two_object_masks()
+    raw_points = _two_object_world_points(left_shift, right_shift)
+    aligned_left = apply_object_point_pose_transform(
+        left_correction,
+        raw_points[left_mask],
+    )
+    aligned_right = apply_object_point_pose_transform(
+        right_correction,
+        raw_points[right_mask],
+    )
+    reference = _two_object_world_points()
+    assert torch.allclose(aligned_left, reference[left_mask], atol=2e-2)
+    assert torch.allclose(aligned_right, reference[right_mask], atol=2e-2)
+
+
+def test_pipeline_applies_per_instance_corrections_only_to_matching_tracks() -> None:
+    left_shift = torch.tensor([0.08, -0.04, 0.02])
+    right_shift = torch.tensor([-0.06, 0.05, -0.03])
+    geometry = (
+        _geometry(0, _two_object_world_points()),
+        _geometry(1, _two_object_world_points(left_shift, right_shift)),
+    )
+    segmentation = (_two_object_segmentation(0), _two_object_segmentation(1))
+    pipeline = SemanticMapPipeline(
+        geometry=_StaticGeometryProvider(geometry),
+        segmentation=_StaticSegmentationProvider(segmentation),
+        mapper=SemanticMapBuilder(
+            SemanticMapConfig(
+                fusion_policy="raw",
+                object_only=True,
+                voxel_size_m=0.02,
+                max_points_per_observation=64,
+            )
+        ),
+    )
+
+    run = pipeline.run_with_object_pose_refinement(
+        ("frame_0.jpg", "frame_1.jpg"),
+        refiner=ObjectPoseLossRefiner(
+            _config(independent_instance_poses=True)
+        ),
+        prompts=("bed", "chair"),
+        object_only=True,
+    )
+
+    raw = run.raw_results["raw"]
+    aligned = run.refined_results["raw"]
+    assert torch.equal(raw.scene_voxel_points, aligned.scene_voxel_points)
+    assert raw.metadata["camera_pose_modified"] is False
+    assert aligned.metadata["full_scene_geometry_modified"] is False
+    assert aligned.metadata["pointmap_modified_scope"] == (
+        "static_sam_object_points_per_instance_only"
+    )
+    assert aligned.metadata["object_point_pose_alignment"]["per_instance"] is True
+    raw_tracks = {track.instance_id: track.points for track in raw.object_tracks}
+    aligned_tracks = {
+        track.instance_id: track.points for track in aligned.object_tracks
+    }
+    assert set(raw_tracks) == {7, 8}
+    assert set(aligned_tracks) == {7, 8}
+    assert not torch.allclose(raw_tracks[7], aligned_tracks[7])
+    assert not torch.allclose(raw_tracks[8], aligned_tracks[8])
 
 
 class _StaticGeometryProvider:

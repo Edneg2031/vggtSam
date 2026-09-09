@@ -12,6 +12,7 @@ PYTHON="${STREAMING_COUPING_PYTHON:-/home/huawei/miniconda3/envs/horizonstream/b
 
 INPUT_DIR="${OBJECT_POSE_LOSS_OBJECT_ONLY_OUTPUT_DIR:-${OBJECT_POSE_LOSS_OUTPUT_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_loss_object_only_v1}}"
 EVAL_DIR="${OBJECT_POSE_LOSS_OBJECT_ONLY_EVAL_DIR:-$INPUT_DIR/gt_evaluation}"
+ALIGNED_BRANCH="${OBJECT_POSE_ALIGNED_BRANCH:-object_pose_object_only}"
 MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
 SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
 GEOMETRY_CACHE="${HORIZONSTREAM_GEOMETRY_CACHE:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_consecutive/horizonstream_geometry.pt}"
@@ -47,7 +48,7 @@ TRACK_DIR="$EVAL_DIR/object_ply_comparison/object_tracks"
 
 for ply in \
   raw_pose_object_tracks.ply \
-  object_pose_object_only_object_tracks.ply \
+  "${ALIGNED_BRANCH}_object_tracks.ply" \
   gt_object_tracks.ply; do
   [[ -s "$TRACK_DIR/$ply" ]] || {
     print -u2 "missing or empty aggregate PLY: $TRACK_DIR/$ply"
@@ -59,6 +60,7 @@ print "===== SCANNET OBJECT POSE LOSS OBJECT-ONLY EVALUATION ====="
 print "input=$INPUT_DIR"
 print "map_source=tracks"
 print "camera_pose_branch=raw_pose_only"
+print "aligned_branch=$ALIGNED_BRANCH"
 print "object_track_plys=$TRACK_DIR"
 cat "$COPYABLE"
 print "evaluation_summary=$SUMMARY"

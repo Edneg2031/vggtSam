@@ -740,6 +740,7 @@ class SemanticMapBuilder:
         self._object_memory: dict[int, _ObjectMemoryState] = {}
         self._object_memory_events: list[dict[str, object]] = []
         self._v1_object_point_alignment_frames: set[int] = set()
+        self._per_instance_object_point_transform_frames: set[int] = set()
         self._temporal_consensus = (
             TemporalConsensusMemory(self.config.temporal_consensus)
             if self.config.fusion_policy == "temporal_consensus"
@@ -843,12 +844,24 @@ class SemanticMapBuilder:
                 threshold=self.config.static_score_threshold,
                 require_score=self.config.require_static_score,
             )
-            if is_static and geometry.object_point_transform is not None:
+            object_point_transform = geometry.object_point_transform
+            if geometry.object_point_transforms is not None:
+                object_point_transform = geometry.object_point_transforms.get(
+                    int(observation.instance_id)
+                )
+            per_instance_transform = (
+                geometry.object_point_transforms is not None
+                and object_point_transform is not None
+            )
+            if is_static and object_point_transform is not None:
                 selected_points = apply_object_point_pose_transform(
-                    geometry.object_point_transform,
+                    object_point_transform,
                     selected_points,
                 )
-                self._v1_object_point_alignment_frames.add(frame_id)
+                if per_instance_transform:
+                    self._per_instance_object_point_transform_frames.add(frame_id)
+                else:
+                    self._v1_object_point_alignment_frames.add(frame_id)
             memory_state = self._object_memory.setdefault(
                 int(observation.instance_id),
                 _ObjectMemoryState(
@@ -867,13 +880,17 @@ class SemanticMapBuilder:
             track_points = selected_points
             object_point_pose_event: dict[str, object] = {
                 "enabled": bool(
-                    is_static and geometry.object_point_transform is not None
+                    is_static and object_point_transform is not None
                 ),
                 "application_scope": (
-                    "static_sam_object_points_only"
-                    if is_static and geometry.object_point_transform is not None
+                    "static_sam_object_points_per_instance_only"
+                    if is_static and per_instance_transform
+                    else "static_sam_object_points_only"
+                    if is_static and object_point_transform is not None
                     else "none"
                 ),
+                "instance_id": int(observation.instance_id),
+                "per_instance": bool(per_instance_transform),
                 "raw_points": raw_object_point_count,
                 "output_points": int(selected_points.shape[0]),
             }
@@ -1060,6 +1077,7 @@ class SemanticMapBuilder:
                 "static_observation": int(is_static),
                 "fusion_policy": str(self.config.fusion_policy),
                 "v1_object_point_alignment": object_point_pose_event,
+                "object_point_pose_alignment": object_point_pose_event,
                 "instance_point_alignment": alignment_event,
                 "instance_point_consistency": consistency_event,
                 "temporal_consensus": consensus_event,
@@ -1203,6 +1221,7 @@ class SemanticMapBuilder:
             bool(
                 self._instance_point_alignment is not None
                 or self._v1_object_point_alignment_frames
+                or self._per_instance_object_point_transform_frames
             ),
         )
         result_metadata.setdefault(
@@ -1210,6 +1229,8 @@ class SemanticMapBuilder:
             (
                 "object_points_only"
                 if self._instance_point_alignment is not None
+                else "static_sam_object_points_per_instance_only"
+                if self._per_instance_object_point_transform_frames
                 else "static_sam_object_points_only"
                 if self._v1_object_point_alignment_frames
                 else "none"
@@ -1218,6 +1239,13 @@ class SemanticMapBuilder:
         result_metadata.setdefault(
             "v1_object_point_alignment_frames",
             [int(value) for value in sorted(self._v1_object_point_alignment_frames)],
+        )
+        result_metadata.setdefault(
+            "per_instance_object_point_transform_frames",
+            [
+                int(value)
+                for value in sorted(self._per_instance_object_point_transform_frames)
+            ],
         )
         result_metadata.setdefault("object_only", bool(self.config.object_only))
         result_metadata.setdefault(
