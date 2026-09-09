@@ -1,0 +1,88 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# Minimal 50-frame HorizonStream GT pose feedback proof of concept.
+# No SAM3, object loss, ICP, or training is used.
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+HORIZON_PYTHON="${HORIZONSTREAM_PYTHON:-/home/huawei/miniconda3/envs/horizonstream/bin/python}"
+HORIZON_REPO="$ROOT/externals/horizonstream"
+HORIZON_CHECKPOINT="${HORIZONSTREAM_CHECKPOINT:-/home/bod/86Nas/95_data_bak/FoundationModels/HorizonStream.pt}"
+
+MANIFEST_PATH="${GT_FEEDBACK_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
+SCENE_ID="${GT_FEEDBACK_SCENE_ID:-00a231a370}"
+FRAME_START="${GT_FEEDBACK_FRAME_START:-0}"
+FRAME_STRIDE="${GT_FEEDBACK_FRAME_STRIDE:-1}"
+FRAME_COUNT="${GT_FEEDBACK_FRAME_COUNT:-50}"
+CORRECTION_FRAME="${GT_FEEDBACK_CORRECTION_FRAME:-15}"
+HORIZON_DEVICE="${HORIZONSTREAM_DEVICE:-cuda:0}"
+HORIZON_WINDOW_SIZE="${HORIZONSTREAM_WINDOW_SIZE:-10}"
+HORIZON_SLIDING_SIZE="${HORIZONSTREAM_SLIDING_SIZE:-1}"
+HORIZON_IMAGE_SIZE="${HORIZONSTREAM_IMAGE_SIZE:-518}"
+HORIZON_PATCH_SIZE="${HORIZONSTREAM_PATCH_SIZE:-14}"
+HORIZON_PRECISION="${HORIZONSTREAM_PRECISION:-float16}"
+OUTPUT_DIR="${GT_FEEDBACK_OUTPUT_DIR:-$STORAGE_ROOT/outputs/horizonstream_gt_feedback_poc_${FRAME_COUNT}f_t${CORRECTION_FRAME}}"
+RUN_LOG="$OUTPUT_DIR/run.log"
+
+cd "$ROOT"
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export PYTHONPATH="$HORIZON_REPO:$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
+[[ -x "$HORIZON_PYTHON" ]] || {
+  print -u2 "missing HorizonStream Python: $HORIZON_PYTHON"
+  exit 1
+}
+[[ -d "$HORIZON_REPO/horizonstream" ]] || {
+  print -u2 "missing HorizonStream source: $HORIZON_REPO"
+  exit 1
+}
+[[ -f "$HORIZON_CHECKPOINT" ]] || {
+  print -u2 "missing HorizonStream checkpoint: $HORIZON_CHECKPOINT"
+  exit 1
+}
+[[ -f "$MANIFEST_PATH" ]] || {
+  print -u2 "missing ScanNet++ manifest: $MANIFEST_PATH"
+  exit 1
+}
+
+mkdir -p "$OUTPUT_DIR"
+print "===== SCANNET HORIZONSTREAM GT FEEDBACK POC ====="
+print "scene=$SCENE_ID frames=${FRAME_COUNT} frame_start=${FRAME_START} frame_stride=${FRAME_STRIDE}"
+print "correction_frame=$CORRECTION_FRAME horizon_device=$HORIZON_DEVICE"
+print "window=$HORIZON_WINDOW_SIZE sliding=$HORIZON_SLIDING_SIZE precision=$HORIZON_PRECISION"
+print "output=$OUTPUT_DIR"
+
+set +e
+PYTHONPATH="$HORIZON_REPO:$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$HORIZON_PYTHON" -m streaming_couping.scripts.run_scannet_horizonstream_gt_feedback_poc \
+  --manifest "$MANIFEST_PATH" \
+  --scene-id "$SCENE_ID" \
+  --frame-start "$FRAME_START" \
+  --frame-stride "$FRAME_STRIDE" \
+  --frame-count "$FRAME_COUNT" \
+  --correction-frame "$CORRECTION_FRAME" \
+  --horizon-repo "$HORIZON_REPO" \
+  --checkpoint "$HORIZON_CHECKPOINT" \
+  --output-dir "$OUTPUT_DIR" \
+  --device "$HORIZON_DEVICE" \
+  --window-size "$HORIZON_WINDOW_SIZE" \
+  --sliding-size "$HORIZON_SLIDING_SIZE" \
+  --image-size "$HORIZON_IMAGE_SIZE" \
+  --patch-size "$HORIZON_PATCH_SIZE" \
+  --precision "$HORIZON_PRECISION" \
+  --crop \
+  >"$RUN_LOG" 2>&1
+exit_code=$?
+set -e
+
+if (( exit_code != 0 )); then
+  print -u2 "GT feedback POC failed status=$exit_code log=$RUN_LOG"
+  tail -n 100 "$RUN_LOG"
+  exit "$exit_code"
+fi
+
+print "run_log=$RUN_LOG"
+print "summary=$OUTPUT_DIR/summary.json"
+print "future_pose_gain=$OUTPUT_DIR/future_pose_gain.csv"
