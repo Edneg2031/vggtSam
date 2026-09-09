@@ -124,8 +124,13 @@ if [[ "$INDEPENDENT_INSTANCE_POSES" == "1" ]]; then
   RUN_TITLE="OBJECT-ONLY PER-INSTANCE"
 fi
 
-print "===== SCANNET OBJECT POSE LOSS $RUN_TITLE ${FRAME_COUNT}F ====="
-print "scene=$SCENE_ID frames=$FRAME_COUNT frame_start=$FRAME_START frame_stride=$FRAME_STRIDE"
+if [[ "$FRAME_COUNT" == "0" ]]; then
+  FRAME_COUNT_LABEL="ALL"
+else
+  FRAME_COUNT_LABEL="${FRAME_COUNT}F"
+fi
+print "===== SCANNET OBJECT POSE LOSS $RUN_TITLE $FRAME_COUNT_LABEL ====="
+print "scene=$SCENE_ID frames=$FRAME_COUNT_LABEL frame_start=$FRAME_START frame_stride=$FRAME_STRIDE"
 print "horizon_device=$HORIZON_DEVICE sam_device=$SAM_DEVICE loss_device=cpu"
 print "output=$OUTPUT_DIR"
 
