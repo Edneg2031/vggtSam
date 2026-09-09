@@ -1,7 +1,8 @@
 #!/usr/bin/env zsh
 set -euo pipefail
 
-# ScanNet++ 100-frame object-only pose-loss experiment.
+# ScanNet++ object-only pose-loss experiment. The wrapper controls the
+# selected frame count; the historical filename is kept for compatibility.
 # HorizonStream camera poses and background geometry stay raw.  The loss
 # refiner still optimizes a per-frame 6DoF correction, but that correction is
 # applied only to static SAM-mask object points during map fusion.
@@ -123,7 +124,7 @@ if [[ "$INDEPENDENT_INSTANCE_POSES" == "1" ]]; then
   RUN_TITLE="OBJECT-ONLY PER-INSTANCE"
 fi
 
-print "===== SCANNET OBJECT POSE LOSS $RUN_TITLE 100F ====="
+print "===== SCANNET OBJECT POSE LOSS $RUN_TITLE ${FRAME_COUNT}F ====="
 print "scene=$SCENE_ID frames=$FRAME_COUNT frame_start=$FRAME_START frame_stride=$FRAME_STRIDE"
 print "horizon_device=$HORIZON_DEVICE sam_device=$SAM_DEVICE loss_device=cpu"
 print "output=$OUTPUT_DIR"
