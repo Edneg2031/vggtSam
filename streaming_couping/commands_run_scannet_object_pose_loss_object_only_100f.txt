@@ -16,9 +16,9 @@ SAM_DEVICE="${SAM_DEVICE:-cuda:2}"
 
 MANIFEST_PATH="$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json"
 SCENE_ID="00a231a370"
-FRAME_START=90
-FRAME_STRIDE=1
-FRAME_COUNT=100
+FRAME_START="${OBJECT_POSE_LOSS_FRAME_START:-90}"
+FRAME_STRIDE="${OBJECT_POSE_LOSS_FRAME_STRIDE:-1}"
+FRAME_COUNT="${OBJECT_POSE_LOSS_FRAME_COUNT:-100}"
 PROMPTS=("bed" "wardrobe" "chair" "rug" "dustbin")
 
 BASELINE_OUTPUT_DIR="$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_consecutive"
