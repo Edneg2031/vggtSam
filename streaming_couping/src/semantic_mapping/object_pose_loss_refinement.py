@@ -65,6 +65,7 @@ class ObjectPoseLossRefinementConfig:
     trace_optimization: bool = False
     device: str = "cpu"
     independent_instance_poses: bool = False
+    export_feedback_diagnostics: bool = False
 
     def validate(self) -> "ObjectPoseLossRefinementConfig":
         for name, value in (
@@ -114,6 +115,12 @@ class ObjectPoseLossRefinementConfig:
             raise ValueError("object_pose_loss.pose_prior_weight cannot be negative.")
         if not str(self.device).strip():
             raise ValueError("object_pose_loss.device must not be empty.")
+        if self.export_feedback_diagnostics and not self.independent_instance_poses:
+            raise ValueError(
+                "object_pose_loss.export_feedback_diagnostics requires "
+                "independent_instance_poses; the camera-feedback consumer needs "
+                "per-instance proposals."
+            )
         return self
 
     def to_dict(self) -> dict[str, Any]:
@@ -145,6 +152,7 @@ class ObjectPoseLossRefinementConfig:
             "min_relative_loss_improvement": float(self.min_relative_loss_improvement),
             "trace_optimization": bool(self.trace_optimization),
             "independent_instance_poses": bool(self.independent_instance_poses),
+            "export_feedback_diagnostics": bool(self.export_feedback_diagnostics),
             "device": str(self.device),
         }
 
@@ -304,6 +312,36 @@ class ObjectPoseLossRefiner:
         optimization_trace: list[dict[str, Any]] = []
         object_point_corrections: dict[int, dict[int, torch.Tensor]] = {}
         independent_instance_poses = bool(self.config.independent_instance_poses)
+        export_feedback = bool(self.config.export_feedback_diagnostics)
+        index_by_frame = {
+            int(frame_id): index for index, frame_id in enumerate(frame_ids)
+        }
+        feedback_observations: list[dict[str, Any]] = []
+        feedback_pairings: list[dict[str, Any]] = []
+        feedback_proposals: list[dict[str, Any]] = []
+        if export_feedback:
+            for frame_id_value in frame_ids:
+                for observation in observations_by_frame.get(int(frame_id_value), ()):
+                    feedback_observations.append(
+                        {
+                            "frame_id": int(observation.frame_id),
+                            "sequence_index": int(
+                                index_by_frame[int(observation.frame_id)]
+                            ),
+                            "instance_id": int(observation.instance_id),
+                            "category": str(observation.category),
+                            "points_camera": observation.points_camera.detach()
+                            .float()
+                            .cpu(),
+                            "weights": observation.weights.detach().float().cpu(),
+                            "track_score": float(observation.track_score),
+                            "geometry_confidence": float(
+                                observation.geometry_confidence
+                            ),
+                            "mask_pixels": int(observation.mask_pixels),
+                            "static": bool(observation.static),
+                        }
+                    )
 
         for sequence_index, (frame_id, raw_pose) in enumerate(zip(frame_ids, raw_poses)):
             current = observations_by_frame.get(int(frame_id), ())
@@ -362,6 +400,39 @@ class ObjectPoseLossRefiner:
                             anchors,
                             history,
                         )
+                        if export_feedback:
+                            snapshot_references: list[dict[str, Any]] = []
+                            seen_reference_frames: set[int] = set()
+                            for pair in pair_specs:
+                                reference = pair.reference
+                                if int(reference.frame_id) in seen_reference_frames:
+                                    continue
+                                seen_reference_frames.add(int(reference.frame_id))
+                                snapshot_references.append(
+                                    {
+                                        "frame_id": int(reference.frame_id),
+                                        "sequence_index": int(
+                                            index_by_frame[int(reference.frame_id)]
+                                        ),
+                                        "role": str(reference.role),
+                                        "quality": float(reference.quality),
+                                        "points_world": reference.points_world.detach()
+                                        .float()
+                                        .cpu(),
+                                        "weights": reference.weights.detach()
+                                        .float()
+                                        .cpu(),
+                                    }
+                                )
+                            if snapshot_references:
+                                feedback_pairings.append(
+                                    {
+                                        "frame_id": int(frame_id),
+                                        "sequence_index": int(sequence_index),
+                                        "instance_id": int(instance_id),
+                                        "references": snapshot_references,
+                                    }
+                                )
                         if pair_specs:
                             outcome = self._optimize_current_pose(
                                 raw_pose,
@@ -379,6 +450,60 @@ class ObjectPoseLossRefiner:
                                 outcome["frame_diagnostic"].get("accepted")
                             ):
                                 accepted_instance_ids.add(instance_id)
+                            if export_feedback:
+                                best_pose = outcome.get("best_pose")
+                                correction = (
+                                    _pose4(best_pose) @ _invert_pose(raw_pose)
+                                    if best_pose is not None
+                                    else None
+                                )
+                                if correction is not None:
+                                    correction = correction.detach().float().cpu()
+                                diagnostic = outcome["frame_diagnostic"]
+                                feedback_proposals.append(
+                                    {
+                                        "frame_id": int(frame_id),
+                                        "sequence_index": int(sequence_index),
+                                        "instance_id": int(instance_id),
+                                        "category": str(
+                                            instance_observations[0].category
+                                        ),
+                                        "accepted": bool(
+                                            diagnostic.get("accepted")
+                                        ),
+                                        "reason": str(
+                                            diagnostic.get("reason", "unknown")
+                                        ),
+                                        "correction": correction,
+                                        "initial_loss_m": diagnostic.get(
+                                            "initial_loss_m"
+                                        ),
+                                        "final_loss_m": diagnostic.get(
+                                            "final_loss_m"
+                                        ),
+                                        "initial_match_count": diagnostic.get(
+                                            "initial_match_count"
+                                        ),
+                                        "final_match_count": diagnostic.get(
+                                            "final_match_count"
+                                        ),
+                                        "relative_loss_improvement": diagnostic.get(
+                                            "relative_loss_improvement"
+                                        ),
+                                        "reference_frames": [
+                                            int(pair.reference.frame_id)
+                                            for pair in pair_specs
+                                        ],
+                                        "reference_roles": [
+                                            str(pair.reference.role)
+                                            for pair in pair_specs
+                                        ],
+                                        "pair_weights": [
+                                            float(pair.weight)
+                                            for pair in pair_specs
+                                        ],
+                                    }
+                                )
                             candidates.extend(outcome["candidates"])
                             accepted_edges.extend(outcome["accepted_edges"])
                             rejected_edges.extend(outcome["rejected_edges"])
@@ -387,6 +512,28 @@ class ObjectPoseLossRefiner:
                             )
                         else:
                             instance_poses[instance_id] = raw_pose
+                            if export_feedback:
+                                feedback_proposals.append(
+                                    {
+                                        "frame_id": int(frame_id),
+                                        "sequence_index": int(sequence_index),
+                                        "instance_id": int(instance_id),
+                                        "category": str(
+                                            instance_observations[0].category
+                                        ),
+                                        "accepted": False,
+                                        "reason": "no_historical_instance_reference",
+                                        "correction": None,
+                                        "initial_loss_m": None,
+                                        "final_loss_m": None,
+                                        "initial_match_count": None,
+                                        "final_match_count": None,
+                                        "relative_loss_improvement": None,
+                                        "reference_frames": [],
+                                        "reference_roles": [],
+                                        "pair_weights": [],
+                                    }
+                                )
                             if self.config.trace_optimization:
                                 optimization_trace.append(
                                     {
@@ -645,6 +792,32 @@ class ObjectPoseLossRefiner:
                 "accepted_frame_count": int(len(accepted_frames)),
             },
         }
+        feedback_diagnostics: Mapping[str, Any] | None = None
+        if export_feedback:
+            feedback_diagnostics = {
+                "schema": "object_pose_loss_feedback_diagnostics_r1",
+                "frame_ids": [int(value) for value in frame_ids],
+                "raw_camera_to_world": torch.stack(
+                    tuple(pose.detach().float().cpu() for pose in raw_poses)
+                ),
+                "observations": feedback_observations,
+                "pairing_snapshots": feedback_pairings,
+                "proposals": feedback_proposals,
+                # Thresholds the consumer's re-check must mirror; see
+                # object_pose_feedback.REFINER_SETTING_MIRRORS.
+                "refiner_settings": {
+                    "anchor_frame_count": int(self.config.anchor_frame_count),
+                    "max_correction_rotation_deg": float(
+                        self.config.max_correction_rotation_deg
+                    ),
+                    "max_correction_translation_m": float(
+                        self.config.max_correction_translation_m
+                    ),
+                    "max_match_distance_m": float(self.config.max_match_distance_m),
+                    "trim_ratio": float(self.config.trim_ratio),
+                    "min_matches_per_pair": int(self.config.min_matches_per_pair),
+                },
+            }
         return PoseRefinementResult(
             frame_ids=frame_ids,
             raw_camera_to_world=tuple(p.detach().float().cpu() for p in raw_poses),
@@ -666,6 +839,7 @@ class ObjectPoseLossRefiner:
                 if independent_instance_poses
                 else None
             ),
+            feedback_diagnostics=feedback_diagnostics,
         )
 
     def _pair_specs(
@@ -775,6 +949,7 @@ class ObjectPoseLossRefiner:
             )
             return {
                 "pose": raw_pose,
+                "best_pose": raw_pose,
                 "candidates": candidates,
                 "accepted_edges": [],
                 "rejected_edges": rejected,
@@ -932,6 +1107,7 @@ class ObjectPoseLossRefiner:
             )
             return {
                 "pose": raw_pose,
+                "best_pose": best_pose.detach().float().cpu(),
                 "candidates": candidates,
                 "accepted_edges": [],
                 "rejected_edges": rejected,
@@ -1037,6 +1213,7 @@ class ObjectPoseLossRefiner:
                 candidates.append(candidate)
         return {
             "pose": best_pose.detach().float().cpu(),
+            "best_pose": best_pose.detach().float().cpu(),
             "candidates": candidates,
             "accepted_edges": accepted_edges,
             "rejected_edges": rejected_edges,

@@ -1,34 +1,41 @@
-# 当前物体点云独立对齐 Pipeline、实验结果与结论
+# HorizonStream + SAM3.1 物体点云对齐实验总结
 
-更新时间：2026-09-09  
-当前实现提交：`75e3a5e`
+更新时间：2026-09-10
+代码分支：`main`  参考提交：`f3509e7`
 
-本文总结当前实验主线：保持 HorizonStream 预估的相机位姿不变，只使用 SAM 实例 mask 选出的物体点云进行物体级 6DoF 修正。
+## 摘要
 
-## 1. 目标与基本假设
+本阶段验证的问题是：
 
-目标不是重新估计整段相机轨迹，而是验证：
+> 在保持 HorizonStream 原始相机位姿不变的情况下，能否利用 SAM3.1 的物体 mask 和跨帧物体匹配，把同一物体的点云对齐得更紧，从而提升物体级点云质量？
 
-> 如果同一个 SAM instance 在不同帧中对应的是同一个静态物体，那么可以用该物体的跨帧点云一致性估计一个小的刚体修正，并只把修正应用到这个物体的点云。
+当前得到的最准确结论是：
 
-因此当前实验明确区分两种变换：
+> 物体级 6DoF 点云修正已经真正生效，并且可以改善部分物体；但是在当前 ScanNet++ 场景和当前 SAM 跟踪、最近点匹配及接受规则下，整体物体点云指标没有稳定提升。100 帧片段中曾出现局部增益，300 帧连续实验反而进一步暴露了长序列中的跟踪、误差累积和参考污染问题。因此目前只能说方法“局部有效”，还不能宣称 SAM 能够可靠地提升所有物体的点云质量。
+
+本实验不是闭环位姿估计实验，也不训练模型。当前最终目标是“只修正物体点云”，而不是修改 HorizonStream 的相机轨迹。
+
+## 1. 实验问题与假设
+
+### 1.1 目标
+
+对同一个被 SAM3.1 跟踪的静态物体，将不同帧中由 HorizonStream 生成的物体点云变换到统一世界坐标系，再用跨帧点云一致性估计一个小刚体修正。修正只作用于该物体的点云。
+
+### 1.2 最近点假设
+
+当前方法假设：当相邻帧之间的运动足够小、SAM mask 确实对应同一个物体时，预测点云之间的最近点大概率对应同一物理表面。于是可以使用最近点残差优化小幅 6DoF 修正。
+
+这个假设只有在以下条件同时成立时才可靠：
 
 ```text
-真实相机位姿：
-    p_world = T_raw_camera_to_world[f] * p_camera
-
-实验性的物体点云修正：
-    p_aligned_object = C[f, instance] * p_raw_world
+同一物体身份正确
+        + mask 没有明显混入背景
+        + 相邻帧位移较小
+        + 点云具有足够的三维约束
+        + 最近点对应落在同一表面
 ```
 
-`C[f, instance]` 是实验用的物体点云修正，不再被解释为真实相机位姿。当前 pipeline 中：
-
-- HorizonStream 的 `raw_camera_to_world` 保持不变；
-- 背景点云保持不变；
-- 非 SAM 物体点保持不变；
-- 同一帧内不同 instance 可以有不同的 6DoF；
-- 只有通过 gate 的 instance 才会应用修正；
-- 物体指标只统计物体级点云，不把背景点云混入物体级汇总。
+如果最近点对应错误，优化 loss 仍然可能下降，但修正后的点云可能离 GT 更远。
 
 ## 2. 当前 Pipeline
 
@@ -38,409 +45,479 @@ ScanNet++ RGB 帧
         ├── HorizonStream
         │      ├── depth / pointmap
         │      ├── geometry confidence
-        │      ├── intrinsics
-        │      └── raw camera-to-world pose
+        │      ├── camera intrinsics
+        │      └── raw camera pose
         │
         └── SAM3.1
-               ├── prompt mask
-               ├── persistent instance ID
+               ├── text-prompted object masks
+               ├── persistent instance IDs
                ├── track score
                └── static score
                          │
                          ▼
-             mask 内 camera-space 物体点云
+             mask 内的 camera-space 物体点云
                          │
                          ▼
-          与该 instance 的历史观察建立最近点对应
+          与同一 instance 的历史观察建立最近点对应
                          │
                          ▼
-              每个 instance 独立优化一个 6DoF
+        shared 或 per-instance 的 6DoF loss optimization
                          │
                          ▼
-          只修正当前帧该 instance 的 object points
+          只变换通过 gate 的物体点云
                          │
                          ▼
-       raw_pose 分支 / object_pose_object_only_per_instance 分支
+          raw object map vs aligned object map
 ```
 
-### 2.1 几何和 SAM 输入
+### 2.1 几何输入
 
-当前 ScanNet++ 场景为 `00a231a370`，prompt 为：
+HorizonStream 先独立生成并缓存每帧几何，物体对齐阶段复用该缓存。相机位姿和背景几何不因 SAM 修正而改变。
+
+当前主要场景是 ScanNet++：
+
+```text
+scene = 00a231a370
+```
+
+### 2.2 SAM3.1 的 prompt 方式
+
+当前 object-pose-loss 主命令使用文本 prompt：
 
 ```text
 bed, wardrobe, chair, rug, dustbin
 ```
 
-HorizonStream 生成并缓存：
+因此当前主实验只会请求这些类别，不是完全无 prompt 的开放世界自动检测。代码中另有基于规则网格正点的 class-agnostic visual-point proposal 分支，但它是独立的 SAM 自动提议诊断，没有接入本总结中的主要 object-pose-loss 结果。
 
-- 每帧深度或点图；
-- 几何置信度；
-- 相机内参；
-- 原始 `camera_to_world`；
-- 处理后的 RGB 输入。
+普通的 `SAM31SegmentationAdapter` 在 RGB 模式下要求至少提供一个文本 prompt。SAM3.1 负责生成 mask 和跟踪 ID；它本身并不负责通过当前 loss 自动纠正 HorizonStream 的相机位姿。
 
-SAM3.1 提供 mask、持久 instance ID、track score 和 static score。物体修正不重新改变 SAM 的 ID，也不修改 HorizonStream 内部状态或 KV cache。
+### 2.3 物体点云修正的坐标含义
 
-### 2.2 观测过滤
+HorizonStream 模型输出 convention 是 `world_to_camera`；几何接口内部使用 `camera_to_world` 将 camera-space 点变换到世界坐标：
 
-当前 100/200/all-frame 命令使用的主要过滤参数为：
+```text
+p_world = T_raw_camera_to_world[f] · p_camera
+```
 
-| 条件 | 当前值 |
+独立物体模式中，每个帧-实例有自己的点云修正：
+
+```text
+p_aligned_object[f, i] = C[f, i] · p_raw_world[f, i]
+```
+
+其中 `C[f, i]` 是实验性的物体点云变换，不应解释为真实相机位姿。当前 independent 分支中：
+
+- HorizonStream 的 raw camera pose 保持不变；
+- `pose=raw_pose` 仍是唯一的相机位姿分支；
+- 背景点云不变；
+- 非目标物体点不变；
+- 同一帧内不同 instance 可以使用不同的 6DoF；
+- 只有通过接受条件的 object points 才应用修正。
+
+### 2.4 历史参考与优化
+
+当前主要设置如下：
+
+| 参数 | 值 |
 |---|---:|
+| anchor 帧数 | `5` |
+| 每个 instance 最多 anchor observation | `3` |
+| 每个 instance 最多 recent history observation | `2` |
+| 每次观测最多点数 | `256` |
+| 每次观测最少有效点数 | `24` |
 | 最低 track score | `0.50` |
-| static score threshold | `0.20` |
 | 最低 geometry confidence | `0.30` |
 | 最低 mask 像素数 | `32` |
 | 最大 mask 面积比例 | `0.85` |
-| 每次观测最多点数 | `256` |
-| 每次观测最少有效几何点 | `24` |
+| 最大匹配距离 | `0.25 m` |
+| 最近点保留比例 | `70%` |
+| 每个 pair 最少匹配数 | `8` |
+| 总匹配数下限 | `16` |
+| 最大 rotation correction | `10°` |
+| 最大 translation correction | `0.25 m` |
 
-默认 `require_static_score=False`。也就是说，缺失 static score 时不会自动过滤；有 score 时才根据 `0.20` 判断静态性。
-
-### 2.3 历史参考点云
-
-- 前 `5` 个输入帧只作为 anchor，不做修正；
-- 每个 instance 最多保留 `3` 个 anchor observation；
-- 另外使用最近 `2` 个 history observation；
-- 当前帧只和同一个 `instance_id` 的历史点云匹配；
-- 每个物体独立构造参考，不把同一帧其他物体合并进来。
-
-这与之前的 shared 版本不同。shared 版本把一帧内多个物体的约束合到同一个 6DoF；当前 per-instance 版本为每个物体单独优化。
-
-### 2.4 最近点匹配和损失
-
-当前对应关系不是 GT 对应，而是由预测点云自己产生：
-
-1. 将当前 camera-space 点云用 raw HorizonStream pose 变换到 world frame；
-2. 对当前点和历史参考点计算 `torch.cdist`；
-3. 采用 mutual nearest neighbor；
-4. 只保留距离不超过 `0.25 m` 的对应；
-5. 按距离排序后保留较近的 `70%`，至少满足每对 `8` 个匹配；
-6. 所有参考对合计至少需要 `16` 个匹配。
-
-优化变量是 6D 增量：3D rotation vector 加 3D translation。它左乘到 raw pose 上：
+优化变量是 rotation vector 加 translation 的 6D 增量。候选变换左乘 raw pose：
 
 ```text
-T_candidate = Exp(delta_6d) * T_raw
+T_candidate = Exp(delta_6d) · T_raw
 ```
 
-实际损失为加权的 robust nearest-point loss：
+损失由 robust nearest-point loss 和 raw pose prior 组成：
 
 ```text
-L_match = weighted_mean( Huber(||T_candidate p_current - p_reference||) )
-L_total = L_match + 0.02 * L_pose_prior
+L = weighted_Huber(nearest_point_residual) + 0.02 · pose_prior
 ```
 
-当前参数：
+需要强调：这个 loss 比较的是预测点云之间的 self-consistency，不是直接比较 GT 点云。
 
-```text
-Huber delta                 = 0.05 m
-Adam outer iterations       = 4
-每次 outer 的 optimizer step = 30
-learning rate               = 0.03
-pose prior weight           = 0.02
-最大 rotation correction   = 10 deg
-最大 translation correction = 0.25 m
-```
+### 2.5 shared 与 per-instance 的区别
 
-### 2.5 接受条件
+| 模式 | 6DoF 数量 | 修正范围 | 主要问题 |
+|---|---|---|---|
+| shared object-only | 每帧一个 | 当前帧所有通过筛选的物体点 | 多个物体互相折中 |
+| per-instance object-only | 每帧每个 instance 一个 | 当前 instance 的物体点 | 自由度高，容易被错误 track 或错误对应带偏 |
 
-候选修正需要满足：
+per-instance 模式不是为所有物体估计真实相机 pose，而是分别修正每个物体的点云。
 
-- 最终总匹配数不少于 `16`；
-- 保留下来的匹配 pair 数不少于初始 pair 数的 `50%`；
-- object loss 相对下降至少 `2%`；
-- 每个存活 pair 最少有 `8` 个匹配。
+## 3. 评价方式
 
-注意：这个 gate 只判断“预测历史点云之间的 loss 是否下降”，不判断 GT 指标是否变好。
+物体级评价只在离线阶段读取 GT instance mask 和 GT object point cloud；GT 不参与 SAM proposal、track、最近点匹配或优化。
 
-### 2.6 点云写回范围
+主要指标：
 
-独立模式下，当前帧每个 instance 都有自己的修正矩阵：
+| 指标 | 趋势 | 含义 |
+|---|---|---|
+| `object_accuracy_m` | 越低越好 | 预测点到 GT 的平均距离 |
+| `object_completeness_m` | 越低越好 | GT 到预测点的平均距离 |
+| `fscore_5cm` | 越高越好 | 5 cm 阈值下的 precision/recall 综合指标 |
+| `voxel_iou_5cm` | 越高越好 | 5 cm 体素占用重合度 |
+| `ghost_point_ratio` | 越低越好 | 物体点中落在错误区域的比例 |
 
-```text
-object_point_transforms[frame_id][instance_id] -> 4x4
-```
+日志中的多物体汇总通常是 matched objects 的 macro mean，不是全场景点云指标。评价时 raw 和 aligned 使用同一评价范围，不能只看一个指标判断改进。
 
-映射阶段只对以下点应用矩阵：
-
-```text
-static SAM-selected object points of this instance
-```
-
-`refined_camera_to_world` 在 independent 模式下仍保存 raw pose，因此评估输出中只有 `raw_pose` 位姿分支。这是有意设计的：物体点云修正不是相机位姿修正。
-
-## 3. 评估方式
-
-物体级评估使用 GT instance mask 和 GT object pointmap，仅在离线评估阶段读取 GT，不参与候选生成和优化。
-
-当前主要指标：
-
-| 指标 | 方向 |
-|---|---|
-| `object_accuracy_m` | 越低越好 |
-| `object_completeness_m` | 越低越好 |
-| `fscore_5cm` | 越高越好 |
-| `voxel_iou_5cm` | 越高越好 |
-| `ghost_point_ratio` | 越低越好 |
-
-日志中的多物体汇总是“匹配物体的 macro mean”，不是整场景点云指标；背景点云没有进入这个 object-only 汇总。`ATE/RPE` 只是额外确认 raw HorizonStream 相机位姿，没有被当前物体修正改变。
-
-长序列的 dense pointmap evaluation 中，RMSE 和有效点数保持精确统计；为避免
-`torch.quantile` 的大张量限制，整体 residual 的 median/p90 使用最多 100,000 个确定性均匀采样点计算。
-
-评估器对预测 object 和 GT object 使用类别兼容性加 voxel IoU 的一对一 Hungarian assignment。因而：
-
-- 同一 GT 物体不能被多个预测 object 同时正式匹配；
-- 未匹配但有点的预测 object 会进入 duplicate/unmatched 统计；
-- `object=dustbin` 这一列来自 GT label，当前简洁打印脚本没有同时打印 `predicted_category`。
-
-所以仅凭日志中出现多个 `dustbin`，还不能直接断言都是 SAM 误检；需要查看 `map_objects.csv` 中的 `gt_instance_id`、`predicted_instance_id`、`predicted_category` 和 assignment。若场景 GT 确实只有一个 dustbin，理论上只有一个 GT dustbin 行可以正式匹配，其余应表现为未匹配或 duplicate track。
+`predicted_instance_id` 来自 SAM tracking。出现多个 `dustbin` 标签不等于场景中有多个真实 dustbin；需要结合 `map_objects.csv` 中的 `gt_instance_id`、`predicted_instance_id`、`predicted_category` 和 assignment 判断是否是重复 track、类别显示或匹配错误。
 
 ## 4. 已完成实验结果
 
-### 4.1 可公平比较的 shared object-only 100 帧实验
+### 4.1 V1 object point alignment：没有形成有效修正
 
-帧段：`90–189`，共 100 帧。相机位姿仍为 HorizonStream raw，但一帧内所有物体共享一个 6DoF 修正。
+设置：100 帧，`frame_start=90`，raw pose 用于两个分支。
 
-| 指标 | raw | shared object-only | 变化 |
-|---|---:|---:|---:|
-| object accuracy | `0.0735035` | `0.0765191` | 变差 |
-| object completeness | `0.0861875` | `0.0829532` | 改善 |
-| F5cm | `0.4742214` | `0.4879335` | 改善 |
-| ghost ratio | `0.2463200` | `0.2612594` | 变差 |
+V1 输出显示：
 
-bed 单独的结果当时比较明显：
+```text
+mean_correction_rotation_deg = 0.0
+mean_correction_translation_m ≈ 5.8e-17
+max_correction_translation_m  ≈ 3.2e-16
+```
 
-| 指标 | raw | shared object-only | 变化 |
-|---|---:|---:|---:|
+raw 和 V1 aligned 的所有点云指标完全相同：
+
+| 指标 | raw | V1 aligned |
+|---|---:|---:|
+| accuracy | `0.0882103` | `0.0882103` |
+| completeness | `0.0718032` | `0.0718032` |
+| F5cm | `0.3480705` | `0.3480705` |
+| voxel IoU | `0.1063202` | `0.1063202` |
+| ghost ratio | `0.1846276` | `0.1846276` |
+
+因此这次 V1 run 实际没有应用有效点云变换，不能作为“V1 点云提升”的证据。更可能是 V1 artifact 与当前 raw-pose/object-only 接口之间没有产生可用 correction。
+
+### 4.2 shared object-only loss：bed 有明显局部提升
+
+设置：100 帧，`frame_start=90`，`frame_stride=1`。保持 raw 相机位姿，只对目标物体点应用一帧共享的 6DoF。
+
+整体 matched-object macro mean：
+
+| 指标 | raw | shared aligned | aligned - raw | 趋势 |
+|---|---:|---:|---:|---|
+| accuracy | `0.0735035` | `0.0765191` | `+0.0030156` | 变差 |
+| completeness | `0.0861875` | `0.0829532` | `-0.0032343` | 改善 |
+| F5cm | `0.4742214` | `0.4879335` | `+0.0137121` | 改善 |
+| ghost ratio | `0.2463200` | `0.2612594` | `+0.0149395` | 变差 |
+
+bed 的结果：
+
+| 指标 | raw | shared aligned | 趋势 |
+|---|---:|---:|---|
 | accuracy | `0.0709000` | `0.0587268` | 改善 |
 | completeness | `0.0907613` | `0.0843056` | 改善 |
 | F5cm | `0.3974930` | `0.5243894` | 明显改善 |
 | ghost ratio | `0.2346191` | `0.1762695` | 改善 |
 
-这个结果说明：只修正物体点云、保持相机位姿不变，确实可以让某些物体（尤其 bed）变好。但 shared 变换是多个物体的折中，不代表每个物体都能同时变好。
+这说明“保持 raw pose、只改物体点云”确实能让部分物体变好。但 shared correction 是多个物体的折中，不能保证所有物体同时改善。
 
-### 4.2 当前 per-instance 100 帧实验
+### 4.3 V3 instance point alignment：内部 loss 下降，但 GT 指标几乎不改善
 
-帧段：`90–189`，共 100 帧。每个 instance 独立优化 6DoF。
+设置：100 帧，`frame_start=90`，raw HorizonStream pose 用于两个分支；背景和全场景几何保持不变，仅修改 object points。
+
+运行审计：
+
+```text
+camera_pose_modified=False
+full_scene_geometry_modified=False
+object_points_modified=True
+decision_count=294
+bootstrap_count=9
+accepted_count=78
+rejected_count=188
+mean_initial_rmse_m=0.0369341
+mean_final_rmse_m=0.0108241
+mean_relative_improvement=0.5855030
+```
+
+整体 object-map 结果：
+
+| 指标 | raw | aligned | aligned - raw | 趋势 |
+|---|---:|---:|---:|---|
+| accuracy | `0.0882103` | `0.0886103` | `+0.0004000` | 变差 |
+| completeness | `0.0718032` | `0.0719695` | `+0.0001662` | 变差 |
+| F5cm | `0.3480705` | `0.3484249` | `+0.0003546` | 极小改善 |
+| voxel IoU | `0.1063202` | `0.1050106` | `-0.0013097` | 变差 |
+| ghost ratio | `0.1846276` | `0.1860131` | `+0.0013856` | 变差 |
+
+选定的 3 个 aligned objects 的 macro mean：
+
+| 指标 | raw | aligned | aligned - raw |
+|---|---:|---:|---:|
+| accuracy | `0.0917350` | `0.0924016` | `+0.0006666` |
+| completeness | `0.0533775` | `0.0536547` | `+0.0002772` |
+| F5cm | `0.5477839` | `0.5486108` | `+0.0008269` |
+| voxel IoU | `0.1676975` | `0.1646416` | `-0.0030559` |
+| ghost ratio | `0.2465198` | `0.2497528` | `+0.0032330` |
+
+结论是：算法内部的对齐 RMSE 明显下降，但 GT 几何质量没有同步改善。这是“self-consistency loss 下降不等于真实点云质量提升”的直接例子。
+
+### 4.4 per-instance object-only loss：部分物体提升，整体 F5cm 下降
+
+设置：100 帧，`frame_start=90`，`frame_stride=1`，每个 persistent SAM instance 独立优化一个 6DoF；相机位姿仍为 raw。
 
 运行摘要：
 
 ```text
 independent_instance_poses=True
 raw_matched_objects=6
+common_matched_objects=6
 accepted_frames=93
 object_point_correction_frames=93
 object_point_correction_instances=206
 pose=raw_pose
-ATE_RMSE=0.1192301 m
-RPE_t_RMSE=0.0090871 m
-RPE_r_RMSE=0.3176797 deg
 ```
 
-这里的 `object_point_correction_instances=206` 是“帧-实例修正次数”，不是场景中有 206 个不同物体。
+`object_point_correction_instances=206` 表示帧-实例修正次数，不是场景中存在 206 个物体。
 
-匹配物体的 macro mean：
+整体 matched-object macro mean：
 
-| 指标 | raw | per-instance | 变化 | 结论 |
+| 指标 | raw | per-instance aligned | aligned - raw | 趋势 |
 |---|---:|---:|---:|---|
-| object accuracy | `0.0735035` | `0.0708708` | `-0.0026327` | 改善 |
-| object completeness | `0.0861875` | `0.0881111` | `+0.0019236` | 变差 |
+| accuracy | `0.0735035` | `0.0708708` | `-0.0026327` | 改善 |
+| completeness | `0.0861875` | `0.0881111` | `+0.0019236` | 变差 |
 | F5cm | `0.4742214` | `0.4464289` | `-0.0277925` | 变差 |
-| voxel IoU 5cm | `0.1484792` | `0.1376399` | `-0.0108393` | 变差 |
+| voxel IoU | `0.1484792` | `0.1376399` | `-0.0108393` | 变差 |
 | ghost ratio | `0.2463200` | `0.2362977` | `-0.0100222` | 改善 |
 
 逐物体结果：
 
-| object / predicted ID | F5cm raw → aligned | voxel IoU raw → aligned | ghost raw → aligned | 结论 |
+| 预测 track / 显示类别 | F5cm raw → aligned | voxel IoU raw → aligned | ghost raw → aligned | 简要判断 |
 |---|---:|---:|---:|---|
-| bed / 0 | `0.397493 → 0.402995` | `0.103926 → 0.087386` | `0.234619 → 0.189941` | 混合；F5cm、ghost 改善 |
-| dustbin / 2 | `0.677055 → 0.763275` | `0.200820 → 0.227273` | `0.020384 → 0.020384` | 明显改善 |
-| dustbin / 3 | `0.734813 → 0.534510` | `0.243523 → 0.207650` | `0.018066 → 0.025879` | 明显变差 |
-| chair / 4 | `0.138428 → 0.136272` | `0.054054 → 0.057834` | `0.500341 → 0.484642` | 混合；整体接近 |
-| wardrobe / 5 | `0.818529 → 0.762512` | `0.276576 → 0.233720` | `0.037842 → 0.030273` | 混合；F5cm、IoU 下降 |
-| dustbin / 6 | `0.079010 → 0.079010` | `0.011976 → 0.011976` | `0.666667 → 0.666667` | 未改变 |
+| `0 / bed` | `0.397493 → 0.402995` | `0.103926 → 0.087386` | `0.234619 → 0.189941` | F5cm、ghost 改善，IoU 下降 |
+| `2 / dustbin` | `0.677055 → 0.763275` | `0.200820 → 0.227273` | `0.020384 → 0.020384` | 明显改善 |
+| `3 / dustbin` | `0.734813 → 0.534510` | `0.243523 → 0.207650` | `0.018066 → 0.025879` | 明显变差 |
+| `4 / chair` | `0.138428 → 0.136272` | `0.054054 → 0.057834` | `0.500341 → 0.484642` | 指标方向混合 |
+| `5 / wardrobe` | `0.818529 → 0.762512` | `0.276576 → 0.233720` | `0.037842 → 0.030273` | F5cm、IoU 下降 |
+| `6 / dustbin` | `0.079010 → 0.079010` | `0.011976 → 0.011976` | `0.666667 → 0.666667` | 没有变化 |
 
-因此当前 per-instance 版本的准确结论是：
+这个结果是目前最接近目标的实验。它证明：
 
-- bed 仍然有小幅提升，但不如 shared 版本明显；
-- dustbin ID 2 有明显提升；
-- dustbin ID 3 和 wardrobe 的 F5cm/voxel IoU 下降；
-- chair 的不同指标方向不一致；
-- 汇总后的 F5cm 和 voxel IoU 没有提升。
+- 独立 per-instance 6DoF 确实被应用到物体点云；
+- bed 和 track 2 的部分指标有增益；
+- 但是 track 3、wardrobe 等物体明显下降；
+- 六个匹配物体的总体 F5cm 和 voxel IoU 下降。
 
-### 4.3 不可直接作为结论的 first-100 结果
+### 4.5 per-instance object-only loss：300 帧连续实验
 
-此前 `frame_start=0` 的 first-100 实验只有 `2` 个匹配物体，raw ATE 约 `0.732 m`，与 `90–189` 实验的 `6` 个匹配物体、raw ATE `0.119 m` 不同。因此它不能用于判断方法好坏，也不能和 `90–189` 的结果直接比较。
+设置：前 300 帧，`frame_start=0`，`frame_stride=1`，每个 persistent SAM instance 独立优化一个 6DoF；相机位姿仍为 raw。该实验已经成功完成，包括长序列 GT evaluation。
 
-### 4.4 全量帧实验状态
+运行摘要：
 
-全量帧命令已经准备并推送：
-
-```bash
-zsh streaming_couping/commands_run_scannet_object_pose_loss_object_per_instance_allf.txt
+```text
+independent_instance_poses=True
+raw_matched_objects=2
+common_matched_objects=2
+accepted_frames=266
+object_point_correction_frames=266
+object_point_correction_instances=687
+pose=raw_pose
 ```
 
-配置为：
+整体 matched-object macro mean：
+
+| 指标 | raw | per-instance aligned | aligned - raw | 趋势 |
+|---|---:|---:|---:|---|
+| accuracy | `0.2079359` | `0.2097914` | `+0.0018556` | 变差 |
+| completeness | `0.2766066` | `0.2946774` | `+0.0180708` | 变差 |
+| F5cm | `0.0410128` | `0.0235497` | `-0.0174631` | 明显变差 |
+| voxel IoU | `0.0079089` | `0.0086149` | `+0.0007060` | 极小改善 |
+| ghost ratio | `0.8160400` | `0.8259277` | `+0.0098877` | 变差 |
+
+逐物体结果：
+
+| 预测 track / 显示类别 | F5cm raw → aligned | voxel IoU raw → aligned | ghost raw → aligned | 简要判断 |
+|---|---:|---:|---:|---|
+| `0 / bed` | `0.022955 → 0.020802` | `0.004389 → 0.005639` | `0.829346 → 0.832275` | F5cm、ghost 变差，IoU 极小上升 |
+| `7 / chair` | `0.059071 → 0.026297` | `0.011429 → 0.011591` | `0.802734 → 0.819580` | F5cm、ghost 明显变差 |
+
+300 帧结果说明：
+
+- 300 帧中有 `266` 个帧级修正被接受，但最终只有 `2` 个 matched objects；高 accepted count 不能说明 SAM instance 身份一直正确。
+- aligned 分支只有 voxel IoU 出现极小的数值上升，accuracy、completeness、F5cm 和 ghost ratio 全部变差；从整体几何质量看，这是失败结果。
+- bed 的 F5cm 从 `0.022955` 降到 `0.020802`，chair 的 F5cm 从 `0.059071` 降到 `0.026297`，说明更长历史没有自动解决错误匹配问题。
+- 与 `90–189` 的 100 帧结果相比，300 帧实验还改变了时间段和 matched-object 数量，因此不能把两者的绝对指标直接当作严格的帧数 ablation。
+
+这次实验没有支持“连续帧越多，最近点匹配就越可靠”。更可能的现象是：在当前实现中，长序列增加了可用观测，但也增加了 track identity switch、错误 history 写入、点云污染和累积误差的机会。
+
+### 4.6 first-100 与 90–189 不是同一个实验条件
+
+曾经运行过 `frame_start=0` 的 100 帧实验，只有 2 个 matched objects，raw ATE 约为 `0.732 m`。而 `frame_start=90` 的 100 帧实验有 6 个 matched objects，raw ATE 约为 `0.119 m`。
+
+两者的场景时间段、跟踪稳定性和几何质量不同，不能直接比较，也不能把 first-100 的结果当作方法整体性能。
+
+## 5. 相关但不属于主目标的位姿实验
+
+### 5.1 在线 object pose loop：loss 降低但相机位姿和地图变差
+
+这是一个较早的共享位姿在线修正实验，不是当前的 object-only 方案。100 帧、`frame_start=90` 的结果：
+
+| 指标 | raw pose | object-pose refined |
+|---|---:|---:|
+| ATE RMSE | `0.1192303 m` | `0.1243705 m` |
+| RPE translation | `0.0090871 m` | `0.0095768 m` |
+| RPE rotation | `0.317706°` | `0.3773099°` |
+| map F5cm | `0.3480705` | `0.3378542` |
+| map voxel IoU | `0.1063202` | `0.1061097` |
+
+虽然 object loss 从 `0.00015093` 降到 `0.00007921`，但 GT pose 和地图指标变差。这进一步说明，不能用优化 loss 单独代表真实质量。
+
+### 5.2 GT feedback POC：验证的是外部位姿累积器，不是 SAM
+
+另一个 50 帧、修正帧 `t=15` 的 GT correction POC 不使用 SAM。它用于验证：如果已知 GT pose，外部 pose accumulator 是否能把 correction 传递到后续绝对位姿。
+
+| 分支 | ATE RMSE | RPE translation | RPE rotation |
+|---|---:|---:|---:|
+| Raw | `0.057001 m` | `0.005613 m` | `0.125996°` |
+| Post-hoc | `0.056748 m` | `0.009018 m` | `0.169455°` |
+| Feedback | `0.055676 m` | `0.008833 m` | `0.168344°` |
+
+在 `t+1` 到 `t+10`：
+
+```text
+translation improved = 10/10
+rotation improved    = 6/10
+posthoc future unchanged = true
+```
+
+这个 POC 说明外部位姿累积器可以接受一个已知正确的 pose correction；但它不证明 SAM 能估计出正确 correction，也不证明 HorizonStream 的 KV/GLA 状态会读取 pose correction。它与当前“只压物体点云”的主目标是分开的。
+
+## 6. 当前结论
+
+### 6.1 已经验证
+
+1. **物体点云独立修正机制已经真正生效。**
+   per-instance 实验中存在有效帧-实例 correction，且 raw pose 分支没有被修改。
+
+2. **SAM 引导的物体级对齐对部分物体有效。**
+   bed 和至少一个 dustbin track 的 F5cm、voxel IoU 或 ghost ratio 有改善。
+
+3. **对齐 loss 下降不保证 GT 点云质量提升。**
+   V3 和 per-instance 实验都表现出 loss/局部指标下降，但 aggregate F5cm 或 voxel IoU 下降。
+
+4. **shared correction 曾经让 bed 明显改善。**
+   这说明多个物体共同约束能够提供额外正则，但 shared 变换不一定适合每一个物体。
+
+5. **raw HorizonStream pose 可以保持不变。**
+   当前 object-only pipeline 不需要闭环，也不需要修改 HorizonStream KV、GLA cache 或在线相机位姿。
+
+### 6.2 目前不能声称
+
+目前不能写成：
+
+> SAM3.1 已经能够稳定优化 HorizonStream 位姿或稳定提升场景中所有物体的点云质量。
+
+更准确的表述是：
+
+> SAM3.1 提供的 persistent object mask 可以作为物体级点云对齐的约束；在当前实验中，该约束对部分物体产生了增益，但由于实例身份、mask 质量和最近点对应仍不稳定，整体物体点云质量尚未稳定提升。
+
+如果只讨论当前独立物体点云实验，可以写成：
+
+> The per-instance 6DoF correction is effective at the implementation level and improves selected objects, but the current self-consistency objective is not yet a reliable proxy for ground-truth object reconstruction quality.
+
+## 7. 结果不稳定的原因分析
+
+### 7.1 SAM track 可能不是稳定的物体身份
+
+同一个文本 prompt 可能导致：
+
+- 一个物体被拆成多个 track；
+- track 只覆盖物体的一部分；
+- mask 混入墙、地面或相邻物体；
+- 遮挡后重新出现时身份变化；
+- 同一类别的不同物体发生身份混淆。
+
+独立 6DoF 会给每一个错误 track 更高的自由度，因此容易把错误拟合得更好。
+
+### 7.2 最近点对应可能错误
+
+当前最大匹配距离是 `0.25 m`。对于平面、遮挡、稀疏点云和边界噪声，这个范围仍可能把点匹配到错误表面。mutual nearest 和 70% trimming 只能降低 outlier 数量，不能保证物理对应正确。
+
+### 7.3 优化目标和 GT 评价目标不同
+
+优化的是：
+
+```text
+当前预测 object cloud ↔ 历史预测 object cloud
+```
+
+评价的是：
+
+```text
+累计预测 object cloud ↔ GT object cloud
+```
+
+如果历史点云已经带有共同的系统误差，或者 mask 一直带入相同背景区域，self-consistency 会变好而 GT 距离不会变好。
+
+### 7.4 单物体几何可能退化
+
+单个物体可见区域经常接近平面，导致部分旋转或平移方向不可观测。`16` 个匹配点只是数量下限，不代表这些点在三维空间中具有足够的非共面约束。
+
+### 7.5 reference history 可能传播错误
+
+如果错误修正通过 gate，后续帧会把这次修正后的 observation 放入 history，之后可能持续对齐到错误参考。当前前 5 帧 anchor 固定，但 recent history 仍可能发生误差传播。
+
+### 7.6 指标之间并不等价
+
+accuracy 下降不代表 F5cm、voxel IoU 一定上升；ghost ratio 下降也不保证完整性变好。当前 per-instance 结果正是 accuracy 和 ghost ratio 改善，但 F5cm 和 voxel IoU 下降。
+
+## 8. 300 帧实验状态与采样说明
+
+300 帧命令已经准备好，当前设置为：
 
 ```text
 frame_start=0
 frame_stride=1
-frame_count=0  # 由输入解析器定义为剩余全部帧
+frame_count=300
 ```
 
-输出目录：
+之前 300 帧运行是在 GT evaluation 的 `torch.quantile()` 大输入处失败。该评估内存问题已经在 `main` 修复；300 帧脚本的默认输出目录也已切换为新的 `..._v2`，避免复用旧的失败半成品。修复后的 300 帧实验已经成功完成，但结果整体变差，详见第 4.5 节。
+
+需要注意：如果数据帧率和 `frame_stride` 不变，改成 300 帧并不会改变相邻两帧之间的实际运动距离；它增加的是连续观测数量和可用历史参考。只有减小 `frame_stride` 或使用更高帧率，才会真正减小相邻输入之间的位移。
+
+运行命令：
+
+```zsh
+zsh streaming_couping/commands_run_scannet_object_pose_loss_object_per_instance_300f.txt
+```
+
+对应输出目录：
 
 ```text
-/data184/open_source/vggtSam/outputs/semantic_map_allframes_horizonstream_object_pose_loss_object_per_instance_v1
+/data184/open_source/vggtSam/outputs/semantic_map_300frames_horizonstream_object_pose_loss_object_per_instance_v2
 ```
 
-截至本文撰写时，全量帧实验还没有新的终端结果。因此不能提前声称 200 帧或全量帧会提升；它只能检验更多时间参考是否改善匹配稳定性。
+## 9. 建议的下一步
 
-## 5. 当前结论
+300 帧结果已经表明，单纯增加连续观测数量不能保证最近点匹配更可靠。下一步应优先定位失败来源，而不是继续盲目增加帧数。
 
-### 5.1 已经验证的部分
+之后按以下顺序分析：
 
-1. **相机位姿没有被物体修正改变。**  
-   per-instance 输出中的 `pose=raw_pose` 与 raw branch 相同，修正保存在 `object_point_corrections.pt`，只作用于物体点云。
+1. 查看 `map_objects.csv`，确认重复 `dustbin` 行对应的是预测 track、GT instance 还是 assignment 展示问题。
+2. 对每个 instance 同时记录 accepted correction 数、匹配点数、初始/最终 loss、correction 大小和 GT 指标变化。
+3. 将 reference observation 分成优化用和 hold-out 验证用，防止只对训练匹配 loss 过拟合。
+4. 对候选 correction 增加三维非退化检查和空间分布检查。
+5. 以同一时间段做帧数 ablation，例如固定 `frame_start=90`，比较 `100/200` 帧；不要把起始帧和帧数同时改变。
+6. 在固定时间段基线之后，再单独测试更严格的匹配距离，例如 `0.05–0.08 m`，不要和帧数变化同时修改。
+7. 对 duplicate / identity-switch 的 SAM track 做过滤后，再比较 per-instance 结果。
 
-2. **每个物体独立 6DoF 的机制已经真正生效。**  
-   `independent_instance_poses=True`，且 `object_point_correction_instances=206`；不是把一个 shared 变换错误地广播给所有物体。
+## 10. 可引用的最终阶段性结论
 
-3. **物体级修正确实能提升局部物体。**  
-   bed 和 dustbin ID 2 的部分指标提升，说明“raw pose + object-only correction”这个方向不是完全无效。
-
-4. **当前 loss 不能保证 GT 点云质量提升。**  
-   per-instance 版本的内部历史匹配 loss 可以下降，但 macro F5cm 和 voxel IoU 反而下降。
-
-### 5.2 当前不能得出的结论
-
-不能根据当前一次 100 帧 per-instance 实验得出“独立 6DoF 思路错误”。更准确的说法是：
-
-> 独立 6DoF 已正确实现，但当前的最近点对应、参考点云、接受 gate 和 SAM track 质量还不足以保证每个物体的真实 GT 几何指标提升。
-
-同样，也不能因为日志里有三个 `dustbin` 就直接认定是 SAM 分错。必须查看 GT instance 数量、`predicted_category` 和 duplicate/unmatched 行。
-
-## 6. 表现不稳定的主要原因
-
-### 6.1 优化目标和评价目标不一致
-
-优化使用的是预测历史点云之间的 self-consistency：
-
-```text
-当前预测点云 ↔ 历史预测点云
-```
-
-评价使用的是：
-
-```text
-当前累计点云 ↔ GT 点云
-```
-
-如果历史点云已经带有同方向的系统误差，或者多个帧都把背景写进了物体 mask，那么修正可以降低 self-consistency loss，同时离 GT 更远。
-
-### 6.2 最近点对应不一定正确
-
-当前 `max_match_distance_m=0.25` 相对宽。对于小偏移、平面、遮挡或稀疏深度，多个点可能具有相近的最近邻。mutual nearest 和 70% trimming 能减少一部分 outlier，但无法证明保留下来的点是物理上同一个表面点。
-
-这正是当前假设最敏感的地方：
-
-```text
-最近点对应正确  →  6DoF 优化可能有效
-最近点对应错误  →  loss 仍可能下降，但会把点云带偏
-```
-
-### 6.3 SAM mask/track 的错误会被独立 6DoF 放大
-
-同一个 prompt 可能产生：
-
-- 同一物体被拆成多个 track；
-- 一个 track 只覆盖物体局部；
-- mask 混入墙、地面或其他物体；
-- 遮挡后重新出现时 ID 不稳定；
-- 同类别多个候选之间发生身份混淆。
-
-shared 6DoF 会把这些错误平均掉一部分；per-instance 6DoF 则给每个错误 track 更大的自由度，容易单独过拟合。
-
-### 6.4 单个物体的几何约束可能退化
-
-每次观测最多 256 点，但经过 mask、confidence、mutual match、距离和 trimming 后，真正参与优化的点可能不多。床、衣柜、墙边等点云经常接近平面，导致某些 rotation/translation 方向不可观测或不稳定。
-
-`16` 个总匹配只说明数量达到下限，不代表三维空间中有足够的非共面约束。
-
-### 6.5 当前接受 gate 偏向训练匹配 loss
-
-当前主要接受标准是相对 loss 改善 `2%`。它没有：
-
-- 独立 hold-out 参考帧验证；
-- 最终绝对 RMSE 上限；
-- 点云秩/非退化检查；
-- 对应点的空间分布检查；
-- 预测 mask 污染比例检查；
-- 同类重复 track 抑制。
-
-所以一个错误但容易拟合的物体修正也可能被接受。
-
-### 6.6 参考点云可能发生误差传播
-
-前 5 帧 anchor 是固定的，但后续通过 gate 的修正 observation 会进入 history。若某一帧错误修正被接受，后续帧可能继续对齐到这个错误 history，从而形成局部 drift。
-
-### 6.7 F5cm、voxel IoU 与 accuracy 不完全等价
-
-一个修正可能让平均最近距离下降，却让点云整体边界、占用体素或 recall 变差。因此不能只看 accuracy：当前 per-instance 结果正好表现为 accuracy、ghost 改善，但 F5cm、voxel IoU 下降。
-
-## 7. 为什么之前 shared 版本的 bed 更好
-
-shared 版本把一帧内多个物体的观测合并来估计一个 6DoF，具有两个效果：
-
-1. 约束数量更多，优化 basin 更稳定；
-2. 多个物体对同一个变换构成隐式正则，减少单个物体退化或错误最近点的影响。
-
-如果 bed 的误差方向与 shared 估计方向一致，它会得到明显改善；但同一个 shared 变换不可能同时适合所有物体，所以其他物体可能下降。
-
-per-instance 版本去掉了这个隐式正则，理论自由度更合理，但对 mask、对应点和 gate 的要求更高。这解释了为什么 bed 仍有提升，而 dustbin ID 3、wardrobe 等物体反而下降。
-
-合理的后续设计不是把 shared 6DoF 作为最终结果广播给所有物体，而是可以把 shared 结果仅用作：
-
-- per-instance ICP/优化的初始化；
-- 小范围搜索的中心；
-- per-instance correction 的先验或上限；
-- 检测同一帧内明显冲突的异常物体。
-
-最终写回仍保持每个物体自己的 correction。
-
-## 8. 当前实验命令和输出
-
-| 用途 | 命令/路径 |
-|---|---|
-| shared object-only 100 帧 | `streaming_couping/commands_run_scannet_object_pose_loss_object_only_100f.txt` |
-| per-instance 100 帧，90–189 | `streaming_couping/commands_run_scannet_object_pose_loss_object_per_instance_100f.txt` |
-| per-instance 200 帧，0–199 | `streaming_couping/commands_run_scannet_object_pose_loss_object_per_instance_200f_start0.txt` |
-| per-instance 200 帧，90–289 | `streaming_couping/commands_run_scannet_object_pose_loss_object_per_instance_200f.txt` |
-| per-instance 全部帧 | `streaming_couping/commands_run_scannet_object_pose_loss_object_per_instance_allf.txt` |
-| 当前 per-instance 评估摘要 | `gt_evaluation/object_pose_loss_object_per_instance_metrics.txt` |
-| 逐物体 CSV | `gt_evaluation/object_pose_loss_object_per_instance_metrics.csv` |
-| refinement summary | `object_pose_refinement/pose_refinement_summary.json` |
-| 逐次优化 trace | `object_pose_refinement/optimization_trace.json` |
-| accepted/rejected edges | `object_pose_refinement/accepted_edges.json`、`rejected_edges.json` |
-| per-instance correction artifact | `object_pose_refinement/object_point_corrections.pt` |
-
-实际输出根目录取决于实验帧段。例如已完成的 90–189 实验为：
-
-```text
-/data184/open_source/vggtSam/outputs/semantic_map_100frames_horizonstream_object_pose_loss_object_per_instance_90_189_v1
-```
-
-## 9. 建议的下一步判断顺序
-
-1. 先运行全量帧实验，保持当前参数不变，观察是否仍然只有少数物体受益。
-2. 读取 `map_objects.csv`，确认三个 `dustbin` 是三个 GT instance、三个预测 track，还是 GT/预测类别显示混淆。
-3. 按 instance 汇总 accepted/rejected correction、最终 RMSE、匹配数和 correction 大小。
-4. 对每个 instance 增加 hold-out 历史帧验证：训练匹配 loss 下降但 hold-out 变差时拒绝修正。
-5. 收紧最近点 gate，例如先试 `0.05–0.08 m`，并增加绝对 RMSE 和三维非退化检查。
-6. 对明显重复的同类 SAM track 做 duplicate suppression，再比较 per-instance 点云指标。
-
-在这些检查完成前，最稳妥的结论是：
-
-> HorizonStream raw pose 应继续作为相机位姿；物体级独立 6DoF 可以作为点云修正实验保留，但当前 loss 和匹配 gate 还不能保证物体点云整体提升。
+> 我们实现了一个保持 HorizonStream 原始相机位姿不变的 SAM3.1-guided object-level point-cloud alignment pipeline。该方法从 persistent SAM instance mask 中提取物体点云，并为每个物体估计独立的小幅 6DoF correction，只将修正写回对应物体点云。100 帧实验中，部分物体获得了局部增益；300 帧连续实验中，内部修正被大量接受，但整体 F5cm、accuracy、completeness 和 ghost ratio 变差。结果表明，SAM 物体匹配提供了有用但不稳定的局部几何约束，当前 self-consistency loss 还不能可靠地转化为 GT reconstruction gain。

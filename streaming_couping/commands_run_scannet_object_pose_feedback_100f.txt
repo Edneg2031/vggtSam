@@ -1,0 +1,246 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# ScanNet++ SAM-object-consensus camera-pose feedback experiment (100 frames,
+# 90-189).  Four stages:
+#   1. HorizonStream geometry cache + chunk camera-map aux artifact;
+#   2a. semantic-map run with per-instance object-pose-loss proposals and
+#       feedback diagnostics export (Branch D: per-instance object points);
+#   2b. CPU-only consensus/gating/accumulator-replay analysis (branches A/B/C);
+#   3. GT object-map evaluation for Branch D;
+#   4. metric printing.
+# Camera poses in branch D stay raw; branch C injects consensus corrections
+# into the causal pose accumulator only.  No training, no DINO, no KV writes.
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+HORIZON_PYTHON="${HORIZONSTREAM_PYTHON:-/home/huawei/miniconda3/envs/horizonstream/bin/python}"
+SAM_PYTHON="${STREAMING_COUPING_PYTHON:-$HORIZON_PYTHON}"
+HORIZON_REPO="$ROOT/externals/horizonstream"
+HORIZON_CHECKPOINT="${HORIZONSTREAM_CHECKPOINT:-/home/bod/86Nas/95_data_bak/FoundationModels/HorizonStream.pt}"
+HORIZON_DEVICE="${HORIZONSTREAM_DEVICE:-cuda:0}"
+SAM_DEVICE="${SAM_DEVICE:-cuda:2}"
+
+MANIFEST_PATH="$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json"
+SCENE_ID="00a231a370"
+FRAME_START="${OBJECT_POSE_FEEDBACK_FRAME_START:-90}"
+FRAME_STRIDE="${OBJECT_POSE_FEEDBACK_FRAME_STRIDE:-1}"
+FRAME_COUNT="${OBJECT_POSE_FEEDBACK_FRAME_COUNT:-100}"
+PROMPTS=("bed" "wardrobe" "chair" "rug" "dustbin")
+
+RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v1}"
+GEOMETRY_CACHE="${OBJECT_POSE_FEEDBACK_GEOMETRY_CACHE:-$RUN_DIR/horizonstream_geometry.pt}"
+OUTPUT_DIR="$RUN_DIR"
+EVAL_DIR="$RUN_DIR/gt_evaluation"
+FEEDBACK_DIR="$RUN_DIR/object_pose_feedback"
+RECOVERY_CONFIG="${RECOVERY_CONFIG_PATH:-$ROOT/streaming_couping/configs/recovery_dynamic_instance.yaml}"
+GEOMETRY_LOG="$RUN_DIR/horizonstream_geometry.log"
+RUN_LOG="$RUN_DIR/run.log"
+FEEDBACK_LOG="$FEEDBACK_DIR/analysis.log"
+EVAL_LOG="$EVAL_DIR/evaluator.log"
+ALIGNED_BRANCH="object_pose_object_only_per_instance"
+
+# Frequently tuned feedback thresholds (defaults live in
+# ObjectPoseFeedbackConfig; see docs/object_pose_feedback.md).
+MIN_CONSENSUS_OBJECTS="${OBJECT_POSE_FEEDBACK_MIN_CONSENSUS_OBJECTS:-2}"
+MAX_CONSENSUS_TRANSLATION_M="${OBJECT_POSE_FEEDBACK_MAX_CONSENSUS_TRANSLATION_M:-0.20}"
+MAX_CONSENSUS_ROTATION_DEG="${OBJECT_POSE_FEEDBACK_MAX_CONSENSUS_ROTATION_DEG:-8.0}"
+
+cd "$ROOT"
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+[[ -x "$HORIZON_PYTHON" ]] || { print -u2 "missing Python: $HORIZON_PYTHON"; exit 1; }
+[[ -x "$SAM_PYTHON" ]] || { print -u2 "missing Python: $SAM_PYTHON"; exit 1; }
+[[ -d "$HORIZON_REPO/horizonstream" ]] || { print -u2 "missing HorizonStream source: $HORIZON_REPO"; exit 1; }
+[[ -f "$HORIZON_CHECKPOINT" ]] || { print -u2 "missing HorizonStream checkpoint: $HORIZON_CHECKPOINT"; exit 1; }
+[[ -f "$MANIFEST_PATH" ]] || { print -u2 "missing ScanNet++ manifest: $MANIFEST_PATH"; exit 1; }
+[[ -f "$RECOVERY_CONFIG" ]] || { print -u2 "missing recovery config: $RECOVERY_CONFIG"; exit 1; }
+
+if ! "$SAM_PYTHON" -c 'import iopath, ftfy, regex, huggingface_hub, timm, einops, pycocotools' >/dev/null 2>&1; then
+  print -u2 "SAM3 runtime dependencies are missing"
+  exit 1
+fi
+
+mkdir -p "$OUTPUT_DIR" "$EVAL_DIR" "$FEEDBACK_DIR"
+
+if [[ "$FRAME_COUNT" == "0" ]]; then
+  FRAME_COUNT_LABEL="ALL"
+else
+  FRAME_COUNT_LABEL="${FRAME_COUNT}F"
+fi
+print "===== SCANNET OBJECT-CONSENSUS POSE FEEDBACK $FRAME_COUNT_LABEL ====="
+print "scene=$SCENE_ID frames=$FRAME_COUNT_LABEL frame_start=$FRAME_START frame_stride=$FRAME_STRIDE"
+print "horizon_device=$HORIZON_DEVICE sam_device=$SAM_DEVICE analysis=cpu"
+print "run_dir=$RUN_DIR"
+
+# ---- Stage 1: geometry cache + chunk camera maps --------------------------
+HORIZON_ARGS=(
+  --manifest "$MANIFEST_PATH"
+  --scene-id "$SCENE_ID"
+  --frame-start "$FRAME_START"
+  --frame-stride "$FRAME_STRIDE"
+  --frame-count "$FRAME_COUNT"
+  --repo-path "$HORIZON_REPO"
+  --checkpoint "$HORIZON_CHECKPOINT"
+  --output-cache "$GEOMETRY_CACHE"
+  --device "$HORIZON_DEVICE"
+  --window-size 10
+  --sliding-size 1
+  --image-size 518
+  --patch-size 14
+  --crop
+  --precision float16
+  --reuse-if-valid
+  --save-chunk-cam-maps
+)
+
+PYTHONPATH="$HORIZON_REPO:$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$HORIZON_PYTHON" -m streaming_couping.scripts.generate_horizonstream_geometry_cache \
+  "${HORIZON_ARGS[@]}" >"$GEOMETRY_LOG" 2>&1
+
+[[ -f "$GEOMETRY_CACHE" ]] || { print -u2 "missing geometry cache: $GEOMETRY_CACHE"; exit 1; }
+[[ -f "$RUN_DIR/horizonstream_geometry_chunk_cam_maps.pt" ]] || {
+  print -u2 "missing chunk camera-map artifact: $RUN_DIR/horizonstream_geometry_chunk_cam_maps.pt"
+  exit 1
+}
+
+# ---- Stage 2a: semantic map + per-instance proposals + diagnostics --------
+ARGS=(
+  --manifest "$MANIFEST_PATH"
+  --scene-id "$SCENE_ID"
+  --frame-start "$FRAME_START"
+  --frame-stride "$FRAME_STRIDE"
+  --frame-count "$FRAME_COUNT"
+  --prompts "${PROMPTS[@]}"
+  --geometry-cache "$GEOMETRY_CACHE"
+  --output-dir "$OUTPUT_DIR"
+  --fusion-policy raw
+  --recovery-config "$RECOVERY_CONFIG"
+  --sam-device "$SAM_DEVICE"
+  --sam-grounding-batch-size 1
+  --sam-offload-video-to-cpu
+  --object-only
+  --object-pose-loss-refinement
+  --object-pose-loss-object-only
+  --object-pose-loss-independent-instances
+  --object-pose-loss-export-feedback-diagnostics
+  --object-pose-loss-anchor-frames 5
+  --object-pose-loss-max-anchor-observations 3
+  --object-pose-loss-max-history-observations 2
+  --object-pose-loss-max-points-per-observation 256
+  --object-pose-loss-min-points-per-observation 24
+  --object-pose-loss-min-track-score 0.50
+  --object-pose-loss-static-score-threshold 0.20
+  --object-pose-loss-min-geometry-confidence 0.30
+  --object-pose-loss-min-mask-pixels 32
+  --object-pose-loss-max-match-distance-m 0.25
+  --object-pose-loss-trim-ratio 0.70
+  --object-pose-loss-min-matches-per-pair 8
+  --object-pose-loss-min-total-matches 16
+  --object-pose-loss-outer-iterations 4
+  --object-pose-loss-optimizer-steps 30
+  --object-pose-loss-learning-rate 0.03
+  --object-pose-loss-huber-delta-m 0.05
+  --object-pose-loss-pose-prior-weight 0.02
+  --object-pose-loss-anchor-reference-weight 1.0
+  --object-pose-loss-local-reference-weight 0.50
+  --object-pose-loss-max-correction-rotation-deg 10.0
+  --object-pose-loss-max-correction-translation-m 0.25
+  --object-pose-loss-min-relative-improvement 0.02
+  --object-pose-loss-device cpu
+  --object-pose-loss-trace
+)
+
+set +e
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$SAM_PYTHON" -m streaming_couping.scripts.run_semantic_map \
+  "${ARGS[@]}" >"$RUN_LOG" 2>&1
+run_exit_code=$?
+set -e
+if (( run_exit_code != 0 )); then
+  print -u2 "semantic-map run failed status=$run_exit_code log=$RUN_LOG"
+  tail -n 80 "$RUN_LOG"
+  exit "$run_exit_code"
+fi
+
+for branch in raw_pose "$ALIGNED_BRANCH"; do
+  [[ -s "$OUTPUT_DIR/$branch/semantic_map.pt" ]] || {
+    print -u2 "missing branch artifact: $OUTPUT_DIR/$branch/semantic_map.pt"
+    exit 1
+  }
+  [[ -s "$OUTPUT_DIR/$branch/object_tracks.ply" ]] || {
+    print -u2 "missing or empty object tracks: $OUTPUT_DIR/$branch/object_tracks.ply"
+    exit 1
+  }
+done
+[[ -s "$OUTPUT_DIR/object_pose_refinement/feedback_diagnostics.pt" ]] || {
+  print -u2 "missing feedback diagnostics: $OUTPUT_DIR/object_pose_refinement/feedback_diagnostics.pt"
+  exit 1
+}
+
+# ---- Stage 2b: consensus / gating / accumulator replay (CPU) ---------------
+FEEDBACK_ARGS=(
+  --run-dir "$RUN_DIR"
+  --geometry-cache "$GEOMETRY_CACHE"
+  --manifest "$MANIFEST_PATH"
+  --scene-id "$SCENE_ID"
+  --output-dir "$FEEDBACK_DIR"
+  --horizon-repo "$HORIZON_REPO"
+  --min-consensus-objects "$MIN_CONSENSUS_OBJECTS"
+  --max-consensus-translation-m "$MAX_CONSENSUS_TRANSLATION_M"
+  --max-consensus-rotation-deg "$MAX_CONSENSUS_ROTATION_DEG"
+)
+
+set +e
+PYTHONPATH="$HORIZON_REPO:$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$SAM_PYTHON" -m streaming_couping.scripts.run_object_pose_feedback \
+  "${FEEDBACK_ARGS[@]}" >"$FEEDBACK_LOG" 2>&1
+feedback_exit_code=$?
+set -e
+if (( feedback_exit_code != 0 )); then
+  print -u2 "feedback analysis failed status=$feedback_exit_code log=$FEEDBACK_LOG"
+  tail -n 80 "$FEEDBACK_LOG"
+  exit "$feedback_exit_code"
+fi
+[[ -s "$FEEDBACK_DIR/summary.json" ]] || {
+  print -u2 "missing feedback summary: $FEEDBACK_DIR/summary.json"
+  exit 1
+}
+
+# ---- Stage 3: GT object-map evaluation for Branch D ------------------------
+set +e
+VGGT_SAM_ROOT="$ROOT" \
+VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT" \
+SEMANTIC_MAP_MANIFEST="$MANIFEST_PATH" \
+SEMANTIC_MAP_SCENE_ID="$SCENE_ID" \
+HORIZONSTREAM_GEOMETRY_CACHE="$GEOMETRY_CACHE" \
+OBJECT_POSE_LOSS_OBJECT_ONLY_OUTPUT_DIR="$OUTPUT_DIR" \
+OBJECT_POSE_LOSS_OBJECT_ONLY_EVAL_DIR="$EVAL_DIR" \
+OBJECT_POSE_ALIGNED_BRANCH="$ALIGNED_BRANCH" \
+STREAMING_COUPING_PYTHON="$SAM_PYTHON" \
+  zsh "$ROOT/streaming_couping/commands_evaluate_scannet_object_pose_loss_object_only.txt" \
+  >"$EVAL_LOG" 2>&1
+eval_exit_code=$?
+set -e
+if (( eval_exit_code != 0 )); then
+  print -u2 "GT evaluation failed status=$eval_exit_code log=$EVAL_LOG"
+  tail -n 80 "$EVAL_LOG"
+  exit "$eval_exit_code"
+fi
+
+# ---- Stage 4: summaries ----------------------------------------------------
+SUMMARY_PATH="$OUTPUT_DIR/object_pose_refinement/pose_refinement_summary.json"
+EVAL_SUMMARY="$EVAL_DIR/summary.json"
+[[ -f "$SUMMARY_PATH" && -f "$EVAL_SUMMARY" ]] || {
+  print -u2 "missing object-only summary files"
+  exit 1
+}
+
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$SAM_PYTHON" "$ROOT/streaming_couping/scripts/print_object_pose_loss_object_only_metrics.py" \
+  "$SUMMARY_PATH" "$EVAL_SUMMARY" "$ALIGNED_BRANCH"
+print "feedback_summary=$FEEDBACK_DIR/summary.json"
+print "run_log=$RUN_LOG"
+print "feedback_log=$FEEDBACK_LOG"
+print "evaluation_log=$EVAL_LOG"

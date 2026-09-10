@@ -64,6 +64,7 @@ def main() -> None:
 
     settings = _request_settings(args, repo_path, checkpoint, config_path)
     output_cache = args.output_cache.expanduser().resolve()
+    aux_chunk_path = output_cache.parent / f"{output_cache.stem}_chunk_cam_maps.pt"
     if args.reuse_if_valid and output_cache.is_file():
         try:
             existing = load_horizonstream_cache(output_cache)
@@ -76,11 +77,26 @@ def main() -> None:
                 checkpoint=checkpoint,
                 settings=settings,
             ):
-                print(
-                    "HorizonStream geometry cache reused "
-                    f"frames={len(image_paths)} path={output_cache}"
+                aux_usable = (
+                    not args.save_chunk_cam_maps
+                    or _chunk_cam_maps_aux_matches(
+                        aux_chunk_path,
+                        frame_count=len(image_paths),
+                        window_size=int(args.window_size),
+                        sliding_size=int(args.sliding_size),
+                        request=existing.get("request"),
+                    )
                 )
-                return
+                if aux_usable:
+                    print(
+                        "HorizonStream geometry cache reused "
+                        f"frames={len(image_paths)} path={output_cache}"
+                    )
+                    return
+                print(
+                    "Chunk camera-map aux artifact is missing or stale; "
+                    "regenerating."
+                )
             print("HorizonStream cache request changed; regenerating.")
 
     if str(repo_path) not in sys.path:
@@ -278,6 +294,34 @@ def main() -> None:
         if temporary.exists():
             temporary.unlink()
 
+    if args.save_chunk_cam_maps:
+        aux_payload = {
+            "schema": "horizonstream_chunk_cam_maps",
+            "schema_version": 1,
+            "frame_count": int(frame_count),
+            "window_size": int(args.window_size),
+            "sliding_size": int(args.sliding_size),
+            "image_size_hw": (int(height), int(width)),
+            "chunk_count": len(camera_chunks),
+            "chunk_cam_maps": [
+                chunk.detach().float().cpu() for chunk in camera_chunks
+            ],
+            "request": payload["request"],
+        }
+        aux_temporary = aux_chunk_path.with_name(
+            f".{aux_chunk_path.name}.tmp-{os.getpid()}"
+        )
+        try:
+            torch.save(aux_payload, aux_temporary)
+            aux_temporary.replace(aux_chunk_path)
+        finally:
+            if aux_temporary.exists():
+                aux_temporary.unlink()
+        print(
+            "Chunk camera-map aux artifact saved "
+            f"chunks={len(camera_chunks)} path={aux_chunk_path}"
+        )
+
     del model, state, images
     gc.collect()
     if torch.cuda.is_available():
@@ -286,6 +330,32 @@ def main() -> None:
         "HorizonStream geometry cache completed "
         f"frames={frame_count} size={(height, width)} path={output_cache}"
     )
+
+
+def _chunk_cam_maps_aux_matches(
+    path: Path,
+    *,
+    frame_count: int,
+    window_size: int,
+    sliding_size: int,
+    request: Any,
+) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        chunks = payload.get("chunk_cam_maps")
+        return (
+            payload.get("schema") == "horizonstream_chunk_cam_maps"
+            and int(payload.get("frame_count", -1)) == int(frame_count)
+            and int(payload.get("window_size", -1)) == int(window_size)
+            and int(payload.get("sliding_size", -1)) == int(sliding_size)
+            and isinstance(chunks, list)
+            and len(chunks) > 0
+            and payload.get("request") == request
+        )
+    except (AttributeError, EOFError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return False
 
 
 def _parse_args() -> argparse.Namespace:
@@ -327,6 +397,17 @@ def _parse_args() -> argparse.Namespace:
         "--reuse-if-valid",
         action=argparse.BooleanOptionalAction,
         default=False,
+    )
+    parser.add_argument(
+        "--save-chunk-cam-maps",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Additionally save the raw per-chunk camera maps next to the "
+            "geometry cache so the pose-accumulator replay can run on CPU "
+            "without re-running the model. The sibling file is named "
+            "<cache stem>_chunk_cam_maps.pt."
+        ),
     )
     args = parser.parse_args()
     for name in ("window_size", "sliding_size", "image_size", "patch_size"):

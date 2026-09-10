@@ -657,6 +657,7 @@ class PoseRefinementResult:
     object_point_corrections: Mapping[
         int, Mapping[int, torch.Tensor]
     ] | None = None
+    feedback_diagnostics: Mapping[str, Any] | None = None
 
     def pose_by_frame(self) -> dict[int, torch.Tensor]:
         return {
@@ -1211,6 +1212,8 @@ def write_pose_refinement_debug(
         paths["object_point_corrections"] = (
             directory / "object_point_corrections.pt"
         )
+    if result.feedback_diagnostics is not None:
+        paths["feedback_diagnostics"] = directory / "feedback_diagnostics.pt"
     _write_json(paths["candidate_edges"], list(result.candidates))
     _write_json(paths["accepted_edges"], [edge.to_dict() for edge in result.accepted_edges])
     _write_json(paths["rejected_edges"], list(result.rejected_edges))
@@ -1246,6 +1249,8 @@ def write_pose_refinement_debug(
             },
             paths["object_point_corrections"],
         )
+    if result.feedback_diagnostics is not None:
+        torch.save(result.feedback_diagnostics, paths["feedback_diagnostics"])
     _write_json(paths["summary"], dict(result.summary))
     return {key: str(value) for key, value in paths.items()}
 

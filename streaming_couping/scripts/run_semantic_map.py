@@ -1061,6 +1061,17 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--object-pose-loss-device", default="cpu")
+    parser.add_argument(
+        "--object-pose-loss-export-feedback-diagnostics",
+        dest="object_pose_loss_export_feedback_diagnostics",
+        action="store_true",
+        help=(
+            "Export per-instance observations, pairing snapshots, and "
+            "accepted/rejected 6DoF proposals for the camera-pose feedback "
+            "consumer. Requires independent instances; the baseline maps are "
+            "unchanged."
+        ),
+    )
     parser.add_argument("--object-pose-online-window-size", type=int, default=10)
     parser.add_argument("--object-pose-online-max-reference-frames", type=int, default=5)
     parser.add_argument("--object-pose-online-max-reference-gap", type=int, default=10)
@@ -1536,6 +1547,9 @@ def _object_pose_loss_config(
         min_relative_loss_improvement=args.object_pose_loss_min_relative_improvement,
         trace_optimization=args.object_pose_loss_trace,
         independent_instance_poses=args.object_pose_loss_independent_instances,
+        export_feedback_diagnostics=(
+            args.object_pose_loss_export_feedback_diagnostics
+        ),
         device=args.object_pose_loss_device,
     ).validate()
 
