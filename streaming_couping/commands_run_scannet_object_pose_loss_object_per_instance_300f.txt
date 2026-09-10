@@ -7,7 +7,9 @@ set -euo pipefail
 # object-point correction.
 ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
-OUTPUT_DIR="${OBJECT_POSE_LOSS_OBJECT_PER_INSTANCE_300F_OUTPUT_DIR:-$STORAGE_ROOT/outputs/semantic_map_300frames_horizonstream_object_pose_loss_object_per_instance_v1}"
+# Use a fresh artifact directory because the previous 300-frame attempt could
+# have stopped after writing maps but before GT evaluation completed.
+OUTPUT_DIR="${OBJECT_POSE_LOSS_OBJECT_PER_INSTANCE_300F_OUTPUT_DIR:-$STORAGE_ROOT/outputs/semantic_map_300frames_horizonstream_object_pose_loss_object_per_instance_v2}"
 
 export OBJECT_POSE_LOSS_OBJECT_ONLY_OUTPUT_DIR="$OUTPUT_DIR"
 export OBJECT_POSE_LOSS_OBJECT_ONLY_INDEPENDENT_INSTANCES=1
