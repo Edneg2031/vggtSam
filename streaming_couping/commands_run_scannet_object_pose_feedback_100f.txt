@@ -164,8 +164,13 @@ PYTHONPATH="$HORIZON_REPO:$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   "${HORIZON_ARGS[@]}" >"$GEOMETRY_LOG" 2>&1
 
 [[ -f "$GEOMETRY_CACHE" ]] || { print -u2 "missing geometry cache: $GEOMETRY_CACHE"; exit 1; }
-[[ -f "$RUN_DIR/horizonstream_geometry_chunk_cam_maps.pt" ]] || {
-  print -u2 "missing chunk camera-map artifact: $RUN_DIR/horizonstream_geometry_chunk_cam_maps.pt"
+# The aux artifact is written next to the cache, not next to the run dir.
+# Those coincide only when GEOMETRY_CACHE is not overridden, and the branch
+# sweep overrides it so that every branch shares one geometry pass -- so
+# deriving the path from RUN_DIR silently checks the wrong file.
+AUX_CHUNK_CAM_MAPS="${GEOMETRY_CACHE%.pt}_chunk_cam_maps.pt"
+[[ -f "$AUX_CHUNK_CAM_MAPS" ]] || {
+  print -u2 "missing chunk camera-map artifact: $AUX_CHUNK_CAM_MAPS"
   exit 1
 }
 
