@@ -1149,6 +1149,24 @@ def main() -> None:
             "gt_source": "manifest.world_to_camera inverted to camera_to_world, "
             "normalized to the first selected frame",
         },
+        # What this verdict does and does not cover.  A GO here is one scene
+        # and one frame window, and every threshold in the config was chosen on
+        # that same window, so it is a pilot result rather than a
+        # generalization claim.
+        "claim_scope": {
+            "scene_count": 1,
+            "protocol_role": "development_window",
+            "thresholds_selected_on_this_window": True,
+            "held_out_scene_evidence": False,
+            "guards": [
+                "sim3_ate_improvement_ratio",
+                "future_rotation_gain_median_deg",
+            ],
+            "note": (
+                "Pose metrics only.  The corrected trajectory has not been "
+                "mapped, so no object-map improvement is claimed."
+            ),
+        },
         "gt_audit": {
             "gt_used_for_proposals": False,
             "gt_used_for_reliability_consensus_or_gating": False,

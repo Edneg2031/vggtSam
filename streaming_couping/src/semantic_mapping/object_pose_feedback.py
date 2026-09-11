@@ -10,6 +10,16 @@ camera-pose correction hypothesis per frame:
         → robust cross-object consensus over ξ_k = log(ΔT_k)
         → explicit gating (accept / reject with reason)
 
+All five consensus variants are computed and reported.  The headlined one is
+``robust_semantic`` (see ``MAIN_VARIANT_NAME``), not the
+``robust_semantic_geometric`` that the weights above describe: the 100-frame
+attribution measured the geometric reliability term to be anti-predictive
+(within-category rho = +0.34), and the sweep showed adding it halves the
+direct-ATE gain and fails the rotation guard.  ``robust`` and
+``robust_semantic`` differ from each other by less than the run-to-run spread,
+so the semantic term is not what is doing the work either -- cross-object
+agreement is.
+
 Design boundaries:
 
 * Proposals are computed once on the raw HorizonStream geometry (two-pass).
@@ -809,7 +819,13 @@ CONSENSUS_VARIANTS: tuple[ConsensusVariant, ...] = (
     ),
 )
 
-MAIN_VARIANT_NAME = "robust_semantic_geometric"
+#: The variant the summary headlines and the one the decision is read from.
+#:
+#: It is "robust_semantic" rather than "robust_semantic_geometric" because the
+#: sweep measured the geometric reliability term to be anti-predictive: adding
+#: it halves the direct-ATE gain (+14.3% -> +7.8%) and it is what fails the
+#: rotation guard.  All five variants are still computed and reported.
+MAIN_VARIANT_NAME = "robust_semantic"
 
 
 @dataclass(frozen=True)

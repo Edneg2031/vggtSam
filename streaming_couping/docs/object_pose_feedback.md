@@ -90,7 +90,8 @@ consensus/gating/阈值迭代只重跑 Stage 2b。
 | `mean` | 加权平均 | 均匀 |
 | `robust` | Huber IRLS | 均匀 |
 | `robust_semantic` | Huber IRLS | S_sem |
-| `robust_semantic_geometric`（主方法） | Huber IRLS | S_sem×S_geo |
+| `robust_semantic`（**主方法**） | Huber IRLS | S_sem |
+| `robust_semantic_geometric` | Huber IRLS | S_sem×S_geo（实测有害，增益减半） |
 
 帧级门控按优先级输出 reject reason：
 `insufficient_objects → low_track_confidence → degenerate_geometry /
@@ -107,7 +108,7 @@ per-instance 最优 loss 代替。所有阈值集中在 `ObjectPoseFeedbackConfi
 |---|---|
 | A raw | 无注入重放；内置等价性断言（vs cache 轨迹，平移 <1e-3 m / 旋转 <0.01°） |
 | B no-feedback | 只分析 proposals（含被拒 best_pose）与 ΔT_GT 的误差及 clamp 饱和标志 |
-| C feedback | 五个变体；主方法 `robust_semantic_geometric` |
+| C feedback | 五个变体；主方法 `robust_semantic` |
 | D per-instance | Stage 2a/3 的逐实例物体点修正地图（相机位姿保持 raw） |
 
 ## 6. 输出
@@ -163,7 +164,7 @@ RPE 额外报告**排除 correction-boundary 对**的版本（相邻对任一端
 
 ## 7. GO / NO-GO 判据（仅位姿指标，alignment loss 不进判据）
 
-主方法 `robust_semantic_geometric` 需同时满足：
+主方法 `robust_semantic` 需同时满足：
 
 1. direct ATE 相对 raw 改善 ≥ 5%；
 2. accepted 帧的 future translation gain（t+1..t+10）中位数 > 0 且 ≥ 60% 为正；

@@ -16,6 +16,7 @@ from typing import Any, Mapping, Sequence
 import pytest
 
 from streaming_couping.scripts.analyze_object_pose_feedback_attribution import (
+    BASELINE_VARIANT,
     MAIN_VARIANT,
     _parse_int_list,
     category_stratified_correlations,
@@ -28,12 +29,14 @@ from streaming_couping.scripts.analyze_object_pose_feedback_attribution import (
     selection_quality,
 )
 
+# Both of the constants the collapse check compares, named symbolically so
+# swapping which variant is headlined does not silently remove one of them.
 CONSENSUS_VARIANTS = (
     "single",
     "mean",
     "robust",
-    "robust_semantic",
     MAIN_VARIANT,
+    BASELINE_VARIANT,
 )
 
 
@@ -171,7 +174,7 @@ def test_consensus_collapse_flags_single_inlier_regime() -> None:
         )
     text, payload = consensus_collapse(rows)
     assert "consensus collapse" in text
-    baseline = payload["variants"]["robust_semantic"]
+    baseline = payload["variants"][BASELINE_VARIANT]
     main = payload["variants"][MAIN_VARIANT]
     assert baseline["inlier_count_mean"] == pytest.approx(2.0)
     assert main["inlier_count_mean"] == pytest.approx(1.0)

@@ -38,8 +38,10 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
-MAIN_VARIANT = "robust_semantic_geometric"
-BASELINE_VARIANT = "robust_semantic"
+# The claimed method, and the variant it is compared against in the collapse
+# check: whether adding the geometric reliability term collapses the consensus.
+MAIN_VARIANT = "robust_semantic"
+BASELINE_VARIANT = "robust_semantic_geometric"
 PERMUTATION_ITERATIONS = 4000
 SEED = 20260911
 

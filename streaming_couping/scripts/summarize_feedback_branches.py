@@ -118,6 +118,27 @@ def branch_row(run_dir: Path) -> tuple[list[Any], dict[str, Any]]:
     )
     gate_reasons = _dig(summary, "gate_stats", main, "reject_reason_counts", default={})
     decision = _dig(summary, "decisions", main, "decision")
+    # Which consensus variants passed EVERY criterion.  Reporting only the main
+    # variant's verdict hides the finding that the headline variant can fail
+    # while others pass all seven criteria, including the sim3 and rotation
+    # guards that catch the two known failure modes.
+    decisions = summary.get("decisions")
+    go_variants = (
+        sorted(
+            str(name)
+            for name, entry in decisions.items()
+            if isinstance(entry, Mapping) and entry.get("decision") == "OBJECT_FEEDBACK_GO"
+        )
+        if isinstance(decisions, Mapping)
+        else []
+    )
+    failed_criteria = sorted(
+        str(key)
+        for key, entry in (
+            _dig(summary, "decisions", main, "criteria", default={}) or {}
+        ).items()
+        if isinstance(entry, Mapping) and not entry.get("passed")
+    )
     max_age = _dig(settings, "max_reference_age_frames")
     refresh = _dig(settings, "anchor_refresh_interval_frames")
     # The two proposal-side targets: how wrong the proposals are, and how old
@@ -148,6 +169,8 @@ def branch_row(run_dir: Path) -> tuple[list[Any], dict[str, Any]]:
             "OBJECT_FEEDBACK_GO": "GO",
             "OBJECT_FEEDBACK_NO_GO": "NO_GO",
         }.get(str(decision), str(decision)),
+        ",".join(go_variants) if go_variants else "-",
+        ",".join(failed_criteria) if failed_criteria else "-",
     ]
     payload = {
         "run_dir": str(run_dir),
@@ -170,6 +193,8 @@ def branch_row(run_dir: Path) -> tuple[list[Any], dict[str, Any]]:
         "sim3_ate_improvement_ratio": _ratio(raw_sim3, main_sim3),
         "future_rotation_gain_median_deg": future_rotation,
         "decision": decision,
+        "go_variants": go_variants,
+        "main_variant_failed_criteria": failed_criteria,
         "reject_reason_counts": gate_reasons,
         "anchor_reference_age_median_frames": _dig(staleness, "median_age_frames"),
         "anchor_reference_age_rho_within_category": _dig(
@@ -271,6 +296,8 @@ HEADERS: tuple[str, ...] = (
     "anchor_age",
     "anchor_rho",
     "decision",
+    "go_variants",
+    "main_failed",
 )
 
 
