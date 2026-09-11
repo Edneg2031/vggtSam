@@ -46,13 +46,18 @@ BRANCHES=(baseline fresh factorized fresh_factor)
 FRESH_MAX_AGE="${OBJECT_POSE_FEEDBACK_MAX_REFERENCE_AGE_FRAMES:-15}"
 FRESH_REFRESH="${OBJECT_POSE_FEEDBACK_ANCHOR_REFRESH_INTERVAL_FRAMES:-20}"
 
-# How many times to run the FULL baseline pipeline.  The two replay checks
-# below are free and catch any residual nondeterminism in the analysis chain,
-# but only repeating the segmentation model measures how much IT moves the
-# answer -- and that is the number a GO/NO-GO has to clear to mean anything.
-# Set to 3 (or more) when you want the real noise floor; each extra run is a
-# full stage-1 + stage-2a pass.
-SAM_REPEATS="${OBJECT_POSE_FEEDBACK_SAM_REPEATS:-1}"
+# How many times to run the FULL baseline pipeline.  The replay checks below
+# are free and catch any residual nondeterminism in the analysis chain, but
+# only repeating the segmentation model measures how much IT moves the answer
+# -- and that is the number a GO/NO-GO has to clear to mean anything.  The
+# measured spread of one unchanged configuration was 0.026 against a branch
+# effect of 0.006, so a single run cannot distinguish the branches.
+#
+# 3 means two extra stage-2a passes; stage 1 is reused from the cache by
+# --reuse-if-valid, so the geometry model runs once.  Lower it to 1 only if
+# the GPU time is unavailable, and then read the table as "no noise floor
+# measured" rather than as a comparison.
+SAM_REPEATS="${OBJECT_POSE_FEEDBACK_SAM_REPEATS:-3}"
 
 MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
 SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
