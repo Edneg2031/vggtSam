@@ -57,6 +57,7 @@ from streaming_couping.src.semantic_mapping.object_pose_refinement import (
     write_pose_refinement_debug,
 )
 from streaming_couping.src.semantic_mapping.object_pose_loss_refinement import (
+    PROPOSAL_MODES,
     ObjectPoseLossRefinementConfig,
     ObjectPoseLossRefiner,
 )
@@ -1028,6 +1029,31 @@ def _parse_args() -> argparse.Namespace:
         help="Maximum absolute matrix difference allowed for V1/raw pose agreement.",
     )
     parser.add_argument("--object-pose-loss-anchor-frames", type=int, default=5)
+    parser.add_argument(
+        "--object-pose-loss-max-reference-age-frames",
+        type=int,
+        default=0,
+        help=(
+            "Drop object references older than this many frames. 0 keeps the "
+            "original behavior, where the anchor clouds from the first frames "
+            "stay usable for the whole sequence."
+        ),
+    )
+    parser.add_argument(
+        "--object-pose-loss-anchor-refresh-interval-frames",
+        type=int,
+        default=0,
+        help=(
+            "Re-take the high-weight anchor set every N frames instead of "
+            "pinning it to the first frames. 0 disables the refresh."
+        ),
+    )
+    parser.add_argument(
+        "--object-pose-loss-proposal-mode",
+        default="joint",
+        choices=sorted(PROPOSAL_MODES),
+        help="6DoF parameterization for the per-object correction proposal.",
+    )
     parser.add_argument("--object-pose-loss-max-anchor-observations", type=int, default=3)
     parser.add_argument("--object-pose-loss-max-history-observations", type=int, default=2)
     parser.add_argument("--object-pose-loss-max-points-per-observation", type=int, default=256)
@@ -1531,6 +1557,11 @@ def _object_pose_loss_config(
         min_geometry_confidence=args.object_pose_loss_min_geometry_confidence,
         min_mask_pixels=args.object_pose_loss_min_mask_pixels,
         max_mask_area_ratio=args.object_pose_loss_max_mask_area_ratio,
+        max_reference_age_frames=args.object_pose_loss_max_reference_age_frames,
+        anchor_refresh_interval_frames=(
+            args.object_pose_loss_anchor_refresh_interval_frames
+        ),
+        proposal_mode=args.object_pose_loss_proposal_mode,
         max_match_distance_m=args.object_pose_loss_max_match_distance_m,
         trim_ratio=args.object_pose_loss_trim_ratio,
         min_matches_per_pair=args.object_pose_loss_min_matches_per_pair,

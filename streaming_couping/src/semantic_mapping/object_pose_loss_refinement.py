@@ -30,6 +30,12 @@ from .geometry import geometry_confidence_for_frame, resize_bool_mask
 from .object_pose_refinement import PoseRefinementResult
 
 
+#: How the per-object 6DoF correction is parameterized.
+PROPOSAL_MODES: frozenset[str] = frozenset(
+    {"joint", "rotation_then_translation"}
+)
+
+
 @dataclass(frozen=True)
 class ObjectPoseLossRefinementConfig:
     """Conservative settings for causal object-cloud loss optimization."""
@@ -46,6 +52,26 @@ class ObjectPoseLossRefinementConfig:
     min_geometry_confidence: float = 0.30
     min_mask_pixels: int = 32
     max_mask_area_ratio: float = 0.85
+
+    # --- reference freshness (0 keeps the original fixed-anchor behavior) ---
+    #
+    # Attribution on the 100-frame run showed the proposal error is dominated
+    # by how old the reference set is: the permanent anchor clouds taken from
+    # the first ``anchor_frame_count`` frames (median age 37.5 frames) carry
+    # rho = +0.785 with the GT correction error *within* object category,
+    # while the one-frame-old local history carries none (p = 0.32).  These two
+    # knobs bound that age; both default to 0 so the raw branch is unchanged.
+    max_reference_age_frames: int = 0
+    anchor_refresh_interval_frames: int = 0
+
+    # --- proposal parameterization ---
+    # "joint": one 6DoF variable, the original behavior.
+    # "rotation_then_translation": within each outer iteration, optimize the
+    # rotation half first, then hold it and optimize translation.  Observed
+    # rotation consensus error (0.61 deg) exceeds the noise floor of the raw
+    # per-frame RPE rotation (0.32 deg), so rotation is the poorly conditioned
+    # half on the mostly planar/linear objects in this scene.
+    proposal_mode: str = "joint"
 
     max_match_distance_m: float = 0.25
     trim_ratio: float = 0.70
@@ -86,6 +112,30 @@ class ObjectPoseLossRefinementConfig:
             raise ValueError(
                 "object_pose_loss.min_total_matches cannot be smaller than "
                 "min_matches_per_pair."
+            )
+        # 0 disables the knob, so only a negative value is invalid.
+        for name, value in (
+            ("max_reference_age_frames", self.max_reference_age_frames),
+            (
+                "anchor_refresh_interval_frames",
+                self.anchor_refresh_interval_frames,
+            ),
+        ):
+            if int(value) < 0:
+                raise ValueError(f"object_pose_loss.{name} cannot be negative.")
+        if self.proposal_mode not in PROPOSAL_MODES:
+            raise ValueError(
+                "object_pose_loss.proposal_mode must be one of "
+                f"{sorted(PROPOSAL_MODES)}, got {self.proposal_mode!r}."
+            )
+        if (
+            int(self.anchor_refresh_interval_frames) > 0
+            and int(self.anchor_refresh_interval_frames)
+            < int(self.anchor_frame_count)
+        ):
+            raise ValueError(
+                "object_pose_loss.anchor_refresh_interval_frames must be at "
+                "least anchor_frame_count, otherwise anchor epochs overlap."
             )
         for name, value in (
             ("min_track_score", self.min_track_score),
@@ -150,6 +200,11 @@ class ObjectPoseLossRefinementConfig:
             "max_correction_rotation_deg": float(self.max_correction_rotation_deg),
             "max_correction_translation_m": float(self.max_correction_translation_m),
             "min_relative_loss_improvement": float(self.min_relative_loss_improvement),
+            "max_reference_age_frames": int(self.max_reference_age_frames),
+            "anchor_refresh_interval_frames": int(
+                self.anchor_refresh_interval_frames
+            ),
+            "proposal_mode": str(self.proposal_mode),
             "trace_optimization": bool(self.trace_optimization),
             "independent_instance_poses": bool(self.independent_instance_poses),
             "export_feedback_diagnostics": bool(self.export_feedback_diagnostics),
@@ -343,9 +398,23 @@ class ObjectPoseLossRefiner:
                         }
                     )
 
+        anchor_refresh = int(self.config.anchor_refresh_interval_frames)
         for sequence_index, (frame_id, raw_pose) in enumerate(zip(frame_ids, raw_poses)):
             current = observations_by_frame.get(int(frame_id), ())
-            is_anchor_frame = sequence_index < int(self.config.anchor_frame_count)
+            # Anchors are the high-weight references.  With a refresh interval
+            # they are re-taken from a moving epoch instead of staying pinned
+            # to the first frames of the sequence for its whole length.
+            if anchor_refresh > 0:
+                anchor_phase = sequence_index % anchor_refresh
+                is_anchor_frame = anchor_phase < int(self.config.anchor_frame_count)
+                if anchor_phase == 0 and sequence_index >= int(
+                    self.config.anchor_frame_count
+                ):
+                    anchors.clear()  # a new epoch replaces the stale one
+            else:
+                is_anchor_frame = sequence_index < int(
+                    self.config.anchor_frame_count
+                )
             refined_pose = raw_pose
             instance_poses: dict[int, torch.Tensor] = {}
             accepted_instance_ids: set[int] = set()
@@ -807,6 +876,15 @@ class ObjectPoseLossRefiner:
                 # object_pose_feedback.REFINER_SETTING_MIRRORS.
                 "refiner_settings": {
                     "anchor_frame_count": int(self.config.anchor_frame_count),
+                    "max_reference_age_frames": int(
+                        self.config.max_reference_age_frames
+                    ),
+                    "anchor_refresh_interval_frames": int(
+                        self.config.anchor_refresh_interval_frames
+                    ),
+                    # Not a threshold to mirror, but the consumer must know
+                    # which proposal parameterization produced the proposals.
+                    "proposal_mode": str(self.config.proposal_mode),
                     "max_correction_rotation_deg": float(
                         self.config.max_correction_rotation_deg
                     ),
@@ -854,6 +932,7 @@ class ObjectPoseLossRefiner:
                 int(observation.instance_id),
                 anchors,
                 history,
+                current_frame_id=int(observation.frame_id),
                 config=self.config,
             )
             for reference in references:
@@ -875,6 +954,62 @@ class ObjectPoseLossRefiner:
                     )
                 )
         return pair_specs
+
+    def _run_factorized_steps(
+        self,
+        delta: torch.nn.Parameter,
+        raw_device: torch.Tensor,
+        pairs: Sequence[_TensorPair],
+        match_sets: Sequence[_MatchSet],
+    ) -> None:
+        """Optimize rotation, then translation, holding the other half fixed.
+
+        Each half gets its own leaf and its own Adam state.  Freezing by
+        zeroing the gradient would not work: Adam keeps per-parameter moment
+        estimates, so a zeroed gradient still moves a parameter whose moments
+        are warm.
+        """
+
+        for indices in ((0, 1, 2), (3, 4, 5)):
+            self._run_optimizer_stage(
+                delta, raw_device, pairs, match_sets, indices=indices
+            )
+
+    def _run_optimizer_stage(
+        self,
+        delta: torch.nn.Parameter,
+        raw_device: torch.Tensor,
+        pairs: Sequence[_TensorPair],
+        match_sets: Sequence[_MatchSet],
+        *,
+        indices: Sequence[int],
+    ) -> None:
+        """Optimize only ``indices`` of the 6DoF variable; the rest is frozen."""
+
+        steps = int(self.config.optimizer_steps)
+        index = torch.as_tensor(list(indices), dtype=torch.long, device=self.device)
+        active = torch.nn.Parameter(delta.detach()[index].clone())
+        optimizer = torch.optim.Adam([active], lr=float(self.config.learning_rate))
+        for _ in range(steps):
+            optimizer.zero_grad(set_to_none=True)
+            candidate = delta.detach().clone()
+            candidate[index] = active
+            loss = self._loss_from_matches(
+                candidate,
+                raw_device,
+                pairs,
+                match_sets,
+                include_prior=True,
+            )
+            if not bool(torch.isfinite(loss)):
+                break
+            loss.backward()
+            optimizer.step()
+            with torch.no_grad():
+                candidate = delta.detach().clone()
+                candidate[index] = active
+                _clamp_pose_delta(candidate, self.config)
+                delta.copy_(candidate)
 
     def _optimize_current_pose(
         self,
@@ -1028,21 +1163,24 @@ class ObjectPoseLossRefiner:
                 if self.config.trace_optimization:
                     trace_rows.append(trace_row)
                 break
-            for _ in range(int(self.config.optimizer_steps)):
-                optimizer.zero_grad(set_to_none=True)
-                loss = self._loss_from_matches(
-                    delta,
-                    raw_device,
-                    pairs,
-                    match_sets,
-                    include_prior=True,
-                )
-                if not bool(torch.isfinite(loss)):
-                    break
-                loss.backward()
-                optimizer.step()
-                with torch.no_grad():
-                    _clamp_pose_delta(delta, self.config)
+            if self.config.proposal_mode == "rotation_then_translation":
+                self._run_factorized_steps(delta, raw_device, pairs, match_sets)
+            else:
+                for _ in range(int(self.config.optimizer_steps)):
+                    optimizer.zero_grad(set_to_none=True)
+                    loss = self._loss_from_matches(
+                        delta,
+                        raw_device,
+                        pairs,
+                        match_sets,
+                        include_prior=True,
+                    )
+                    if not bool(torch.isfinite(loss)):
+                        break
+                    loss.backward()
+                    optimizer.step()
+                    with torch.no_grad():
+                        _clamp_pose_delta(delta, self.config)
             candidate_pose = self._left_updated_pose(delta.detach(), raw_device)
             candidate_sets = self._collect_match_sets(candidate_pose, pairs)
             candidate_count = sum(
@@ -1485,11 +1623,30 @@ def _collect_observations(
     return observations_by_frame, tracked_ids, filter_stats
 
 
+def _reference_is_fresh(
+    reference: _StoredObjectCloud,
+    *,
+    current_frame_id: int,
+    config: ObjectPoseLossRefinementConfig,
+) -> bool:
+    """Whether a reference is recent enough to align against.
+
+    ``max_reference_age_frames = 0`` disables the bound, which is the original
+    behavior: the anchor clouds from the first frames stay usable forever.
+    """
+
+    max_age = int(config.max_reference_age_frames)
+    if max_age <= 0:
+        return True
+    return (int(current_frame_id) - int(reference.frame_id)) <= max_age
+
+
 def _select_references(
     instance_id: int,
     anchors: Mapping[int, Sequence[_StoredObjectCloud]],
     history: Mapping[int, Sequence[_StoredObjectCloud]],
     *,
+    current_frame_id: int,
     config: ObjectPoseLossRefinementConfig,
 ) -> tuple[_StoredObjectCloud, ...]:
     output: list[_StoredObjectCloud] = []
@@ -1497,11 +1654,19 @@ def _select_references(
     for reference in anchors.get(int(instance_id), ()):
         if int(reference.frame_id) in seen_frames:
             continue
+        if not _reference_is_fresh(
+            reference, current_frame_id=current_frame_id, config=config
+        ):
+            continue
         output.append(reference)
         seen_frames.add(int(reference.frame_id))
     recent = list(history.get(int(instance_id), ()))
     for reference in reversed(recent):
         if int(reference.frame_id) in seen_frames:
+            continue
+        if not _reference_is_fresh(
+            reference, current_frame_id=current_frame_id, config=config
+        ):
             continue
         output.append(reference)
         seen_frames.add(int(reference.frame_id))

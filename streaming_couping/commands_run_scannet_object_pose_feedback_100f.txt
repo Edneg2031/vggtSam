@@ -45,6 +45,70 @@ MIN_CONSENSUS_OBJECTS="${OBJECT_POSE_FEEDBACK_MIN_CONSENSUS_OBJECTS:-2}"
 MAX_CONSENSUS_TRANSLATION_M="${OBJECT_POSE_FEEDBACK_MAX_CONSENSUS_TRANSLATION_M:-0.20}"
 MAX_CONSENSUS_ROTATION_DEG="${OBJECT_POSE_FEEDBACK_MAX_CONSENSUS_ROTATION_DEG:-8.0}"
 
+# --- proposal-side experiment branch ---------------------------------------
+# These only affect the refiner inside stage 2a; the stage-1 geometry cache is
+# shared, so a branch change does not need stage 1 re-run.
+#
+# Attribution on the baseline run showed the proposal error is dominated by
+# reference age: the permanent frame-0 anchors (median age 37.5 frames) carry
+# rho = +0.785 with the GT correction error inside every object category,
+# while the one-frame-old history carries none (p = 0.32).  The refiner gave
+# the stale half weight 1.0 and the fresh half 0.50.
+#
+#   baseline      joint 6DoF, permanent anchors          (current behavior)
+#   fresh         joint 6DoF, bounded reference age
+#   factorized    rotation-then-translation, permanent anchors
+#   fresh_factor  both
+#
+# Set PROPOSAL_BRANCH below; all three knobs are 0/"joint" by default so the
+# baseline branch is byte-identical to the pre-change behavior.
+PROPOSAL_BRANCH="${OBJECT_POSE_FEEDBACK_PROPOSAL_BRANCH:-baseline}"
+case "$PROPOSAL_BRANCH" in
+  baseline)
+    MAX_REFERENCE_AGE_FRAMES=0
+    ANCHOR_REFRESH_INTERVAL_FRAMES=0
+    PROPOSAL_MODE="joint"
+    ;;
+  fresh|fresh_factor)
+    # Anchors are re-taken every 20 frames and nothing older than 15 frames is
+    # ever aligned against, so the reference set tracks the current frame.
+    MAX_REFERENCE_AGE_FRAMES="${OBJECT_POSE_FEEDBACK_MAX_REFERENCE_AGE_FRAMES:-15}"
+    ANCHOR_REFRESH_INTERVAL_FRAMES="${OBJECT_POSE_FEEDBACK_ANCHOR_REFRESH_INTERVAL_FRAMES:-20}"
+    PROPOSAL_MODE="joint"
+    ;;
+  factorized)
+    MAX_REFERENCE_AGE_FRAMES=0
+    ANCHOR_REFRESH_INTERVAL_FRAMES=0
+    PROPOSAL_MODE="rotation_then_translation"
+    ;;
+  *)
+    print -u2 "unknown PROPOSAL_BRANCH: $PROPOSAL_BRANCH"
+    print -u2 "use one of: baseline fresh factorized fresh_factor"
+    exit 1
+    ;;
+esac
+if [[ "$PROPOSAL_BRANCH" == "fresh_factor" ]]; then
+  PROPOSAL_MODE="rotation_then_translation"
+fi
+
+# Branches must not overwrite each other.  A run dir given explicitly via
+# OBJECT_POSE_FEEDBACK_RUN_DIR is honoured as-is; only the shared default gets
+# a branch suffix.
+#
+# GEOMETRY_CACHE deliberately keeps pointing at the shared, un-suffixed path:
+# the proposal knobs live entirely in stage 2a, so stage 1 is identical for
+# every branch and its output is shared.  With --reuse-if-valid the first
+# branch pays for the geometry run and the rest reuse it.
+if [[ "$PROPOSAL_BRANCH" != "baseline" && -z "${OBJECT_POSE_FEEDBACK_RUN_DIR:-}" ]]; then
+  RUN_DIR="$RUN_DIR.$PROPOSAL_BRANCH"
+  OUTPUT_DIR="$RUN_DIR"
+  EVAL_DIR="$RUN_DIR/gt_evaluation"
+  FEEDBACK_DIR="$RUN_DIR/object_pose_feedback"
+  RUN_LOG="$RUN_DIR/run.log"
+  FEEDBACK_LOG="$FEEDBACK_DIR/analysis.log"
+  EVAL_LOG="$EVAL_DIR/evaluator.log"
+fi
+
 cd "$ROOT"
 export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
 export PYTHONUNBUFFERED=1
@@ -126,6 +190,9 @@ ARGS=(
   --object-pose-loss-independent-instances
   --object-pose-loss-export-feedback-diagnostics
   --object-pose-loss-anchor-frames 5
+  --object-pose-loss-max-reference-age-frames "$MAX_REFERENCE_AGE_FRAMES"
+  --object-pose-loss-anchor-refresh-interval-frames "$ANCHOR_REFRESH_INTERVAL_FRAMES"
+  --object-pose-loss-proposal-mode "$PROPOSAL_MODE"
   --object-pose-loss-max-anchor-observations 3
   --object-pose-loss-max-history-observations 2
   --object-pose-loss-max-points-per-observation 256

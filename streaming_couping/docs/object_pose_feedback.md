@@ -195,6 +195,52 @@ RPE 额外报告**排除 correction-boundary 对**的版本（相邻对任一端
 - GT 只在 Stage 2b 所有决策之后加载，summary 记录 `gt_used_for_feedback: false`
   审计标志。
 
+## 8.5 提案侧实验分支（参考新鲜度 / factorized 6DoF）
+
+100 帧基线的归因把瓶颈定位到了**提案本身**，而不是下游的聚合与验证：
+
+- 提案的 GT 平移误差中位数 **0.086 m**，raw ATE 只有 **0.117 m** —— 同一量级；
+  下游的 consensus 和门控只是在噪声里做选择。
+- 误差的主导变量是**参考集的年龄**。`anchor_reference_age`（帧 0–4 的固定 anchor，
+  中位 37.5 帧）与 GT 修正误差的相关 ρ = **+0.933**，**类内 +0.785** —— 比
+  `track_length`（+0.776）还高，说明 `track_length` 一直只是 anchor 年龄的代理。
+- 而 local history（中位 **1 帧**）的 ρ = −0.088，**p = 0.32，完全无信号**。
+- refiner 给前者权重 **1.0**、后者 **0.50**：**决定误差的那一半拿满权重，零信号的
+  那一半被砍半。**
+- 两个"可靠性分数"也都是反向的（S_sem 类内 +0.634、S_geo 类内 +0.342），
+  `reliable` 硬拒筛选零区分度（0.0866 vs 0.0859）。真正有效的是 consensus inlier
+  测试（0.0753 vs 0.1573）和帧门控（0.0405 vs 0.0914）。
+
+因此这一轮改的是**提案**，不是聚合：
+
+| 配置项 | 作用 | 默认 |
+|---|---|---|
+| `max_reference_age_frames` | 丢弃比当前帧老这么多帧的参考 | `0`（不限制 = 原行为） |
+| `anchor_refresh_interval_frames` | 每 N 帧重新采集高权重的 anchor 集，而不是钉在序列开头 | `0`（不刷新 = 原行为） |
+| `proposal_mode` | `joint`（原行为）或 `rotation_then_translation` | `joint` |
+
+factorized 的依据：共识 rotation 误差中位 **0.611°**，而 raw 逐帧 RPE rotation
+只有 **0.318°** —— 旋转估计误差是噪声底的 2 倍，且本场景物体 97% 是 planar/linear
+（volumetric 只有 5 个样本），平移和旋转在联合优化里会互相补偿。
+
+四个分支由 `commands_run_scannet_object_pose_feedback_100f.txt` 顶部的
+`PROPOSAL_BRANCH` 选择：
+
+| 分支 | 内容 | run 目录后缀 |
+|---|---|---|
+| `baseline` | joint + 固定 anchor（等于改动前行为，逐位一致） | 无 |
+| `fresh` | joint + 有界参考年龄（age 15 / refresh 20） | `.fresh` |
+| `factorized` | rotation→translation + 固定 anchor | `.factorized` |
+| `fresh_factor` | 两者叠加 | `.fresh_factor` |
+
+**注意**：三个默认值合起来必须逐位复现改动前的行为，否则 baseline 对照失效。
+Stage 1 的几何 cache 与分支无关，四个分支共用同一份（`--reuse-if-valid`），
+所以只有第一个分支付几何推理的 GPU 成本。
+
+已知风险：丢弃 anchor 会让每帧的参考对变少（history 上限只有 2），可能增加
+`too_few_initial_object_matches` 的拒绝数、减少提案总量。所以新分支要先看
+`proposal_count` 有没有明显下降，再比较提案误差。
+
 ## 9. 相关代码
 
 | 文件 | 角色 |
