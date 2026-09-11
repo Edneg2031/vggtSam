@@ -186,6 +186,77 @@ def branch_row(run_dir: Path) -> tuple[list[Any], dict[str, Any]]:
     return row, payload
 
 
+#: Metrics whose run-to-run spread is the noise floor a branch difference has
+#: to beat to mean anything.
+NOISE_FLOOR_METRICS: tuple[str, ...] = (
+    "direct_ate_improvement_ratio",
+    "sim3_ate_improvement_ratio",
+    "proposal_translation_error_median_m",
+    "consensus_translation_error_median_m",
+    "accepted_frame_count",
+    "proposal_count",
+)
+
+
+def noise_floor(run_dirs: Sequence[Path]) -> dict[str, Any]:
+    """Spread of the key metrics across repeated runs of one configuration."""
+
+    payloads = [
+        branch_row(run_dir.expanduser().resolve())[1] for run_dir in run_dirs
+    ]
+    available = [entry for entry in payloads if entry.get("available")]
+    floor: dict[str, Any] = {"run_count": len(available), "metrics": {}}
+    if len(available) < 2:
+        floor["note"] = "fewer than two runs; no spread to report"
+        return floor
+    for metric in NOISE_FLOOR_METRICS:
+        values = [
+            float(entry[metric])
+            for entry in available
+            if entry.get(metric) is not None
+        ]
+        if len(values) < 2:
+            continue
+        largest = max(abs(min(values)), abs(max(values)))
+        floor["metrics"][metric] = {
+            "min": min(values),
+            "max": max(values),
+            "median": float(np_median(values)),
+            "spread": max(values) - min(values),
+            "spread_relative": (
+                (max(values) - min(values)) / largest if largest != 0.0 else None
+            ),
+        }
+    return floor
+
+
+def np_median(values: Sequence[float]) -> float:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return float(ordered[middle])
+    return 0.5 * (ordered[middle - 1] + ordered[middle])
+
+
+def render_noise_floor(floor: Mapping[str, Any]) -> str:
+    if not floor.get("metrics"):
+        return (
+            f"noise floor: not measured ({floor.get('note', 'one run only')}); "
+            "a branch difference below the run-to-run spread is not a result"
+        )
+    lines = [
+        f"noise floor from {floor['run_count']} runs of one configuration "
+        "(a branch difference smaller than this is not a result):"
+    ]
+    for metric, stats in floor["metrics"].items():
+        relative = stats.get("spread_relative")
+        rendered = "-" if relative is None else f"{relative:.3f}"
+        lines.append(
+            f"  {metric:42s} spread={stats['spread']:.6g} (relative {rendered})"
+        )
+    return "\n".join(lines)
+
+
 HEADERS: tuple[str, ...] = (
     "branch",
     "mode",
@@ -214,6 +285,17 @@ def main() -> None:
         help="Repeat once per branch, in the order to print.",
     )
     parser.add_argument("--json-out", type=Path, default=None)
+    parser.add_argument(
+        "--noise-floor",
+        type=Path,
+        action="append",
+        default=None,
+        dest="noise_floor_dirs",
+        help=(
+            "Repeat once per run of the SAME configuration; their spread is "
+            "printed above the table as the noise floor."
+        ),
+    )
     args = parser.parse_args()
 
     rows: list[list[Any]] = []
@@ -222,6 +304,13 @@ def main() -> None:
         row, payload = branch_row(run_dir)
         rows.append(row)
         payloads.append(payload)
+
+    floor = (
+        noise_floor(args.noise_floor_dirs) if args.noise_floor_dirs else {}
+    )
+    if floor:
+        print(render_noise_floor(floor))
+        print()
 
     print("object pose feedback branches")
     print(
@@ -253,7 +342,13 @@ def main() -> None:
             )
     if args.json_out is not None:
         args.json_out.expanduser().resolve().write_text(
-            json.dumps(payloads, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            json.dumps(
+                {"branches": payloads, "noise_floor": floor},
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
         )
 
 

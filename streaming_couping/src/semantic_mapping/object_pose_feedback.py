@@ -103,6 +103,21 @@ class ObjectPoseFeedbackConfig:
     decision_min_accepted_ratio: float = 0.10
     future_gain_window: int = 10
 
+    # Direct ATE alone is not enough: a correction can improve it purely by
+    # absorbing a global similarity (scale/rigid) offset, leaving the relative
+    # trajectory unchanged.  The 100-frame run showed both failure modes -- the
+    # main variant gained 5.3% on direct ATE while losing 0.6% on sim3, and a
+    # re-run of the *unchanged* baseline flipped its sim3 gain from -0.006 to
+    # +0.020.  Require the similarity-aligned error not to degrade.
+    decision_min_sim3_improvement_ratio: float = 0.0
+
+    # The rotation correction is worse than the noise floor of the trajectory
+    # it is applied to (0.61 deg consensus error against a 0.32 deg raw RPE
+    # rotation), and the baseline's accepted frames show a negative median
+    # future rotation gain.  Requiring it to be positive keeps a correction
+    # that only helps translation from passing as a pose improvement.
+    decision_min_future_rotation_gain_deg: float = 0.0
+
     def validate(self) -> "ObjectPoseFeedbackConfig":
         for name, value in (
             ("anchor_frame_count", self.anchor_frame_count),
@@ -235,6 +250,12 @@ class ObjectPoseFeedbackConfig:
             ),
             "decision_min_accepted_ratio": float(self.decision_min_accepted_ratio),
             "future_gain_window": int(self.future_gain_window),
+            "decision_min_sim3_improvement_ratio": float(
+                self.decision_min_sim3_improvement_ratio
+            ),
+            "decision_min_future_rotation_gain_deg": float(
+                self.decision_min_future_rotation_gain_deg
+            ),
         }
 
 
@@ -1398,6 +1419,10 @@ RPE_EXCLUDED_BOUNDARY_PAIR_COUNT_KEY = (
 @dataclass(frozen=True)
 class TrajectoryComparison:
     ate_improvement_ratio: float | None
+    #: Same comparison after a similarity alignment.  A direct gain with a
+    #: negative sim3 gain means the correction absorbed a global scale/rigid
+    #: offset rather than improving the relative trajectory.
+    sim3_ate_improvement_ratio: float | None
     rpe_translation_ratio: float | None
     rpe_rotation_ratio: float | None
 
@@ -1431,6 +1456,10 @@ def compare_trajectories(
     return TrajectoryComparison(
         ate_improvement_ratio=ratio(
             raw_metrics.get("ate_rmse_m"), feedback_metrics.get("ate_rmse_m")
+        ),
+        sim3_ate_improvement_ratio=ratio(
+            raw_metrics.get("ate_rmse_sim3_m"),
+            feedback_metrics.get("ate_rmse_sim3_m"),
         ),
         rpe_translation_ratio=ratio(
             raw_metrics.get(raw_rpe_translation_key),
@@ -1493,6 +1522,21 @@ def decide_object_feedback(
     accepted_ok = accepted_ratio is not None and (
         float(accepted_ratio) >= float(config.decision_min_accepted_ratio)
     )
+    sim3_ok = (
+        comparison.sim3_ate_improvement_ratio is not None
+        and comparison.sim3_ate_improvement_ratio
+        >= float(config.decision_min_sim3_improvement_ratio)
+    )
+    finite_rotation_gains = [
+        float(value) for value in future_rotation_gains if math.isfinite(value)
+    ]
+    rotation_median_gain = (
+        float(np.median(finite_rotation_gains)) if finite_rotation_gains else None
+    )
+    rotation_ok = (
+        rotation_median_gain is not None
+        and rotation_median_gain >= float(config.decision_min_future_rotation_gain_deg)
+    )
     criteria = {
         "direct_ate_improvement_ratio": {
             "value": comparison.ate_improvement_ratio,
@@ -1518,6 +1562,16 @@ def decide_object_feedback(
             "value": accepted_ratio,
             "threshold": float(config.decision_min_accepted_ratio),
             "passed": bool(accepted_ok),
+        },
+        "sim3_ate_improvement_ratio": {
+            "value": comparison.sim3_ate_improvement_ratio,
+            "threshold": float(config.decision_min_sim3_improvement_ratio),
+            "passed": bool(sim3_ok),
+        },
+        "future_rotation_gain_median_deg": {
+            "value": rotation_median_gain,
+            "threshold": float(config.decision_min_future_rotation_gain_deg),
+            "passed": bool(rotation_ok),
         },
     }
     decision = (

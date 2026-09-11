@@ -46,6 +46,14 @@ BRANCHES=(baseline fresh factorized fresh_factor)
 FRESH_MAX_AGE="${OBJECT_POSE_FEEDBACK_MAX_REFERENCE_AGE_FRAMES:-15}"
 FRESH_REFRESH="${OBJECT_POSE_FEEDBACK_ANCHOR_REFRESH_INTERVAL_FRAMES:-20}"
 
+# How many times to run the FULL baseline pipeline.  The two replay checks
+# below are free and catch any residual nondeterminism in the analysis chain,
+# but only repeating the segmentation model measures how much IT moves the
+# answer -- and that is the number a GO/NO-GO has to clear to mean anything.
+# Set to 3 (or more) when you want the real noise floor; each extra run is a
+# full stage-1 + stage-2a pass.
+SAM_REPEATS="${OBJECT_POSE_FEEDBACK_SAM_REPEATS:-1}"
+
 MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
 SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
 GEOMETRY_CACHE="$BASE_RUN_DIR/horizonstream_geometry.pt"
@@ -67,13 +75,18 @@ print "branches=${(j:, :)BRANCHES}"
 print "freshness=$FRESH_MAX_AGE/$FRESH_REFRESH"
 
 # ---- Stage 2a once, for the baseline --------------------------------------
+existing=()
 for branch in "${BRANCHES[@]}"; do
-  case "$branch" in
-    baseline) expected="$BASE_RUN_DIR.baseline" ;;
-    *)        expected="$BASE_RUN_DIR.$branch" ;;
-  esac
+  existing+=("$BASE_RUN_DIR.$branch")
+done
+if (( SAM_REPEATS > 1 )); then
+  for repeat in $(seq 2 "$SAM_REPEATS"); do
+    existing+=("$BASE_RUN_DIR.baseline_r$repeat")
+  done
+fi
+for expected in "${existing[@]}"; do
   if [[ -e "$expected" ]]; then
-    print -u2 "refusing to overwrite an existing branch directory: $expected"
+    print -u2 "refusing to overwrite an existing run directory: $expected"
     print -u2 "move it aside (or delete it) and re-run."
     exit 1
   fi
@@ -93,9 +106,13 @@ fi
   exit 1
 }
 
-# ---- Gate: the replay must reproduce the run it came from -----------------
+# ---- Gate: a replay of the baseline must reproduce the whole chain --------
+# Proposals matching is necessary but not sufficient: what the comparison
+# reads is the stage-2b output.  So replay, re-run stage 2b, and compare the
+# decisions end to end.  Any material difference means the branch differences
+# would be sitting on top of an unstable chain.
 print ""
-print "########## replay equivalence gate ##########"
+print "########## replay determinism gate ##########"
 GATE_DIR="$BASE_RUN_DIR.replay_gate"
 rm -rf "$GATE_DIR"
 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
@@ -104,11 +121,54 @@ PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   --output-dir "$GATE_DIR" \
   --check-equivalence
 if (( $? != 0 )); then
-  print -u2 "replay does not reproduce the baseline; aborting before any"
-  print -u2 "branch comparison, because every branch would rest on it."
+  print -u2 "replay does not reproduce the baseline proposals; aborting before"
+  print -u2 "any branch comparison, because every branch would rest on it."
+  exit 1
+fi
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m streaming_couping.scripts.run_object_pose_feedback \
+  --run-dir "$GATE_DIR" \
+  --geometry-cache "$GEOMETRY_CACHE" \
+  --manifest "$MANIFEST_PATH" \
+  --scene-id "$SCENE_ID" \
+  --output-dir "$GATE_DIR/object_pose_feedback" \
+  --horizon-repo "$ROOT/externals/horizonstream"
+if (( $? != 0 )); then
+  print -u2 "stage 2b failed on the replay gate; aborting"
+  exit 1
+fi
+print "decisions from a replay of the baseline, vs the baseline itself:"
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m streaming_couping.scripts.compare_json \
+  --prefix decisions \
+  "$BASELINE_RUN_DIR/object_pose_feedback/summary.json" \
+  "$GATE_DIR/object_pose_feedback/summary.json"
+if (( $? != 0 )); then
+  print -u2 "the replayed chain does not reproduce the baseline's decisions;"
+  print -u2 "aborting, because no branch difference above could be read."
   exit 1
 fi
 rm -rf "$GATE_DIR"
+
+# ---- Optional: repeat the whole baseline to measure the segmenter's spread -
+noise_floor_dirs=()
+if (( SAM_REPEATS > 1 )); then
+  for repeat in $(seq 2 "$SAM_REPEATS"); do
+    repeat_dir="$BASE_RUN_DIR.baseline_r$repeat"
+    print ""
+    print "########## baseline repeat $repeat/$SAM_REPEATS (GPU) ##########"
+    OBJECT_POSE_FEEDBACK_PROPOSAL_BRANCH=baseline \
+    OBJECT_POSE_FEEDBACK_RUN_DIR="$repeat_dir" \
+      zsh "$RUN_SCRIPT"
+    if (( $? != 0 )); then
+      print -u2 "baseline repeat $repeat FAILED; it will not join the noise floor"
+      continue
+    fi
+    noise_floor_dirs+=(--noise-floor "$repeat_dir")
+  done
+  # the first baseline is part of the same population
+  noise_floor_dirs+=(--noise-floor "$BASELINE_RUN_DIR")
+fi
 
 # ---- Replay each branch, then analyse it ----------------------------------
 failed_branches=()
@@ -179,6 +239,7 @@ done
 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   "$PYTHON" -m streaming_couping.scripts.summarize_feedback_branches \
   "${summary_args[@]}" \
+  "${noise_floor_dirs[@]}" \
   --json-out "$BASE_RUN_DIR.branches.json"
 
 if (( ${#failed_branches} > 0 )); then

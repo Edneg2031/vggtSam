@@ -168,7 +168,18 @@ RPE 额外报告**排除 correction-boundary 对**的版本（相邻对任一端
 1. direct ATE 相对 raw 改善 ≥ 5%；
 2. accepted 帧的 future translation gain（t+1..t+10）中位数 > 0 且 ≥ 60% 为正；
 3. 排边界 RPE translation 不劣于 raw × 1.05；
-4. accepted ratio（有提案的在线帧中）≥ 10%。
+4. accepted ratio（有提案的在线帧中）≥ 10%；
+5. **sim3 ATE 不劣于 raw**（`decision_min_sim3_improvement_ratio`，默认 0）。
+   direct ATE 单独不够——修正可以只吸收一个全局相似变换（尺度/刚体）偏移而相对
+   轨迹完全没变。两种失败模式都实测到了：主变体 direct +5.3% 而 sim3 −0.6%；
+   **同一配置**重跑一次，sim3 增益从 −0.006 翻到 +0.020。
+6. **accepted 帧的 future rotation gain 中位数 ≥ 0**
+   （`decision_min_future_rotation_gain_deg`，默认 0）。旋转修正比它要修的轨迹噪声
+   底还差（共识旋转误差 0.61° vs raw RPE rotation 0.32°），baseline 的 accepted
+   帧旋转增益中位数是负的。这条防止"只帮了平移"的修正被当成位姿改善。
+
+两条守卫的阈值都可以通过 `ObjectPoseFeedbackConfig` 放宽（设为负值即等于关闭），
+但默认值是数据支持的。
 
 不满足则 `OBJECT_FEEDBACK_NO_GO`，summary 同时给出启发式瓶颈归因
 （`sam_tracking` / `nn_correspondence_or_object_geometry` / `consensus` /
@@ -240,8 +251,25 @@ zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
 0.053 摆到 0.079、`d_sim3` 翻转符号，而分支效应只有 0.006：**噪声是效应的 4 倍**。
 重放路径没有 GPU、也没有分割模型的方差，分支差异因此只来自被测的那个旋钮。
 
-重放前有一道**闸门**：用 baseline 自己的设置重放必须复现 baseline 的 proposals，
-否则直接中止——否则后面每个比较都建立在一个不忠实的重放上。
+重放前有一道**闸门**，而且它检查的是**整条链**而不只是 proposals：用 baseline 自己的
+设置重放 → 重跑 Stage 2b → 用 `compare_json` 比对两边 `summary.json` 的 `decisions`。
+任何实质差异都会中止，因为那说明分支差异建立在一个不稳定的链条上。这道检查是免费的
+（纯 CPU），它测的是分析链的确定性。
+
+### 噪声底
+
+分析链的确定性 ≠ 分割模型的确定性。`SAM_REPEATS`（命令文件顶部，默认 `1`）控制
+**完整 baseline pipeline** 跑几次；设为 `3` 就会测出分割模型跨 run 的散布，并打印在
+对比表上方：
+
+```
+noise floor from 3 runs of one configuration
+  direct_ate_improvement_ratio  spread=0.0xx (relative 0.xxx)
+```
+
+**这张表里任何小于该 spread 的分支差异都不是结果。** 上一轮的实测值是 0.026
+（相对 ~0.33），而 `fresh` 的效应只有 0.006。多跑两次是唯一能给 GO/NO_GO 定出
+可信区间的方式。
 
 第二轮的实测结果（见 §8.6）：参考年龄假设被否证，噪声底大于效应。所以这个表目前
 的用途是**量化噪声**并确认机制是否生效，不是拿来选分支。

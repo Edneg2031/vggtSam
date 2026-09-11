@@ -857,9 +857,11 @@ def _branch_metrics(
     ate: float,
     rpe_translation: float,
     rpe_rotation: float,
+    sim3: float = 0.05,
 ) -> dict[str, Any]:
     return {
         "ate_rmse_m": ate,
+        "ate_rmse_sim3_m": sim3,
         RPE_TRANSLATION_BOUNDARY_EXCLUDED_KEY: rpe_translation,
         RPE_ROTATION_BOUNDARY_EXCLUDED_KEY: rpe_rotation,
     }
@@ -922,6 +924,79 @@ def test_decide_object_feedback_reports_rotation_ratio_informationally() -> None
         "rpe_rotation_ratio_boundary_excluded_informational"
         not in decision["criteria"]
     )
+
+
+def _decision_with(**overrides: Any) -> dict[str, Any]:
+    values: dict[str, Any] = dict(
+        raw_metrics=_branch_metrics(
+            ate=0.40, rpe_translation=0.020, rpe_rotation=0.10, sim3=0.050
+        ),
+        feedback_metrics=_branch_metrics(
+            ate=0.34, rpe_translation=0.0195, rpe_rotation=0.08, sim3=0.048
+        ),
+        future_translation_gains=[0.01] * 10,
+        future_rotation_gains=[0.001] * 10,
+        accepted_ratio=0.5,
+    )
+    values.update(overrides)
+    return decide_object_feedback(
+        variant_name=MAIN_VARIANT_NAME, config=_config(), **values
+    )
+
+
+def test_sim3_guard_rejects_a_gauge_only_gain() -> None:
+    """Direct ATE up but sim3 ATE down is a global offset, not a fix."""
+
+    decision = _decision_with(
+        feedback_metrics=_branch_metrics(
+            ate=0.34, rpe_translation=0.0195, rpe_rotation=0.08, sim3=0.055
+        )
+    )
+    assert decision["decision"] == "OBJECT_FEEDBACK_NO_GO"
+    criterion = decision["criteria"]["sim3_ate_improvement_ratio"]
+    assert criterion["passed"] is False
+    assert criterion["value"] < 0
+    # the direct gain and every other criterion still pass
+    assert decision["criteria"]["direct_ate_improvement_ratio"]["passed"] is True
+
+
+def test_rotation_guard_rejects_a_translation_only_gain() -> None:
+    decision = _decision_with(future_rotation_gains=[-0.02] * 10)
+    assert decision["decision"] == "OBJECT_FEEDBACK_NO_GO"
+    criterion = decision["criteria"]["future_rotation_gain_median_deg"]
+    assert criterion["passed"] is False
+    assert criterion["value"] == pytest.approx(-0.02)
+
+
+def test_guards_are_relaxable_through_config() -> None:
+    relaxed = decide_object_feedback(
+        variant_name=MAIN_VARIANT_NAME,
+        raw_metrics=_branch_metrics(
+            ate=0.40, rpe_translation=0.020, rpe_rotation=0.10, sim3=0.050
+        ),
+        feedback_metrics=_branch_metrics(
+            ate=0.34, rpe_translation=0.0195, rpe_rotation=0.08, sim3=0.055
+        ),
+        future_translation_gains=[0.01] * 10,
+        future_rotation_gains=[-0.02] * 10,
+        accepted_ratio=0.5,
+        config=_config(
+            decision_min_sim3_improvement_ratio=-0.20,
+            decision_min_future_rotation_gain_deg=-0.10,
+        ),
+    )
+    assert relaxed["decision"] == "OBJECT_FEEDBACK_GO"
+
+
+def test_missing_sim3_metric_fails_the_guard_rather_than_passing() -> None:
+    """An unavailable metric must not read as an improvement."""
+
+    metrics = _branch_metrics(
+        ate=0.34, rpe_translation=0.0195, rpe_rotation=0.08
+    )
+    metrics.pop("ate_rmse_sim3_m")
+    decision = _decision_with(feedback_metrics=metrics)
+    assert decision["criteria"]["sim3_ate_improvement_ratio"]["passed"] is False
 
 
 def test_check_refiner_settings_accepts_mirrored_thresholds() -> None:

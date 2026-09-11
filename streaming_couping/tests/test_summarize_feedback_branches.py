@@ -11,6 +11,8 @@ from streaming_couping.scripts.summarize_feedback_branches import (
     HEADERS,
     branch_row,
     main,
+    noise_floor,
+    render_noise_floor,
 )
 
 
@@ -209,8 +211,79 @@ def test_cli_prints_every_branch_in_order_and_writes_json(
     assert "run.fresh" in printed
     assert printed.index("run.baseline") < printed.index("run.fresh")
     payload = json.loads(out.read_text(encoding="utf-8"))
-    assert [entry["run_dir"].split("/")[-1] for entry in payload] == [
+    assert [entry["run_dir"].split("/")[-1] for entry in payload["branches"]] == [
         "run.baseline",
         "run.fresh",
     ]
-    assert payload[1]["proposal_count"] == 210
+    assert payload["branches"][1]["proposal_count"] == 210
+
+
+# ---------------------------------------------------------------------------
+# Noise floor.
+# ---------------------------------------------------------------------------
+
+
+def test_noise_floor_reports_the_spread_across_repeats(tmp_path: Path) -> None:
+    first = _write_branch(
+        tmp_path,
+        "r1",
+        proposals=229,
+        variant_ate=0.1081,
+        variant_sim3=0.0554,
+    )
+    second = _write_branch(
+        tmp_path,
+        "r2",
+        proposals=241,
+        variant_ate=0.1042,
+        variant_sim3=0.0531,
+    )
+    floor = noise_floor([first, second])
+    assert floor["run_count"] == 2
+    assert floor["metrics"]["proposal_count"]["spread"] == 12
+    # the ATE improvement moved too, and that is the point of measuring it
+    assert floor["metrics"]["direct_ate_improvement_ratio"]["spread"] > 0
+    rendered = render_noise_floor(floor)
+    assert "noise floor from 2 runs" in rendered
+    assert "direct_ate_improvement_ratio" in rendered
+
+
+def test_noise_floor_says_so_when_there_is_only_one_run(tmp_path: Path) -> None:
+    only = _write_branch(tmp_path, "r1")
+    floor = noise_floor([only])
+    assert floor["run_count"] == 1
+    assert "metrics" not in floor or not floor["metrics"]
+    assert "not measured" in render_noise_floor(floor)
+
+
+def test_noise_floor_ignores_unavailable_runs(tmp_path: Path) -> None:
+    good = _write_branch(tmp_path, "r1", proposals=229)
+    floor = noise_floor([good, tmp_path / "missing"])
+    assert floor["run_count"] == 1
+    assert not floor.get("metrics")
+
+
+def test_cli_prints_the_noise_floor_before_the_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    first = _write_branch(tmp_path, "run.baseline", proposals=229)
+    repeat = _write_branch(tmp_path, "run.repeat", proposals=241)
+    fresh = _write_branch(tmp_path, "run.fresh", max_age=15, proposals=210)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "summarize",
+            "--run-dir",
+            str(first),
+            "--run-dir",
+            str(fresh),
+            "--noise-floor",
+            str(first),
+            "--noise-floor",
+            str(repeat),
+        ],
+    )
+    main()
+    printed = capsys.readouterr().out
+    assert "noise floor from 2 runs" in printed
+    assert printed.index("noise floor") < printed.index("object pose feedback branches")
