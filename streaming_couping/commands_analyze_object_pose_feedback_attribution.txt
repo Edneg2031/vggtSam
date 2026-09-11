@@ -1,0 +1,88 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# Stage-2b attribution post-mortem for the object-consensus pose-feedback run.
+#
+#   zsh streaming_couping/commands_analyze_object_pose_feedback_attribution.txt
+#
+# Read-only by default: it reads the CSVs stage 2b already wrote and prints the
+# attribution sections.  No model runs, no GPU, a few seconds.  Answers where
+# the next iteration should go: did the geometric reliability term collapse the
+# consensus into a single-object estimate, do the reliability scores actually
+# predict proposal correctness, and does the gate reject the right frames.
+#
+# RERUN_STAGE_2B=1 additionally regenerates stage 2b first (CPU only; the
+# replay is deterministic).  That is only needed for the frame-level section
+# (c2), because the pre-existing CSVs were written before rejected frames
+# started carrying their consensus delta.  The current output is backed up
+# next to itself first; existing backups are never overwritten.
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
+
+RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v1}"
+FEEDBACK_DIR="$RUN_DIR/object_pose_feedback"
+GEOMETRY_CACHE="$RUN_DIR/horizonstream_geometry.pt"
+MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
+SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
+HORIZON_REPO="$ROOT/externals/horizonstream"
+RERUN_STAGE_2B="${RERUN_STAGE_2B:-0}"
+
+# These must mirror the stage-2a refiner thresholds; a mismatch is refused by
+# the run itself.  See docs/object_pose_feedback.md.
+MIN_CONSENSUS_OBJECTS="${OBJECT_POSE_FEEDBACK_MIN_CONSENSUS_OBJECTS:-2}"
+MAX_CONSENSUS_TRANSLATION_M="${OBJECT_POSE_FEEDBACK_MAX_CONSENSUS_TRANSLATION_M:-0.20}"
+MAX_CONSENSUS_ROTATION_DEG="${OBJECT_POSE_FEEDBACK_MAX_CONSENSUS_ROTATION_DEG:-8.0}"
+
+cd "$ROOT"
+export PYTHONUNBUFFERED=1
+
+[[ -d "$FEEDBACK_DIR" ]] || { print -u2 "missing feedback dir: $FEEDBACK_DIR"; exit 1; }
+[[ -n "$PYTHON" ]] || { print -u2 "no python interpreter found"; exit 1; }
+
+print "===== OBJECT POSE FEEDBACK ATTRIBUTION ====="
+print "feedback_dir=$FEEDBACK_DIR"
+print "rerun_stage_2b=$RERUN_STAGE_2B"
+
+if [[ "$RERUN_STAGE_2B" == "1" ]]; then
+  for required in "$GEOMETRY_CACHE" "$MANIFEST_PATH"; do
+    [[ -f "$required" ]] || { print -u2 "missing: $required"; exit 1; }
+  done
+  BACKUP="$FEEDBACK_DIR.bak"
+  if [[ -e "$BACKUP" ]]; then
+    print -u2 "refusing to overwrite an existing backup: $BACKUP"
+    print -u2 "move it aside first if you really want a fresh backup."
+    exit 1
+  fi
+  cp -r "$FEEDBACK_DIR" "$BACKUP"
+  print "backup=$BACKUP"
+
+  PYTHONPATH="$HORIZON_REPO:$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "$PYTHON" -m streaming_couping.scripts.run_object_pose_feedback \
+    --run-dir "$RUN_DIR" \
+    --geometry-cache "$GEOMETRY_CACHE" \
+    --manifest "$MANIFEST_PATH" \
+    --scene-id "$SCENE_ID" \
+    --output-dir "$FEEDBACK_DIR" \
+    --horizon-repo "$HORIZON_REPO" \
+    --min-consensus-objects "$MIN_CONSENSUS_OBJECTS" \
+    --max-consensus-translation-m "$MAX_CONSENSUS_TRANSLATION_M" \
+    --max-consensus-rotation-deg "$MAX_CONSENSUS_ROTATION_DEG"
+
+  # Recording extra diagnostics must not move any number.  Warn, do not abort:
+  # the attribution is still worth reading when this trips.
+  "$PYTHON" -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    before = json.load(handle)["decisions"]
+with open(sys.argv[2], encoding="utf-8") as handle:
+    after = json.load(handle)["decisions"]
+print("decisions identical to the backup" if before == after
+      else "WARNING: decisions changed vs the backup; investigate before "
+           "trusting the new (c2) section")
+' "$BACKUP/summary.json" "$FEEDBACK_DIR/summary.json"
+fi
+
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m streaming_couping.scripts.analyze_object_pose_feedback_attribution \
+  --feedback-dir "$FEEDBACK_DIR"
