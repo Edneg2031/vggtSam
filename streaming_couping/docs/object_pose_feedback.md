@@ -223,8 +223,21 @@ factorized 的依据：共识 rotation 误差中位 **0.611°**，而 raw 逐帧
 只有 **0.318°** —— 旋转估计误差是噪声底的 2 倍，且本场景物体 97% 是 planar/linear
 （volumetric 只有 5 个样本），平移和旋转在联合优化里会互相补偿。
 
-四个分支由 `commands_run_scannet_object_pose_feedback_100f.txt` 顶部的
-`PROPOSAL_BRANCH` 选择：
+**一键跑全部四个分支**：
+
+```bash
+zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
+```
+
+它按顺序对 `baseline / fresh / factorized / fresh_factor` 各跑一遍完整的四阶段
+pipeline，再对每个分支跑一次归因，最后打印横向对比表并写出
+`<base>.branches.json`。每个分支写进自己的 `<base>.<branch>` 目录，
+**不碰你已有的结果**，所以 `<base>.baseline` 与现有 run 的对比就是"默认值有没有
+改变旧行为"的回归检查。某个分支失败不会丢弃已跑完的分支，最后统一报告并以非零
+退出。
+
+单个分支也可以单独跑，由 `commands_run_scannet_object_pose_feedback_100f.txt`
+顶部的 `PROPOSAL_BRANCH`（或 `OBJECT_POSE_FEEDBACK_PROPOSAL_BRANCH`）选择：
 
 | 分支 | 内容 | run 目录后缀 |
 |---|---|---|

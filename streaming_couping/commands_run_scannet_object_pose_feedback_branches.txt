@@ -1,0 +1,98 @@
+#!/usr/bin/env zsh
+
+# One-shot sweep over the proposal-side branches of the object-consensus pose
+# feedback experiment.
+#
+#   zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
+#
+# No arguments and no environment variables are needed; edit the block below if
+# you want to change the branch list or the freshness thresholds.
+#
+#   baseline      joint 6DoF, permanent anchors       (the previous behavior)
+#   fresh         joint 6DoF, bounded reference age
+#   factorized    rotation-then-translation, permanent anchors
+#   fresh_factor  both
+#
+# Each branch runs the full four-stage pipeline into its own run directory and
+# then runs the attribution analysis over it.  All four share one stage-1
+# geometry cache: the knobs live entirely in stage 2a, so the geometry run
+# happens at most once and later branches reuse it with --reuse-if-valid.
+#
+# The baseline results already on disk are NOT touched -- every branch,
+# including baseline, writes to its own <default>.branch directory.  Comparing
+# <default>.baseline against the existing run is the regression check that the
+# new knobs' defaults really did preserve the old behavior.
+#
+# `set -e` is deliberately absent: a failing branch should not discard the
+# branches that already finished.  Failures are collected and reported at the
+# end, and the script exits non-zero if any occurred.
+set -uo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
+
+BASE_RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v1}"
+BRANCHES=(baseline fresh factorized fresh_factor)
+
+RUN_SCRIPT="$ROOT/streaming_couping/commands_run_scannet_object_pose_feedback_100f.txt"
+ANALYZE_SCRIPT="$ROOT/streaming_couping/commands_analyze_object_pose_feedback_attribution.txt"
+
+cd "$ROOT"
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+export PYTHONUNBUFFERED=1
+
+for required in "$RUN_SCRIPT" "$ANALYZE_SCRIPT"; do
+  [[ -f "$required" ]] || { print -u2 "missing: $required"; exit 1; }
+done
+
+print "===== OBJECT POSE FEEDBACK BRANCH SWEEP ====="
+print "base_run_dir=$BASE_RUN_DIR"
+print "branches=${(j:, :)BRANCHES}"
+
+failed_branches=()
+run_dirs=()
+for branch in "${BRANCHES[@]}"; do
+  run_dir="$BASE_RUN_DIR.$branch"
+  run_dirs+=("$run_dir")
+  print ""
+  print "########## branch=$branch ##########"
+  print "run_dir=$run_dir"
+
+  OBJECT_POSE_FEEDBACK_PROPOSAL_BRANCH="$branch" \
+  OBJECT_POSE_FEEDBACK_RUN_DIR="$run_dir" \
+    zsh "$RUN_SCRIPT"
+  if (( $? != 0 )); then
+    print -u2 "branch $branch FAILED at the run stage; skipping its analysis"
+    failed_branches+=("$branch")
+    continue
+  fi
+
+  OBJECT_POSE_FEEDBACK_RUN_DIR="$run_dir" \
+    zsh "$ANALYZE_SCRIPT"
+  if (( $? != 0 )); then
+    print -u2 "branch $branch FAILED at the analysis stage"
+    failed_branches+=("$branch")
+  fi
+done
+
+print ""
+print "===== BRANCH COMPARISON ====="
+summary_args=()
+for run_dir in "${run_dirs[@]}"; do
+  summary_args+=(--run-dir "$run_dir")
+done
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m streaming_couping.scripts.summarize_feedback_branches \
+  "${summary_args[@]}" \
+  --json-out "$BASE_RUN_DIR.branches.json"
+
+if (( ${#failed_branches} > 0 )); then
+  print -u2 ""
+  print -u2 "FAILED branches: ${(j:, :)failed_branches}"
+  print -u2 "re-run just those with OBJECT_POSE_FEEDBACK_PROPOSAL_BRANCH=<name>"
+  exit 1
+fi
+print ""
+print "all ${#BRANCHES} branches completed"
+print "comparison_json=$BASE_RUN_DIR.branches.json"
