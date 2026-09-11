@@ -493,6 +493,48 @@ def test_gate_frame_reject_reasons() -> None:
         )
 
 
+def test_gate_frame_keeps_consensus_delta_on_post_consensus_rejection() -> None:
+    """A rejected gate must still expose its consensus correction.
+
+    The offline evaluation scores rejected frames against GT to decide whether
+    the gate rejects the right frames; that is impossible if the delta is
+    dropped on rejection.  Injection is driven by ``target_c2w``/``accepted``,
+    so carrying the delta here cannot change the replay.
+    """
+
+    config = _config()
+    shift = (0.12, 0.0, 0.0)
+    # Identity consensus that cannot improve the aggregate alignment loss.
+    proposals = [
+        _proposal(instance_id=k, correction=torch.eye(4)) for k in (0, 1)
+    ]
+    result = gate_frame(
+        proposals,
+        _variant(MAIN_VARIANT_NAME),
+        context=_context(reference_shift=shift),
+        config=config,
+    )
+    assert not result.accepted
+    assert result.reason == "no_alignment_improvement"
+    assert result.delta is not None
+    assert result.target_c2w is None
+    assert result.consensus_translation_norm is not None
+
+
+def test_gate_frame_has_no_delta_without_a_consensus() -> None:
+    config = _config()
+    shift = (0.12, 0.0, 0.0)
+    result = gate_frame(
+        [_proposal(instance_id=0, correction=_translation_pose(shift))],
+        _variant(MAIN_VARIANT_NAME),
+        context=_context(reference_shift=shift),
+        config=config,
+    )
+    assert result.reason == "insufficient_objects"
+    assert result.delta is None
+    assert result.consensus_translation_norm is None
+
+
 # ---------------------------------------------------------------------------
 # Diagnostics payload consumption.
 # ---------------------------------------------------------------------------

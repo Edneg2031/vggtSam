@@ -122,6 +122,34 @@ per-instance 最优 loss 代替。所有阈值集中在 `ObjectPoseFeedbackConfi
 | `future_pose_gain.csv` | 每 (variant, accepted 帧, k=1..10)：raw/feedback 未来误差与增益 |
 | `poses.pt` | raw / gt / ΔT_GT / 各变体轨迹 |
 | `summary.json` | 8 个问题的数值答案、bottleneck 归因、GO/NO_GO 决策与判据、`refiner_settings_audit` |
+| `attribution.json` | 归因脚本的输出（不参与建图，只在分析时生成） |
+
+### 离线归因
+
+`summary.json` 只回答"整体有没有改善"，不回答"为什么"。当 GO/NO_GO 落在阈值附近时，
+用它判断下一步改哪里：
+
+```bash
+python -m streaming_couping.scripts.analyze_object_pose_feedback_attribution \
+  --feedback-dir outputs/<run>/object_pose_feedback
+```
+
+它输出五节，全部离线、不重跑任何模型：
+
+- **(a) 共识塌缩**：在每个变体真正形成共识的帧上统计 `inlier_count`。如果主方法的平均
+  inlier 数掉到 1 而 `robust_semantic` 保持 ≥2，说明乘法退化抑制把跨物体共识退化成
+  了单物体估计，问题在 S_geo 的用法而非共识本身。
+- **(b) 特征预测力**：每个提案特征对 `gt_translation_correction_error` 的 Spearman 秩相关
+  与置换 p 值，外加中位数二分表。**一个不能给提案正确性排序的分数，无论怎么加权都不会
+  改善共识**——这是判断 S_sem/S_geo 值不值得留的依据。
+- **(b2)/(b3)**：按 `geometry_type` 和 `category` 分桶的 GT 误差。
+- **(c) 筛选质量**：提案层（refiner 判决、`consensus_inlier`）和被拒帧 vs 接受帧的 GT 共识
+  误差。后半部分需要拒绝帧也记录共识 delta（当前 revision 已支持）；旧 CSV 那几格为空时
+  脚本会明确提示重跑 Stage 2b，而不是给出误导性的 0。
+- **(d) 逐帧局部效果**：接受帧上注入后的位姿是否真的比 raw 更接近 GT（传播之前）。
+
+所有 p 值都是置换检验（默认 4000 次），不是正态近似；提案数只有几百，**不要只看
+rho 的大小，要看 p 值和分桶后的样本数**。
 
 RPE 额外报告**排除 correction-boundary 对**的版本（相邻对任一端是修正帧则排除），
 避免注入造成的相邻帧 RPE 假跳变。
@@ -176,7 +204,9 @@ RPE 额外报告**排除 correction-boundary 对**的版本（相邻对任一端
 | `object_pose_loss_refinement.py` | 新增 `export_feedback_diagnostics`（默认关）：observations / pairing_snapshots / rejected best_pose |
 | `generate_horizonstream_geometry_cache.py` | 新增 `--save-chunk-cam-maps`（默认关）：chunk 相机图 aux 文件 |
 | `scripts/run_scannet_horizonstream_gt_feedback_poc.py` | 已验证的注入原语与评测函数（本实验原样复用，未修改） |
-| `tests/test_object_pose_feedback.py` | 18 个 CPU 测试：Lie 代数、退化分类、可靠性规则、共识拒外点、门控全部 reject 原因、**重放等价性**、注入语义、RPE key 契约、refiner 阈值镜像校验 |
+| `scripts/analyze_object_pose_feedback_attribution.py` | 离线归因：共识是否塌缩成单物体、可靠性分数是否真能预测提案对错、筛选有没有选对 |
+| `tests/test_object_pose_feedback.py` | 20 个 CPU 测试：Lie 代数、退化分类、可靠性规则、共识拒外点、门控全部 reject 原因、**重放等价性**、注入语义、RPE key 契约、refiner 阈值镜像校验、拒绝帧仍携带共识 delta |
+| `tests/test_analyze_object_pose_feedback_attribution.py` | 9 个 CPU 测试：塌缩检测、信号/噪声特征区分、筛选质量、缺列时显式报错 |
 
 注意 `test_replay_equivalence_with_motion_averaging` 和 `test_replay_injection_semantics`
 需要 `horizonstream` 可导入，否则 pytest 会 skip。本地/CI 运行时要显式加上子模块路径：

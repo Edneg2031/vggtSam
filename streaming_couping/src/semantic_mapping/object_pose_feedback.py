@@ -1044,6 +1044,11 @@ class FrameGateResult:
     frame_id: int
     accepted: bool
     reason: str | None
+    #: Consensus correction computed for this frame.  Carried whenever a
+    #: consensus was formed, including on gates rejected after that point, so
+    #: the offline evaluation can score rejected proposals against GT.  Only
+    #: ``target_c2w`` (and ``accepted``) decide whether a correction is
+    #: injected, so this never affects the replay.
     delta: torch.Tensor | None
     target_c2w: torch.Tensor | None
     num_proposals: int
@@ -1091,7 +1096,7 @@ def gate_frame(
         num_reliable: int,
         aggregate: tuple[float, float] | None,
     ) -> FrameGateResult:
-        delta = consensus.delta if accepted and consensus is not None else None
+        delta = consensus.delta if consensus is not None else None
         return FrameGateResult(
             variant=variant.name,
             sequence_index=sequence_index,
