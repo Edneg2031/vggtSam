@@ -73,9 +73,17 @@ cd "$ROOT"
 export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
 export PYTHONUNBUFFERED=1
 
-for required in "$RUN_SCRIPT" "$MANIFEST_PATH" "$GEOMETRY_CACHE"; do
+for required in "$RUN_SCRIPT" "$MANIFEST_PATH"; do
   [[ -f "$required" ]] || { print -u2 "missing: $required"; exit 1; }
 done
+# The geometry cache is stage 1's OUTPUT, not an input: requiring it here would
+# abort exactly when the outputs were cleaned out, which is when the sweep
+# should be building them.
+if [[ -f "$GEOMETRY_CACHE" ]]; then
+  print "geometry_cache=$GEOMETRY_CACHE (will be reused)"
+else
+  print "geometry_cache=$GEOMETRY_CACHE (absent; stage 1 will build it)"
+fi
 
 print "===== OBJECT POSE FEEDBACK BRANCH SWEEP ====="
 print "base_run_dir=$BASE_RUN_DIR"
@@ -100,6 +108,20 @@ for expected in "${existing[@]}"; do
   fi
 done
 
+# ---- Stage 2a once, for the baseline --------------------------------------
+print ""
+print "########## branch=baseline (full pipeline; the only GPU stage) ##########"
+OBJECT_POSE_FEEDBACK_PROPOSAL_BRANCH=baseline \
+OBJECT_POSE_FEEDBACK_RUN_DIR="$BASELINE_RUN_DIR" \
+  zsh "$RUN_SCRIPT"
+if (( $? != 0 )); then
+  print -u2 "baseline run FAILED; nothing else can be compared against it"
+  exit 1
+fi
+[[ -f "$BASELINE_DIAGNOSTICS" ]] || {
+  print -u2 "missing baseline diagnostics: $BASELINE_DIAGNOSTICS"
+  exit 1
+}
 # ---- Oracle control: GT masks instead of the segmenter (CPU only) ---------
 # This deliberately feeds ground truth into candidate generation, which the
 # project otherwise forbids, because it is the only way to split the proposal
@@ -139,20 +161,6 @@ else
   print -u2 "oracle control FAILED; the SAM-vs-GT comparison will be missing"
 fi
 
-# ---- Stage 2a once, for the baseline --------------------------------------
-print ""
-print "########## branch=baseline (full pipeline; the only GPU stage) ##########"
-OBJECT_POSE_FEEDBACK_PROPOSAL_BRANCH=baseline \
-OBJECT_POSE_FEEDBACK_RUN_DIR="$BASELINE_RUN_DIR" \
-  zsh "$RUN_SCRIPT"
-if (( $? != 0 )); then
-  print -u2 "baseline run FAILED; nothing else can be compared against it"
-  exit 1
-fi
-[[ -f "$BASELINE_DIAGNOSTICS" ]] || {
-  print -u2 "missing baseline diagnostics: $BASELINE_DIAGNOSTICS"
-  exit 1
-}
 
 # ---- Gate: a replay of the baseline must reproduce the whole chain --------
 # Proposals matching is necessary but not sufficient: what the comparison
