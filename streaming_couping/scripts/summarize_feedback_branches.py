@@ -98,7 +98,8 @@ def branch_row(run_dir: Path) -> tuple[list[Any], dict[str, Any]]:
     label = name.rsplit(".", 1)[-1] if "." in name else name
 
     if summary is None:
-        return [label, "no summary.json", "-", "-", "-", "-", "-", "-", "-", "-"], {
+        # Width derived from HEADERS so adding a column cannot desynchronise it.
+        return [label, "no summary.json"] + ["-"] * (len(HEADERS) - 2), {
             "run_dir": str(run_dir),
             "available": False,
         }
@@ -112,34 +113,52 @@ def branch_row(run_dir: Path) -> tuple[list[Any], dict[str, Any]]:
     staleness = _dig(
         attribution, "reference_staleness", "anchor_reference_age", default={}
     )
+    oldest = _dig(
+        attribution, "reference_staleness", "oldest_reference_age", default={}
+    )
     gate_reasons = _dig(summary, "gate_stats", main, "reject_reason_counts", default={})
     decision = _dig(summary, "decisions", main, "decision")
+    max_age = _dig(settings, "max_reference_age_frames")
+    refresh = _dig(settings, "anchor_refresh_interval_frames")
+    # The two proposal-side targets: how wrong the proposals are, and how old
+    # the reference set they were fitted against is.
+    proposal_error = _dig(summary, "answers", "q2_single_proposal_error", "translation_median_m")
+    consensus_error = _dig(
+        summary,
+        "answers",
+        "q3_consensus_vs_single_object",
+        "main_variant_consensus_translation_median_m",
+    )
+    future_rotation = _dig(summary, "decisions", main, "future_rotation_gain_median_deg")
 
     row = [
         label,
         str(_dig(settings, "proposal_mode", default="-")),
-        _dig(settings, "max_reference_age_frames"),
-        _dig(settings, "anchor_refresh_interval_frames"),
+        "-" if not (max_age or refresh) else f"{max_age}/{refresh}",
         summary.get("proposal_count"),
+        proposal_error,
+        consensus_error,
         _dig(summary, "gate_stats", main, "accepted_frame_count"),
         _ratio(raw_ate, main_ate),
         _ratio(raw_sim3, main_sim3),
+        future_rotation,
+        _dig(staleness, "median_age_frames"),
+        _dig(staleness, "spearman_rho_within_category"),
         {
             "OBJECT_FEEDBACK_GO": "GO",
             "OBJECT_FEEDBACK_NO_GO": "NO_GO",
         }.get(str(decision), str(decision)),
-        _dig(staleness, "spearman_rho_within_category"),
     ]
     payload = {
         "run_dir": str(run_dir),
         "available": True,
         "main_variant": main,
         "proposal_mode": _dig(settings, "proposal_mode"),
-        "max_reference_age_frames": _dig(settings, "max_reference_age_frames"),
-        "anchor_refresh_interval_frames": _dig(
-            settings, "anchor_refresh_interval_frames"
-        ),
+        "max_reference_age_frames": max_age,
+        "anchor_refresh_interval_frames": refresh,
         "proposal_count": summary.get("proposal_count"),
+        "proposal_translation_error_median_m": proposal_error,
+        "consensus_translation_error_median_m": consensus_error,
         "accepted_frame_count": _dig(
             summary, "gate_stats", main, "accepted_frame_count"
         ),
@@ -149,15 +168,20 @@ def branch_row(run_dir: Path) -> tuple[list[Any], dict[str, Any]]:
         "raw_ate_rmse_sim3_m": raw_sim3,
         "variant_ate_rmse_sim3_m": main_sim3,
         "sim3_ate_improvement_ratio": _ratio(raw_sim3, main_sim3),
+        "future_rotation_gain_median_deg": future_rotation,
         "decision": decision,
         "reject_reason_counts": gate_reasons,
+        "anchor_reference_age_median_frames": _dig(staleness, "median_age_frames"),
         "anchor_reference_age_rho_within_category": _dig(
             staleness, "spearman_rho_within_category"
         ),
         "anchor_reference_age_p_within_category": _dig(
             staleness, "permutation_p_within_category"
         ),
-        "anchor_reference_age_median_frames": _dig(staleness, "median_age_frames"),
+        "oldest_reference_age_median_frames": _dig(oldest, "median_age_frames"),
+        "oldest_reference_age_rho_within_category": _dig(
+            oldest, "spearman_rho_within_category"
+        ),
     }
     return row, payload
 
@@ -165,14 +189,17 @@ def branch_row(run_dir: Path) -> tuple[list[Any], dict[str, Any]]:
 HEADERS: tuple[str, ...] = (
     "branch",
     "mode",
-    "max_age",
-    "refresh",
+    "fresh",
     "proposals",
+    "prop_err",
+    "cons_err",
     "accepted",
     "d_ATE",
     "d_sim3",
-    "decision",
+    "fut_rot",
+    "anchor_age",
     "anchor_rho",
+    "decision",
 )
 
 
@@ -205,11 +232,18 @@ def main() -> None:
     )
     print()
     print(
-        "d_ATE / d_sim3 = improvement of the main variant over raw "
-        "(positive is better);\n"
-        "anchor_rho = within-category Spearman between anchor reference age "
-        "and the GT correction error (the proposal-side driver this round "
-        "targets; see the attribution's (b6))."
+        "prop_err  median GT translation error of a single proposal (m) -- the\n"
+        "          bottleneck this round targets (baseline 0.086)\n"
+        "cons_err  median GT translation error of the consensus (baseline 0.042)\n"
+        "d_ATE     improvement of the main variant over raw (positive better)\n"
+        "d_sim3    same after a similarity alignment: if d_ATE > 0 but d_sim3 < 0\n"
+        "          the gain was a global gauge fix, not better relative geometry\n"
+        "fut_rot   median future rotation gain over t+1..t+10 (deg; the\n"
+        "          factorized branch targets rotation, so watch this one)\n"
+        "fresh     max_reference_age_frames / anchor_refresh_interval_frames\n"
+        "anchor_age median age of the anchor reference set (frames)\n"
+        "anchor_rho within-category Spearman between anchor age and the GT\n"
+        "          correction error (baseline +0.785; see attribution (b6))"
     )
     for payload in payloads:
         if payload.get("available"):

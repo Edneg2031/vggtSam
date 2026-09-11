@@ -29,6 +29,9 @@ def _write_branch(
     variant_sim3: float = 0.0554,
     decision: str = "OBJECT_FEEDBACK_GO",
     anchor_rho: float | None = 0.7848,
+    anchor_age: float | None = 37.5,
+    proposal_error: float = 0.0856,
+    future_rotation: float = -0.0105,
     with_attribution: bool = True,
 ) -> Path:
     run_dir = root / name
@@ -58,7 +61,16 @@ def _write_branch(
             }
         },
         "decisions": {
-            "robust_semantic_geometric": {"decision": decision},
+            "robust_semantic_geometric": {
+                "decision": decision,
+                "future_rotation_gain_median_deg": future_rotation,
+            }
+        },
+        "answers": {
+            "q2_single_proposal_error": {"translation_median_m": proposal_error},
+            "q3_consensus_vs_single_object": {
+                "main_variant_consensus_translation_median_m": 0.0424,
+            },
         },
     }
     (feedback / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
@@ -68,8 +80,12 @@ def _write_branch(
                 "anchor_reference_age": {
                     "spearman_rho_within_category": anchor_rho,
                     "permutation_p_within_category": 0.0002,
-                    "median_age_frames": 37.5,
-                }
+                    "median_age_frames": anchor_age,
+                },
+                "oldest_reference_age": {
+                    "spearman_rho_within_category": 0.75,
+                    "median_age_frames": 20.0,
+                },
             }
         }
         (feedback / "attribution.json").write_text(
@@ -111,6 +127,33 @@ def test_sim3_improvement_is_reported_separately(tmp_path: Path) -> None:
     _, payload = branch_row(run_dir)
     assert payload["direct_ate_improvement_ratio"] > 0
     assert payload["sim3_ate_improvement_ratio"] < 0
+
+
+def test_freshness_column_is_blank_when_both_knobs_are_off(tmp_path: Path) -> None:
+    off = _write_branch(tmp_path, "a")
+    on = _write_branch(tmp_path, "b", max_age=15, refresh=20)
+    assert branch_row(off)[0][HEADERS.index("fresh")] == "-"
+    assert branch_row(on)[0][HEADERS.index("fresh")] == "15/20"
+
+
+def test_proposal_error_and_rotation_gain_are_surfaced(tmp_path: Path) -> None:
+    """These two are the targets of this round's change; both must be visible."""
+
+    run_dir = _write_branch(
+        tmp_path, "run.fresh", proposal_error=0.061, future_rotation=0.052
+    )
+    row, payload = branch_row(run_dir)
+    assert payload["proposal_translation_error_median_m"] == pytest.approx(0.061)
+    assert payload["future_rotation_gain_median_deg"] == pytest.approx(0.052)
+    assert row[HEADERS.index("prop_err")] == pytest.approx(0.061)
+    assert row[HEADERS.index("fut_rot")] == pytest.approx(0.052)
+
+
+def test_anchor_age_is_reported_from_the_attribution(tmp_path: Path) -> None:
+    run_dir = _write_branch(tmp_path, "run.fresh", anchor_age=7.5)
+    row, payload = branch_row(run_dir)
+    assert payload["anchor_reference_age_median_frames"] == pytest.approx(7.5)
+    assert row[HEADERS.index("anchor_age")] == pytest.approx(7.5)
 
 
 def test_missing_summary_is_reported_not_crashed(tmp_path: Path) -> None:
