@@ -72,6 +72,12 @@ RUN_SCRIPT="$ROOT/streaming_couping/commands_run_scannet_object_pose_feedback_10
 cd "$ROOT"
 export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
 export PYTHONUNBUFFERED=1
+# Pin the shared cache path explicitly.  The inner script derives it from its
+# own RUN_DIR, so naming a run dir per branch (as this sweep must) would
+# otherwise put a full geometry cache inside every branch directory -- stage 1
+# would run once per branch and the oracle would find nothing at the shared
+# path.  Exporting it is what makes "one geometry run for all branches" true.
+export OBJECT_POSE_FEEDBACK_GEOMETRY_CACHE="$GEOMETRY_CACHE"
 
 for required in "$RUN_SCRIPT" "$MANIFEST_PATH"; do
   [[ -f "$required" ]] || { print -u2 "missing: $required"; exit 1; }
@@ -90,6 +96,27 @@ print "base_run_dir=$BASE_RUN_DIR"
 print "branches=${(j:, :)BRANCHES}"
 print "freshness=$FRESH_MAX_AGE/$FRESH_REFRESH"
 
+# ---- Adopt a stranded geometry cache --------------------------------------
+# A run aborted after stage 1 but before the cache was where it belongs leaves
+# a full cache inside a branch directory.  Rescuing it saves the whole geometry
+# pass, and --reuse-if-valid re-validates it, so adopting a stale one is safe.
+if [[ ! -f "$GEOMETRY_CACHE" ]]; then
+  for stranded in "$BASE_RUN_DIR".*/horizonstream_geometry.pt; do
+    [[ -f "$stranded" ]] || continue
+    # The base directory may itself be gone, so the cache cannot merely be
+    # renamed into it.
+    mkdir -p "$GEOMETRY_CACHE:h"
+    print "adopting a stranded geometry cache from ${stranded:h:t}/"
+    mv -n "$stranded" "$GEOMETRY_CACHE" || {
+      print -u2 "could not move $stranded; leaving it in place"
+      continue
+    }
+    mv -n "$stranded:h/horizonstream_geometry_chunk_cam_maps.pt" \
+          "$GEOMETRY_CACHE:h/" 2>/dev/null
+    break
+  done
+fi
+
 # ---- Refuse to clobber anything this sweep would write --------------------
 existing=("$BASE_RUN_DIR.oracle_mask")
 for branch in "${BRANCHES[@]}"; do
@@ -100,13 +127,20 @@ if (( SAM_REPEATS > 1 )); then
     existing+=("$BASE_RUN_DIR.baseline_r$repeat")
   done
 fi
+stale=()
 for expected in "${existing[@]}"; do
-  if [[ -e "$expected" ]]; then
-    print -u2 "refusing to overwrite an existing run directory: $expected"
-    print -u2 "move it aside (or delete it) and re-run."
-    exit 1
-  fi
+  [[ -e "$expected" ]] && stale+=("$expected")
 done
+if (( ${#stale} > 0 )); then
+  print -u2 "refusing to overwrite existing run directories:"
+  for entry in "${stale[@]}"; do
+    print -u2 "  $entry"
+  done
+  print -u2 ""
+  print -u2 "remove the ones left over from an aborted run, then re-run:"
+  print -u2 "  rm -rf ${(j: :)stale}"
+  exit 1
+fi
 
 # ---- Stage 2a once, for the baseline --------------------------------------
 print ""
