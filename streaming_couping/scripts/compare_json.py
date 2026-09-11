@@ -146,6 +146,18 @@ def main() -> None:
             "values by percent."
         ),
     )
+    parser.add_argument(
+        "--structural-only",
+        action="store_true",
+        help=(
+            "Exit non-zero only for structural differences: a field that "
+            "appeared or disappeared, a changed string, a flipped boolean.  "
+            "Float drift is always reported with its magnitude but never "
+            "fails.  Use when the underlying computation is known to move in "
+            "its last bits, so the checker measures that instead of tripping "
+            "on it."
+        ),
+    )
     args = parser.parse_args()
 
     before = _load(args.before.expanduser().resolve(), args.prefix)
@@ -155,6 +167,42 @@ def main() -> None:
     added: list[tuple[str, Any]] = []
     _walk(before, after, "", material, drifted, added, args.tolerance)
     label = args.prefix or "whole document"
+
+    # `drifted` already holds every float that moved, with its magnitude; the
+    # ones beyond tolerance also landed in `material`.  Anything in `material`
+    # that is not a float pair -- a string, a boolean, a vanished field -- is
+    # structural.
+    numeric = drifted
+    structural = [
+        entry
+        for entry in material
+        if not (isinstance(entry[1], float) and isinstance(entry[2], float))
+    ]
+
+    if args.structural_only:
+        # Report every float movement, including the large ones, because the
+        # magnitude IS the thing being measured here.
+        if numeric:
+            worst = max(gap for _, _, _, gap in numeric)
+            print(
+                f"{len(numeric)} numeric value(s) moved (max relative "
+                f"{worst:.2e}) [{label}] -- analysis-chain noise"
+            )
+            for path, old, new, gap in sorted(
+                numeric, key=lambda entry: entry[3], reverse=True
+            )[: args.max_changes]:
+                print(f"  {path}: {_render(old)} -> {_render(new)} ({gap:.2e})")
+            if len(numeric) > args.max_changes:
+                print(f"  ... and {len(numeric) - args.max_changes} more")
+        if added:
+            print(f"{len(added)} newly recorded field(s) [{label}]")
+        if not structural:
+            print(f"no structural change ({label})")
+            return
+        print(f"{len(structural)} structural change(s) ({label}):")
+        for path, old, new in structural[: args.max_changes]:
+            print(f"  {path}: {_render(old)} -> {_render(new)}")
+        raise SystemExit(1)
 
     if added:
         print(f"{len(added)} newly recorded field(s) [{label}]:")

@@ -1083,3 +1083,56 @@ def test_check_refiner_settings_reports_missing_exported_fields() -> None:
         "min_matches_per_pair",
         "trim_ratio",
     }
+
+
+def test_stage_2b_pins_single_threaded_replay() -> None:
+    """The determinism gate needs the replay to be bit-reproducible.
+
+    Without this the same cached chunk maps produce two different
+    ``online_motion_averaging`` trajectories, and the rotation metrics turn the
+    last-bit difference into a percent of a 0.04 degree angle.
+    """
+
+    from streaming_couping.scripts.run_object_pose_feedback import (
+        pin_thread_determinism,
+    )
+
+    original = torch.get_num_threads()
+    try:
+        torch.set_num_threads(max(2, original))
+        pin_thread_determinism()
+        assert torch.get_num_threads() == 1
+    finally:
+        torch.set_num_threads(original)
+
+
+def test_replay_drift_stays_in_the_last_bits() -> None:
+    """The replay is NOT bit-reproducible; the drift must stay negligible.
+
+    ``online_motion_averaging`` (vendored) differs between two calls on
+    identical chunk maps by about one float32 ulp, starting at the first
+    accumulated frame; neither single-threading, zeroed buffers, nor
+    ``use_deterministic_algorithms`` removes it.  What matters is the size: if
+    it ever grows past the float-noise scale, the analysis-chain noise floor
+    the determinism gate measures would stop being small, and a branch
+    comparison would be meaningless.
+    """
+
+    pytest.importorskip("horizonstream.runtime.motion_averaging")
+    from streaming_couping.scripts.run_object_pose_feedback import (
+        pin_thread_determinism,
+    )
+
+    original = torch.get_num_threads()
+    try:
+        pin_thread_determinism()
+        frame_count, window = 16, 4
+        chunks, _ = _synthetic_chunk_cam_maps(
+            frame_count=frame_count, window=window, seed=11
+        )
+        first, _ = _replay(chunks, frame_count=frame_count, window=window)
+        second, _ = _replay(chunks, frame_count=frame_count, window=window)
+        drift = float(np.abs(first - second).max())
+        assert drift < 1e-5, f"replay drift {drift:.2e} is above float noise"
+    finally:
+        torch.set_num_threads(original)

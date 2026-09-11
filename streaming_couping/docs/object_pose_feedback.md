@@ -256,20 +256,36 @@ zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
 任何实质差异都会中止，因为那说明分支差异建立在一个不稳定的链条上。这道检查是免费的
 （纯 CPU），它测的是分析链的确定性。
 
-### 噪声底
+### 两个噪声底
 
-分析链的确定性 ≠ 分割模型的确定性。`SAM_REPEATS`（命令文件顶部，默认 `1`）控制
-**完整 baseline pipeline** 跑几次；设为 `3` 就会测出分割模型跨 run 的散布，并打印在
-对比表上方：
+**分析链噪声（免费、每次运行都测）**：闸门把 baseline 的 `summary.json` 和"重放同一份
+缓存后重跑 Stage 2b"的 `summary.json` 逐叶子比对，并**区分**：
+
+- **结构性变化**（某个 `passed` 翻转、`decision` 改变、字段出现/消失）→ **中止**，链条坏了
+- **数值漂移**（浮点）→ 报出最大相对漂移，**继续**
+
+实测：同一份缓存输入重放两次，姿态指标漂移 **1.0e-2** 相对量级。根因是 vendored 的
+`online_motion_averaging` 逐位不可复现——从第一个累积帧开始差约 1 个 float32 ulp，
+单线程、零初始化 buffer、`use_deterministic_algorithms` 都消不掉。这个 1e-7 的轨迹差
+被"接近零角的旋转测量"放大成 1e-2。
+
+**分割模型噪声（`SAM_REPEATS`，默认 `3`）**：控制**完整 baseline pipeline** 跑几次，
+测出分割模型跨 run 的散布，打印在对比表上方：
 
 ```
 noise floor from 3 runs of one configuration
   direct_ate_improvement_ratio  spread=0.0xx (relative 0.xxx)
 ```
 
-**这张表里任何小于该 spread 的分支差异都不是结果。** 上一轮的实测值是 0.026
-（相对 ~0.33），而 `fresh` 的效应只有 0.006。多跑两次是唯一能给 GO/NO_GO 定出
-可信区间的方式。
+**任何一个噪声底都大于分支效应时，那张表读不出结论。** 上一轮分割模型的实测散布是
+0.026（相对 ~0.33），而 `fresh` 的效应只有 0.006——**噪声是效应的 4 倍**。分析链噪声
+（1e-2）同样不可忽略。
+
+**根因说明**：vendored 的 `online_motion_averaging` 逐位不可复现（从第一个累积帧
+起差约 1 个 float32 ulp），单线程 / 零初始化 buffer / `use_deterministic_algorithms`
+都无效。所以姿态指标的可复现上限大约是 1e-2 相对量级——**小于这个的分支差异，
+无论看起来多合理，都不是结果**。要更小的噪声必须修 HorizonStream 内部或在
+torch 之外重写累积器。
 
 第二轮的实测结果（见 §8.6）：参考年龄假设被否证，噪声底大于效应。所以这个表目前
 的用途是**量化噪声**并确认机制是否生效，不是拿来选分支。

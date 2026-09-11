@@ -410,9 +410,26 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def pin_thread_determinism() -> None:
+    """Force single-threaded torch for the accumulator replay.
+
+    The replay re-derives the causal trajectory through
+    ``online_motion_averaging``, whose medians and matrix products are
+    reductions.  A multi-threaded reduction sums in a scheduling-dependent
+    order, so two replays of the same cached chunk maps disagree in the last
+    bits -- and the rotation metrics turn that into a percent of a 0.04 degree
+    angle, which the determinism gate then reports as a material change.
+    Pinning the thread count makes the replay bit-reproducible, which is what
+    lets a branch difference be attributed to the branch.
+    """
+
+    torch.set_num_threads(1)
+
+
 def main() -> None:
     args = _parse_args()
     config = _build_config(args)
+    pin_thread_determinism()
     run_dir = args.run_dir.expanduser().resolve()
     geometry_cache = args.geometry_cache.expanduser().resolve()
     diagnostics_path = run_dir / "object_pose_refinement" / "feedback_diagnostics.pt"

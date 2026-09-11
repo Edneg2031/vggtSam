@@ -233,13 +233,18 @@ print "decisions from a replay of the baseline, vs the baseline itself:"
 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   "$PYTHON" -m streaming_couping.scripts.compare_json \
   --prefix decisions \
+  --structural-only \
   "$BASELINE_RUN_DIR/object_pose_feedback/summary.json" \
   "$GATE_DIR/object_pose_feedback/summary.json"
 if (( $? != 0 )); then
-  print -u2 "the replayed chain does not reproduce the baseline's decisions;"
-  print -u2 "aborting, because no branch difference above could be read."
+  print -u2 "the replayed chain does not reproduce the baseline structurally"
+  print -u2 "(a decision flipped, or a field appeared or vanished); aborting,"
+  print -u2 "because no branch difference above could be read."
   exit 1
 fi
+print "the numeric drift above is the ANALYSIS-CHAIN noise floor: the same"
+print "cached inputs replayed twice move the pose metrics by that much, so a"
+print "branch difference has to clear it as well as the segmentation spread."
 rm -rf "$GATE_DIR"
 
 # ---- Optional: repeat the whole baseline to measure the segmenter's spread -

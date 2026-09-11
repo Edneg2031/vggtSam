@@ -142,3 +142,53 @@ def test_missing_prefix_raises(
     )
     with pytest.raises(KeyError):
         compare_main()
+
+
+def test_structural_only_separates_a_flipped_flag_from_float_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """The determinism gate needs that distinction: a flipped `passed` or a
+    changed decision means the chain is broken, while float movement is a
+    magnitude to be measured."""
+
+    before = {"criteria": {"ate": {"value": 0.10, "passed": True}}}
+    drifted = {"criteria": {"ate": {"value": 0.1005, "passed": True}}}
+    flipped = {"criteria": {"ate": {"value": 0.10, "passed": False}}}
+    left = tmp_path / "before.json"
+    left.write_text(json.dumps(before), encoding="utf-8")
+
+    right = tmp_path / "drifted.json"
+    right.write_text(json.dumps(drifted), encoding="utf-8")
+    monkeypatch.setattr(
+        "sys.argv", ["compare_json", str(left), str(right), "--structural-only"]
+    )
+    compare_main()  # float drift alone must not fail
+    output = capsys.readouterr().out
+    assert "numeric value(s) moved" in output
+    assert "no structural change" in output
+
+    right = tmp_path / "flipped.json"
+    right.write_text(json.dumps(flipped), encoding="utf-8")
+    monkeypatch.setattr(
+        "sys.argv", ["compare_json", str(left), str(right), "--structural-only"]
+    )
+    with pytest.raises(SystemExit) as exit_info:
+        compare_main()
+    assert exit_info.value.code == 1
+    assert "structural change" in capsys.readouterr().out
+
+
+def test_structural_only_treats_a_vanished_field_as_structural(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    before = {"a": {"b": 1.0, "c": 2.0}}
+    after = {"a": {"b": 1.0}}
+    left = tmp_path / "before.json"
+    right = tmp_path / "after.json"
+    left.write_text(json.dumps(before), encoding="utf-8")
+    right.write_text(json.dumps(after), encoding="utf-8")
+    monkeypatch.setattr(
+        "sys.argv", ["compare_json", str(left), str(right), "--structural-only"]
+    )
+    with pytest.raises(SystemExit):
+        compare_main()
