@@ -347,6 +347,35 @@ class ObjectPoseLossRefiner:
             len(segmentation_by_id[int(frame_id)].observations)
             for frame_id in frame_ids
         )
+        raw_poses = tuple(_pose4(frame.camera_to_world) for frame in geometry)
+        return self.refine_from_observations(
+            frame_ids=frame_ids,
+            raw_poses=raw_poses,
+            observations_by_frame=observations_by_frame,
+            tracked_ids=tracked_ids,
+            filter_stats=filter_stats,
+            raw_observation_count=raw_observation_count,
+        )
+
+    def refine_from_observations(
+        self,
+        *,
+        frame_ids: Sequence[int],
+        raw_poses: Sequence[torch.Tensor],
+        observations_by_frame: Mapping[int, Sequence[ObjectCloudObservation]],
+        tracked_ids: set[int],
+        filter_stats: Counter[str],
+        raw_observation_count: int,
+    ) -> PoseRefinementResult:
+        """Run the causal loop over already-collected observations.
+
+        Split out of ``refine`` so a run can be replayed from a cached set of
+        observations without re-running the segmentation model: given the same
+        observations and config this is deterministic, which is what makes a
+        refiner-parameter comparison free of the segmentation model's
+        run-to-run variance.
+        """
+
         retained_observation_count = sum(
             len(observations) for observations in observations_by_frame.values()
         )
@@ -355,8 +384,6 @@ class ObjectPoseLossRefiner:
             for observations in observations_by_frame.values()
             for observation in observations
         }
-        raw_poses = tuple(_pose4(frame.camera_to_world) for frame in geometry)
-
         anchors: dict[int, list[_StoredObjectCloud]] = {}
         history: dict[int, list[_StoredObjectCloud]] = {}
         refined_poses: list[torch.Tensor] = []
@@ -872,28 +899,19 @@ class ObjectPoseLossRefiner:
                 "observations": feedback_observations,
                 "pairing_snapshots": feedback_pairings,
                 "proposals": feedback_proposals,
-                # Thresholds the consumer's re-check must mirror; see
-                # object_pose_feedback.REFINER_SETTING_MIRRORS.
-                "refiner_settings": {
-                    "anchor_frame_count": int(self.config.anchor_frame_count),
-                    "max_reference_age_frames": int(
-                        self.config.max_reference_age_frames
-                    ),
-                    "anchor_refresh_interval_frames": int(
-                        self.config.anchor_refresh_interval_frames
-                    ),
-                    # Not a threshold to mirror, but the consumer must know
-                    # which proposal parameterization produced the proposals.
-                    "proposal_mode": str(self.config.proposal_mode),
-                    "max_correction_rotation_deg": float(
-                        self.config.max_correction_rotation_deg
-                    ),
-                    "max_correction_translation_m": float(
-                        self.config.max_correction_translation_m
-                    ),
-                    "max_match_distance_m": float(self.config.max_match_distance_m),
-                    "trim_ratio": float(self.config.trim_ratio),
-                    "min_matches_per_pair": int(self.config.min_matches_per_pair),
+                # The FULL config, not just the mirrored thresholds, so a
+                # replay can rebuild the refiner exactly and change only the
+                # knobs under test.  The consumer's mirror check reads its
+                # subset by name; see object_pose_feedback.REFINER_SETTING_MIRRORS.
+                "refiner_settings": dict(self.config.to_dict()),
+                # Pre-filter collection counters, so a replay reports the same
+                # summary as the run it came from.
+                "collection": {
+                    "raw_observation_count": int(raw_observation_count),
+                    "tracked_instance_ids": sorted(int(value) for value in tracked_ids),
+                    "filter_stats": {
+                        str(key): int(value) for key, value in filter_stats.items()
+                    },
                 },
             }
         return PoseRefinementResult(

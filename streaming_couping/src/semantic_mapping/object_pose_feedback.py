@@ -347,9 +347,31 @@ def xi_to_pose(xi: np.ndarray) -> torch.Tensor:
 
 
 def rotation_angle_deg(rotation: torch.Tensor | np.ndarray) -> float:
+    """Rotation angle in degrees, stable at both ends of the range.
+
+    ``acos((trace - 1) / 2)`` is ill-conditioned near identity: a matrix that
+    is orthonormal only to float32 precision (trace 2.999852) reports about
+    0.028 degrees *against itself*, because acos amplifies the error as
+    sqrt(2 * eps).  Use the two-argument form, which is exact at zero and
+    well conditioned at pi.
+    """
+
     value = torch.as_tensor(rotation).detach().float().cpu()
-    cosine = torch.clamp((torch.trace(value) - 1.0) * 0.5, -1.0, 1.0)
-    return math.degrees(float(torch.acos(cosine)))
+    if tuple(value.shape) != (3, 3):
+        raise ValueError("rotation_angle_deg expects a 3x3 rotation.")
+    cosine = float(torch.clamp((torch.trace(value) - 1.0) * 0.5, -1.0, 1.0))
+    # |vee(R - R^T)| / 2 == sin(angle), and is non-negative.
+    skew = 0.5 * (value - value.transpose(0, 1))
+    sine = float(
+        torch.linalg.vector_norm(
+            torch.stack((skew[2, 1], skew[0, 2], skew[1, 0]))
+        )
+    )
+    if cosine > 0.0:
+        return math.degrees(math.atan2(sine, cosine))
+    # Near pi the trace form is the ill-conditioned one; fall back to acos,
+    # which is well behaved there.
+    return math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
 
 
 def translation_norm(delta: torch.Tensor | np.ndarray) -> float:

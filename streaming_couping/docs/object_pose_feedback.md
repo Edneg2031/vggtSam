@@ -229,12 +229,37 @@ factorized 的依据：共识 rotation 误差中位 **0.611°**，而 raw 逐帧
 zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
 ```
 
-它按顺序对 `baseline / fresh / factorized / fresh_factor` 各跑一遍完整的四阶段
-pipeline，再对每个分支跑一次归因，最后打印横向对比表并写出
-`<base>.branches.json`。每个分支写进自己的 `<base>.<branch>` 目录，
-**不碰你已有的结果**，所以 `<base>.baseline` 与现有 run 的对比就是"默认值有没有
-改变旧行为"的回归检查。某个分支失败不会丢弃已跑完的分支，最后统一报告并以非零
-退出。
+**只有 baseline 跑完整 pipeline（唯一的 GPU 阶段）；其余三个分支用
+`run_object_pose_loss_replay` 从 baseline 缓存的观测重放 refiner，纯 CPU。**
+对比表在最后打印并写出 `<base>.branches.json`。每个分支写进自己的
+`<base>.<branch>` 目录，**不碰你已有的结果**，所以 `<base>.baseline` 与现有 run
+的对比就是"默认值有没有改变旧行为"的回归检查。
+
+为什么不是四个分支各跑一遍 pipeline：旋钮在 stage 2a 里、紧挨着分割模型，而分割
+模型在 GPU 上跨 run 不确定。上一轮这样跑的后果是——**同一配置**的 `d_ATE` 从
+0.053 摆到 0.079、`d_sim3` 翻转符号，而分支效应只有 0.006：**噪声是效应的 4 倍**。
+重放路径没有 GPU、也没有分割模型的方差，分支差异因此只来自被测的那个旋钮。
+
+重放前有一道**闸门**：用 baseline 自己的设置重放必须复现 baseline 的 proposals，
+否则直接中止——否则后面每个比较都建立在一个不忠实的重放上。
+
+第二轮的实测结果（见 §8.6）：参考年龄假设被否证，噪声底大于效应。所以这个表目前
+的用途是**量化噪声**并确认机制是否生效，不是拿来选分支。
+
+### 重放 refiner（`run_object_pose_loss_replay`）
+
+```bash
+python -m streaming_couping.scripts.run_object_pose_loss_replay \
+  --diagnostics <run>/object_pose_refinement/feedback_diagnostics.pt \
+  --output-dir  <branch-dir> \
+  --object-pose-loss-max-reference-age-frames 15 \
+  --object-pose-loss-proposal-mode rotation_then_translation
+```
+
+它只读 `feedback_diagnostics.pt`（观测、帧 id、raw poses、**完整** refiner 配置、
+预过滤计数都在里面），写出 `<output-dir>/object_pose_refinement/feedback_diagnostics.pt`
+——正是 stage 2b 期望的位置，所以后续分析原样可用。`--check-equivalence` 会用源配置
+重放并断言 proposals 一致。
 
 单个分支也可以单独跑，由 `commands_run_scannet_object_pose_feedback_100f.txt`
 顶部的 `PROPOSAL_BRANCH`（或 `OBJECT_POSE_FEEDBACK_PROPOSAL_BRANCH`）选择：
@@ -254,6 +279,53 @@ Stage 1 的几何 cache 与分支无关，四个分支共用同一份（`--reuse
 `too_few_initial_object_matches` 的拒绝数、减少提案总量。所以新分支要先看
 `proposal_count` 有没有明显下降，再比较提案误差。
 
+## 8.6 第二轮分支 sweep 的结果（参考年龄假设被否证 + 噪声底）
+
+四分支 sweep 跑完后（`<base>.branches.json`）：
+
+| | baseline | fresh | factorized | fresh_factor |
+|---|---:|---:|---:|---:|
+| `anchor_age` 中位（帧） | 37.5 | **8.0** | 37.5 | **8.0** |
+| `anchor_rho` 类内 | 0.791 | **0.166** | 0.760 | **0.161** |
+| **`prop_err` 中位（m）** | 0.0868 | **0.0855** | 0.0853 | 0.0927 |
+| `proposals` | 229 | 182 | 229 | 182 |
+| `d_ATE` | +0.0790 | +0.0731 | **−0.0131** | +0.0235 |
+| `d_sim3` | +0.0195 | **−0.0137** | −0.0138 | −0.0116 |
+| decision | GO | GO | NO_GO | NO_GO |
+
+**结论一：参考年龄是混淆，不是因果。** `fresh` 机械上完全生效——anchor 年龄从
+37.5 压到 8.0，类内相关性从 0.79 掉到 0.17（不再显著）——但**提案误差纹丝不动**
+（0.0868 → 0.0855）。之前那个 ρ=+0.785 只是 anchor 年龄与 `frame` / `track_length`
+共线的产物；真正驱动误差的东西不随参考新鲜度改变。残留的最强预测因子仍是
+`track_length`（fresh 分支里类内 ρ 反而升到 0.809）和 `semantic_confidence`（0.726）。
+
+**结论二：factorization 让提案更差**（超出噪声）。`d_ATE` 转负、(d) 里 `single` 的
+局部变好率从 0.667 掉到 0.143。
+
+**结论三（最重要）：这个测量目前的噪声大于要测的效应。** baseline 分支跑的是
+改动前的默认行为，可以和你原来的 run 直接对比：
+
+| | 原 run | baseline 分支 | 变化 |
+|---|---:|---:|---:|
+| `d_ATE` | 0.0528 | **0.0790** | **+50%** |
+| `d_sim3` | −0.0057 | **+0.0195** | **符号翻转** |
+| accepted（主变体） | 13 | 16 | +23% |
+| `prop_err` | 0.0856 | 0.0868 | +1.4% |
+
+同一份代码、同一场景、同一帧窗：`d_ATE` 摆动 **0.026**，而 `fresh` 相对 baseline 的
+效应只有 **0.0059**——**噪声是效应的 4 倍**。所以 `fresh` 那一行没有判别力，且此前
+所有落在 5% 阈值附近的 GO/NO_GO 都不可靠。
+
+对比之下 `prop_err` 跨 run 只差 **1.4%**，是稳定得多的端点。
+
+**结论四：旋转角的测量公式此前有数值地板。** `acos((trace-1)/2)` 在接近单位阵时
+病态：一个只在 float32 精度上正交的旋转矩阵（trace 2.999852）**与自己做比较**也会
+报出约 **0.028°**，因为 acos 以 sqrt(2ε) 放大误差。已改为 `atan2(sin, cos)` 形式
+（`rotation_angle_deg`）。受影响的是所有用该公式的地方：`proposal_rotation_median_deg`
+（1.34°，约 2% 偏差）、共识旋转误差（0.611°，约 5%），以及**主变体的
+`future_rotation_gain_median_deg`（−0.0105°）和 `single` 的（−0.0130°）——这两个
+本来就低于旧地板，属于噪声**。轨迹 RPE 走 POC 的 SVD 投影路径，不受影响。
+
 ## 9. 相关代码
 
 | 文件 | 角色 |
@@ -263,7 +335,10 @@ Stage 1 的几何 cache 与分支无关，四个分支共用同一份（`--reuse
 | `object_pose_loss_refinement.py` | 新增 `export_feedback_diagnostics`（默认关）：observations / pairing_snapshots / rejected best_pose |
 | `generate_horizonstream_geometry_cache.py` | 新增 `--save-chunk-cam-maps`（默认关）：chunk 相机图 aux 文件 |
 | `scripts/run_scannet_horizonstream_gt_feedback_poc.py` | 已验证的注入原语与评测函数（本实验原样复用，未修改） |
-| `scripts/analyze_object_pose_feedback_attribution.py` | 离线归因：共识是否塌缩成单物体、可靠性分数是否真能预测提案对错、筛选有没有选对 |
+| `scripts/analyze_object_pose_feedback_attribution.py` | 离线归因：共识是否塌缩成单物体、可靠性分数是否真能预测提案对错、筛选有没有选对、参考年龄 |
+| `scripts/run_object_pose_loss_replay.py` | 从 `feedback_diagnostics.pt` 重放 refiner（纯 CPU、确定性），使分支对比不含分割模型的方差 |
+| `scripts/summarize_feedback_branches.py` | 多分支横向对比表 |
+| `tests/test_object_pose_loss_replay.py` | 重放忠实性：同一份观测重放必须复现源 proposals |
 | `tests/test_object_pose_feedback.py` | 20 个 CPU 测试：Lie 代数、退化分类、可靠性规则、共识拒外点、门控全部 reject 原因、**重放等价性**、注入语义、RPE key 契约、refiner 阈值镜像校验、拒绝帧仍携带共识 delta |
 | `tests/test_analyze_object_pose_feedback_attribution.py` | 9 个 CPU 测试：塌缩检测、信号/噪声特征区分、筛选质量、缺列时显式报错 |
 

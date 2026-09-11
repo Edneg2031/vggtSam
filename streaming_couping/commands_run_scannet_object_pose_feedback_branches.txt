@@ -5,27 +5,36 @@
 #
 #   zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
 #
-# No arguments and no environment variables are needed; edit the block below if
-# you want to change the branch list or the freshness thresholds.
+# No arguments and no environment variables are needed; edit the block below to
+# change the branch list or the freshness thresholds.
 #
 #   baseline      joint 6DoF, permanent anchors       (the previous behavior)
 #   fresh         joint 6DoF, bounded reference age
 #   factorized    rotation-then-translation, permanent anchors
 #   fresh_factor  both
 #
-# Each branch runs the full four-stage pipeline into its own run directory and
-# then runs the attribution analysis over it.  All four share one stage-1
-# geometry cache: the knobs live entirely in stage 2a, so the geometry run
-# happens at most once and later branches reuse it with --reuse-if-valid.
+# HOW THIS DIFFERS FROM RUNNING THE FOUR PIPELINES IN SEQUENCE
 #
-# The baseline results already on disk are NOT touched -- every branch,
-# including baseline, writes to its own <default>.branch directory.  Comparing
-# <default>.baseline against the existing run is the regression check that the
-# new knobs' defaults really did preserve the old behavior.
+# The refiner knobs live inside stage 2a, next to the segmentation model, so a
+# naive sweep runs the segmentation model four times -- and it is not
+# deterministic across runs on GPU.  The previous sweep of this form moved the
+# *unchanged* baseline's direct-ATE gain from 0.053 to 0.079 and flipped the
+# sign of its sim3 gain, while the branch effect being measured was 0.006.
+# The measurement noise was four times the effect.
 #
-# `set -e` is deliberately absent: a failing branch should not discard the
-# branches that already finished.  Failures are collected and reported at the
-# end, and the script exits non-zero if any occurred.
+# So only the baseline runs the pipeline.  Every other branch replays the
+# refiner from the baseline's cached observations, which needs no GPU and
+# carries none of the segmentation model's variance -- the branch difference
+# is then purely the knob under test.
+#
+# The replay is gated: before any branch is compared, a replay with the
+# baseline's own settings must reproduce the baseline proposals.  If that
+# assertion fails the sweep aborts, because every later comparison would rest
+# on a replay that is not faithful.
+#
+# Stage 3 (the object-map evaluation for the per-instance branch) is only run
+# for the baseline: it needs the per-instance maps that only a full stage 2a
+# exports, and the branch comparison does not read its output.
 set -uo pipefail
 
 ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
@@ -34,46 +43,131 @@ PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
 
 BASE_RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v1}"
 BRANCHES=(baseline fresh factorized fresh_factor)
+FRESH_MAX_AGE="${OBJECT_POSE_FEEDBACK_MAX_REFERENCE_AGE_FRAMES:-15}"
+FRESH_REFRESH="${OBJECT_POSE_FEEDBACK_ANCHOR_REFRESH_INTERVAL_FRAMES:-20}"
 
+MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
+SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
+GEOMETRY_CACHE="$BASE_RUN_DIR/horizonstream_geometry.pt"
+BASELINE_RUN_DIR="$BASE_RUN_DIR.baseline"
+BASELINE_DIAGNOSTICS="$BASELINE_RUN_DIR/object_pose_refinement/feedback_diagnostics.pt"
 RUN_SCRIPT="$ROOT/streaming_couping/commands_run_scannet_object_pose_feedback_100f.txt"
-ANALYZE_SCRIPT="$ROOT/streaming_couping/commands_analyze_object_pose_feedback_attribution.txt"
 
 cd "$ROOT"
 export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
 export PYTHONUNBUFFERED=1
 
-for required in "$RUN_SCRIPT" "$ANALYZE_SCRIPT"; do
+for required in "$RUN_SCRIPT" "$MANIFEST_PATH" "$GEOMETRY_CACHE"; do
   [[ -f "$required" ]] || { print -u2 "missing: $required"; exit 1; }
 done
 
 print "===== OBJECT POSE FEEDBACK BRANCH SWEEP ====="
 print "base_run_dir=$BASE_RUN_DIR"
 print "branches=${(j:, :)BRANCHES}"
+print "freshness=$FRESH_MAX_AGE/$FRESH_REFRESH"
 
+# ---- Stage 2a once, for the baseline --------------------------------------
+for branch in "${BRANCHES[@]}"; do
+  case "$branch" in
+    baseline) expected="$BASE_RUN_DIR.baseline" ;;
+    *)        expected="$BASE_RUN_DIR.$branch" ;;
+  esac
+  if [[ -e "$expected" ]]; then
+    print -u2 "refusing to overwrite an existing branch directory: $expected"
+    print -u2 "move it aside (or delete it) and re-run."
+    exit 1
+  fi
+done
+
+print ""
+print "########## branch=baseline (full pipeline; the only GPU stage) ##########"
+OBJECT_POSE_FEEDBACK_PROPOSAL_BRANCH=baseline \
+OBJECT_POSE_FEEDBACK_RUN_DIR="$BASELINE_RUN_DIR" \
+  zsh "$RUN_SCRIPT"
+if (( $? != 0 )); then
+  print -u2 "baseline run FAILED; nothing else can be compared against it"
+  exit 1
+fi
+[[ -f "$BASELINE_DIAGNOSTICS" ]] || {
+  print -u2 "missing baseline diagnostics: $BASELINE_DIAGNOSTICS"
+  exit 1
+}
+
+# ---- Gate: the replay must reproduce the run it came from -----------------
+print ""
+print "########## replay equivalence gate ##########"
+GATE_DIR="$BASE_RUN_DIR.replay_gate"
+rm -rf "$GATE_DIR"
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m streaming_couping.scripts.run_object_pose_loss_replay \
+  --diagnostics "$BASELINE_DIAGNOSTICS" \
+  --output-dir "$GATE_DIR" \
+  --check-equivalence
+if (( $? != 0 )); then
+  print -u2 "replay does not reproduce the baseline; aborting before any"
+  print -u2 "branch comparison, because every branch would rest on it."
+  exit 1
+fi
+rm -rf "$GATE_DIR"
+
+# ---- Replay each branch, then analyse it ----------------------------------
 failed_branches=()
 run_dirs=()
 for branch in "${BRANCHES[@]}"; do
   run_dir="$BASE_RUN_DIR.$branch"
   run_dirs+=("$run_dir")
-  print ""
-  print "########## branch=$branch ##########"
-  print "run_dir=$run_dir"
+  if [[ "$branch" == "baseline" ]]; then
+    print ""
+    print "########## baseline already ran; analysing ##########"
+  else
+    replay_flags=()
+    case "$branch" in
+      fresh)
+        replay_flags+=(--object-pose-loss-max-reference-age-frames "$FRESH_MAX_AGE")
+        replay_flags+=(--object-pose-loss-anchor-refresh-interval-frames "$FRESH_REFRESH")
+        ;;
+      factorized)
+        replay_flags+=(--object-pose-loss-proposal-mode rotation_then_translation)
+        ;;
+      fresh_factor)
+        replay_flags+=(--object-pose-loss-max-reference-age-frames "$FRESH_MAX_AGE")
+        replay_flags+=(--object-pose-loss-anchor-refresh-interval-frames "$FRESH_REFRESH")
+        replay_flags+=(--object-pose-loss-proposal-mode rotation_then_translation)
+        ;;
+    esac
+    print ""
+    print "########## branch=$branch (replay, CPU) ##########"
+    print "run_dir=$run_dir"
+    PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+      "$PYTHON" -m streaming_couping.scripts.run_object_pose_loss_replay \
+      --diagnostics "$BASELINE_DIAGNOSTICS" \
+      --output-dir "$run_dir" \
+      "${replay_flags[@]}"
+    if (( $? != 0 )); then
+      print -u2 "branch $branch FAILED at the replay stage"
+      failed_branches+=("$branch")
+      continue
+    fi
+  fi
 
-  OBJECT_POSE_FEEDBACK_PROPOSAL_BRANCH="$branch" \
-  OBJECT_POSE_FEEDBACK_RUN_DIR="$run_dir" \
-    zsh "$RUN_SCRIPT"
+  PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "$PYTHON" -m streaming_couping.scripts.run_object_pose_feedback \
+    --run-dir "$run_dir" \
+    --geometry-cache "$GEOMETRY_CACHE" \
+    --manifest "$MANIFEST_PATH" \
+    --scene-id "$SCENE_ID" \
+    --output-dir "$run_dir/object_pose_feedback" \
+    --horizon-repo "$ROOT/externals/horizonstream"
   if (( $? != 0 )); then
-    print -u2 "branch $branch FAILED at the run stage; skipping its analysis"
+    print -u2 "branch $branch FAILED at the stage-2b analysis"
     failed_branches+=("$branch")
     continue
   fi
 
-  OBJECT_POSE_FEEDBACK_RUN_DIR="$run_dir" \
-    zsh "$ANALYZE_SCRIPT"
-  if (( $? != 0 )); then
-    print -u2 "branch $branch FAILED at the analysis stage"
-    failed_branches+=("$branch")
-  fi
+  PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "$PYTHON" -m streaming_couping.scripts.analyze_object_pose_feedback_attribution \
+    --feedback-dir "$run_dir/object_pose_feedback" \
+    || print -u2 "branch $branch: attribution failed (comparison table still usable)"
 done
 
 print ""
@@ -90,9 +184,8 @@ PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
 if (( ${#failed_branches} > 0 )); then
   print -u2 ""
   print -u2 "FAILED branches: ${(j:, :)failed_branches}"
-  print -u2 "re-run just those with OBJECT_POSE_FEEDBACK_PROPOSAL_BRANCH=<name>"
   exit 1
 fi
 print ""
-print "all ${#BRANCHES} branches completed"
+print "all ${#BRANCHES} branches completed (1 GPU run, $(( ${#BRANCHES} - 1 )) CPU replays)"
 print "comparison_json=$BASE_RUN_DIR.branches.json"

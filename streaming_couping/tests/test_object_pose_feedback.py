@@ -33,6 +33,7 @@ from streaming_couping.src.semantic_mapping.object_pose_feedback import (
     gt_correction_error,
     pose_to_xi,
     robust_consensus,
+    rotation_angle_deg,
     rotation_log,
     semantic_reliability,
     xi_to_pose,
@@ -140,6 +141,54 @@ def _context(
 # ---------------------------------------------------------------------------
 # Lie algebra and geometry classification.
 # ---------------------------------------------------------------------------
+
+
+def test_rotation_angle_is_stable_near_identity() -> None:
+    """Regression: acos((trace-1)/2) reports ~0.03 deg for R against itself.
+
+    A float32 rotation matrix is orthonormal only to ~1e-7, and acos amplifies
+    that as sqrt(2*eps).  The comparator therefore flagged two bit-identical
+    corrections as 0.028 degrees apart, which no tolerance in the replay check
+    could fix without also masking real differences.
+    """
+
+    rotation = xi_to_pose(
+        torch.tensor([0.02, -0.01, 0.03, 0.0, 0.0, 0.0]).numpy()
+    )[:3, :3]
+    # genuinely not orthonormal to more than float32 precision
+    assert float(torch.trace(rotation)) < 3.0
+    assert rotation_angle_deg(rotation.transpose(0, 1) @ rotation) == 0.0
+
+
+def test_rotation_angle_matches_known_values() -> None:
+    assert rotation_angle_deg(torch.eye(3)) == 0.0
+    half = math.radians(90.0)
+    quarter = torch.tensor(
+        [
+            [math.cos(half), -math.sin(half), 0.0],
+            [math.sin(half), math.cos(half), 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    assert rotation_angle_deg(quarter) == pytest.approx(90.0, abs=1e-4)
+    assert rotation_angle_deg(torch.diag(torch.tensor([1.0, -1.0, -1.0]))) == (
+        pytest.approx(180.0, abs=1e-4)
+    )
+    # 179 degrees stays accurate: that is where the acos form is well behaved
+    nearly_pi = math.radians(179.0)
+    rotation = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, math.cos(nearly_pi), -math.sin(nearly_pi)],
+            [0.0, math.sin(nearly_pi), math.cos(nearly_pi)],
+        ]
+    )
+    assert rotation_angle_deg(rotation) == pytest.approx(179.0, abs=1e-3)
+
+
+def test_rotation_angle_rejects_non_rotation_input() -> None:
+    with pytest.raises(ValueError, match="3x3"):
+        rotation_angle_deg(torch.eye(4))
 
 
 def test_so3_log_exp_roundtrip() -> None:
