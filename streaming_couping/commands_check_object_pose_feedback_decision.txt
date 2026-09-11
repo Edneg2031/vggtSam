@@ -22,6 +22,7 @@ RUN_DIR="$BASE_RUN_DIR.baseline"
 GEOMETRY_CACHE="$BASE_RUN_DIR/horizonstream_geometry.pt"
 MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
 SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
+PROMPTS=(bed wardrobe chair rug dustbin)
 
 cd "$ROOT"
 export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
@@ -63,3 +64,19 @@ print ""
 print "the 'decision' column is the headlined variant's verdict; 'go_variants'"
 print "lists every consensus variant that passed ALL criteria, and 'main_failed'"
 print "the criteria the headlined one did not."
+
+# ---- Does the pose improvement reach the object map? ----------------------
+# Same observations, placed by each trajectory in turn, against a reference
+# built from the GT masks through the GROUND-TRUTH poses.  CPU only: no model
+# runs, because the camera-space points are already in the diagnostics.
+print ""
+print "===== OBJECT MAP PER TRAJECTORY ====="
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m streaming_couping.scripts.evaluate_pose_feedback_object_map \
+  --run-dir "$RUN_DIR" \
+  --geometry-cache "$GEOMETRY_CACHE" \
+  --manifest "$MANIFEST_PATH" \
+  --scene-id "$SCENE_ID" \
+  --prompts "${PROMPTS[@]}" \
+  --json-out "$RUN_DIR/object_pose_feedback/object_map_metrics.json" \
+  || print -u2 "object-map evaluation failed (the verdict above still stands)"
