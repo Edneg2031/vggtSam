@@ -191,6 +191,54 @@ def test_rotation_angle_rejects_non_rotation_input() -> None:
         rotation_angle_deg(torch.eye(4))
 
 
+def test_poc_rotation_error_is_stable_at_small_angles() -> None:
+    """Regression for the deterministic-replay gate.
+
+    The gate replayed identical cached observations twice and got two different
+    sets of rotation metrics: `acos((trace-1)/2)` turns a 1e-7 float32
+    difference into a percent-level angle error when the angle is a few
+    hundredths of a degree, which is exactly where the reported future
+    rotation gains live.
+    """
+
+    from streaming_couping.scripts.run_scannet_horizonstream_gt_feedback_poc import (
+        _project_rotation,
+        _rotation_error_deg,
+    )
+
+    for degrees in (0.04, 0.1, 1.0, 10.0, 90.0, 179.0):
+        radians = math.radians(degrees)
+        rotation = _project_rotation(
+            np.array(
+                [
+                    [1.0, 0.0, 0.0],
+                    [0.0, math.cos(radians), -math.sin(radians)],
+                    [0.0, math.sin(radians), math.cos(radians)],
+                ],
+                dtype=np.float32,
+            ).astype(np.float64)
+        )
+        assert _rotation_error_deg(rotation, np.eye(3)) == pytest.approx(
+            degrees, abs=1e-3
+        ), degrees
+        # comparing a rotation with itself must be zero to numerical noise
+        # (inv(R) @ R is not exactly the identity), not to a percent
+        assert _rotation_error_deg(rotation, rotation) < 1e-9, degrees
+
+    # a float32-scale perturbation must not move the number by a percent
+    radians = math.radians(0.04)
+    rotation = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, math.cos(radians), -math.sin(radians)],
+            [0.0, math.sin(radians), math.cos(radians)],
+        ]
+    )
+    perturbed = rotation.copy()
+    perturbed[0, 1] += 1e-7
+    assert _rotation_error_deg(rotation, perturbed) < 1e-4
+
+
 def test_so3_log_exp_roundtrip() -> None:
     rng = np.random.default_rng(0)
     for angle in (0.0, 0.01, 0.175, 1.2, 3.0):

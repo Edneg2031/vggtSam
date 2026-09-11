@@ -57,9 +57,37 @@ def _project_rotation(rotation: np.ndarray) -> np.ndarray:
 
 
 def _rotation_error_deg(predicted: np.ndarray, target: np.ndarray) -> float:
+    """Angle between two rotations, in degrees.
+
+    The two-argument form is used rather than ``acos((trace - 1) / 2)`` because
+    the latter is ill conditioned near identity, where the metrics this feeds
+    (RPE rotation, future rotation gain) live.  For an angle of 0.04 degrees,
+    ``cos(theta)`` is ``1 - 2.4e-7`` while its own absolute error at float64
+    after a float32 pipeline is around ``1e-7``, so acos turns a 1e-7
+    difference in the trajectory into a percent-level difference in the
+    reported angle.  The deterministic-replay gate caught exactly that: the
+    same cached observations produced two different sets of rotation metrics.
+
+    ``sin`` comes from the skew part, which is first-order in the angle and
+    therefore stable where the trace form is not.  The projection to SO(3) is
+    kept so that a slightly non-orthonormal input still measures a rotation.
+    """
+
     relative = np.linalg.inv(target[:3, :3]) @ predicted[:3, :3]
     relative = _project_rotation(relative)
     cosine = float(np.clip((np.trace(relative) - 1.0) * 0.5, -1.0, 1.0))
+    sine = float(
+        np.linalg.norm(
+            [
+                relative[2, 1] - relative[1, 2],
+                relative[0, 2] - relative[2, 0],
+                relative[1, 0] - relative[0, 1],
+            ]
+        )
+        * 0.5
+    )
+    if cosine > 0.0:
+        return float(np.degrees(np.arctan2(sine, cosine)))
     return float(np.degrees(np.arccos(cosine)))
 
 
