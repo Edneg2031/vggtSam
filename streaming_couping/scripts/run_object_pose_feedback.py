@@ -641,6 +641,9 @@ def main() -> None:
         reference_frames = ";".join(
             str(value) for value in proposal.reference_frames
         )
+        reference_roles = ";".join(
+            str(value) for value in proposal.reference_roles
+        )
         proposal_rows.append(
             {
                 "frame": int(proposal.sequence_index),
@@ -683,6 +686,7 @@ def main() -> None:
                     gt_rotation_saturated[proposal.sequence_index]
                 ),
                 "reference_frames": reference_frames,
+                "reference_roles": reference_roles,
             }
         )
     _write_csv(
@@ -719,6 +723,7 @@ def main() -> None:
             "gt_translation_saturated",
             "gt_rotation_saturated",
             "reference_frames",
+            "reference_roles",
         ),
     )
 

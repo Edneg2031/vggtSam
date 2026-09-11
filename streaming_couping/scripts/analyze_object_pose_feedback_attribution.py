@@ -99,6 +99,8 @@ CATEGORY_STRATIFIED_FEATURES: tuple[str, ...] = (
     "geometry_confidence",
     "inlier_ratio",
     "overlap_count",
+    "alignment_loss_before",
+    "alignment_loss_after",
 )
 
 
@@ -563,6 +565,212 @@ def feature_predictiveness(
     return f"{title}\n{table}", payload
 
 
+# ---------------------------------------------------------------------------
+# Reference staleness: is the proposal noisy because it aligns against a
+# reference set that is far away in time?
+#
+# Age is ``frame - reference_frame``, so a larger value means an older
+# reference.  ``newest`` is the shortest baseline in the set, ``oldest`` the
+# longest.  The refiner weights anchors (frames < anchor_frame_count, fixed at
+# the start of the sequence) at 1.0 and recent history at 0.5, so splitting by
+# role says whether the stale half of the set is the one driving the error.
+# ---------------------------------------------------------------------------
+
+REFERENCE_AGE_FEATURES: tuple[str, ...] = (
+    "newest_reference_age",
+    "oldest_reference_age",
+    "mean_reference_age",
+)
+
+ANCHOR_ROLE = "anchor"
+
+
+def _parse_int_list(value: Any) -> list[int]:
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return []
+    frames: list[int] = []
+    for part in text.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            frames.append(int(float(part)))
+        except ValueError:
+            return []
+    return frames
+
+
+def _parse_str_list(value: Any) -> list[str]:
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return []
+    return [part.strip() for part in text.split(";")]
+
+
+def reference_age_features(row: Mapping[str, str]) -> dict[str, float] | None:
+    """Ages of the reference set for one proposal, or None when unusable."""
+
+    frames = _parse_int_list(row.get("reference_frames"))
+    frame = _float(row.get("frame"))
+    if not frames or frame is None:
+        return None
+    features = {
+        "newest_reference_age": frame - max(frames),
+        "oldest_reference_age": frame - min(frames),
+        "mean_reference_age": frame - sum(frames) / len(frames),
+        "reference_count": float(len(frames)),
+    }
+    # Role split is only available once the writer records reference_roles.
+    roles = _parse_str_list(row.get("reference_roles"))
+    if len(roles) == len(frames):
+        anchors = [f for f, role in zip(frames, roles) if role == ANCHOR_ROLE]
+        history = [f for f, role in zip(frames, roles) if role != ANCHOR_ROLE]
+        if anchors:
+            features["anchor_reference_age"] = frame - max(anchors)
+        if history:
+            features["history_reference_age"] = frame - max(history)
+    return features
+
+
+def _age_matrix(
+    proposals: Sequence[Mapping[str, str]],
+) -> tuple[dict[str, list[float | None]], np.ndarray, list[str]]:
+    """Derived-age columns aligned with the target, plus category labels."""
+
+    usable = [
+        row
+        for row in proposals
+        if _float(row.get("gt_translation_correction_error")) is not None
+    ]
+    target = _paired(_column(usable, "gt_translation_correction_error"))
+    categories = [
+        (row.get("category") or "<empty>").strip() or "<empty>" for row in usable
+    ]
+    parsed = [reference_age_features(row) for row in usable]
+    names = list(REFERENCE_AGE_FEATURES)
+    for optional in ("anchor_reference_age", "history_reference_age"):
+        if any(entry is not None and optional in entry for entry in parsed):
+            names.append(optional)
+    columns = {
+        name: [None if entry is None else entry.get(name) for entry in parsed]
+        for name in names
+    }
+    return columns, target, categories
+
+
+def _quantile_buckets(values: np.ndarray, *, buckets: int = 4) -> list[np.ndarray]:
+    """Row indices of roughly equal-count buckets ordered by value."""
+
+    order = np.argsort(values, kind="stable")
+    edges = np.linspace(0, values.shape[0], buckets + 1).astype(int)
+    return [order[edges[i] : edges[i + 1]] for i in range(buckets)]
+
+
+def reference_staleness(
+    proposals: Sequence[Mapping[str, str]],
+) -> tuple[str, dict[str, Any]]:
+    """Correlate reference age with proposal error, plus a bucket table."""
+
+    columns, target, categories = _age_matrix(proposals)
+    rows: list[list[Any]] = []
+    payload: dict[str, Any] = {}
+    for name, values in columns.items():
+        paired = np.asarray(
+            [index for index, value in enumerate(values) if value is not None],
+            dtype=int,
+        )
+        if paired.shape[0] < 8:
+            continue
+        feature_values = np.asarray(
+            [float(values[index]) for index in paired], dtype=np.float64
+        )
+        feature_target = target[paired]
+        if float(feature_values.std()) <= 1e-9:
+            continue
+        rho, p_value = _spearman(feature_values, feature_target)
+        within_rho, within_p = _stratified_spearman(
+            feature_values,
+            feature_target,
+            _group_masks([categories[index] for index in paired]),
+        )
+        rows.append(
+            [
+                name,
+                feature_values.shape[0],
+                _median(feature_values.tolist()),
+                rho,
+                p_value,
+                within_rho,
+                within_p,
+            ]
+        )
+        payload[name] = {
+            "n": int(feature_values.shape[0]),
+            "median_age_frames": _median(feature_values.tolist()),
+            "spearman_rho": rho,
+            "permutation_p": p_value,
+            "spearman_rho_within_category": within_rho,
+            "permutation_p_within_category": within_p,
+        }
+    if not rows:
+        return "(b6) reference staleness: no usable reference_frames column", payload
+
+    rows.sort(key=lambda row: abs(float(row[3])), reverse=True)
+    text = (
+        "(b6) reference staleness: age = frame - reference_frame "
+        "(larger = older reference)\n"
+        "     newest_reference_age is the SHORTEST baseline in the set, "
+        "oldest_reference_age the longest"
+    )
+    text += "\n" + _table(
+        [
+            "feature",
+            "n",
+            "median_age",
+            "rho_marginal",
+            "p_perm",
+            "rho_within",
+            "p_within",
+        ],
+        rows,
+    )
+
+    # Bucket view: monotonic rise in GT error across age quartiles is the
+    # readable form of the same claim.
+    bucket_feature = "oldest_reference_age"
+    bucket_rows: list[list[Any]] = []
+    values = columns.get(bucket_feature)
+    if values is not None:
+        paired = np.asarray(
+            [index for index, value in enumerate(values) if value is not None],
+            dtype=int,
+        )
+        if paired.shape[0] >= 16:
+            feature_values = np.asarray(
+                [float(values[index]) for index in paired], dtype=np.float64
+            )
+            feature_target = target[paired]
+            for bucket in _quantile_buckets(feature_values):
+                bucket_rows.append(
+                    [
+                        _median(feature_values[bucket].tolist()),
+                        bucket.shape[0],
+                        _median(feature_target[bucket].tolist()),
+                    ]
+                )
+            payload[f"{bucket_feature}_quartiles"] = bucket_rows
+    if bucket_rows:
+        text += (
+            "\n\n(b7) GT correction error by oldest-reference-age quartile "
+            "(Q1 = freshest reference set)"
+        )
+        text += "\n" + _table(
+            ["median_age", "n", "median_gt_error_m"], bucket_rows
+        )
+    return text, payload
+
+
 def category_stratified_correlations(
     proposals: Sequence[Mapping[str, str]],
 ) -> tuple[str, dict[str, Any]]:
@@ -581,35 +789,46 @@ def category_stratified_correlations(
     payload: dict[str, Any] = {}
     for label in sorted(set(categories)):
         mask = np.asarray([c == label for c in categories], dtype=bool)
-        target_group = target[mask]
         row: list[Any] = [label, int(mask.sum())]
         entry: dict[str, Any] = {"n": int(mask.sum())}
         for feature in CATEGORY_STRATIFIED_FEATURES:
-            values = np.asarray(
-                [
-                    float(value)
-                    for value, keep in zip(_column(usable, feature), mask)
-                    if keep and value is not None
-                ],
-                dtype=np.float64,
-            )
-            if (
-                values.shape[0] < 6
-                or float(values.std()) <= 1e-9
-                or values.shape[0] != target_group.shape[0]
-            ):
+            values_all = _column(usable, feature)
+            # Pair feature and target on the rows where the feature is present:
+            # a feature with any missing value in this category must still be
+            # scored on the rows that remain, not dropped wholesale.
+            present = [
+                index
+                for index, (keep, value) in enumerate(zip(mask, values_all))
+                if keep and value is not None
+            ]
+            if len(present) < 6:
                 row.append(None)
                 entry[feature] = None
                 continue
-            rho, p_value = _spearman(values, target_group)
+            values = np.asarray(
+                [float(values_all[index]) for index in present], dtype=np.float64
+            )
+            feature_target = np.asarray(
+                [float(target[index]) for index in present], dtype=np.float64
+            )
+            if float(values.std()) <= 1e-9:
+                row.append(None)
+                entry[feature] = None
+                continue
+            rho, p_value = _spearman(values, feature_target)
             row.append(rho)
-            entry[feature] = {"rho": rho, "p": p_value}
+            entry[feature] = {
+                "n": len(present),
+                "rho": rho,
+                "p": p_value,
+            }
         table_rows.append(row)
         payload[label] = entry
     text = (
         "(b5) per-category Spearman rho vs GT translation correction error\n"
-        "     (if a feature is only a category proxy, these are near zero "
-        "while (b)'s rho_marginal is large)"
+        "     (a category proxy drops to ~0 here while (b)'s rho_marginal "
+        "stays large; 'n' is the category size and a feature missing values "
+        "is scored on its own paired subset -- see the json for its n)"
     )
     return (
         text
@@ -897,6 +1116,7 @@ def main() -> None:
             "category_stratified_correlations",
             category_stratified_correlations(proposals),
         ),
+        ("reference_staleness", reference_staleness(proposals)),
         ("selection_quality", selection_quality(proposals, consensus_rows)),
         ("per_frame_effect", per_frame_effect(frame_rows)),
     ):

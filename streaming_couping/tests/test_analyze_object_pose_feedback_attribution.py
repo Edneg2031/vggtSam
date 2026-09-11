@@ -17,11 +17,14 @@ import pytest
 
 from streaming_couping.scripts.analyze_object_pose_feedback_attribution import (
     MAIN_VARIANT,
+    _parse_int_list,
     category_stratified_correlations,
     consensus_collapse,
     feature_predictiveness,
     main,
     per_frame_effect,
+    reference_age_features,
+    reference_staleness,
     selection_quality,
 )
 
@@ -263,7 +266,9 @@ def _confounded_rows(*, per_category: int = 40) -> list[dict[str, Any]]:
                     "degeneracy_factor": 0.2,
                     "delta_translation_norm": 0.05,
                     "delta_rotation_deg": 1.0,
-                    "semantic_confidence": 0.5,
+                    # varies within the category, in a third order again
+                    "semantic_confidence": 0.5
+                    + ((index * 7) % per_category) * 0.001,
                     "geometry_confidence": 0.5,
                     "accepted_by_refiner": "True",
                     "refiner_reason": "object_loss_accepted",
@@ -296,6 +301,71 @@ def test_category_stratified_correlations_break_out_each_category() -> None:
     assert set(payload) == {"bed", "rug"}
     assert payload["bed"]["n"] == 40
     assert abs(payload["bed"]["track_length"]["rho"]) < 0.35
+
+
+def _age_rows(*, count: int = 120) -> list[dict[str, Any]]:
+    """Error tracks the anchor's age exactly; the history age is a sawtooth."""
+
+    rows: list[dict[str, Any]] = []
+    for index in range(count):
+        frame = 10 + index
+        anchor = 5  # the fixed anchor set from the first few frames
+        history = frame - (4 + index % 4)  # varies, uncorrelated with frame
+        rows.append(
+            {
+                "frame": frame,
+                "category": "bed",
+                "reference_frames": f"{anchor};{history}",
+                "reference_roles": "anchor;history",
+                "gt_translation_correction_error": 0.001 * (frame - anchor),
+            }
+        )
+    return rows
+
+
+def test_reference_age_features_split_anchor_from_history() -> None:
+    row = _age_rows(count=20)[8]
+    features = reference_age_features(row)
+    assert features is not None  # the anchor is the oldest reference
+    assert features["oldest_reference_age"] == pytest.approx(row["frame"] - 5)
+    assert features["anchor_reference_age"] == pytest.approx(row["frame"] - 5)
+    assert features["history_reference_age"] == pytest.approx(
+        row["frame"] - max(_parse_int_list(row["reference_frames"]))
+    )
+    assert features["newest_reference_age"] == pytest.approx(
+        features["history_reference_age"]
+    )
+
+
+def test_reference_staleness_detects_age_tracking_error() -> None:
+    _text, payload = reference_staleness(_age_rows())
+    assert payload["oldest_reference_age"]["n"] == 120
+    assert payload["oldest_reference_age"]["spearman_rho"] > 0.99
+    assert payload["oldest_reference_age"]["permutation_p"] < 0.01
+    # the history baseline varies without tracking the error
+    assert abs(payload["newest_reference_age"]["spearman_rho"]) < 0.2
+
+
+def test_reference_staleness_handles_missing_reference_column() -> None:
+    rows = _proposal_rows()
+    for row in rows:
+        row.pop("reference_frames", None)
+    text, payload = reference_staleness(rows)
+    assert payload == {}
+    assert "no usable reference_frames" in text
+
+
+def test_category_stratified_scores_a_feature_with_missing_values() -> None:
+    """Regression: a missing value must shrink a feature's paired subset, not
+    blank the whole category cell."""
+
+    rows = _confounded_rows()
+    for row in rows[:5]:
+        row["semantic_confidence"] = ""  # 5 of 80 missing
+    _text, payload = category_stratified_correlations(rows)
+    assert payload["bed"]["semantic_confidence"] is not None
+    # bed holds 40 rows; the 5 dropped ones all sit in the first category
+    assert payload["bed"]["semantic_confidence"]["n"] == 35
 
 
 def test_selection_quality_reports_proposal_and_frame_levels() -> None:
