@@ -91,6 +91,16 @@ PROPOSAL_FEATURES: tuple[str, ...] = (
     "translation_consensus_error",
 )
 
+#: Features the per-category breakdown reports: the two reliability scores the
+#: consensus weights are built from, plus the two that feed them.
+CATEGORY_STRATIFIED_FEATURES: tuple[str, ...] = (
+    "track_length",
+    "semantic_confidence",
+    "geometry_confidence",
+    "inlier_ratio",
+    "overlap_count",
+)
+
 
 # ---------------------------------------------------------------------------
 # CSV parsing (``_write_csv`` writes None as "" and bools as True/False).
@@ -183,6 +193,59 @@ def _spearman(
     threshold = abs(rho) - 1e-12
     for _ in range(PERMUTATION_ITERATIONS):
         shuffled = generator.permutation(target_ranks)
+        if abs(_pearson(feature_ranks, shuffled)) >= threshold:
+            extreme += 1
+    return rho, (extreme + 1) / (PERMUTATION_ITERATIONS + 1)
+
+
+def _group_masks(labels: Sequence[str]) -> list[np.ndarray]:
+    buckets: dict[str, list[int]] = {}
+    for index, label in enumerate(labels):
+        buckets.setdefault(label, []).append(index)
+    return [np.asarray(values, dtype=int) for values in buckets.values()]
+
+
+def _centered_within_ranks(
+    values: np.ndarray, groups: Sequence[np.ndarray]
+) -> np.ndarray:
+    """Ranks computed inside each group, then centred on the group mean."""
+
+    ranks = np.zeros(values.shape[0], dtype=np.float64)
+    for group in groups:
+        group_ranks = _ranks(values[group])
+        ranks[group] = group_ranks - group_ranks.mean()
+    return ranks
+
+
+def _stratified_spearman(
+    features: np.ndarray,
+    target: np.ndarray,
+    groups: Sequence[np.ndarray],
+) -> tuple[float, float]:
+    """Spearman within each stratum, pooled; the permutation keeps strata.
+
+    Centring each group's ranks removes between-group differences, so this
+    measures the association that survives with the grouping variable held
+    fixed -- the test for "is this feature predictive, or merely a proxy for
+    the group?".  Returns NaN when the feature has no within-group variation.
+    """
+
+    if len(groups) < 2:
+        return float("nan"), float("nan")
+    feature_ranks = _centered_within_ranks(features, groups)
+    target_ranks = _centered_within_ranks(target, groups)
+    if float(feature_ranks.std()) <= 0.0:
+        return float("nan"), float("nan")
+    rho = _pearson(feature_ranks, target_ranks)
+    if not math.isfinite(rho):
+        return float("nan"), float("nan")
+    generator = np.random.default_rng(SEED)
+    extreme = 0
+    threshold = abs(rho) - 1e-12
+    shuffled = target_ranks.copy()
+    for _ in range(PERMUTATION_ITERATIONS):
+        for group in groups:
+            shuffled[group] = generator.permutation(target_ranks[group])
         if abs(_pearson(feature_ranks, shuffled)) >= threshold:
             extreme += 1
     return rho, (extreme + 1) / (PERMUTATION_ITERATIONS + 1)
@@ -411,6 +474,9 @@ def feature_predictiveness(
         if _float(row.get("gt_translation_correction_error")) is not None
     ]
     target = _paired(_column(usable, "gt_translation_correction_error"))
+    categories = [
+        (row.get("category") or "<empty>").strip() or "<empty>" for row in usable
+    ]
     rows: list[list[Any]] = []
     payload: dict[str, Any] = {"usable_proposals": len(usable)}
     if len(usable) >= 8:
@@ -440,12 +506,24 @@ def feature_predictiveness(
             low = feature_target[order[:half]]
             high = feature_target[order[half:]]
             split_p = _median_split_p(feature_values, feature_target)
+            # Does the association survive holding the object category fixed?
+            feature_categories = [
+                label
+                for label, keep in zip(categories, paired_mask)
+                if keep
+            ]
+            groups = _group_masks(feature_categories)
+            within_rho, within_p = _stratified_spearman(
+                feature_values, feature_target, groups
+            )
             rows.append(
                 [
                     feature,
                     feature_values.shape[0],
                     rho,
                     p_value,
+                    within_rho,
+                    within_p,
                     _median(low),
                     _median(high),
                     split_p,
@@ -455,6 +533,8 @@ def feature_predictiveness(
                 "n": int(feature_values.shape[0]),
                 "spearman_rho": rho,
                 "permutation_p": p_value,
+                "spearman_rho_within_category": within_rho,
+                "permutation_p_within_category": within_p,
                 "median_gt_error_low_half_m": _median(low),
                 "median_gt_error_high_half_m": _median(high),
                 "median_split_p": split_p,
@@ -462,14 +542,18 @@ def feature_predictiveness(
         rows.sort(key=lambda row: abs(float(row[2])), reverse=True)
     title = (
         "(b) proposal feature vs GT translation correction error "
-        "(rho>0 = larger feature means worse proposal)"
+        "(rho>0 = larger feature means worse proposal)\n"
+        "    rho_within = same correlation computed inside each category, "
+        "holding the category fixed"
     )
     table = _table(
         [
             "feature",
             "n",
-            "spearman_rho",
+            "rho_marginal",
             "p_perm",
+            "rho_within",
+            "p_within",
             "gt_med_low",
             "gt_med_high",
             "p_split",
@@ -477,6 +561,65 @@ def feature_predictiveness(
         rows,
     )
     return f"{title}\n{table}", payload
+
+
+def category_stratified_correlations(
+    proposals: Sequence[Mapping[str, str]],
+) -> tuple[str, dict[str, Any]]:
+    """Per-category Spearman rho for the features the weights depend on."""
+
+    usable = [
+        row
+        for row in proposals
+        if _float(row.get("gt_translation_correction_error")) is not None
+    ]
+    target = _paired(_column(usable, "gt_translation_correction_error"))
+    categories = [
+        (row.get("category") or "<empty>").strip() or "<empty>" for row in usable
+    ]
+    table_rows: list[list[Any]] = []
+    payload: dict[str, Any] = {}
+    for label in sorted(set(categories)):
+        mask = np.asarray([c == label for c in categories], dtype=bool)
+        target_group = target[mask]
+        row: list[Any] = [label, int(mask.sum())]
+        entry: dict[str, Any] = {"n": int(mask.sum())}
+        for feature in CATEGORY_STRATIFIED_FEATURES:
+            values = np.asarray(
+                [
+                    float(value)
+                    for value, keep in zip(_column(usable, feature), mask)
+                    if keep and value is not None
+                ],
+                dtype=np.float64,
+            )
+            if (
+                values.shape[0] < 6
+                or float(values.std()) <= 1e-9
+                or values.shape[0] != target_group.shape[0]
+            ):
+                row.append(None)
+                entry[feature] = None
+                continue
+            rho, p_value = _spearman(values, target_group)
+            row.append(rho)
+            entry[feature] = {"rho": rho, "p": p_value}
+        table_rows.append(row)
+        payload[label] = entry
+    text = (
+        "(b5) per-category Spearman rho vs GT translation correction error\n"
+        "     (if a feature is only a category proxy, these are near zero "
+        "while (b)'s rho_marginal is large)"
+    )
+    return (
+        text
+        + "\n"
+        + _table(
+            ["category", "n", *CATEGORY_STRATIFIED_FEATURES],
+            table_rows,
+        ),
+        payload,
+    )
 
 
 def grouped_error_tables(
@@ -750,6 +893,10 @@ def main() -> None:
         ("consensus_collapse", consensus_collapse(consensus_rows)),
         ("feature_predictiveness", feature_predictiveness(proposals)),
         ("grouped_error", grouped_error_tables(proposals)),
+        (
+            "category_stratified_correlations",
+            category_stratified_correlations(proposals),
+        ),
         ("selection_quality", selection_quality(proposals, consensus_rows)),
         ("per_frame_effect", per_frame_effect(frame_rows)),
     ):

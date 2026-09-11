@@ -9,6 +9,7 @@ a loud error instead of an empty table, and
 from __future__ import annotations
 
 import csv
+import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -16,6 +17,7 @@ import pytest
 
 from streaming_couping.scripts.analyze_object_pose_feedback_attribution import (
     MAIN_VARIANT,
+    category_stratified_correlations,
     consensus_collapse,
     feature_predictiveness,
     main,
@@ -223,6 +225,77 @@ def test_feature_predictiveness_skips_constant_columns() -> None:
         row["alignment_loss_after"] = 0.03  # constant, must not yield nan rho
     _text, payload = feature_predictiveness(rows)
     assert "alignment_loss_after" not in payload
+
+
+def _confounded_rows(*, per_category: int = 40) -> list[dict[str, Any]]:
+    """``track_length`` separates the categories; inside a category its order is
+    unrelated to the error's order.  Any marginal correlation is a category
+    artifact, and the stratified one is ~0."""
+
+    rows: list[dict[str, Any]] = []
+    for label, track_base, error_base in (
+        ("bed", 20.0, 0.05),
+        ("rug", 200.0, 0.15),
+    ):
+        for index in range(per_category):
+            rows.append(
+                {
+                    "frame": len(rows),
+                    "instance_id": 0,
+                    "category": label,
+                    "geometry_type": "planar",
+                    # feature order is `index`; target order is a different
+                    # permutation, so the two are unrelated within a category
+                    "track_length": track_base + index * 0.001,
+                    "gt_translation_correction_error": (
+                        error_base
+                        + ((index * 17) % per_category) * 0.0005
+                    ),
+                    "visibility_ratio": 1.0,
+                    "point_count": 200,
+                    "overlap_count": 100,
+                    "alignment_loss_before": 0.08,
+                    "alignment_loss_after": 0.03,
+                    "inlier_ratio": 0.5,
+                    "eigenvalue_1": 1.0,
+                    "eigenvalue_2": 0.5,
+                    "eigenvalue_3": 0.2,
+                    "degeneracy_factor": 0.2,
+                    "delta_translation_norm": 0.05,
+                    "delta_rotation_deg": 1.0,
+                    "semantic_confidence": 0.5,
+                    "geometry_confidence": 0.5,
+                    "accepted_by_refiner": "True",
+                    "refiner_reason": "object_loss_accepted",
+                    "object_reject_reason": "",
+                    "consensus_inlier": "True",
+                    "translation_consensus_error": 0.01,
+                    "rotation_consensus_error": 0.1,
+                    "gt_rotation_correction_error": 0.5,
+                    "gt_translation_saturated": "False",
+                    "gt_rotation_saturated": "False",
+                    "reference_frames": "1;2",
+                }
+            )
+    return rows
+
+
+def test_feature_predictiveness_reports_within_category_rho() -> None:
+    """A category proxy keeps its marginal rho but loses its within-category one."""
+
+    _text, payload = feature_predictiveness(_confounded_rows())
+    track = payload["track_length"]
+    assert track["spearman_rho"] > 0.6  # marginal: picks up the category split
+    within = track["spearman_rho_within_category"]
+    assert math.isfinite(within)
+    assert abs(within) < 0.35  # vanishes once the category is held fixed
+
+
+def test_category_stratified_correlations_break_out_each_category() -> None:
+    _text, payload = category_stratified_correlations(_confounded_rows())
+    assert set(payload) == {"bed", "rug"}
+    assert payload["bed"]["n"] == 40
+    assert abs(payload["bed"]["track_length"]["rho"]) < 0.35
 
 
 def test_selection_quality_reports_proposal_and_frame_levels() -> None:
