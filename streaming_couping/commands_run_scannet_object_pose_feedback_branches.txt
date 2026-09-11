@@ -56,6 +56,9 @@ SAM_REPEATS="${OBJECT_POSE_FEEDBACK_SAM_REPEATS:-1}"
 
 MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
 SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
+# Must match the prompts the SAM branches used, or the oracle's GT instances
+# and the SAM tracks would cover different object sets.
+PROMPTS=(bed wardrobe chair rug dustbin)
 GEOMETRY_CACHE="$BASE_RUN_DIR/horizonstream_geometry.pt"
 BASELINE_RUN_DIR="$BASE_RUN_DIR.baseline"
 BASELINE_DIAGNOSTICS="$BASELINE_RUN_DIR/object_pose_refinement/feedback_diagnostics.pt"
@@ -74,8 +77,8 @@ print "base_run_dir=$BASE_RUN_DIR"
 print "branches=${(j:, :)BRANCHES}"
 print "freshness=$FRESH_MAX_AGE/$FRESH_REFRESH"
 
-# ---- Stage 2a once, for the baseline --------------------------------------
-existing=()
+# ---- Refuse to clobber anything this sweep would write --------------------
+existing=("$BASE_RUN_DIR.oracle_mask")
 for branch in "${BRANCHES[@]}"; do
   existing+=("$BASE_RUN_DIR.$branch")
 done
@@ -92,6 +95,46 @@ for expected in "${existing[@]}"; do
   fi
 done
 
+# ---- Oracle control: GT masks instead of the segmenter (CPU only) ---------
+# This deliberately feeds ground truth into candidate generation, which the
+# project otherwise forbids, because it is the only way to split the proposal
+# error between "the segmentation model got the mask/identity wrong" and
+# "nearest-neighbour correspondence or degenerate geometry is the limit".
+# Its output is a diagnostic upper bound and must never be reported as a branch
+# of the system. Compare its prop_err against the baseline's; that single
+# comparison is the result.
+ORACLE_RUN_DIR="$BASE_RUN_DIR.oracle_mask"
+run_dirs=("$ORACLE_RUN_DIR")
+print ""
+print "########## oracle control: ground-truth instance masks (CPU) ##########"
+print "run_dir=$ORACLE_RUN_DIR"
+print "NOTE: diagnostic upper bound only; not a method result."
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m streaming_couping.scripts.run_object_pose_loss_oracle \
+  --geometry-cache "$GEOMETRY_CACHE" \
+  --manifest "$MANIFEST_PATH" \
+  --scene-id "$SCENE_ID" \
+  --prompts "${PROMPTS[@]}" \
+  --output-dir "$ORACLE_RUN_DIR"
+if (( $? == 0 )); then
+  PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "$PYTHON" -m streaming_couping.scripts.run_object_pose_feedback \
+    --run-dir "$ORACLE_RUN_DIR" \
+    --geometry-cache "$GEOMETRY_CACHE" \
+    --manifest "$MANIFEST_PATH" \
+    --scene-id "$SCENE_ID" \
+    --output-dir "$ORACLE_RUN_DIR/object_pose_feedback" \
+    --horizon-repo "$ROOT/externals/horizonstream" \
+    || print -u2 "oracle: stage-2b analysis failed"
+  PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "$PYTHON" -m streaming_couping.scripts.analyze_object_pose_feedback_attribution \
+    --feedback-dir "$ORACLE_RUN_DIR/object_pose_feedback" \
+    || print -u2 "oracle: attribution failed (prop_err is still reported)"
+else
+  print -u2 "oracle control FAILED; the SAM-vs-GT comparison will be missing"
+fi
+
+# ---- Stage 2a once, for the baseline --------------------------------------
 print ""
 print "########## branch=baseline (full pipeline; the only GPU stage) ##########"
 OBJECT_POSE_FEEDBACK_PROPOSAL_BRANCH=baseline \
@@ -172,7 +215,6 @@ fi
 
 # ---- Replay each branch, then analyse it ----------------------------------
 failed_branches=()
-run_dirs=()
 for branch in "${BRANCHES[@]}"; do
   run_dir="$BASE_RUN_DIR.$branch"
   run_dirs+=("$run_dir")
@@ -248,5 +290,8 @@ if (( ${#failed_branches} > 0 )); then
   exit 1
 fi
 print ""
-print "all ${#BRANCHES} branches completed (1 GPU run, $(( ${#BRANCHES} - 1 )) CPU replays)"
+print "all ${#BRANCHES} branches + the oracle control completed"
+print "(1 GPU run, $(( ${#BRANCHES} - 1 )) CPU replays, 1 CPU oracle)"
+print "the oracle's prop_err vs baseline's is the SAM-vs-GT comparison;"
+print "it is a diagnostic upper bound, not a branch of the system"
 print "comparison_json=$BASE_RUN_DIR.branches.json"

@@ -354,6 +354,39 @@ Stage 1 的几何 cache 与分支无关，四个分支共用同一份（`--reuse
 `future_rotation_gain_median_deg`（−0.0105°）和 `single` 的（−0.0130°）——这两个
 本来就低于旧地板，属于噪声**。轨迹 RPE 走 POC 的 SVD 投影路径，不受影响。
 
+## 8.7 Mask oracle 对照（GT mask 替换 SAM mask）
+
+动机失败在一个结构性缺口上：SAM 给的是 **2D 支撑 + 身份**，要变成位姿约束还需要
+(i) 跨帧对应正确、(ii) 物体三维结构非退化。两者都有量化失败证据——但**无法区分**是
+分割模型的问题还是对应/几何的问题。唯一能拆开的实验是把 mask 换成 GT。
+
+```bash
+python -m streaming_couping.scripts.run_object_pose_loss_oracle \
+  --geometry-cache <run>/horizonstream_geometry.pt \
+  --manifest <manifest> --scene-id 00a231a370 \
+  --prompts bed wardrobe chair rug dustbin \
+  --output-dir <base>.oracle_mask
+```
+
+**它只需要 CPU**：几何来自缓存的 HorizonStream cache，mask 来自 manifest 里的
+`instance_mask` 标注，完全绕过分割模型和 HorizonStream。
+
+读法——只看 `prop_err`，和 baseline（SAM）比：
+
+| 结果 | 结论 |
+|---|---|
+| oracle 的 `prop_err` 明显更小 | 瓶颈在**分割模型**：身份、mask 边界、或 re-entry |
+| oracle 的 `prop_err` 几乎不变 | 瓶颈在 mask **下游**：最近点对应，或物体几何退化 |
+
+**它是诊断上界，不是方法分支。** 它故意违反"GT 不进入候选生成"这条项目规则——这正是
+对照的意义。产出的 `feedback_diagnostics.pt` 里带 `oracle` 审计块
+（`gt_used_for_proposals: true`、`purpose: diagnostic_upper_bound_only`、
+`not_a_method_result: true`、`segmentation_model_bypassed: true`），目录名是
+`<base>.oracle_mask`，**任何情况下都不能当作系统的一个分支报告**。
+
+sweep 命令文件会自动先跑这个对照（CPU、几秒，而且排在 GPU 之前，所以即使后面的
+pipeline 失败它的结果仍然保留），并把它作为第五行放进对比表。
+
 ## 9. 相关代码
 
 | 文件 | 角色 |
@@ -365,6 +398,8 @@ Stage 1 的几何 cache 与分支无关，四个分支共用同一份（`--reuse
 | `scripts/run_scannet_horizonstream_gt_feedback_poc.py` | 已验证的注入原语与评测函数（本实验原样复用，未修改） |
 | `scripts/analyze_object_pose_feedback_attribution.py` | 离线归因：共识是否塌缩成单物体、可靠性分数是否真能预测提案对错、筛选有没有选对、参考年龄 |
 | `scripts/run_object_pose_loss_replay.py` | 从 `feedback_diagnostics.pt` 重放 refiner（纯 CPU、确定性），使分支对比不含分割模型的方差 |
+| `scripts/run_object_pose_loss_oracle.py` | mask oracle 对照：用 GT instance mask 跑 refiner（纯 CPU），拆分"分割模型"与"对应/几何"两个瓶颈 |
+| `tests/test_object_pose_loss_oracle.py` | oracle 注入的是 GT 身份与标注，且带不可当方法结果的审计标志 |
 | `scripts/summarize_feedback_branches.py` | 多分支横向对比表 |
 | `tests/test_object_pose_loss_replay.py` | 重放忠实性：同一份观测重放必须复现源 proposals |
 | `tests/test_object_pose_feedback.py` | 20 个 CPU 测试：Lie 代数、退化分类、可靠性规则、共识拒外点、门控全部 reject 原因、**重放等价性**、注入语义、RPE key 契约、refiner 阈值镜像校验、拒绝帧仍携带共识 delta |
