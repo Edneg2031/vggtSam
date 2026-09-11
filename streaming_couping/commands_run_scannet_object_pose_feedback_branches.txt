@@ -132,14 +132,16 @@ for expected in "${existing[@]}"; do
   [[ -e "$expected" ]] && stale+=("$expected")
 done
 if (( ${#stale} > 0 )); then
-  print -u2 "refusing to overwrite existing run directories:"
+  print ""
+  print "archiving run directories left over from an earlier attempt:"
   for entry in "${stale[@]}"; do
-    print -u2 "  $entry"
+    archive="$entry.previous"
+    rm -rf "$archive"
+    mv "$entry" "$archive"
+    print "  ${entry:t} -> ${archive:t}"
   done
-  print -u2 ""
-  print -u2 "remove the ones left over from an aborted run, then re-run:"
-  print -u2 "  rm -rf ${(j: :)stale}"
-  exit 1
+  print "(one generation is kept per branch; delete the *.previous dirs when"
+  print " you no longer want them)"
 fi
 
 # ---- Stage 2a once, for the baseline --------------------------------------
