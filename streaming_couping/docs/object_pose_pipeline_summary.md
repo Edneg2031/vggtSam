@@ -40,7 +40,25 @@ HorizonStream 的累计位姿漂移，并把修正反馈到后续帧。
 | object-consensus feedback（100 帧，baseline） | 主方法 direct ATE +5.3% 但 **sim3 −0.6%**；accepted 帧只有 **38.5%** 局部变好、中位增益 **−2.3 mm** |
 | branch `fresh`（有界参考年龄） | anchor 年龄 37.5 → **8.0**、相关性 0.79 → **0.17**（p=0.09），但 `prop_err` **0.0868 → 0.0855 纹丝不动** |
 | branch `factorized`（先旋转后平移） | `d_ATE` **−0.0131**（比 raw 更差）、`single` 变体局部变好率 0.667 → 0.143 |
-| mask oracle（GT mask 替换 SAM） | `prop_err` **0.1023 vs SAM 0.0845**——**没有改善，反而略差** |
+| mask oracle（GT mask 替换 SAM） | `prop_err` **0.1023 vs SAM 0.0845**——**没有改善，反而略差**；`d_sim3` −4.6% |
+
+四分支 + oracle 的完整对照（噪声底 2e-5）：
+
+| 分支 | prop_err | d_ATE | d_sim3 | fut_rot | decision |
+|---|---:|---:|---:|---:|---|
+| **baseline** | 0.0868 | +7.8% | **+3.0%** | −0.041 | NO_GO |
+| fresh | 0.0856 | +7.3% | −1.4% | −0.007 | NO_GO |
+| factorized | 0.0846 | +3.0% | −0.8% | −0.049 | NO_GO |
+| fresh_factor | 0.0943 | +1.5% | −1.7% | +0.001 | NO_GO |
+| oracle_mask | 0.1027 | +2.8% | −4.6% | +0.006 | NO_GO |
+
+各 consensus 变体（同一 run）：
+
+| 变体 | 权重 | d_ATE | decision |
+|---|---|---:|---|
+| `robust` | 均匀 | +13.94% | **GO** |
+| `robust_semantic` | 只 S_sem | **+14.25%** | **GO** |
+| `robust_semantic_geometric`（原主方法） | S_sem × S_geo | +7.83% | NO_GO |
 
 ### 2.3 关键的可复现性事实
 
@@ -48,10 +66,11 @@ HorizonStream 的累计位姿漂移，并把修正反馈到后续帧。
   （0.763275 / 0.763275 / 0.763452），track3 dustbin 的下降都是 −0.20。
 - **聚合指标不可复现**：**同一配置**重跑，`d_ATE` 从 0.053 摆到 0.079（+50%），
   sim3 增益从 −0.006 翻到 +0.020。
-- 分割模型跨 run 散布 **0.026**，而 `fresh` 相对 baseline 的效应只有 **0.006**——
-  **噪声是效应的 4 倍**。
-- 分析链噪声约 **1e-2 相对**：vendored 的 `online_motion_averaging` 逐位不可复现
-  （从第一个累积帧起差约 1 个 float32 ulp，单线程/零初始化/确定性算法都无效）。
+- **pipeline 是可复现的**：三次独立 baseline run 逐位相同，`d_ATE` 散布
+  **2.08e-05**、`proposal_count` 散布 **0**。此前"噪声 0.026 是效应 4 倍"的说法
+  作废——那是对比**跨代码版本**的 run，不是重复实验。
+- 分析链唯一的漂移在**极小旋转角**（0.04° 量级）的测量上，最大 ~1e-2 相对，
+  没有翻转任何判定。
 
 ## 3. 为什么位姿修正失败
 
@@ -142,14 +161,11 @@ agreement jointly determine whether a correction should be fed back"。实测：
 **"observability" 这一路（S_geo）在实现上是反预测的；"cross-object agreement"
 这一路是有效的。** 而 `reliable` 硬拒筛选零区分度（保留 0.0881 vs 丢弃 0.0810）。
 
-### 3.6 测量能力也挡住了结论
+### 3.6 测量能力（已定标）
 
-- 分割模型跨 run 散布 **0.026**，而 `fresh` 的效应只有 **0.006**——**噪声是效应的 4 倍**
-- 分析链噪声约 **1e-2 相对**（vendored `online_motion_averaging` 逐位不可复现，
-  单线程 / 零初始化 / 确定性算法都无效）
-
-**小于这两个数的差异不是结果。** 这也意味着此前所有落在 5% 阈值附近的 GO/NO_GO
-都不可靠。
+`d_ATE` 的跨 run 散布是 **2.08e-05**，`proposal_count` 散布 **0**。所以表中百分之几
+量级的分支差异全部有效。唯一需要小心的是**小于 0.01° 的旋转角**——那个尺度上测量
+本身有 ~1e-2 相对漂移。
 
 ## 4. 结论
 
@@ -163,12 +179,18 @@ agreement jointly determine whether a correction should be fed back"。实测：
 4. **不能再声称的**：SAM3.1 能稳定优化 HorizonStream 位姿或稳定提升所有物体点云质量。
    **可以声称的**：persistent object masks 提供了有用但不稳定的局部几何约束；
    self-consistency loss 不能可靠地转化为 GT reconstruction gain。
-5. **测量能力的边界**：姿态指标的可复现上限约 **1e-2 相对**（分析链）+ **0.026**
-   （分割模型跨 run）。**小于这两个数的分支差异不是结果。**
+5. **有一个站得住的正面结果**：`robust` / `robust_semantic`（**不带 S_geo 加权**）
+   direct ATE **+14%** 且 sim3 **+5.3%**，六条判据全过，接受帧 82% 局部变好。
+   而原主方法（带 S_geo）只有 +7.8%、旋转守卫不过。**差别全在 S_geo——它是反预测的。**
+6. **测量能力**：`d_ATE` 跨 run 散布 **2e-05**，所以表中百分之几的差异全部有效；
+   只有小于 0.01° 的旋转角测量有 ~1e-2 相对漂移。
 
-## 5. 若要继续，唯一有依据的方向
+## 5. 若要继续
 
-不是再加一个修正分支，而是**造一个能区分"哪个物体会赢"的判据**。
+**第一步（已实现，待测）：`translation_only`。** 平移那一半有效（+7.8%，去掉 S_geo 后
++14%），旋转那一半有害（fut_rot −0.041°）——**把预算全给平移**。
+
+**第二步：造一个能区分"哪个物体会赢"的判据。**
 
 - `track_length` 是唯一活下来的预测因子，但它只在**事后**可得且方向为负（track 越老
   越差）——需要把它变成一个**事前**判据，或者用近期观测密度 / 短窗口重锚来替代
