@@ -8,24 +8,25 @@
 # No arguments and no environment variables are needed; edit the block below to
 # change the branch list or the freshness thresholds.
 #
-#   baseline      joint 6DoF, permanent anchors       (the previous behavior)
-#   fresh         joint 6DoF, bounded reference age
-#   factorized    rotation-then-translation, permanent anchors
-#   fresh_factor  both
+#   baseline          joint 6DoF, permanent anchors   (the previous behavior)
+#   translation_only  joint budget spent on translation only
+#   fresh             joint 6DoF, bounded reference age
+#   factorized        rotation-then-translation, permanent anchors
+#   fresh_factor      both
 #
 # HOW THIS DIFFERS FROM RUNNING THE FOUR PIPELINES IN SEQUENCE
 #
 # The refiner knobs live inside stage 2a, next to the segmentation model, so a
-# naive sweep runs the segmentation model four times -- and it is not
-# deterministic across runs on GPU.  The previous sweep of this form moved the
-# *unchanged* baseline's direct-ATE gain from 0.053 to 0.079 and flipped the
-# sign of its sim3 gain, while the branch effect being measured was 0.006.
-# The measurement noise was four times the effect.
+# naive sweep runs the segmentation model once per branch.  Replaying from the
+# baseline's cached observations costs no GPU and makes the branch difference
+# purely the knob under test.
 #
-# So only the baseline runs the pipeline.  Every other branch replays the
-# refiner from the baseline's cached observations, which needs no GPU and
-# carries none of the segmentation model's variance -- the branch difference
-# is then purely the knob under test.
+# (Three identical baseline runs measured a spread of 2e-05 on the direct-ATE
+# gain and 0 on the proposal count, so the pipeline itself turned out to be
+# reproducible; the replay is kept because it is free, not because the
+# segmentation model is noisy.  An earlier claim here that the run-to-run
+# spread was 0.026 came from comparing runs built from different code
+# revisions, not from repeating one.)
 #
 # The replay is gated: before any branch is compared, a replay with the
 # baseline's own settings must reproduce the baseline proposals.  If that
@@ -42,21 +43,18 @@ STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
 
 BASE_RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v1}"
-BRANCHES=(baseline fresh factorized fresh_factor)
+BRANCHES=(baseline translation_only fresh factorized fresh_factor)
 FRESH_MAX_AGE="${OBJECT_POSE_FEEDBACK_MAX_REFERENCE_AGE_FRAMES:-15}"
 FRESH_REFRESH="${OBJECT_POSE_FEEDBACK_ANCHOR_REFRESH_INTERVAL_FRAMES:-20}"
 
-# How many times to run the FULL baseline pipeline.  The replay checks below
-# are free and catch any residual nondeterminism in the analysis chain, but
-# only repeating the segmentation model measures how much IT moves the answer
-# -- and that is the number a GO/NO-GO has to clear to mean anything.  The
-# measured spread of one unchanged configuration was 0.026 against a branch
-# effect of 0.006, so a single run cannot distinguish the branches.
+# How many times to run the FULL baseline pipeline, to measure the spread of
+# one unchanged configuration.  Three runs came out at 2e-05 on the direct-ATE
+# gain and 0 on the proposal count, which is the evidence that a branch
+# difference of a few percent is readable.
 #
 # 3 means two extra stage-2a passes; stage 1 is reused from the cache by
-# --reuse-if-valid, so the geometry model runs once.  Lower it to 1 only if
-# the GPU time is unavailable, and then read the table as "no noise floor
-# measured" rather than as a comparison.
+# --reuse-if-valid, so the geometry model runs once.  Set it to 1 to skip the
+# measurement and read the table without a noise floor.
 SAM_REPEATS="${OBJECT_POSE_FEEDBACK_SAM_REPEATS:-3}"
 
 MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
@@ -284,6 +282,9 @@ for branch in "${BRANCHES[@]}"; do
         ;;
       factorized)
         replay_flags+=(--object-pose-loss-proposal-mode rotation_then_translation)
+        ;;
+      translation_only)
+        replay_flags+=(--object-pose-loss-proposal-mode translation_only)
         ;;
       fresh_factor)
         replay_flags+=(--object-pose-loss-max-reference-age-frames "$FRESH_MAX_AGE")

@@ -244,3 +244,16 @@ def test_factorized_schedule_differs_from_joint() -> None:
                     indices=(0, 1, 2, 3, 4, 5),
                 )
     assert not torch.allclose(joint.detach(), factored.detach())
+
+
+def test_translation_only_leaves_rotation_at_identity() -> None:
+    """The joint branch measured translation helping and rotation harming, so
+    this mode spends the whole budget on translation."""
+
+    refiner, delta, raw_pose, pairs, match_sets = _stage_fixture("joint")
+    refiner._run_optimizer_stage(
+        delta, raw_pose, pairs, match_sets, indices=(3, 4, 5)
+    )
+    assert delta.detach()[:3].abs().max() == 0
+    assert float(torch.linalg.vector_norm(delta.detach()[3:])) > 0.0
+    assert _config(proposal_mode="translation_only").proposal_mode in PROPOSAL_MODES

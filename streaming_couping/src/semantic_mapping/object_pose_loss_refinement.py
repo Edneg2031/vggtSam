@@ -32,7 +32,7 @@ from .object_pose_refinement import PoseRefinementResult
 
 #: How the per-object 6DoF correction is parameterized.
 PROPOSAL_MODES: frozenset[str] = frozenset(
-    {"joint", "rotation_then_translation"}
+    {"joint", "rotation_then_translation", "translation_only"}
 )
 
 
@@ -71,6 +71,12 @@ class ObjectPoseLossRefinementConfig:
     # rotation consensus error (0.61 deg) exceeds the noise floor of the raw
     # per-frame RPE rotation (0.32 deg), so rotation is the poorly conditioned
     # half on the mostly planar/linear objects in this scene.
+    # "translation_only": leave rotation at identity and optimize translation.
+    # The 100-frame sweep measured the translation half helping (direct ATE
+    # +7.8%, sim3 +3.0% for the joint branch, +14.3% with the semantic-only
+    # weighting) while the rotation half was harmful (median future rotation
+    # gain -0.041 deg, and the rotation guard is what turned every branch
+    # NO_GO).  Dropping the half that loses should keep the half that wins.
     proposal_mode: str = "joint"
 
     max_match_distance_m: float = 0.25
@@ -1183,6 +1189,11 @@ class ObjectPoseLossRefiner:
                 break
             if self.config.proposal_mode == "rotation_then_translation":
                 self._run_factorized_steps(delta, raw_device, pairs, match_sets)
+            elif self.config.proposal_mode == "translation_only":
+                # rotation stays exactly at identity
+                self._run_optimizer_stage(
+                    delta, raw_device, pairs, match_sets, indices=(3, 4, 5)
+                )
             else:
                 for _ in range(int(self.config.optimizer_steps)):
                     optimizer.zero_grad(set_to_none=True)
