@@ -96,11 +96,12 @@ print "===== OBJECT POSE FEEDBACK ATTRIBUTION ====="
 print "feedback_dir=$FEEDBACK_DIR"
 print "rerun_stage_2b=$RERUN_STAGE_2B"
 
+BACKUP="$FEEDBACK_DIR.bak"
+
 if [[ "$RERUN_STAGE_2B" == "1" ]]; then
   for required in "$GEOMETRY_CACHE" "$MANIFEST_PATH"; do
     [[ -f "$required" ]] || { print -u2 "missing: $required"; exit 1; }
   done
-  BACKUP="$FEEDBACK_DIR.bak"
   if [[ -e "$BACKUP" ]]; then
     print -u2 "refusing to overwrite an existing backup: $BACKUP"
     print -u2 "move it aside first if you really want a fresh backup."
@@ -120,18 +121,21 @@ if [[ "$RERUN_STAGE_2B" == "1" ]]; then
     --min-consensus-objects "$MIN_CONSENSUS_OBJECTS" \
     --max-consensus-translation-m "$MAX_CONSENSUS_TRANSLATION_M" \
     --max-consensus-rotation-deg "$MAX_CONSENSUS_ROTATION_DEG"
+fi
 
-  # Recording extra diagnostics must not move any number.  Warn, do not abort:
-  # the attribution is still worth reading when this trips.  The comparison
-  # names the differing paths -- a newly recorded informational field is not
-  # the same finding as a flipped decision.
-  print "--- decisions vs the backup ---"
+# Report against the backup whenever one exists, not only on the run that made
+# it: the comparison answers "did the number move?", which stays a fair
+# question on every later run.  Recording extra diagnostics must not move any
+# number; a newly recorded informational field is not the same finding as a
+# flipped decision, so the differing paths are named rather than just counted.
+# Warn, do not abort -- the attribution is still worth reading when it trips.
+if [[ -f "$BACKUP/summary.json" && -f "$FEEDBACK_DIR/summary.json" ]]; then
+  print "decisions vs the backup: $BACKUP"
   PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
     "$PYTHON" -m streaming_couping.scripts.compare_json \
     --prefix decisions \
     "$BACKUP/summary.json" "$FEEDBACK_DIR/summary.json" \
-    || print -u2 "WARNING: decisions moved; check the paths above before " \
-                 "trusting the new (c2) section"
+    || print -u2 "WARNING: decisions moved; check the paths above before trusting the new (c2) section"
 fi
 
 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
