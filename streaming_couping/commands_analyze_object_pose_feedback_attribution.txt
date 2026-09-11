@@ -21,6 +21,31 @@ STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
 
 RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v1}"
+
+# Resolve the run directory.  The default assumes the standard layout; if
+# object_pose_feedback is not there, look for candidates under the storage root
+# rather than failing with a path the caller has to go and guess.
+if [[ ! -d "$RUN_DIR/object_pose_feedback" ]]; then
+  candidates=("$STORAGE_ROOT"/outputs/*/object_pose_feedback(N/))
+  if (( ${#candidates} == 1 )); then
+    RUN_DIR="${candidates[1]:h}"
+    print "note: no object_pose_feedback in the default run dir; using $RUN_DIR"
+  elif (( ${#candidates} > 1 )); then
+    print -u2 "no object_pose_feedback in the default run dir: $RUN_DIR"
+    print -u2 "several candidates found -- rerun with one of:"
+    for candidate in "${candidates[@]}"; do
+      print -u2 "  OBJECT_POSE_FEEDBACK_RUN_DIR=${candidate:h} \\"
+    done
+    print -u2 "    zsh streaming_couping/commands_analyze_object_pose_feedback_attribution.txt"
+    exit 1
+  else
+    print -u2 "missing feedback dir: $RUN_DIR/object_pose_feedback"
+    print -u2 "searched: $STORAGE_ROOT/outputs/*/object_pose_feedback"
+    print -u2 "if the run lives elsewhere, set OBJECT_POSE_FEEDBACK_RUN_DIR=<run dir>"
+    exit 1
+  fi
+fi
+
 FEEDBACK_DIR="$RUN_DIR/object_pose_feedback"
 GEOMETRY_CACHE="$RUN_DIR/horizonstream_geometry.pt"
 MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
@@ -37,8 +62,14 @@ MAX_CONSENSUS_ROTATION_DEG="${OBJECT_POSE_FEEDBACK_MAX_CONSENSUS_ROTATION_DEG:-8
 cd "$ROOT"
 export PYTHONUNBUFFERED=1
 
-[[ -d "$FEEDBACK_DIR" ]] || { print -u2 "missing feedback dir: $FEEDBACK_DIR"; exit 1; }
 [[ -n "$PYTHON" ]] || { print -u2 "no python interpreter found"; exit 1; }
+for name in object_proposals.csv consensus_metrics.csv frame_metrics.csv; do
+  [[ -f "$FEEDBACK_DIR/$name" ]] || {
+    print -u2 "missing stage-2b artifact: $FEEDBACK_DIR/$name"
+    print -u2 "was stage 2b run with --object-pose-loss-export-feedback-diagnostics?"
+    exit 1
+  }
+done
 
 print "===== OBJECT POSE FEEDBACK ATTRIBUTION ====="
 print "feedback_dir=$FEEDBACK_DIR"
