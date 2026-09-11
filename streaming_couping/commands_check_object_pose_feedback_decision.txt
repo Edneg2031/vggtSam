@@ -1,0 +1,65 @@
+#!/usr/bin/env zsh
+
+# Re-read the object-consensus pose-feedback verdict from an existing run.
+#
+#   zsh streaming_couping/commands_check_object_pose_feedback_decision.txt
+#
+# CPU only, seconds.  Stage 2b is re-run on the run directory that already
+# exists, and the per-variant verdicts are printed.
+#
+# This is enough whenever only the DECISION changed -- which variant is
+# headlined, which criteria are applied -- because the proposals and the
+# replayed trajectories are untouched.  Stage 2a (the segmentation model) and
+# stage 1 (the geometry model) do not have to run again.
+set -uo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
+
+BASE_RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v1}"
+RUN_DIR="$BASE_RUN_DIR.baseline"
+GEOMETRY_CACHE="$BASE_RUN_DIR/horizonstream_geometry.pt"
+MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
+SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
+
+cd "$ROOT"
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+export PYTHONUNBUFFERED=1
+
+for required in "$RUN_DIR/object_pose_refinement/feedback_diagnostics.pt" \
+                "$GEOMETRY_CACHE" "$MANIFEST_PATH"; do
+  [[ -f "$required" ]] || {
+    print -u2 "missing: $required"
+    print -u2 "run commands_run_scannet_object_pose_feedback_branches.txt first"
+    exit 1
+  }
+done
+
+print "===== OBJECT POSE FEEDBACK VERDICT ====="
+print "run_dir=$RUN_DIR"
+print "cpu_only=1  segmentation_rerun=0"
+
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m streaming_couping.scripts.run_object_pose_feedback \
+  --run-dir "$RUN_DIR" \
+  --geometry-cache "$GEOMETRY_CACHE" \
+  --manifest "$MANIFEST_PATH" \
+  --scene-id "$SCENE_ID" \
+  --output-dir "$RUN_DIR/object_pose_feedback" \
+  --horizon-repo "$ROOT/externals/horizonstream"
+if (( $? != 0 )); then
+  print -u2 "stage-2b re-run failed"
+  exit 1
+fi
+
+print ""
+print "===== PER-VARIANT VERDICT ====="
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m streaming_couping.scripts.summarize_feedback_branches \
+  --run-dir "$RUN_DIR"
+
+print ""
+print "the 'decision' column is the headlined variant's verdict; 'go_variants'"
+print "lists every consensus variant that passed ALL criteria, and 'main_failed'"
+print "the criteria the headlined one did not."
