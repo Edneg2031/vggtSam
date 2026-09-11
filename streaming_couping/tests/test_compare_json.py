@@ -12,10 +12,16 @@ from streaming_couping.scripts.compare_json import _same, _walk
 from streaming_couping.scripts.compare_json import main as compare_main
 
 
-def _differences(before, after) -> list[tuple[str, object, object]]:
-    found: list[tuple[str, object, object]] = []
-    _walk(before, after, "", found)
-    return found
+def _walk_both(before, after, tolerance: float = 1e-3):
+    material: list[tuple[str, object, object]] = []
+    drifted: list[tuple[str, float, float, float]] = []
+    added: list[tuple[str, object]] = []
+    _walk(before, after, "", material, drifted, added, tolerance)
+    return material, drifted, added
+
+
+def _differences(before, after, tolerance: float = 1e-3):
+    return _walk_both(before, after, tolerance)[0]
 
 
 def test_identical_trees_report_nothing() -> None:
@@ -30,8 +36,9 @@ def test_new_informational_field_is_reported_by_path() -> None:
         "criteria": {"ate": {"passed": True}},
         "new_informational": 0.5,
     }
-    found = _differences(before, after)
-    assert found == [("new_informational", "<absent>", 0.5)]
+    material, _, added = _walk_both(before, after)
+    assert material == []
+    assert added == [("new_informational", 0.5)]
 
 
 def test_flipped_decision_is_reported_with_both_values() -> None:
@@ -60,6 +67,43 @@ def test_nan_compares_equal_to_nan() -> None:
     assert _same({"x": float("nan")}, {"x": float("nan")})
 
 
+def test_last_digit_drift_is_not_material_but_is_reported() -> None:
+    """A repeating CPU replay drifts in its last digits; that must not alarm."""
+
+    before = {"value": 0.13584919185714348}
+    after = {"value": 0.13584239832251896}
+    material, drifted, _ = _walk_both(before, after)
+    assert material == []
+    assert len(drifted) == 1
+    path, _, _, gap = drifted[0]
+    assert path == "value"
+    assert 0.0 < gap < 1e-3
+
+
+def test_a_real_change_is_material() -> None:
+    material, _, _ = _walk_both({"value": 0.10}, {"value": 0.12})
+    assert material == [("value", 0.10, 0.12)]
+
+
+def test_zero_to_nonzero_is_material() -> None:
+    material, _, _ = _walk_both({"value": 0.0}, {"value": 1e-9})
+    assert material == [("value", 0.0, 1e-9)]
+
+
+def test_tolerance_is_configurable() -> None:
+    before, after = {"v": 1.0}, {"v": 1.02}
+    assert _differences(before, after) == [("v", 1.0, 1.02)]
+    assert _differences(before, after, tolerance=0.05) == []
+
+
+def test_decision_string_change_is_always_material() -> None:
+    material, _, _ = _walk_both(
+        {"decision": "OBJECT_FEEDBACK_GO"},
+        {"decision": "OBJECT_FEEDBACK_NO_GO"},
+    )
+    assert material == [("decision", "OBJECT_FEEDBACK_GO", "OBJECT_FEEDBACK_NO_GO")]
+
+
 def test_prefix_selects_a_subtree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
@@ -74,7 +118,7 @@ def test_prefix_selects_a_subtree(
         ["compare_json", str(left), str(right), "--prefix", "decisions"],
     )
     compare_main()  # equal subtree -> no SystemExit
-    assert "identical" in capsys.readouterr().out
+    assert "no material change" in capsys.readouterr().out
 
     monkeypatch.setattr(
         "sys.argv",

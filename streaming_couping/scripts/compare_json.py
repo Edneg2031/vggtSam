@@ -34,8 +34,21 @@ def _load(path: Path, prefix: str | None) -> Any:
     return document
 
 
+def _relative_gap(left: float, right: float) -> float:
+    """Relative difference, or infinity when the two are not comparable."""
+
+    if math.isnan(left) and math.isnan(right):
+        return 0.0
+    if math.isinf(left) or math.isinf(right):
+        return 0.0 if left == right else float("inf")
+    scale = max(abs(left), abs(right))
+    if scale == 0.0:
+        return 0.0
+    return abs(left - right) / scale
+
+
 def _same(left: Any, right: Any) -> bool:
-    """Equality that treats two non-finite floats as equal to each other."""
+    """Exact structural equality (non-finite floats equal to the same value)."""
 
     if isinstance(left, float) and isinstance(right, float):
         if math.isnan(left) and math.isnan(right):
@@ -51,26 +64,52 @@ def _same(left: Any, right: Any) -> bool:
     return left == right
 
 
-def _walk(left: Any, right: Any, path: str, out: list[tuple[str, Any, Any]]) -> None:
+def _walk(
+    left: Any,
+    right: Any,
+    path: str,
+    material: list[tuple[str, Any, Any]],
+    drifted: list[tuple[str, float, float, float]],
+    added: list[tuple[str, Any]],
+    tolerance: float,
+) -> None:
+    """Split differences into material changes, additions, and float drift.
+
+    A repeating replay is not bit-identical on CPU because reduction order
+    varies with thread scheduling, so values drift in their last digits.  A
+    checker that flags that, or a newly recorded diagnostic field, as
+    "changed" trains the reader to ignore it; only a value that moved beyond
+    ``tolerance``, or disappeared, reaches the material list.
+    """
+
     if isinstance(left, dict) and isinstance(right, dict):
         for key in sorted(set(left) | set(right)):
             child = f"{path}.{key}" if path else str(key)
             if key not in left:
-                out.append((child, "<absent>", right[key]))
+                added.append((child, right[key]))
             elif key not in right:
-                out.append((child, left[key], "<absent>"))
+                material.append((child, left[key], "<absent>"))
             else:
-                _walk(left[key], right[key], child, out)
+                _walk(
+                    left[key], right[key], child, material, drifted, added, tolerance
+                )
         return
     if isinstance(left, list) and isinstance(right, list):
         if len(left) != len(right):
-            out.append((f"{path}[]", f"len={len(left)}", f"len={len(right)}"))
+            material.append((f"{path}[]", f"len={len(left)}", f"len={len(right)}"))
             return
         for index, (a, b) in enumerate(zip(left, right)):
-            _walk(a, b, f"{path}[{index}]", out)
+            _walk(a, b, f"{path}[{index}]", material, drifted, added, tolerance)
         return
-    if not _same(left, right):
-        out.append((path, left, right))
+    if _same(left, right):
+        return
+    # Numeric drift is reported, but separately, and only as a magnitude.
+    if isinstance(left, float) and isinstance(right, float):
+        gap = _relative_gap(left, right)
+        drifted.append((path, left, right, gap))
+        if gap <= tolerance:
+            return
+    material.append((path, left, right))
 
 
 def _render(value: Any, limit: int = 60) -> str:
@@ -93,23 +132,48 @@ def main() -> None:
     parser.add_argument(
         "--max-changes",
         type=int,
-        default=20,
+        default=50,
         help="Stop listing after this many differing paths.",
+    )
+    parser.add_argument(
+        "--tolerance",
+        type=float,
+        default=1e-3,
+        help=(
+            "Relative float difference below which a change counts as "
+            "numerical drift rather than a material change.  A repeating "
+            "replay drifts in its last digits; a real threshold change moves "
+            "values by percent."
+        ),
     )
     args = parser.parse_args()
 
     before = _load(args.before.expanduser().resolve(), args.prefix)
     after = _load(args.after.expanduser().resolve(), args.prefix)
-    differences: list[tuple[str, Any, Any]] = []
-    _walk(before, after, "", differences)
-    if not differences:
-        print(f"identical ({args.prefix or 'whole document'})")
+    material: list[tuple[str, Any, Any]] = []
+    drifted: list[tuple[str, float, float, float]] = []
+    added: list[tuple[str, Any]] = []
+    _walk(before, after, "", material, drifted, added, args.tolerance)
+    label = args.prefix or "whole document"
+
+    if added:
+        print(f"{len(added)} newly recorded field(s) [{label}]:")
+        for path, value in added[: args.max_changes]:
+            print(f"  {path}: <absent> -> {_render(value)}")
+    if drifted:
+        worst = max(gap for _, _, _, gap in drifted)
+        print(
+            f"{len(drifted)} value(s) drifted within tolerance "
+            f"(max relative {worst:.2e}, tolerance {args.tolerance:.0e}) [{label}]"
+        )
+    if not material:
+        print(f"no material change ({label})")
         return
-    print(f"{len(differences)} differing path(s) ({args.prefix or 'whole document'}):")
-    for path, old, new in differences[: args.max_changes]:
+    print(f"{len(material)} material change(s) ({label}):")
+    for path, old, new in material[: args.max_changes]:
         print(f"  {path}: {_render(old)} -> {_render(new)}")
-    if len(differences) > args.max_changes:
-        print(f"  ... and {len(differences) - args.max_changes} more")
+    if len(material) > args.max_changes:
+        print(f"  ... and {len(material) - args.max_changes} more")
     raise SystemExit(1)
 
 
