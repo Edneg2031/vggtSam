@@ -5,17 +5,21 @@ set -euo pipefail
 #
 #   zsh streaming_couping/commands_analyze_object_pose_feedback_attribution.txt
 #
-# Read-only by default: it reads the CSVs stage 2b already wrote and prints the
-# attribution sections.  No model runs, no GPU, a few seconds.  Answers where
-# the next iteration should go: did the geometric reliability term collapse the
-# consensus into a single-object estimate, do the reliability scores actually
-# predict proposal correctness, and does the gate reject the right frames.
+# Read-only unless the CSVs predate a column the analysis needs.  It reads the
+# artifacts stage 2b already wrote and prints the attribution sections: no
+# model runs, no GPU, seconds.  Answers where the next iteration should go --
+# whether consensus collapsed, whether the reliability scores actually predict
+# proposal correctness, which frames the gate rejects, and whether the proposal
+# error tracks how stale the reference set is.
 #
-# RERUN_STAGE_2B=1 additionally regenerates stage 2b first (CPU only; the
-# replay is deterministic).  That is only needed for the frame-level section
-# (c2), because the pre-existing CSVs were written before rejected frames
-# started carrying their consensus delta.  The current output is backed up
-# next to itself first; existing backups are never overwritten.
+# Stage 2b is regenerated automatically (CPU only, deterministic replay) when
+# object_proposals.csv is missing a column the analysis reads -- today that is
+# reference_roles, needed to split the anchor reference from the local history
+# one.  The existing output is backed up first and existing backups are never
+# overwritten; the decisions in summary.json are diffed afterwards, because
+# recording extra diagnostics must not move any number.
+#
+# RERUN_STAGE_2B=0|1 forces that decision off or on.  No other input is needed.
 ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
@@ -51,7 +55,7 @@ GEOMETRY_CACHE="$RUN_DIR/horizonstream_geometry.pt"
 MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
 SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
 HORIZON_REPO="$ROOT/externals/horizonstream"
-RERUN_STAGE_2B="${RERUN_STAGE_2B:-0}"
+RERUN_STAGE_2B="${RERUN_STAGE_2B:-auto}"
 
 # These must mirror the stage-2a refiner thresholds; a mismatch is refused by
 # the run itself.  See docs/object_pose_feedback.md.
@@ -70,6 +74,23 @@ for name in object_proposals.csv consensus_metrics.csv frame_metrics.csv; do
     exit 1
   }
 done
+
+# Automatic: regenerate stage 2b only when a column the analysis reads is
+# absent from the current CSVs.  Recording extra diagnostics never changes a
+# computed value, so the replay is safe to repeat.
+if [[ "$RERUN_STAGE_2B" == "auto" ]]; then
+  missing_columns=()
+  for column in reference_roles; do
+    head -n 1 "$FEEDBACK_DIR/object_proposals.csv" | grep -qF "$column" \
+      || missing_columns+=("$column")
+  done
+  if (( ${#missing_columns} > 0 )); then
+    RERUN_STAGE_2B=1
+    print "note: object_proposals.csv lacks ${(j:, :)missing_columns}; regenerating stage 2b to record it"
+  else
+    RERUN_STAGE_2B=0
+  fi
+fi
 
 print "===== OBJECT POSE FEEDBACK ATTRIBUTION ====="
 print "feedback_dir=$FEEDBACK_DIR"
