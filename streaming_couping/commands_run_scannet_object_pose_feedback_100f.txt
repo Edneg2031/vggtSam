@@ -25,7 +25,7 @@ SCENE_ID="00a231a370"
 FRAME_START="${OBJECT_POSE_FEEDBACK_FRAME_START:-90}"
 FRAME_STRIDE="${OBJECT_POSE_FEEDBACK_FRAME_STRIDE:-1}"
 FRAME_COUNT="${OBJECT_POSE_FEEDBACK_FRAME_COUNT:-100}"
-PROMPTS=("bed" "wardrobe" "chair" "rug" "dustbin")
+PROMPTS=("bed" "wardrobe" "chair" "rug" "dustbin" "table" "mat" "nightstand" "cabinet" "picture" "window" "door")
 
 RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v1}"
 GEOMETRY_CACHE="${OBJECT_POSE_FEEDBACK_GEOMETRY_CACHE:-$RUN_DIR/horizonstream_geometry.pt}"

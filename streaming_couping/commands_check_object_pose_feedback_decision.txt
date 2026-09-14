@@ -22,7 +22,7 @@ RUN_DIR="$BASE_RUN_DIR.baseline"
 GEOMETRY_CACHE="$BASE_RUN_DIR/horizonstream_geometry.pt"
 MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
 SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
-PROMPTS=(bed wardrobe chair rug dustbin)
+PROMPTS=(bed wardrobe chair rug dustbin table mat nightstand cabinet picture window door)
 
 cd "$ROOT"
 export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"

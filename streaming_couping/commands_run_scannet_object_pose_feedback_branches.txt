@@ -61,7 +61,7 @@ MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_p
 SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
 # Must match the prompts the SAM branches used, or the oracle's GT instances
 # and the SAM tracks would cover different object sets.
-PROMPTS=(bed wardrobe chair rug dustbin)
+PROMPTS=(bed wardrobe chair rug dustbin table mat nightstand cabinet picture window door)
 GEOMETRY_CACHE="$BASE_RUN_DIR/horizonstream_geometry.pt"
 BASELINE_RUN_DIR="$BASE_RUN_DIR.baseline"
 BASELINE_DIAGNOSTICS="$BASELINE_RUN_DIR/object_pose_refinement/feedback_diagnostics.pt"

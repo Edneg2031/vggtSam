@@ -32,7 +32,7 @@ MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_p
 SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
 
 # Edit this list to test a different prompt set.
-PROMPTS=(bed wardrobe chair rug dustbin)
+PROMPTS=(bed wardrobe chair rug dustbin table mat nightstand cabinet picture window door)
 
 cd "$ROOT"
 export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
