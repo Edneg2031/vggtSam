@@ -1,0 +1,65 @@
+#!/usr/bin/env zsh
+
+# What objects does this scene have, and which ones is the run missing?
+#
+#   zsh streaming_couping/commands_list_scene_objects.txt
+#
+# Read-only and CPU only, seconds.  No model runs.
+#
+# The prompts are a hard ceiling: an object no prompt matches cannot be
+# proposed, corrected, or scored, however well it is seen.  This prints
+#
+#   * every ground-truth object visible in the run's own frame window, with the
+#     mask size it gets on the run's own grid and which prompt reaches it;
+#   * the objects no prompt reaches at all;
+#   * the objects visible but too small (or too large) for the pipeline's own
+#     mask filters, so they yield no observation even when prompted;
+#   * what the segmenter actually produced, against the ground-truth side.
+#
+# To test a wider prompt set, add the words to PROMPTS below and run again: an
+# added prompt changes which masks are requested, so it needs a stage-2a re-run,
+# but no model change and no new labels.
+set -uo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
+
+BASE_RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v1}"
+GEOMETRY_CACHE="$BASE_RUN_DIR/horizonstream_geometry.pt"
+DIAGNOSTICS="$BASE_RUN_DIR.baseline/object_pose_refinement/feedback_diagnostics.pt"
+MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
+SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
+
+# Edit this list to test a different prompt set.
+PROMPTS=(bed wardrobe chair rug dustbin)
+
+cd "$ROOT"
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+export PYTHONUNBUFFERED=1
+
+[[ -f "$MANIFEST_PATH" ]] || { print -u2 "missing: $MANIFEST_PATH"; exit 1; }
+[[ -f "$GEOMETRY_CACHE" ]] || { print -u2 "missing: $GEOMETRY_CACHE"; exit 1; }
+
+# The segmenter side is optional: without a run, only the ground-truth side is
+# reported, which is still the answer to "what is in this scene".
+ARGS=(
+  --manifest "$MANIFEST_PATH"
+  --scene-id "$SCENE_ID"
+  --geometry-cache "$GEOMETRY_CACHE"
+  --prompts "${PROMPTS[@]}"
+)
+if [[ -f "$DIAGNOSTICS" ]]; then
+  ARGS+=(--feedback-diagnostics "$DIAGNOSTICS")
+else
+  print -u2 "note: no run diagnostics at $DIAGNOSTICS"
+  print -u2 "      reporting the ground-truth side only"
+fi
+
+print "===== SCENE OBJECT INVENTORY ====="
+print "scene=$SCENE_ID"
+print "prompts=${(j:, :)PROMPTS}"
+print ""
+
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m streaming_couping.scripts.list_scene_objects "${ARGS[@]}"
