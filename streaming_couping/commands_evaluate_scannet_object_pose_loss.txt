@@ -53,8 +53,10 @@ COMBINED="$EVAL_DIR/gt_comparison.txt"
   cat "$COPYABLE"
   print ""
   print "===== PLY VERTEX COUNTS ====="
-  for ply in "$INPUT_DIR"/raw_pose/*.ply "$INPUT_DIR"/raw_pose/objects/*.ply \
-      "$INPUT_DIR"/object_pose_refined/*.ply "$INPUT_DIR"/object_pose_refined/objects/*.ply; do
+  # (N): an unmatched glob is a hard error in zsh, and a run whose refined
+  # branch has no PLY files should print nothing here, not abort.
+  for ply in "$INPUT_DIR"/raw_pose/*.ply(N) "$INPUT_DIR"/raw_pose/objects/*.ply(N) \
+      "$INPUT_DIR"/object_pose_refined/*.ply(N) "$INPUT_DIR"/object_pose_refined/objects/*.ply(N); do
     [[ -f "$ply" ]] || continue
     vertex_count="$(sed -n 's/^element vertex //p' "$ply" | head -n 1)"
     print "$(basename "$ply")=$vertex_count path=$ply"

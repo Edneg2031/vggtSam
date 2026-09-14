@@ -192,7 +192,10 @@ fi
 # a full cache inside a branch directory.  Rescuing it saves the whole geometry
 # pass, and --reuse-if-valid re-validates it, so adopting a stale one is safe.
 if [[ ! -f "$GEOMETRY_CACHE" ]]; then
-  for stranded in "$BASE_RUN_DIR".*/horizonstream_geometry.pt; do
+  # (N) is required: zsh makes an unmatched glob a hard error, so on the
+  # ordinary case -- a new window with no leftovers -- the loop would abort the
+  # sweep instead of finding nothing.
+  for stranded in "$BASE_RUN_DIR".*/horizonstream_geometry.pt(N); do
     [[ -f "$stranded" ]] || continue
     # The base directory may itself be gone, so the cache cannot merely be
     # renamed into it.
