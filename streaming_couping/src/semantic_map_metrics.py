@@ -407,15 +407,36 @@ def nearest_distances(
     *,
     chunk_size: int,
 ) -> torch.Tensor:
+    """Distance from each source point to its nearest target point.
+
+    Both sides are chunked.  Chunking only the source looks sufficient and is
+    not: the block it builds is ``chunk_size x len(target)``, so a reference
+    cloud of a few million points -- which is what a ground-truth object cloud
+    is -- makes a single block tens of gigabytes.  The whole computation then
+    runs at memory bandwidth, or swaps, while producing exactly the same
+    answer it would have produced in a bounded amount of memory.
+
+    Chunking the target does not change the result: the minimum over blocks is
+    the minimum over all of them, and each pairwise distance is computed the
+    same way regardless of which block it lands in.
+    """
+
     if not source.numel() or not target.numel():
         raise ValueError("Nearest distances require non-empty point sets.")
+    step = int(chunk_size)
+    if step < 1:
+        raise ValueError("chunk_size must be positive.")
     output = []
-    for start in range(0, source.shape[0], int(chunk_size)):
-        distance = torch.cdist(
-            source[start : start + int(chunk_size)],
-            target,
-        )
-        output.append(distance.min(dim=1).values)
+    for start in range(0, source.shape[0], step):
+        block = source[start : start + step]
+        best = torch.full((block.shape[0],), float("inf"), dtype=block.dtype)
+        for target_start in range(0, target.shape[0], step):
+            distance = torch.cdist(
+                block,
+                target[target_start : target_start + step],
+            )
+            best = torch.minimum(best, distance.min(dim=1).values)
+        output.append(best)
     return torch.cat(output)
 
 
