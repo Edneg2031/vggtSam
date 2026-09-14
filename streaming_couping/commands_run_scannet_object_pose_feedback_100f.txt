@@ -25,14 +25,25 @@ SCENE_ID="00a231a370"
 FRAME_START="${OBJECT_POSE_FEEDBACK_FRAME_START:-90}"
 FRAME_STRIDE="${OBJECT_POSE_FEEDBACK_FRAME_STRIDE:-1}"
 FRAME_COUNT="${OBJECT_POSE_FEEDBACK_FRAME_COUNT:-100}"
-PROMPTS=("bed" "wardrobe" "chair" "rug" "dustbin" "table" "mat" "nightstand" "cabinet" "picture" "window" "door")
+# The prompt list has ONE source of truth: the branch sweep exports it, and a
+# second copy here would be a copy that has to be remembered into agreement.
+# Getting it wrong is silent and costly -- the oracle's ground-truth instances
+# would then cover a different set of objects than the SAM branches tracked,
+# and the SAM-vs-GT comparison would be comparing two different questions.
+if [[ -n "${OBJECT_POSE_FEEDBACK_PROMPTS:-}" ]]; then
+  PROMPTS=("${(@s:,:)OBJECT_POSE_FEEDBACK_PROMPTS}")
+else
+  # Standalone run: the current generation's set, mirroring the sweep's PROMPTS.
+  PROMPTS=("bed" "wardrobe" "chair" "rug")
+fi
 
 # Defaults to the CURRENT generation.  Running this alone must not land on a
-# previous generation's directory: v1 is a finished result that other scripts
-# read for comparison, and a standalone run would overwrite it in place.  The
+# previous generation's directory: those are finished results that other scripts
+# read for comparison, and a standalone run would overwrite one in place.  The
 # branch sweep passes RUN_DIR explicitly, so this default only decides what an
 # unaccompanied invocation does.
-RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v2}"
+GENERATION="${OBJECT_POSE_FEEDBACK_GENERATION:-v3}"
+RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_$GENERATION}"
 GEOMETRY_CACHE="${OBJECT_POSE_FEEDBACK_GEOMETRY_CACHE:-$RUN_DIR/horizonstream_geometry.pt}"
 OUTPUT_DIR="$RUN_DIR"
 EVAL_DIR="$RUN_DIR/gt_evaluation"

@@ -65,6 +65,11 @@ run 目录名尾部的 `_v1` / `_v2` 是**代数**：同一套分支在不同配
 |---|---|---|
 | `_v1` | `bed wardrobe chair rug dustbin`（5） | 通过全部 7 条判据（`robust_semantic` +14.25% / sim3 +5.35%），**保留只读** |
 | `_v2` | v1 + `table mat nightstand cabinet picture window door`（12） | **已跑完，全部 NO_GO**：主变体 −2.38% / sim3 −4.99% |
+| `_v3` | `bed wardrobe chair rug`（v1 减 dustbin） | 待跑 |
+
+换 prompt 集只需要改 sweep 顶部的 `GENERATION` 和 `PROMPTS` 两行：run 目录、
+缓存种子、对照表和 oracle 的 GT 集合全部由这两行推出。prompt 列表是**单一来源**，
+sweep 通过 `OBJECT_POSE_FEEDBACK_PROMPTS` 传给内层脚本，不再需要两边手抄一致。
 
 v2 说明的是 **prompt 集是方法的一部分，不是自由参数**。v2 产出的类别是
 `bed/cabinet/chair/dustbin/rug/window`，v1 是 `bed/chair/dustbin/rug/wardrobe` ——

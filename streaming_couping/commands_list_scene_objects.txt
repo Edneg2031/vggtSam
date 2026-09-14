@@ -26,8 +26,10 @@ STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
 
 RUNS_ROOT="$STORAGE_ROOT/outputs"
-V1_RUN_DIR="$RUNS_ROOT/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v1"
-V2_RUN_DIR="$RUNS_ROOT/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v2"
+PREFIX="semantic_map_100frames_horizonstream_object_pose_feedback_90_189"
+# Newest last, so the search below takes the most recent generation that has
+# each artifact.
+GENERATIONS=(v1 v2 v3)
 
 # The ground-truth side of the inventory only needs a run's frames and grid;
 # the segmenter side needs a run's diagnostics, and only the NEWEST generation's
@@ -36,20 +38,34 @@ V2_RUN_DIR="$RUNS_ROOT/semantic_map_100frames_horizonstream_object_pose_feedback
 # still missing -- and when the diagnostics do come from the old one, say so,
 # because a v1 segmenter listing read while thinking about v2 prompts is exactly
 # the confusion this check exists to prevent.
-BASE_RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$V2_RUN_DIR}"
-GEOMETRY_CACHE="$BASE_RUN_DIR/horizonstream_geometry.pt"
-DIAGNOSTICS="$BASE_RUN_DIR.baseline/object_pose_refinement/feedback_diagnostics.pt"
+newest="${GENERATIONS[-1]}"
+BASE_RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$RUNS_ROOT/${PREFIX}_$newest}"
+GEOMETRY_CACHE=""
+DIAGNOSTICS=""
+for generation in ${(Oa)GENERATIONS}; do
+  [[ -n "$GEOMETRY_CACHE" ]] || {
+    candidate="$RUNS_ROOT/${PREFIX}_$generation/horizonstream_geometry.pt"
+    [[ -f "$candidate" ]] && GEOMETRY_CACHE="$candidate"
+  }
+  [[ -n "$DIAGNOSTICS" ]] || {
+    candidate="$RUNS_ROOT/${PREFIX}_$generation.baseline/object_pose_refinement/feedback_diagnostics.pt"
+    [[ -f "$candidate" ]] && DIAGNOSTICS="$candidate"
+  }
+done
 
-if [[ ! -f "$GEOMETRY_CACHE" && -f "$V1_RUN_DIR/horizonstream_geometry.pt" ]]; then
-  GEOMETRY_CACHE="$V1_RUN_DIR/horizonstream_geometry.pt"
-  print "note: no geometry cache in ${BASE_RUN_DIR:t}; reading v1's, which only"
-  print "      fixes the frames and grid, so the inventory is unaffected"
-fi
-if [[ ! -f "$DIAGNOSTICS" && -f "$V1_RUN_DIR.baseline/object_pose_refinement/feedback_diagnostics.pt" ]]; then
-  DIAGNOSTICS="$V1_RUN_DIR.baseline/object_pose_refinement/feedback_diagnostics.pt"
-  print "note: no run diagnostics in ${BASE_RUN_DIR:t}.baseline; the segmenter"
-  print "      side below is v1's and shows v1's prompt set, not the current one"
-fi
+# The ground-truth side only needs a run's frames and grid, which any
+# generation supplies; the segmenter side needs a run's diagnostics, and only a
+# CURRENT generation's say anything about the current prompt set.  So say which
+# generation each came from -- a listing read while thinking about the current
+# prompts, but showing an older generation's tracks, is exactly the confusion
+# this check exists to prevent.
+for required in "$GEOMETRY_CACHE" "$DIAGNOSTICS"; do
+  [[ -n "$required" ]] || continue
+  case "$required" in
+    *"${PREFIX}_$newest"*) ;;
+    *) print "note: reading an older generation for $required:t" ;;
+  esac
+done
 MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
 SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
 

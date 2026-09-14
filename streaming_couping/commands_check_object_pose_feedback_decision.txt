@@ -22,34 +22,57 @@ STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
 
 RUNS_ROOT="$STORAGE_ROOT/outputs"
-V1_RUN_DIR="$RUNS_ROOT/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v1"
-V2_RUN_DIR="$RUNS_ROOT/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v2"
+PREFIX="semantic_map_100frames_horizonstream_object_pose_feedback_90_189"
+
+# Newest first: the verdict is re-read for the current generation, and the
+# comparison table carries the older ones beside it.
+GENERATIONS=(v3 v2 v1)
 
 # The prompt list has to match the generation being read: it decides which
 # ground-truth categories the object-map reference is built from, and scoring a
 # 5-prompt run against a 12-prompt reference would pool categories the run
 # never produced.
-PROMPTS_V1=(bed wardrobe chair rug dustbin)
-PROMPTS_V2=(bed wardrobe chair rug dustbin table mat nightstand cabinet picture window door)
+GENERATION_PROMPTS=(
+  "v1:bed wardrobe chair rug dustbin"
+  "v2:bed wardrobe chair rug dustbin table mat nightstand cabinet picture window door"
+  "v3:bed wardrobe chair rug"
+)
 
 if [[ -n "${OBJECT_POSE_FEEDBACK_RUN_DIR:-}" ]]; then
   BASE_RUN_DIR="$OBJECT_POSE_FEEDBACK_RUN_DIR"
-elif [[ -d "$V2_RUN_DIR.baseline" ]]; then
-  BASE_RUN_DIR="$V2_RUN_DIR"
 else
-  BASE_RUN_DIR="$V1_RUN_DIR"
-  print -u2 "note: no v2 run present; reading v1"
-  print -u2 "      run commands_run_scannet_object_pose_feedback_branches.txt for v2"
+  BASE_RUN_DIR=""
+  for generation in "${GENERATIONS[@]}"; do
+    candidate="$RUNS_ROOT/${PREFIX}_$generation"
+    [[ -d "$candidate.baseline" ]] && { BASE_RUN_DIR="$candidate"; break }
+  done
+  [[ -n "$BASE_RUN_DIR" ]] || {
+    print -u2 "no run of any known generation is present"
+    print -u2 "run commands_run_scannet_object_pose_feedback_branches.txt first"
+    exit 1
+  }
 fi
+GENERATION="${${BASE_RUN_DIR:t}##*_}"
 RUN_DIR="$BASE_RUN_DIR.baseline"
 GEOMETRY_CACHE="$BASE_RUN_DIR/horizonstream_geometry.pt"
 MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
 SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
 
-if [[ "$BASE_RUN_DIR" == *"_v1" ]]; then
-  PROMPTS=("${PROMPTS_V1[@]}")
-else
-  PROMPTS=("${PROMPTS_V2[@]}")
+PROMPTS=()
+for entry in "${GENERATION_PROMPTS[@]}"; do
+  [[ "${entry%%:*}" == "$GENERATION" ]] || continue
+  words="${entry#*:}"
+  PROMPTS=("${(@s: :)words}")
+done
+if (( ${#PROMPTS} == 0 )); then
+  # An unlisted generation still has to be scorable: fall back to the newest
+  # set on record rather than to an empty prompt list, which would silently
+  # build the object-map reference from no categories at all.
+  entry="${GENERATION_PROMPTS[-1]}"
+  words="${entry#*:}"
+  PROMPTS=("${(@s: :)words}")
+  print -u2 "note: generation $GENERATION is not in GENERATION_PROMPTS;"
+  print -u2 "      scoring against the newest recorded set instead"
 fi
 
 cd "$ROOT"
@@ -89,9 +112,13 @@ fi
 # a v2 question and are read in the sweep's own table.
 print ""
 print "===== PER-VARIANT VERDICT ====="
+legend=()
+for entry in "${GENERATION_PROMPTS[@]}"; do
+  legend+=(--legend "${entry%%:*} = ${${entry#*:}:gs: :, :} prompts")
+done
 verdict_args=()
 verdict_seen=()
-for candidate in "$V1_RUN_DIR.baseline" "$RUN_DIR"; do
+for candidate in "$RUNS_ROOT/${PREFIX}_v1.baseline" "$RUN_DIR"; do
   [[ -f "$candidate/object_pose_feedback/summary.json" ]] || continue
   # Reading v1 means RUN_DIR *is* the v1 baseline; the same row must not be
   # printed twice, which reads as two runs that happen to agree.
@@ -102,8 +129,7 @@ done
 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   "$PYTHON" -m streaming_couping.scripts.summarize_feedback_branches \
   "${verdict_args[@]}" \
-  --legend "v1 = ${#PROMPTS_V1} prompts: ${(j:, :)PROMPTS_V1}" \
-  --legend "v2 = ${#PROMPTS_V2} prompts: ${(j:, :)PROMPTS_V2}"
+  "${legend[@]}"
 
 print ""
 print "the 'decision' column is the headlined variant's verdict; 'go_variants'"

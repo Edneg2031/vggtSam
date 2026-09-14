@@ -60,15 +60,48 @@ STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
 
 # ---- Generations ----------------------------------------------------------
-# The prompt set is this round's independent variable, so it gets its own
-# generation of run directories.  v1 is the five-prompt run that passed every
-# criterion; it is the result being kept, so NOTHING here writes to it.  The
-# only thing read from it is the stage-1 geometry cache -- and that is COPIED,
-# never moved or linked, so v1 cannot be damaged even if stage 1 decides the
-# cache needs rebuilding.
+# The prompt set is the independent variable, so each one gets its own
+# generation of run directories and nothing here writes to an earlier one.
+# v1 is the five-prompt run that passed every criterion; it is the result being
+# kept, so it is never written to.  The only thing read from a previous
+# generation is the stage-1 geometry cache -- and that is COPIED, never moved
+# or linked, so the earlier generation cannot be damaged even if stage 1
+# decides the cache needs rebuilding.
+#
+# To try another prompt set, change GENERATION and PROMPTS below.  Nothing else
+# needs editing: the run directories, the cache seed, the comparison table and
+# the oracle's ground-truth set all derive from these two lines.
 RUNS_ROOT="$STORAGE_ROOT/outputs"
-PRIOR_RUN_DIR="$RUNS_ROOT/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v1"
-BASE_RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$RUNS_ROOT/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v2}"
+RUN_PREFIX="semantic_map_100frames_horizonstream_object_pose_feedback_90_189"
+GENERATION="${OBJECT_POSE_FEEDBACK_GENERATION:-v3}"
+
+# Prompts for THIS generation.  v1 minus dustbin: v1 produced bed/chair/dustbin/
+# rug/wardrobe and dustbin was the best-scoring category against ground truth,
+# so this asks whether the set still works without it.  Note this is not
+# "v1's objects minus dustbin" -- the prompt list competes for a fixed number of
+# object slots (see adapters.py), so the object set that comes out is not
+# predictable from the words that went in.  v2 taught that the hard way: seven
+# words were ADDED and a category was still lost.
+PROMPTS=(bed wardrobe chair rug)
+
+# Generations the closing table compares, oldest first.  A generation with no
+# readable run is skipped, so listing one that was never run is harmless.
+COMPARE_GENERATIONS=(v1 v2 v3)
+GENERATION_PROMPTS=(
+  "v1:bed wardrobe chair rug dustbin"
+  "v2:bed wardrobe chair rug dustbin table mat nightstand cabinet picture window door"
+  "v3:bed wardrobe chair rug"
+)
+
+PRIOR_RUN_DIR=""
+for candidate in ${(Oa)COMPARE_GENERATIONS}; do
+  [[ "$candidate" == "$GENERATION" ]] && continue
+  if [[ -f "$RUNS_ROOT/${RUN_PREFIX}_$candidate/horizonstream_geometry.pt" ]]; then
+    PRIOR_RUN_DIR="$RUNS_ROOT/${RUN_PREFIX}_$candidate"
+    break
+  fi
+done
+BASE_RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$RUNS_ROOT/${RUN_PREFIX}_$GENERATION}"
 BRANCHES=(baseline translation_only fresh factorized fresh_factor)
 FRESH_MAX_AGE="${OBJECT_POSE_FEEDBACK_MAX_REFERENCE_AGE_FRAMES:-15}"
 FRESH_REFRESH="${OBJECT_POSE_FEEDBACK_ANCHOR_REFRESH_INTERVAL_FRAMES:-20}"
@@ -85,16 +118,6 @@ SAM_REPEATS="${OBJECT_POSE_FEEDBACK_SAM_REPEATS:-3}"
 
 MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
 SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
-# Must match the prompts the SAM branches used (the inner script's PROMPTS),
-# or the oracle's GT instances and the SAM tracks would cover different sets.
-#
-# v1 ran five; the inventory found those reached only 5 of the 71 visible
-# ground-truth objects.  The seven added here are the rigid, well-kept ones it
-# listed as unreachable.  floor/wall/ceiling are deliberately absent: they are
-# structural, so their motion is the room's and they would dominate the
-# consensus instead of anchoring against it.
-PROMPTS=(bed wardrobe chair rug dustbin table mat nightstand cabinet picture window door)
-PROMPTS_V1=(bed wardrobe chair rug dustbin)
 GEOMETRY_CACHE="$BASE_RUN_DIR/horizonstream_geometry.pt"
 BASELINE_RUN_DIR="$BASE_RUN_DIR.baseline"
 BASELINE_DIAGNOSTICS="$BASELINE_RUN_DIR/object_pose_refinement/feedback_diagnostics.pt"
@@ -109,6 +132,11 @@ export PYTHONUNBUFFERED=1
 # would run once per branch and the oracle would find nothing at the shared
 # path.  Exporting it is what makes "one geometry run for all branches" true.
 export OBJECT_POSE_FEEDBACK_GEOMETRY_CACHE="$GEOMETRY_CACHE"
+# One source of truth for the prompt list.  The inner script used to carry its
+# own copy with a comment saying it "must match" this one -- which is a matter
+# of remembering, and getting it wrong makes the oracle score a different set of
+# objects than the SAM branches tracked.  Exporting removes the chance.
+export OBJECT_POSE_FEEDBACK_PROMPTS="${(j:,:)PROMPTS}"
 
 for required in "$RUN_SCRIPT" "$MANIFEST_PATH"; do
   [[ -f "$required" ]] || { print -u2 "missing: $required"; exit 1; }
@@ -214,8 +242,7 @@ if [[ -f "$GEOMETRY_CACHE" ]]; then
     --prompts "${PROMPTS[@]}" \
     || print -u2 "inventory check failed; continuing (it is a check, not a gate)"
   print ""
-  print "v1 prompts (${#PROMPTS_V1}): ${(j:, :)PROMPTS_V1}"
-  print "v2 prompts (${#PROMPTS}): ${(j:, :)PROMPTS}"
+  print "$GENERATION prompts (${#PROMPTS}): ${(j:, :)PROMPTS}"
 fi
 
 # ---- Stage 2a once, for the baseline --------------------------------------
@@ -452,10 +479,11 @@ PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
 # quote for the difference between generations.  A v1-vs-v2 gap is read against
 # that floor, not as though it had one of its own.
 print ""
-print "===== PROMPT-SET COMPARISON (v1 = ${#PROMPTS_V1} prompts, v2 = ${#PROMPTS}) ====="
+print "===== GENERATION COMPARISON (the prompt set is the variable) ====="
 generation_dirs=()
 for branch in "${BRANCHES[@]}"; do
-  for run_dir in "$PRIOR_RUN_DIR.$branch" "$BASE_RUN_DIR.$branch"; do
+  for generation in "${COMPARE_GENERATIONS[@]}"; do
+    run_dir="$RUNS_ROOT/${RUN_PREFIX}_$generation.$branch"
     [[ -f "$run_dir/object_pose_feedback/summary.json" ]] \
       && generation_dirs+=("$run_dir")
   done
@@ -465,17 +493,20 @@ if (( ${#generation_dirs} > 1 )); then
   for run_dir in "${generation_dirs[@]}"; do
     generation_args+=(--run-dir "$run_dir")
   done
+  legend=()
+  for entry in "${GENERATION_PROMPTS[@]}"; do
+    legend+=(--legend "${entry%%:*} = ${${entry#*:}:gs: :, :} prompts")
+  done
   PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
     "$PYTHON" -m streaming_couping.scripts.summarize_feedback_branches \
     "${generation_args[@]}" \
-    --legend "v1 = ${#PROMPTS_V1} prompts: ${(j:, :)PROMPTS_V1}" \
-    --legend "v2 = ${#PROMPTS} prompts: ${(j:, :)PROMPTS}" \
-    --legend "the only intended difference between a v1 and a v2 row of the" \
-    --legend "same branch is the prompt set; stage 1 is a copy of v1's cache." \
+    "${legend[@]}" \
+    --legend "a generation is a prompt set, not a code change: stage 1 is a copy" \
+    --legend "of an earlier generation's cache, so the raw trajectory is identical" \
     --json-out "$BASE_RUN_DIR.prompt_comparison.json"
 else
-  print "only one generation is present; nothing to compare yet"
-  print "(looked for summaries under $PRIOR_RUN_DIR.* and $BASE_RUN_DIR.*)"
+  print "only one generation has a readable run; nothing to compare yet"
+  print "(looked for summaries under $RUNS_ROOT/${RUN_PREFIX}_*.baseline etc.)"
 fi
 
 if (( ${#failed_branches} > 0 )); then
@@ -490,4 +521,5 @@ print "the oracle's prop_err vs baseline's is the SAM-vs-GT comparison;"
 print "it is a diagnostic upper bound, not a branch of the system"
 print "comparison_json=$BASE_RUN_DIR.branches.json"
 print "generation_json=$BASE_RUN_DIR.prompt_comparison.json"
-print "kept_run_dir=$PRIOR_RUN_DIR (v1; read-only this round)"
+print "generation=$GENERATION (this round; earlier generations are read-only)"
+print "seeded_from=$PRIOR_RUN_DIR"
