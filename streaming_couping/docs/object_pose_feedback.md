@@ -66,11 +66,16 @@ run 目录名尾部的 `_v1` / `_v2` 是**代数**：同一套分支在不同配
 | `_v1` | `bed wardrobe chair rug dustbin`（5） | 通过全部 7 条判据（`robust_semantic` +14.25% / sim3 +5.35%），**保留只读** |
 | `_v2` | v1 + `table mat nightstand cabinet picture window door`（12） | **已跑完，全部 NO_GO**：主变体 −2.38% / sim3 −4.99% |
 
-**v2 的结果比"没提升"更重要**：它证明 **prompt 列表不是可加的**。v2 产出的类别是
+v2 说明的是 **prompt 集是方法的一部分，不是自由参数**。v2 产出的类别是
 `bed/cabinet/chair/dustbin/rug/window`，v1 是 `bed/chair/dustbin/rug/wardrobe` ——
 **`wardrobe` 消失**，多出 `cabinet` 和 `window`；补进去的
 `table/mat/nightstand/picture/door` 一个都没产出 proposal。所以 v1→v2 是**换了一套
 物体**，不是"多了 7 个物体"。
+
+机制在代码里（`adapters.py:255`）：每个 prompt 单独跑一次 `track_all_forward`，
+所以加词不会在检测阶段压掉别的词；但检测之后 `accepted` 是**跨 prompt 共享**的 ——
+候选按**出生帧**排序，与已接受 track 的 IoU ≥ `duplicate_iou` 的后来者当重复丢掉，
+再叠加 `--max-objects` 默认 **16** 的全局上限。
 
 坏掉的是**共识**而不是提案：`prop_err` 0.0868 → 0.0888（几乎没动），但 `cons_err`
 0.0730 → **0.0923**。v1 的共识比单提案好 15.9%，**v2 的共识比单提案还差 3.9%**。
