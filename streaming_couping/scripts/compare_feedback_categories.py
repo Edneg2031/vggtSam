@@ -44,7 +44,13 @@ PROPOSAL_COLUMNS = (
     "gt_translation_correction_error",
     "consensus_inlier",
 )
-CONSENSUS_COLUMNS = ("variant", "frame", "num_reliable", "inlier_count")
+CONSENSUS_COLUMNS = (
+    "variant",
+    "frame",
+    "num_reliable",
+    "inlier_count",
+    "gt_consensus_translation_error",
+)
 
 
 def _read_rows(path: Path) -> list[dict[str, str]]:
@@ -191,6 +197,64 @@ def consensus_frames(
     }
 
 
+def within_frame_agreement(
+    proposals: Sequence[Mapping[str, str]],
+    consensus_rows: Sequence[Mapping[str, str]],
+    variant: str,
+) -> dict[str, Any]:
+    """How much the objects disagree with each other, and what came out.
+
+    A median over objects helps when their errors are independent -- they
+    average out -- and hurts when they share a bias, because then every vote
+    reinforces the same mistake.  Those two cases look identical from an
+    aggregate error: both are "objects that are each somewhat wrong".  They
+    come apart here, because the spread among one frame's inlier errors is the
+    independent part, and the consensus error is what survives it.
+
+    Tighter agreement with a WORSE consensus is the signature of a shared bias;
+    looser agreement with a better consensus is errors cancelling.
+    """
+
+    by_frame: dict[int, list[float]] = {}
+    for row in proposals:
+        if not _flag(row.get("consensus_inlier")):
+            continue
+        error = _float(row.get("gt_translation_correction_error"))
+        frame = _float(row.get("frame"))
+        if error is None or frame is None:
+            continue
+        by_frame.setdefault(int(frame), []).append(error)
+
+    spreads = [
+        float(np.std(values, ddof=1))
+        for values in by_frame.values()
+        if len(values) >= 2
+    ]
+    ranges = [
+        max(values) - min(values)
+        for values in by_frame.values()
+        if len(values) >= 2
+    ]
+    consensus_error = {}
+    for row in consensus_rows:
+        if (row.get("variant") or "").strip() != variant:
+            continue
+        frame = _float(row.get("frame"))
+        error = _float(row.get("gt_consensus_translation_error"))
+        if frame is not None and error is not None:
+            consensus_error[int(frame)] = error
+    shared = sorted(set(by_frame) & set(consensus_error))
+    return {
+        "frames_with_two_or_more_inliers": len(spreads),
+        "inlier_spread_median_m": _median(spreads),
+        "inlier_range_median_m": _median(ranges),
+        "consensus_error_median_m": _median(
+            [consensus_error[frame] for frame in shared]
+        ),
+        "frames_compared": len(shared),
+    }
+
+
 def consensus_net_effect(
     proposal_error: float | None, consensus_error: float | None
 ) -> float | None:
@@ -243,6 +307,7 @@ def load_run(run_dir: Path, variant: str | None) -> dict[str, Any]:
         "categories": category_errors(proposals),
         "participation": consensus_participation(proposals),
         "frames": consensus_frames(consensus, main),
+        "agreement": within_frame_agreement(proposals, consensus, main),
         "proposal_error_m": proposal_error,
         "consensus_error_m": consensus_error,
         "net_effect": consensus_net_effect(proposal_error, consensus_error),
@@ -372,6 +437,41 @@ def render_net_effect(runs: Sequence[Mapping[str, Any]]) -> str:
     )
 
 
+def render_agreement(runs: Sequence[Mapping[str, Any]]) -> str:
+    headers = [
+        "run",
+        "inlier_frames",
+        "inlier_spread_m",
+        "inlier_range_m",
+        "consensus_err_m",
+        "consensus_gain",
+    ]
+    rows = [
+        [
+            run["label"],
+            run["agreement"]["frames_with_two_or_more_inliers"],
+            run["agreement"]["inlier_spread_median_m"],
+            run["agreement"]["inlier_range_median_m"],
+            run["agreement"]["consensus_error_median_m"],
+            run["net_effect"],
+        ]
+        for run in runs
+    ]
+    return "\n".join(
+        [
+            "(4) within-frame agreement among the consensus inliers",
+            "    inlier_spread_m is the median per-frame spread of the inlier "
+            "errors: the part\n    that averaging can cancel.  Read it against "
+            "consensus_err_m --",
+            "      wide spread + small consensus error = the objects disagree, "
+            "and the median wins",
+            "      narrow spread + large consensus error = the objects agree on "
+            "the same mistake",
+            _table(headers, rows),
+        ]
+    )
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -404,6 +504,8 @@ def main() -> None:
     print(render_participation(runs))
     print()
     print(render_net_effect(runs))
+    print()
+    print(render_agreement(runs))
 
     if args.json_out is not None:
         args.json_out.expanduser().resolve().write_text(

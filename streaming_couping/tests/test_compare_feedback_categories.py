@@ -27,7 +27,9 @@ PROPOSAL_HEADER = (
     "frame,instance_id,category,gt_translation_correction_error,"
     "consensus_inlier\n"
 )
-CONSENSUS_HEADER = "variant,frame,num_reliable,inlier_count\n"
+CONSENSUS_HEADER = (
+    "variant,frame,num_reliable,inlier_count,gt_consensus_translation_error\n"
+)
 
 
 def _write_run(
@@ -35,7 +37,7 @@ def _write_run(
     name: str,
     *,
     proposals: list[tuple[int, int, str, float | None, bool]],
-    consensus: list[tuple[int, int, int]] | None = None,
+    consensus: list[tuple[int, int, int, float]] | None = None,
     variant: str = "robust_semantic",
     proposal_error: float = 0.09,
     consensus_error: float = 0.07,
@@ -51,10 +53,10 @@ def _write_run(
         )
     (feedback / "object_proposals.csv").write_text("".join(lines), encoding="utf-8")
 
-    rows = consensus if consensus is not None else [(0, 3, 3)]
+    rows = consensus if consensus is not None else [(0, 3, 3, consensus_error)]
     body = [CONSENSUS_HEADER]
-    for frame, reliable, inliers in rows:
-        body.append(f"{variant},{frame},{reliable},{inliers}\n")
+    for frame, reliable, inliers, error in rows:
+        body.append(f"{variant},{frame},{reliable},{inliers},{error}\n")
     (feedback / "consensus_metrics.csv").write_text("".join(body), encoding="utf-8")
 
     (feedback / "summary.json").write_text(
@@ -212,3 +214,57 @@ def test_load_run_rejects_a_renamed_column(tmp_path: Path) -> None:
 def test_load_run_rejects_a_missing_artifact(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="object_proposals.csv"):
         load_run(tmp_path / "nope", None)
+
+
+def test_within_frame_agreement_separates_cancelling_from_shared_bias() -> None:
+    """Tight agreement with a bad consensus is the shared-bias signature."""
+
+    from streaming_couping.scripts.compare_feedback_categories import (
+        within_frame_agreement,
+    )
+
+    def proposal(frame: int, category: str, error: float) -> dict[str, str]:
+        return {
+            "frame": str(frame),
+            "category": category,
+            "gt_translation_correction_error": str(error),
+            "consensus_inlier": "True",
+        }
+
+    consensus = [
+        {
+            "variant": "robust_semantic",
+            "frame": "0",
+            "gt_consensus_translation_error": "0.02",
+        }
+    ]
+    # objects disagree widely, the median lands well
+    cancelling = within_frame_agreement(
+        [proposal(0, "a", 0.02), proposal(0, "b", 0.20)], consensus, "robust_semantic"
+    )
+    assert cancelling["inlier_spread_median_m"] > 0.1
+    assert cancelling["consensus_error_median_m"] == pytest.approx(0.02)
+
+    # objects agree tightly, and the consensus is still wrong
+    shared_bias = within_frame_agreement(
+        [proposal(0, "a", 0.14), proposal(0, "b", 0.15)], consensus, "robust_semantic"
+    )
+    assert shared_bias["inlier_spread_median_m"] < 0.01
+
+
+def test_within_frame_agreement_needs_two_inliers_to_have_a_spread() -> None:
+    from streaming_couping.scripts.compare_feedback_categories import (
+        within_frame_agreement,
+    )
+
+    rows = [
+        {
+            "frame": "0",
+            "category": "bed",
+            "gt_translation_correction_error": "0.1",
+            "consensus_inlier": "True",
+        }
+    ]
+    agreement = within_frame_agreement(rows, [], "robust_semantic")
+    assert agreement["frames_with_two_or_more_inliers"] == 0
+    assert agreement["inlier_spread_median_m"] is None
