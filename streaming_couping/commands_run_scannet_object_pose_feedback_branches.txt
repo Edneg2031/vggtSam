@@ -470,7 +470,7 @@ PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   "$PYTHON" -m streaming_couping.scripts.summarize_feedback_branches \
   "${summary_args[@]}" \
   "${noise_floor_dirs[@]}" \
-  --legend "v2 prompts (${#PROMPTS}): ${(j:, :)PROMPTS}" \
+  --legend "$GENERATION prompts (${#PROMPTS}): ${(j:, :)PROMPTS}" \
   --json-out "$BASE_RUN_DIR.branches.json"
 
 # ---- The comparison this round is actually about --------------------------
