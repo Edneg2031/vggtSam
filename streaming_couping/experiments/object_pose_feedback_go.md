@@ -98,7 +98,40 @@ mask 面积/score）加权；原主方法 `robust_semantic_geometric` 额外乘�
 | 点云绝对数值 | **不可引用**。预测云是 refiner 采样的 ≤256 点/观测（bed 参考云 258 万点、预测约 2.5 万，稀疏约 100 倍），所以 accuracy / F5cm 的 precision 侧可信，**completeness / recall 被稀疏性主导**，只有 raw-vs-修正的**对比**有效 |
 | 类别一致性 | **不均匀**。`chair` / `wardrobe` 的 F5cm 升但 ghost / IoU 降 |
 | 变体选择 | `robust` / `robust_semantic` 是在看过结果后确定为主变体的。它在**预先声明的七条判据**上通过，这一点是事前成立的；但"它是所有变体里最好的"是事后观察 |
-| 代数 | 数字来自 **v1（5 prompt）**。v2（12 prompt）尚未运行，本记录不包含任何 v2 数字 |
+| **prompt 集敏感** | **已实测**：把 prompt 集从 5 个扩到 12 个，同一个 `robust_semantic` 从 +14.25% 掉到 **−2.38%**，判据从 GO 变成 NO_GO。见 §7.1 |
+
+### 7.1 已实测的脆弱性：prompt 集一改就翻
+
+v2（12 prompt）跑完后，同一个场景、同一个 Stage 1（几何缓存是 v1 的拷贝，raw 逐位相同）、
+同一套阈值，逐分支对照：
+
+| 分支 | v1 d_ATE | v1 d_sim3 | v2 d_ATE | v2 d_sim3 |
+|---|---:|---:|---:|---:|
+| baseline（主变体） | **+14.25%** | **+5.35%** | **−2.38%** | **−4.99%** |
+| fresh | +7.32% | −1.38% | +7.57% | −0.10% |
+| factorized | +2.99% | −0.79% | −2.55% | −2.54% |
+| fresh_factor | +1.52% | −1.65% | **+8.32%** | **+0.78%** |
+| translation_only | −1.55% | −6.99% | −14.46% | −15.06% |
+
+**v2 里没有任何分支通过全部判据。**
+
+要紧的不是"12 个不如 5 个"，而是**这件事说明 v1 的 GO 依赖一个当时并不理解的参数**：
+
+- **prompt 列表不是可加的**。v2 产出的类别是 `bed / cabinet / chair / dustbin / rug / window`，
+  v1 是 `bed / chair / dustbin / rug / wardrobe`。**`wardrobe` 消失了**，多出 `cabinet` 和
+  `window`。所以 v1→v2 不是"5 个加 7 个"，而是**换了一套物体**。
+- **共识本身是变坏的那一环**，不是提案：`prop_err` 几乎没动（0.0868 → 0.0888），
+  但 `cons_err` 从 0.0730 涨到 **0.0923**。按 (3) 的定义，v1 的共识比单提案好 15.9%，
+  **v2 的共识比单提案还差 3.9%** —— 多出来的物体是净负贡献。
+- 我上一轮的预测（"补的 7 个刚性物体会给共识增加有效约束"）**是错的**。补进去的
+  `table / mat / nightstand / picture / door` 一个都没产出 proposal。
+
+所以本节第 3 条结论（"有一个端到端的正面结果"）只在**那一个 prompt 集**下成立，
+而那个 prompt 集是扩集之前定下的。**v1 的 +14.25% 仍然是真的**（噪声底 1.2e-05，
+差异远在噪声之上），但它是一个**在单场景、单窗口上对物体集合敏感的结果**，
+不是"给 HorizonStream 加 SAM 就能提升位姿"。
+
+要把它变成可用的结论，缺的不是再调阈值，是**第二个场景**。
 
 ## 8. 复现入口
 
@@ -108,11 +141,15 @@ zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
 
 # 只重读判定 + 跑点云评测（纯 CPU，几秒，无需 GPU）
 zsh streaming_couping/commands_check_object_pose_feedback_decision.txt
+
+# §7.1：prompt 集换了哪些物体、有没有进共识、共识是否还不如单提案（CPU）
+zsh streaming_couping/commands_compare_prompt_sets.txt
 ```
 
 产出：
 - `<base>.branches.json` —— 分支对照表（含噪声底）
 - `<base>.prompt_comparison.json` —— v1/v2 逐代对照
+- `<base>.prompt_categories_<branch>.json` —— §7.1 的逐类别对照
 - `<base>.<branch>/object_pose_feedback/summary.json` —— 各变体判定与指标
 - `<base>.<branch>/object_pose_feedback/attribution.json` —— 归因分析
 - `<base>.baseline/object_pose_feedback/object_map_metrics.json` —— 第 4 节的点云指标

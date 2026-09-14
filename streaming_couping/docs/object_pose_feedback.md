@@ -63,8 +63,19 @@ run 目录名尾部的 `_v1` / `_v2` 是**代数**：同一套分支在不同配
 
 | 代数 | prompt 集 | 状态 |
 |---|---|---|
-| `_v1` | `bed wardrobe chair rug dustbin`（5） | 通过全部 7 条判据的结果，**保留只读** |
-| `_v2` | v1 + `table mat nightstand cabinet picture window door`（12） | 当前实验 |
+| `_v1` | `bed wardrobe chair rug dustbin`（5） | 通过全部 7 条判据（`robust_semantic` +14.25% / sim3 +5.35%），**保留只读** |
+| `_v2` | v1 + `table mat nightstand cabinet picture window door`（12） | **已跑完，全部 NO_GO**：主变体 −2.38% / sim3 −4.99% |
+
+**v2 的结果比"没提升"更重要**：它证明 **prompt 列表不是可加的**。v2 产出的类别是
+`bed/cabinet/chair/dustbin/rug/window`，v1 是 `bed/chair/dustbin/rug/wardrobe` ——
+**`wardrobe` 消失**，多出 `cabinet` 和 `window`；补进去的
+`table/mat/nightstand/picture/door` 一个都没产出 proposal。所以 v1→v2 是**换了一套
+物体**，不是"多了 7 个物体"。
+
+坏掉的是**共识**而不是提案：`prop_err` 0.0868 → 0.0888（几乎没动），但 `cons_err`
+0.0730 → **0.0923**。v1 的共识比单提案好 15.9%，**v2 的共识比单提案还差 3.9%**。
+逐类别对照见 `commands_compare_prompt_sets.txt` 与
+`experiments/object_pose_feedback_go.md` §7.1。
 
 prompt 是硬上限：没有 prompt 命中的物体不可能被提案、修正或评分。场景清单
 （`commands_list_scene_objects.txt`）显示 v1 的 5 个 prompt 只够到 71 个可见
