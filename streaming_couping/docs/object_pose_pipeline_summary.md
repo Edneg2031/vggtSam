@@ -41,6 +41,8 @@ HorizonStream 的累计位姿漂移，并把修正反馈到后续帧。
 | branch `fresh`（有界参考年龄） | anchor 年龄 37.5 → **8.0**、相关性 0.79 → **0.17**（p=0.09），但 `prop_err` **0.0868 → 0.0855 纹丝不动** |
 | branch `factorized`（先旋转后平移） | `d_ATE` **−0.0131**（比 raw 更差）、`single` 变体局部变好率 0.667 → 0.143 |
 | mask oracle（GT mask 替换 SAM） | `prop_err` **0.1023 vs SAM 0.0845**——**没有改善，反而略差**；`d_sim3` −4.6% |
+| branch `translation_only`（只修平移） | **更差**：`robust_semantic` 0.100024 → **0.111681**、`robust` 0.100378 → 0.113167。旋转与平移在联合解里耦合，强制 ω=0 让重叠变差、平移也跟着变差 |
+| **修正轨迹建图并评测** | **传导成功**：`robust_semantic` vs raw，accuracy **−29%**、ghost **−44%**、F5cm **+12%**、completeness −6.7%、voxel IoU 持平 |
 
 四分支 + oracle 的完整对照（噪声底 2e-5）：
 
@@ -59,6 +61,32 @@ HorizonStream 的累计位姿漂移，并把修正反馈到后续帧。
 | `robust` | 均匀 | +13.94% | **GO** |
 | `robust_semantic` | 只 S_sem | **+14.25%** | **GO** |
 | `robust_semantic_geometric`（原主方法） | S_sem × S_geo | +7.83% | NO_GO |
+
+### 2.2b 位姿改善是否传导到点云（CPU，同一批点只换位姿）
+
+`evaluate_pose_feedback_object_map` 把诊断里每个观测的相机系点云，用**各变体的轨迹**重新
+投到世界，参考云由 **GT mask + depth + GT 位姿** 构成。同批点、只换位姿，所以身份错误、
+mask 质量、采样全部抵消。
+
+池化 `[all]`（`robust_semantic` vs raw）：
+
+| 指标 | raw | robust_semantic | Δ |
+|---|---:|---:|---:|
+| object_accuracy_m ↓ | 0.0167 | **0.0119** | **−29%** |
+| object_completeness_m ↓ | 0.0947 | **0.0884** | −6.7% |
+| fscore_5cm ↑ | 0.4895 | **0.5487** | **+12.1%** |
+| voxel_iou_5cm ↑ | 0.1142 | 0.1144 | 持平 |
+| ghost_point_ratio ↓ | 0.0926 | **0.0518** | **−44%** |
+
+**通过轨迹判据的三个变体（`mean`/`robust`/`robust_semantic`）恰好也是地图指标最好的三个**，
+`single` 与 `robust_semantic_geometric` 都落后——轨迹判据与地图指标独立地给出同一排序。
+
+分类别**不均匀**：`bed` 五项全改善（accuracy −37%、F5cm +18%、IoU +22%、ghost −50%）；
+`chair` 和 `wardrobe` 是 F5cm 升但 ghost / IoU 降；`pet bed` 有 GT 但 SAM 无对应 track。
+
+**两个保留**：预测云是 refiner 采样的 ≤256 点/观测（bed 的参考云 258 万点、预测约 2.5 万，
+稀疏 100 倍），所以 accuracy 与 F5cm 的 precision 侧可信，**completeness/recall 被稀疏性
+主导**，不动是预期的；绝对数值不是 pipeline 真实建图的数值，只有 raw-vs-修正的对比有效。
 
 ### 2.3 关键的可复现性事实
 
@@ -179,18 +207,19 @@ agreement jointly determine whether a correction should be fed back"。实测：
 4. **不能再声称的**：SAM3.1 能稳定优化 HorizonStream 位姿或稳定提升所有物体点云质量。
    **可以声称的**：persistent object masks 提供了有用但不稳定的局部几何约束；
    self-consistency loss 不能可靠地转化为 GT reconstruction gain。
-5. **有一个站得住的正面结果**：`robust` / `robust_semantic`（**不带 S_geo 加权**）
-   direct ATE **+14%** 且 sim3 **+5.3%**，六条判据全过，接受帧 82% 局部变好。
+5. **有一个端到端的正面结果**：`robust` / `robust_semantic`（**不带 S_geo 加权**）
+   direct ATE **+14.25%** 且 sim3 **+5.35%**，七条判据全过，接受帧 82% 局部变好；
    而原主方法（带 S_geo）只有 +7.8%、旋转守卫不过。**差别全在 S_geo——它是反预测的。**
+   更重要的是这个改善**传导到了产物**：同一批点换用修正后的轨迹，物体 accuracy **−29%**、
+   ghost **−44%**、F5cm **+12%**。
 6. **测量能力**：`d_ATE` 跨 run 散布 **2e-05**，所以表中百分之几的差异全部有效；
    只有小于 0.01° 的旋转角测量有 ~1e-2 相对漂移。
 
 ## 5. 若要继续
 
-**第一步（已实现，待测）：`translation_only`。** 平移那一半有效（+7.8%，去掉 S_geo 后
-+14%），旋转那一半有害（fut_rot −0.041°）——**把预算全给平移**。
+`translation_only` 已被否证（更差），所以"只保留平移"这条路走不通。剩下的是一条：
 
-**第二步：造一个能区分"哪个物体会赢"的判据。**
+**造一个能区分"哪个物体会赢"的判据。**
 
 - `track_length` 是唯一活下来的预测因子，但它只在**事后**可得且方向为负（track 越老
   越差）——需要把它变成一个**事前**判据，或者用近期观测密度 / 短窗口重锚来替代
@@ -201,8 +230,11 @@ agreement jointly determine whether a correction should be fed back"。实测：
 ## 6. 复现入口
 
 ```bash
-# 四个提案侧分支 + mask oracle + 噪声底，一次跑完
+# 四个提案侧分支 + mask oracle + 噪声底，一次跑完（含 GPU 的 stage 1/2a）
 zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
+
+# 只重读判定 + 跑物体地图评测（纯 CPU，几秒，不需要 GPU）
+zsh streaming_couping/commands_check_object_pose_feedback_decision.txt
 ```
 
 产出：`<base>.branches.json`、各分支的 `object_pose_feedback/summary.json` 与
