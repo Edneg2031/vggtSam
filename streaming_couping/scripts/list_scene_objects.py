@@ -170,23 +170,43 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument("--frame-count", type=int, default=0)
     parser.add_argument("--image-size", type=int, default=518)
+    parser.add_argument(
+        "--report-out",
+        type=Path,
+        default=None,
+        help=(
+            "Write the full per-object table here and print only the summary to "
+            "stdout.  Without it everything goes to stdout."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
+    # Everything below writes through one sink.  With --report-out the detail
+    # goes to a file and stdout gets the summary, so a 70-object scene does not
+    # bury the two lines that say what to do about it.
+    report: list[str] = []
+
+    def emit(text: str = "") -> None:
+        if args.report_out is not None:
+            report.append(text)
+        else:
+            print(text)
+
     manifest_path = args.manifest.expanduser().resolve()
     positions, (height, width) = selection(args)
     if not positions:
         raise RuntimeError("the frame selection is empty")
-    print(
+    emit(
         f"scene={args.scene_id} manifest={manifest_path}\n"
         f"frames={len(positions)} (positions {positions[0]}..{positions[-1]}) "
         f"grid=({height},{width})"
     )
 
     defined = scene_objects(manifest_path, args.scene_id)
-    print(f"\nmanifest defines {len(defined)} objects for this scene")
+    emit(f"\nmanifest defines {len(defined)} objects for this scene")
 
     ground_truth = load_ground_truth_instances(
         manifest_path,
@@ -234,7 +254,7 @@ def main() -> None:
             ]
         )
     rows.sort(key=lambda row: (-int(row[4]), -int(row[2]), str(row[1])))
-    print(
+    emit(
         f"\nvisible instances: {len(rows)} "
         f"(of {len(defined)} defined in the scene)\n"
         f"  px = median mask pixels over the frames where the object is visible, on\n"
@@ -243,7 +263,7 @@ def main() -> None:
         f"<= {PIPELINE_MAX_MASK_AREA_RATIO} area filters, so kept=0 means the\n"
         f"  object contributes no observation at all"
     )
-    print(
+    emit(
         _table(
             ["id", "label", "frames", "px", "kept", "prompt"],
             rows,
@@ -252,12 +272,12 @@ def main() -> None:
 
     never = sorted(set(defined) - {int(value) for value in ground_truth.instance_ids})
     if never:
-        print(
+        emit(
             f"\n{len(never)} object(s) defined in the scene are never visible in "
             "these frames:"
         )
         for instance_id in never:
-            print(f"  id={instance_id} label={defined[instance_id]!r}")
+            emit(f"  id={instance_id} label={defined[instance_id]!r}")
 
     # The table above already carries the prompt column and the kept count, so
     # the rows are not repeated here -- only what the table cannot show: the
@@ -266,32 +286,32 @@ def main() -> None:
     unmatched = [row for row in rows if row[5] == "NONE"]
     if unmatched:
         labels = sorted({str(row[1]) for row in unmatched})
-        print(
+        emit(
             f"\n{len(unmatched)} visible object(s) no prompt reaches, across "
             f"{len(labels)} distinct labels:"
         )
-        print(f"  {labels}")
+        emit(f"  {labels}")
     else:
-        print("\nevery visible ground-truth object is reached by a prompt")
+        emit("\nevery visible ground-truth object is reached by a prompt")
 
     filtered = [row for row in rows if int(row[4]) == 0]
     if filtered:
-        print(
+        emit(
             f"\n{len(filtered)} visible object(s) the pipeline's own mask filters "
             "would drop in every frame (px_median below the 32 px floor):"
         )
-        print(
+        emit(
             "  "
             + ", ".join(f"{row[1]}#{row[0]}({row[3]:.0f}px)" for row in filtered)
         )
 
     if args.feedback_diagnostics is not None:
         sam = sam_inventory(args.feedback_diagnostics)
-        print(
+        emit(
             f"\nsegmenter produced {len(sam)} categories from "
             f"{args.feedback_diagnostics.expanduser().resolve()}"
         )
-        print(
+        emit(
             _table(
                 ["category", "instances", "observations", "points", "in_gt"],
                 [
@@ -319,15 +339,26 @@ def main() -> None:
             )
         )
         if orphan:
-            print(
+            emit(
                 "\nthe segmenter produced categories with no ground-truth object "
                 f"to score against: {orphan}"
             )
-    print(
+    emit(
         "\nAdding a prompt is free at this stage: it changes which masks are "
         "requested,\nso it needs a stage-2a re-run, but no model changes and no "
         "new labels."
     )
+
+    if args.report_out is not None:
+        report_path = args.report_out.expanduser().resolve()
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("\n".join(report) + "\n", encoding="utf-8")
+        print(
+            f"{len(rows)} visible object(s) of {len(defined)} defined; "
+            f"{sum(1 for row in rows if row[5] != 'NONE')} reached by a prompt, "
+            f"{len(unmatched)} not; {len(filtered)} dropped by the mask filters"
+        )
+        print(f"  full table: {report_path}")
 
 
 if __name__ == "__main__":

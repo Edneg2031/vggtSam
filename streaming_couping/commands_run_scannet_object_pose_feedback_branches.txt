@@ -240,6 +240,7 @@ if [[ -f "$GEOMETRY_CACHE" ]]; then
     --scene-id "$SCENE_ID" \
     --geometry-cache "$GEOMETRY_CACHE" \
     --prompts "${PROMPTS[@]}" \
+    --report-out "$BASE_RUN_DIR.prompt_reachability.txt" \
     || print -u2 "inventory check failed; continuing (it is a check, not a gate)"
   print ""
   print "$GENERATION prompts (${#PROMPTS}): ${(j:, :)PROMPTS}"

@@ -19,6 +19,11 @@
 # To test a wider prompt set, add the words to PROMPTS below and run again: an
 # added prompt changes which masks are requested, so it needs a stage-2a re-run,
 # but no model change and no new labels.
+#
+# STDOUT is a few lines: how many objects, how many a prompt reaches, how many
+# the mask filters drop.  The full per-object table goes to the report path
+# printed at the end, because a 70-object scene is reference material, not
+# something to scroll past on every run.
 set -uo pipefail
 
 ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
@@ -86,6 +91,7 @@ ARGS=(
   --scene-id "$SCENE_ID"
   --geometry-cache "$GEOMETRY_CACHE"
   --prompts "${PROMPTS[@]}"
+  --report-out "$STORAGE_ROOT/outputs/${OBJECT_POSE_FEEDBACK_RUN_DIR:-scene}.prompt_reachability.txt"
 )
 if [[ -f "$DIAGNOSTICS" ]]; then
   ARGS+=(--feedback-diagnostics "$DIAGNOSTICS")

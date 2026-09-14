@@ -234,3 +234,35 @@ def test_cli_reports_an_object_no_prompt_matches(
     assert "no prompt reaches" in output
     assert "'bed'" in output
     assert "'pet bed'" in output
+
+
+def test_report_out_puts_the_table_in_a_file_and_summarises_stdout(
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A seventy-object scene is reference material, not a headline."""
+
+    manifest = _write_manifest(tmp_path)
+    report = tmp_path / "out" / "reachability.txt"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "list_scene_objects",
+            "--manifest", str(manifest),
+            "--scene-id", "s",
+            "--geometry-cache", str(_write_cache(tmp_path)),
+            "--prompts", "bed", "wardrobe",
+            "--report-out", str(report),
+        ],
+    )
+    main()
+    printed = capsys.readouterr().out
+    body = report.read_text(encoding="utf-8")
+
+    # a row that only exists in the table, and the grid it was measured on
+    assert "pet bed" not in printed
+    assert "pet bed" in body
+    assert "grid=(24,24)" in body
+    # what stays on stdout is the count that says whether to act
+    assert "visible object(s) of" in printed
+    assert "reached by a prompt" in printed
+    assert str(report) in printed

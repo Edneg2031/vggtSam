@@ -472,6 +472,42 @@ def render_agreement(runs: Sequence[Mapping[str, Any]]) -> str:
     )
 
 
+def render_digest(runs: Sequence[Mapping[str, Any]], report_path: Path | None) -> str:
+    """The few lines worth reading in a terminal.
+
+    The four sections above are wide and per-category; they are worth having
+    and not worth scrolling past on every run, so they go to a file and this
+    says what they came to.
+    """
+
+    lines: list[str] = []
+    for run in runs:
+        gain = run["net_effect"]
+        verdict = (
+            "consensus beats one proposal"
+            if gain is not None and gain > 0
+            else "consensus LOSES to one proposal"
+            if gain is not None
+            else "no consensus formed"
+        )
+        lines.append(
+            f"  {run['label']:14s} {len(run['categories'])} categories  "
+            f"prop_err={_fmt(run['proposal_error_m'])} "
+            f"cons_err={_fmt(run['consensus_error_m'])}  "
+            f"gain={_fmt(gain)}  ({verdict})"
+        )
+    swapped = [
+        name
+        for name in sorted({n for run in runs for n in run["categories"]})
+        if any(name not in run["categories"] for run in runs)
+    ]
+    if swapped:
+        lines.append(f"  not shared by every run: {', '.join(swapped)}")
+    if report_path is not None:
+        lines.append(f"  full report: {report_path}")
+    return "\n".join(lines)
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -488,6 +524,15 @@ def _parse_args() -> argparse.Namespace:
         help="Consensus variant to read; defaults to each run's own main variant.",
     )
     parser.add_argument("--json-out", type=Path, default=None)
+    parser.add_argument(
+        "--report-out",
+        type=Path,
+        default=None,
+        help=(
+            "Write the four detail sections here and print only the headline to "
+            "stdout.  Without it everything goes to stdout."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -495,24 +540,30 @@ def main() -> None:
     args = _parse_args()
     runs = [load_run(path, args.variant) for path in args.run_dirs]
 
-    print("object categories across runs")
-    for run in runs:
-        print(f"  {run['label']}: {run['run_dir']}")
-    print()
-    print(render_categories(runs))
-    print()
-    print(render_participation(runs))
-    print()
-    print(render_net_effect(runs))
-    print()
-    print(render_agreement(runs))
+    sections = "\n\n".join(
+        [
+            "object categories across runs",
+            *[f"  {run['label']}: {run['run_dir']}" for run in runs],
+            render_categories(runs),
+            render_participation(runs),
+            render_net_effect(runs),
+            render_agreement(runs),
+        ]
+    )
+
+    if args.report_out is not None:
+        report_path = args.report_out.expanduser().resolve()
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(sections + "\n", encoding="utf-8")
+        print(render_digest(runs, report_path))
+    else:
+        print(sections)
 
     if args.json_out is not None:
         args.json_out.expanduser().resolve().write_text(
             json.dumps({"runs": runs}, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        print()
         print(f"json_out={args.json_out.expanduser().resolve()}")
 
 

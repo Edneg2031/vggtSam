@@ -25,8 +25,7 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
-#: Outcomes that mean the prompt DID return a track, whatever became of it.
-TRACK_PRODUCING_OUTCOMES = ("accepted", "duplicate", "over_object_cap")
+from streaming_couping.scripts.summarize_feedback_branches import run_label
 
 #: How each outcome reads, and what it says to do about it.
 OUTCOME_MEANING = {
@@ -116,45 +115,112 @@ def _parse_args() -> argparse.Namespace:
         help="Repeat once per run directory, in the order to print.",
     )
     parser.add_argument("--json-out", type=Path, default=None)
+    parser.add_argument(
+        "--report-out",
+        type=Path,
+        default=None,
+        help=(
+            "Write the per-prompt tables here and print only one line per run "
+            "to stdout.  Without it everything goes to stdout."
+        ),
+    )
     return parser.parse_args()
+
+
+def digest_line(run_name: str, summary: Mapping[str, Any] | None, note: str | None) -> str:
+    """One line per run: what the prompt set produced, and what did not.
+
+    The label is the same ``<generation>/<branch>`` the other tables use, so it
+    does not print the whole run-directory name and push the line off screen.
+    """
+
+    run_name = run_label(Path(run_name))
+    if summary is None:
+        return f"  {run_name:58s} {note}"
+    prompts = summary.get("prompts") or []
+    per_prompt = summary.get("per_prompt") or {}
+    no_track = summary.get("prompts_with_no_track") or []
+    dropped = sorted(
+        {
+            outcome
+            for counts in per_prompt.values()
+            for outcome in counts
+            if outcome != "accepted"
+        }
+    )
+    detail = f"{summary.get('total', 0)} tracks / {len(prompts)} prompts"
+    if no_track:
+        detail += f"; no track: {', '.join(map(str, no_track))}"
+    if dropped:
+        detail += f"; dropped as: {', '.join(dropped)}"
+    return f"  {run_name:58s} {detail}"
 
 
 def main() -> None:
     args = _parse_args()
     reports: dict[str, Any] = {}
+    sections: list[str] = []
+    stdout_lines: list[str] = []
+    outcomes_seen: set[str] = set()
+
     for run_dir in args.run_dirs:
         run_dir = run_dir.expanduser().resolve()
         artifact = run_dir / "raw_pose" / "semantic_map.pt"
-        print(f"=== {run_dir.name} ===")
+        sections.append(f"=== {run_dir.name} ===")
         if not artifact.is_file():
-            print(f"  missing: {artifact}")
-            print()
+            sections.append(f"  missing: {artifact}")
+            stdout_lines.append(digest_line(run_dir.name, None, f"missing {artifact.name}"))
             continue
         loaded = load_ledger(artifact)
         if loaded is None:
-            print("  this run predates the candidate ledger, so it cannot say")
-            print("  which prompts were dropped or why.  Re-run stage 2a to record it.")
-            print()
+            note = (
+                "predates the ledger -- re-run stage 2a to record what its "
+                "prompts contributed"
+            )
+            sections.append("  " + note)
+            stdout_lines.append(digest_line(run_dir.name, None, note))
             continue
-        summary = loaded["summary"]
-        summary = {**summary, "prompts": loaded["prompts"]}
+        summary = {**loaded["summary"], "prompts": loaded["prompts"]}
         prompts, outcomes, rows = outcome_matrix(summary)
-        print(
+        outcomes_seen.update(outcomes)
+        sections.append(
             f"  {summary.get('total')} track(s) from {len(prompts)} prompt(s); "
             f"{len(summary.get('prompts_with_no_track') or [])} returned no track"
         )
-        print()
-        print(_table(["prompt", *outcomes], rows))
+        sections.append("")
+        sections.append(_table(["prompt", *outcomes], rows))
         no_track = summary.get("prompts_with_no_track") or []
         if no_track:
-            print()
-            print(f"  returned no track at all: {', '.join(map(str, no_track))}")
-        print()
+            sections.append("")
+            sections.append(f"  returned no track at all: {', '.join(map(str, no_track))}")
+        sections.append("")
         for outcome in outcomes:
             if outcome in OUTCOME_MEANING:
-                print(f"  {outcome:22s} {OUTCOME_MEANING[outcome]}")
-        print()
+                sections.append(f"  {outcome:22s} {OUTCOME_MEANING[outcome]}")
+        stdout_lines.append(digest_line(run_dir.name, summary, None))
         reports[run_dir.name] = summary
+
+    if args.report_out is not None:
+        report_path = args.report_out.expanduser().resolve()
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        legend = [
+            "",
+            "outcome meanings:",
+            *[
+                f"  {outcome:22s} {OUTCOME_MEANING[outcome]}"
+                for outcome in sorted(outcomes_seen, key=str)
+                if outcome in OUTCOME_MEANING
+            ],
+        ]
+        report_path.write_text("\n".join([*sections, *legend]) + "\n", encoding="utf-8")
+        print("per prompt, tracks returned and what became of them")
+        print("\n".join(stdout_lines))
+        print(f"  full report: {report_path}")
+    else:
+        print("\n".join(sections))
+        for outcome in sorted(outcomes_seen, key=str):
+            if outcome in OUTCOME_MEANING:
+                print(f"  {outcome:22s} {OUTCOME_MEANING[outcome]}")
 
     if args.json_out is not None:
         args.json_out.expanduser().resolve().write_text(

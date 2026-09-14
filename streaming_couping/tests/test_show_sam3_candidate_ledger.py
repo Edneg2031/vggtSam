@@ -94,7 +94,9 @@ def test_cli_says_a_run_predates_the_ledger_instead_of_reporting_nothing(
     monkeypatch.setattr("sys.argv", ["show", "--run-dir", str(old)])
     main()
     printed = capsys.readouterr().out
-    assert "predates the candidate ledger" in printed
+    assert "predates the ledger" in printed
+    # and it must not look like an empty result
+    assert "0 track" not in printed
 
 
 def test_cli_prints_the_outcome_table(
@@ -127,3 +129,65 @@ def test_cli_prints_the_outcome_table(
     assert "overlaps a track that was born earlier" in printed
     assert "dropped: behind the --max-objects cut" in printed
     assert "dropped: birth mask below the pixel floor" in printed
+
+
+def test_digest_line_uses_the_shared_short_label() -> None:
+    """The whole run-directory name would push the line off a terminal."""
+
+    from streaming_couping.scripts.show_sam3_candidate_ledger import digest_line
+
+    line = digest_line(
+        "semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v2.baseline",
+        {
+            "total": 3,
+            "prompts": ["bed", "rug"],
+            "per_prompt": {"bed": {"accepted": 1}, "rug": {}},
+            "prompts_with_no_track": ["rug"],
+        },
+        None,
+    )
+    assert "v2/baseline" in line
+    assert "semantic_map_100frames" not in line
+    assert "no track: rug" in line
+
+
+def test_digest_line_for_a_run_that_cannot_answer_says_so() -> None:
+    from streaming_couping.scripts.show_sam3_candidate_ledger import digest_line
+
+    line = digest_line("prefix_v1.baseline", None, "predates the ledger")
+    assert "v1/baseline" in line
+    assert "predates the ledger" in line
+    # a run that cannot answer must not read as one that found nothing
+    assert "0 tracks" not in line
+
+
+def test_report_out_sends_the_tables_to_a_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = _write_run(
+        tmp_path,
+        "base_v3.baseline",
+        {
+            "prompts": ["bed", "table"],
+            "sam3_candidate_ledger": [{"prompt": "bed", "outcome": "accepted"}],
+            "sam3_candidate_ledger_summary": {
+                "total": 2,
+                "prompt_count": 2,
+                "per_prompt": {"bed": {"accepted": 1}, "table": {"birth_mask_rejected": 1}},
+                "prompts_with_no_track": ["table"],
+            },
+        },
+    )
+    report = tmp_path / "out" / "report.txt"
+    monkeypatch.setattr("sys.argv", ["show", "--run-dir", str(run), "--report-out", str(report)])
+    main()
+    printed = capsys.readouterr().out
+    body = report.read_text(encoding="utf-8")
+    # the dashed rule only ever comes from a rendered table
+    assert "--------" not in printed
+    assert "--------" in body
+    assert "v3/baseline" in printed
+    assert "birth_mask_rejected" in body
+    assert "dropped: birth mask below the pixel floor" in body
+    # stdout stays a headline: one line per run plus the paths
+    assert len([line for line in printed.splitlines() if line.strip()]) <= 4

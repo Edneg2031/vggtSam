@@ -4,8 +4,9 @@
 #
 #   zsh streaming_couping/commands_show_sam3_candidate_ledger.txt
 #
-# Seconds, read-only.  Prints, per prompt: how many tracks it returned, and what
-# became of each -- accepted, dropped as a duplicate (naming the track it lost
+# Seconds, read-only.  STDOUT carries one line per run; the per-prompt tables go
+# to <prefix>.sam3_candidate_ledger.txt.  The tables say, per prompt: how many
+# tracks it returned, and what became of each -- accepted, dropped as a duplicate (naming the track it lost
 # to), dropped at birth for size, or left behind the object cap.
 #
 # This is the question that could not be answered before: the observations that
@@ -62,4 +63,5 @@ done
 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   "$PYTHON" -m streaming_couping.scripts.show_sam3_candidate_ledger \
   "${args[@]}" \
+  --report-out "$RUNS_ROOT/${PREFIX}.sam3_candidate_ledger.txt" \
   --json-out "$RUNS_ROOT/${PREFIX}.sam3_candidate_ledger.json"

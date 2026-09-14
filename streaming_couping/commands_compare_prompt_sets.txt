@@ -10,7 +10,11 @@
 # The branch table answers "did it get better or worse".  For a prompt-set
 # change that is not the useful question, because the prompt list is NOT
 # additive -- asking for more objects changes which objects the segmenter
-# tracks at all, including ones it tracked before.  This prints, per category:
+# tracks at all, including ones it tracked before.  STDOUT carries only the
+# headline; the per-category detail goes to <prefix>.prompt_categories_<branch>.txt,
+# because four wide sections per branch is more than anyone reads on every run.
+#
+# The report has, per category:
 #
 #   * proposals contributed and the GT error they carry, per generation;
 #   * which categories only one generation has (the swap);
@@ -65,6 +69,7 @@ for branch in "${PAIRS[@]}"; do
   PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
     "$PYTHON" -m streaming_couping.scripts.compare_feedback_categories \
     "${args[@]}" \
+    --report-out "$RUNS_ROOT/${PREFIX}.prompt_categories_$branch.txt" \
     --json-out "$RUNS_ROOT/${PREFIX}.prompt_categories_$branch.json" \
     || print -u2 "comparison failed for branch=$branch"
 done
