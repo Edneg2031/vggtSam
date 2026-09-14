@@ -2,6 +2,10 @@
 
 更新时间：2026-09-10（实现完成，服务器实验待跑）
 
+> 本文是**实现与判据**的文档：pipeline 怎么搭、输出什么、判据怎么定。
+> 已经**成立**的结果记录在
+> [`experiments/object_pose_feedback_go.md`](../experiments/object_pose_feedback_go.md)。
+
 ## 1. 实验问题
 
 验证：**SAM3.1 的 persistent object tracks 是否可以作为跨帧稳定的 object anchors，

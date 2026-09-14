@@ -2,6 +2,10 @@
 
 更新时间：2026-09-11
 
+> 本文记录**全部**实验，包括被否证的假设，以及为什么失败。
+> 只记录**成立**的结果（含其边界）的那一份在
+> [`experiments/object_pose_feedback_go.md`](../experiments/object_pose_feedback_go.md)。
+
 ## 1. 方法（当前 pipeline）
 
 输入一段 RGB 与文本 prompt，目标是用 SAM3.1 的 persistent object tracks 修正
