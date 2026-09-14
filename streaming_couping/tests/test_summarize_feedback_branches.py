@@ -287,3 +287,58 @@ def test_cli_prints_the_noise_floor_before_the_table(
     printed = capsys.readouterr().out
     assert "noise floor from 2 runs" in printed
     assert printed.index("noise floor") < printed.index("object pose feedback branches")
+
+
+def test_a_row_label_carries_the_generation(tmp_path: Path) -> None:
+    """Two generations of one branch must not print as the same row label."""
+
+    old = _write_branch(tmp_path / "v1", "base_v1.baseline")
+    new = _write_branch(tmp_path / "v2", "base_v2.baseline")
+    assert branch_row(old)[0][HEADERS.index("branch")] == "v1/baseline"
+    assert branch_row(new)[0][HEADERS.index("branch")] == "v2/baseline"
+
+
+def test_run_label_handles_the_suffixed_and_untagged_names(tmp_path: Path) -> None:
+    from streaming_couping.scripts.summarize_feedback_branches import run_label
+
+    # the branch half may itself carry a dot
+    assert run_label(tmp_path / "base_v1.baseline.previous") == "v1/baseline.previous"
+    assert run_label(tmp_path / "base_v2.replay_gate") == "v2/replay_gate"
+    assert run_label(tmp_path / "base_v2.oracle_mask") == "v2/oracle_mask"
+    # an untagged or unsuffixed name stays as it was
+    assert run_label(tmp_path / "baseline") == "baseline"
+    assert run_label(tmp_path / "run.fresh") == "fresh"
+    # "_v1" inside the scene id is not a generation tag
+    assert run_label(tmp_path / "scene_00a231a370.baseline") == "baseline"
+
+
+def test_the_generation_reaches_the_json_payload(tmp_path: Path) -> None:
+    run_dir = _write_branch(tmp_path, "base_v2.fresh", max_age=15)
+    _, payload = branch_row(run_dir)
+    assert payload["generation"] == "v2"
+    assert payload["label"] == "v2/fresh"
+
+
+def test_cli_prints_the_caller_supplied_legend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Only the caller knows what changed between generations."""
+
+    run_dir = _write_branch(tmp_path, "base_v2.baseline")
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "summarize",
+            "--run-dir",
+            str(run_dir),
+            "--legend",
+            "v1 = 5 prompts",
+            "--legend",
+            "v2 = 12 prompts",
+        ],
+    )
+    main()
+    printed = capsys.readouterr().out
+    assert "v1 = 5 prompts" in printed
+    assert "v2 = 12 prompts" in printed
+    assert printed.index("v2/baseline") < printed.index("v1 = 5 prompts")

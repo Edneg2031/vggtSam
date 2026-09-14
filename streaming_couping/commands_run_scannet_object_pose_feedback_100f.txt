@@ -27,7 +27,12 @@ FRAME_STRIDE="${OBJECT_POSE_FEEDBACK_FRAME_STRIDE:-1}"
 FRAME_COUNT="${OBJECT_POSE_FEEDBACK_FRAME_COUNT:-100}"
 PROMPTS=("bed" "wardrobe" "chair" "rug" "dustbin" "table" "mat" "nightstand" "cabinet" "picture" "window" "door")
 
-RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v1}"
+# Defaults to the CURRENT generation.  Running this alone must not land on a
+# previous generation's directory: v1 is a finished result that other scripts
+# read for comparison, and a standalone run would overwrite it in place.  The
+# branch sweep passes RUN_DIR explicitly, so this default only decides what an
+# unaccompanied invocation does.
+RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v2}"
 GEOMETRY_CACHE="${OBJECT_POSE_FEEDBACK_GEOMETRY_CACHE:-$RUN_DIR/horizonstream_geometry.pt}"
 OUTPUT_DIR="$RUN_DIR"
 EVAL_DIR="$RUN_DIR/gt_evaluation"

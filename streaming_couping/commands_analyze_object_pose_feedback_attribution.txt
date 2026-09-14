@@ -24,34 +24,53 @@ ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
 
-RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v1}"
+RUNS_ROOT="$STORAGE_ROOT/outputs"
+# The baseline branch of the newest generation that has one.  Resolved rather
+# than fixed so this keeps working across generations -- and deterministically,
+# because a sweep leaves several branch directories behind and "which one did
+# it pick" must not depend on the order a glob happens to come back in.
+DEFAULT_RUN_DIR=""
+for generation in v2 v1; do
+  candidate="$RUNS_ROOT/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_$generation.baseline"
+  if [[ -d "$candidate/object_pose_feedback" ]]; then
+    DEFAULT_RUN_DIR="$candidate"
+    break
+  fi
+done
 
-# Resolve the run directory.  The default assumes the standard layout; if
-# object_pose_feedback is not there, look for candidates under the storage root
-# rather than failing with a path the caller has to go and guess.
-if [[ ! -d "$RUN_DIR/object_pose_feedback" ]]; then
-  candidates=("$STORAGE_ROOT"/outputs/*/object_pose_feedback(N/))
-  if (( ${#candidates} == 1 )); then
+RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$DEFAULT_RUN_DIR}"
+
+# Fall back to a search, and on several candidates take them newest-name-first
+# (`On`) rather than making the caller disambiguate -- this script is meant to
+# be runnable on its own with no arguments, and the generation tag is at the
+# end of the name, so descending name order is descending generation.
+if [[ -z "$RUN_DIR" || ! -d "$RUN_DIR/object_pose_feedback" ]]; then
+  candidates=("$STORAGE_ROOT"/outputs/*/object_pose_feedback(N/On))
+  if (( ${#candidates} > 0 )); then
     RUN_DIR="${candidates[1]:h}"
-    print "note: no object_pose_feedback in the default run dir; using $RUN_DIR"
-  elif (( ${#candidates} > 1 )); then
-    print -u2 "no object_pose_feedback in the default run dir: $RUN_DIR"
-    print -u2 "several candidates found -- rerun with one of:"
-    for candidate in "${candidates[@]}"; do
-      print -u2 "  OBJECT_POSE_FEEDBACK_RUN_DIR=${candidate:h} \\"
-    done
-    print -u2 "    zsh streaming_couping/commands_analyze_object_pose_feedback_attribution.txt"
-    exit 1
+    print "note: no baseline run for a known generation; using"
+    print "      $RUN_DIR"
+    print "      (${#candidates} candidate(s), newest name first)"
   else
-    print -u2 "missing feedback dir: $RUN_DIR/object_pose_feedback"
+    print -u2 "missing feedback dir: ${RUN_DIR:-<none>}/object_pose_feedback"
     print -u2 "searched: $STORAGE_ROOT/outputs/*/object_pose_feedback"
-    print -u2 "if the run lives elsewhere, set OBJECT_POSE_FEEDBACK_RUN_DIR=<run dir>"
+    print -u2 "run commands_run_scannet_object_pose_feedback_branches.txt first"
     exit 1
   fi
 fi
+print "attribution_run_dir=$RUN_DIR"
 
 FEEDBACK_DIR="$RUN_DIR/object_pose_feedback"
+# A branch run directory does not hold the geometry cache -- the sweep pins one
+# cache per generation, in the un-suffixed base directory, so every branch
+# shares a single geometry pass.  Look there before giving up on the run dir.
 GEOMETRY_CACHE="$RUN_DIR/horizonstream_geometry.pt"
+# Strip the branch suffix from the directory NAME only: the storage root itself
+# may contain a dot, so trimming the first dot in the whole path would cut the
+# wrong end off.
+if [[ ! -f "$GEOMETRY_CACHE" ]]; then
+  GEOMETRY_CACHE="${RUN_DIR:h}/${${RUN_DIR:t}%%.*}/horizonstream_geometry.pt"
+fi
 MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
 SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
 HORIZON_REPO="$ROOT/externals/horizonstream"

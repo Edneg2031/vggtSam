@@ -8,6 +8,23 @@
 # No arguments and no environment variables are needed; edit the block below to
 # change the branch list or the freshness thresholds.
 #
+# GENERATIONS
+#
+# This sweep writes a new generation of run directories (_v2) rather than
+# overwriting the previous one (_v1).  v1 is the five-prompt run that passed
+# every criterion, and it is kept intact: nothing here writes to it.  The one
+# thing read from it is the stage-1 geometry cache, and that is copied, not
+# moved or linked, so v1 cannot be damaged even if stage 1 rebuilds.
+#
+# The prompt set is what changed between the two, so the sweep ends with a
+# generation-against-generation table -- v1/baseline next to v2/baseline,
+# v1/fresh next to v2/fresh -- which is the reading this round is for.  It also
+# prints the prompt reachability inventory before spending any GPU time, since
+# the added prompts only help if they name the objects the way the manifest
+# does.
+#
+# BRANCHES
+#
 #   baseline          joint 6DoF, permanent anchors   (the previous behavior)
 #   translation_only  joint budget spent on translation only
 #   fresh             joint 6DoF, bounded reference age
@@ -42,7 +59,16 @@ ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
 
-BASE_RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v1}"
+# ---- Generations ----------------------------------------------------------
+# The prompt set is this round's independent variable, so it gets its own
+# generation of run directories.  v1 is the five-prompt run that passed every
+# criterion; it is the result being kept, so NOTHING here writes to it.  The
+# only thing read from it is the stage-1 geometry cache -- and that is COPIED,
+# never moved or linked, so v1 cannot be damaged even if stage 1 decides the
+# cache needs rebuilding.
+RUNS_ROOT="$STORAGE_ROOT/outputs"
+PRIOR_RUN_DIR="$RUNS_ROOT/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v1"
+BASE_RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$RUNS_ROOT/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_v2}"
 BRANCHES=(baseline translation_only fresh factorized fresh_factor)
 FRESH_MAX_AGE="${OBJECT_POSE_FEEDBACK_MAX_REFERENCE_AGE_FRAMES:-15}"
 FRESH_REFRESH="${OBJECT_POSE_FEEDBACK_ANCHOR_REFRESH_INTERVAL_FRAMES:-20}"
@@ -59,9 +85,16 @@ SAM_REPEATS="${OBJECT_POSE_FEEDBACK_SAM_REPEATS:-3}"
 
 MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
 SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
-# Must match the prompts the SAM branches used, or the oracle's GT instances
-# and the SAM tracks would cover different object sets.
+# Must match the prompts the SAM branches used (the inner script's PROMPTS),
+# or the oracle's GT instances and the SAM tracks would cover different sets.
+#
+# v1 ran five; the inventory found those reached only 5 of the 71 visible
+# ground-truth objects.  The seven added here are the rigid, well-kept ones it
+# listed as unreachable.  floor/wall/ceiling are deliberately absent: they are
+# structural, so their motion is the room's and they would dominate the
+# consensus instead of anchoring against it.
 PROMPTS=(bed wardrobe chair rug dustbin table mat nightstand cabinet picture window door)
+PROMPTS_V1=(bed wardrobe chair rug dustbin)
 GEOMETRY_CACHE="$BASE_RUN_DIR/horizonstream_geometry.pt"
 BASELINE_RUN_DIR="$BASE_RUN_DIR.baseline"
 BASELINE_DIAGNOSTICS="$BASELINE_RUN_DIR/object_pose_refinement/feedback_diagnostics.pt"
@@ -93,6 +126,28 @@ print "===== OBJECT POSE FEEDBACK BRANCH SWEEP ====="
 print "base_run_dir=$BASE_RUN_DIR"
 print "branches=${(j:, :)BRANCHES}"
 print "freshness=$FRESH_MAX_AGE/$FRESH_REFRESH"
+
+# ---- Seed this generation's cache from the previous one -------------------
+# Stage 1 is the only GPU stage, and it does not depend on the prompt set: the
+# prompts enter at stage 2a, where they decide which masks are requested.  So a
+# generation that changes only the prompt set can reuse the previous one's
+# geometry outright.  Copying rather than pointing at the old path keeps the
+# two generations independent -- if the cache ever fails validation and gets
+# rebuilt, it is rebuilt here, and v1 stays as it was.
+if [[ ! -f "$GEOMETRY_CACHE" && -f "$PRIOR_RUN_DIR/horizonstream_geometry.pt" ]]; then
+  print "seeding the geometry cache from the previous generation"
+  print "  from: $PRIOR_RUN_DIR/horizonstream_geometry.pt"
+  print "  to:   $GEOMETRY_CACHE"
+  mkdir -p "$GEOMETRY_CACHE:h"
+  cp "$PRIOR_RUN_DIR/horizonstream_geometry.pt" "$GEOMETRY_CACHE"
+  # The chunk camera maps are a separate artifact written alongside; the inner
+  # script hard-requires them, so a cache copied without them would fail after
+  # stage 1 had already been skipped.
+  cp "$PRIOR_RUN_DIR/horizonstream_geometry_chunk_cam_maps.pt" \
+     "$GEOMETRY_CACHE:h/horizonstream_geometry_chunk_cam_maps.pt" 2>/dev/null \
+    || print -u2 "note: no chunk camera maps to copy; stage 1 must supply them"
+  print "  v1 is untouched (copy, not move)"
+fi
 
 # ---- Adopt a stranded geometry cache --------------------------------------
 # A run aborted after stage 1 but before the cache was where it belongs leaves
@@ -140,6 +195,27 @@ if (( ${#stale} > 0 )); then
   done
   print "(one generation is kept per branch; delete the *.previous dirs when"
   print " you no longer want them)"
+fi
+
+# ---- Prompt reachability, before anything costs GPU time ------------------
+# The whole round rests on the added prompts actually reaching the objects the
+# inventory listed.  Matching is substring-based on the manifest label, so this
+# is really a check that the names are spelled the way the manifest spells
+# them -- cheap to get wrong, and expensive to discover after stage 2a.  It is
+# a check and not a gate: a missing reach still leaves a run worth having.
+if [[ -f "$GEOMETRY_CACHE" ]]; then
+  print ""
+  print "########## prompt reachability (CPU, seconds) ##########"
+  PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "$PYTHON" -m streaming_couping.scripts.list_scene_objects \
+    --manifest "$MANIFEST_PATH" \
+    --scene-id "$SCENE_ID" \
+    --geometry-cache "$GEOMETRY_CACHE" \
+    --prompts "${PROMPTS[@]}" \
+    || print -u2 "inventory check failed; continuing (it is a check, not a gate)"
+  print ""
+  print "v1 prompts (${#PROMPTS_V1}): ${(j:, :)PROMPTS_V1}"
+  print "v2 prompts (${#PROMPTS}): ${(j:, :)PROMPTS}"
 fi
 
 # ---- Stage 2a once, for the baseline --------------------------------------
@@ -337,7 +413,45 @@ PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   "$PYTHON" -m streaming_couping.scripts.summarize_feedback_branches \
   "${summary_args[@]}" \
   "${noise_floor_dirs[@]}" \
+  --legend "v2 prompts (${#PROMPTS}): ${(j:, :)PROMPTS}" \
   --json-out "$BASE_RUN_DIR.branches.json"
+
+# ---- The comparison this round is actually about --------------------------
+# Widening the prompt set is the independent variable, so the reading is
+# generation against generation, branch by branch: v1/baseline next to
+# v2/baseline, v1/fresh next to v2/fresh.  Interleaved rather than blocked so
+# each pair sits on adjacent rows and a difference is visible without scrolling.
+#
+# No noise floor is attached: the floor measured above belongs to v2's own
+# repeats, and v1 was not re-run this round, so there is no paired spread to
+# quote for the difference between generations.  A v1-vs-v2 gap is read against
+# that floor, not as though it had one of its own.
+print ""
+print "===== PROMPT-SET COMPARISON (v1 = ${#PROMPTS_V1} prompts, v2 = ${#PROMPTS}) ====="
+generation_dirs=()
+for branch in "${BRANCHES[@]}"; do
+  for run_dir in "$PRIOR_RUN_DIR.$branch" "$BASE_RUN_DIR.$branch"; do
+    [[ -f "$run_dir/object_pose_feedback/summary.json" ]] \
+      && generation_dirs+=("$run_dir")
+  done
+done
+if (( ${#generation_dirs} > 1 )); then
+  generation_args=()
+  for run_dir in "${generation_dirs[@]}"; do
+    generation_args+=(--run-dir "$run_dir")
+  done
+  PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "$PYTHON" -m streaming_couping.scripts.summarize_feedback_branches \
+    "${generation_args[@]}" \
+    --legend "v1 = ${#PROMPTS_V1} prompts: ${(j:, :)PROMPTS_V1}" \
+    --legend "v2 = ${#PROMPTS} prompts: ${(j:, :)PROMPTS}" \
+    --legend "the only intended difference between a v1 and a v2 row of the" \
+    --legend "same branch is the prompt set; stage 1 is a copy of v1's cache." \
+    --json-out "$BASE_RUN_DIR.prompt_comparison.json"
+else
+  print "only one generation is present; nothing to compare yet"
+  print "(looked for summaries under $PRIOR_RUN_DIR.* and $BASE_RUN_DIR.*)"
+fi
 
 if (( ${#failed_branches} > 0 )); then
   print -u2 ""
@@ -350,3 +464,5 @@ print "(1 GPU run, $(( ${#BRANCHES} - 1 )) CPU replays, 1 CPU oracle)"
 print "the oracle's prop_err vs baseline's is the SAM-vs-GT comparison;"
 print "it is a diagnostic upper bound, not a branch of the system"
 print "comparison_json=$BASE_RUN_DIR.branches.json"
+print "generation_json=$BASE_RUN_DIR.prompt_comparison.json"
+print "kept_run_dir=$PRIOR_RUN_DIR (v1; read-only this round)"

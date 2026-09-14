@@ -10,6 +10,13 @@ actually went away, and whether the pose metrics moved.
 
 Reads ``<run-dir>/object_pose_feedback/summary.json`` and, when present,
 ``<run-dir>/object_pose_feedback/attribution.json``.
+
+Rows are labelled ``<generation>/<branch>``, the generation being the ``_v1``,
+``_v2``, ... a run-directory base name carries.  Two generations of the same
+branch are different configurations of the pipeline, so they have to be
+distinguishable in one table -- but which configuration is which is not
+recorded anywhere the summarizer can read, so the caller supplies it through
+``--legend``.
 """
 
 from __future__ import annotations
@@ -17,8 +24,41 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+#: The generation tag a run-directory base name carries: the `_v1`, `_v2`, ...
+#: that versions the configuration the runs were produced under.  It is the
+#: only thing distinguishing a row of one generation from the next, so it has
+#: to reach the table: two rows both labelled "baseline" would otherwise be
+#: indistinguishable, and comparing generations is the whole point of running
+#: the same branches under a second configuration.
+_GENERATION = re.compile(r"_(?P<tag>v\d+[a-z0-9]*)$")
+
+
+def generation_tag(run_dir: Path) -> str:
+    """'v1' for '<base>_v1.baseline', '' when the name carries no tag."""
+
+    base = run_dir.name.split(".", 1)[0]
+    match = _GENERATION.search(base)
+    return match.group("tag") if match else ""
+
+
+def run_label(run_dir: Path) -> str:
+    """Row label: '<generation>/<branch>', falling back to the bare branch.
+
+    Branch runs are named ``<base>.<branch>`` and the base carries the
+    generation, so the split is on the FIRST dot -- the branch half may itself
+    contain one (``.baseline.previous``, ``.replay_gate``).
+    """
+
+    name = run_dir.name
+    if "." not in name:
+        return name
+    _, branch = name.split(".", 1)
+    tag = generation_tag(run_dir)
+    return f"{tag}/{branch}" if tag else branch
 
 
 def _load(path: Path) -> Mapping[str, Any] | None:
@@ -92,16 +132,18 @@ def branch_row(run_dir: Path) -> tuple[list[Any], dict[str, Any]]:
     feedback = run_dir / "object_pose_feedback"
     summary = _load(feedback / "summary.json")
     attribution = _load(feedback / "attribution.json")
-    # Branch runs are named "<base>.<branch>"; label by the branch so the table
-    # stays readable instead of repeating the whole run-directory name.
-    name = run_dir.name
-    label = name.rsplit(".", 1)[-1] if "." in name else name
+    # Branch runs are named "<base>.<branch>"; label by generation and branch
+    # so the table stays readable instead of repeating the whole run-directory
+    # name, and so two generations of the same branch stay distinct.
+    label = run_label(run_dir)
 
     if summary is None:
         # Width derived from HEADERS so adding a column cannot desynchronise it.
         return [label, "no summary.json"] + ["-"] * (len(HEADERS) - 2), {
             "run_dir": str(run_dir),
             "available": False,
+            "label": label,
+            "generation": generation_tag(run_dir),
         }
 
     main = str(summary.get("main_variant") or "")
@@ -175,6 +217,8 @@ def branch_row(run_dir: Path) -> tuple[list[Any], dict[str, Any]]:
     payload = {
         "run_dir": str(run_dir),
         "available": True,
+        "label": label,
+        "generation": generation_tag(run_dir),
         "main_variant": main,
         "proposal_mode": _dig(settings, "proposal_mode"),
         "max_reference_age_frames": max_age,
@@ -313,6 +357,18 @@ def main() -> None:
     )
     parser.add_argument("--json-out", type=Path, default=None)
     parser.add_argument(
+        "--legend",
+        action="append",
+        default=None,
+        dest="legend",
+        help=(
+            "Repeat once per line of context printed under the table.  The "
+            "generation tag in the row label says WHICH configuration a run "
+            "came from; only the caller knows what changed between them, so "
+            "the caller supplies the wording."
+        ),
+    )
+    parser.add_argument(
         "--noise-floor",
         type=Path,
         action="append",
@@ -347,6 +403,10 @@ def main() -> None:
         )
     )
     print()
+    if args.legend:
+        for line in args.legend:
+            print(line)
+        print()
     print(
         "prop_err  median GT translation error of a single proposal (m) -- the\n"
         "          bottleneck this round targets (baseline 0.086)\n"
@@ -361,12 +421,17 @@ def main() -> None:
         "anchor_rho within-category Spearman between anchor age and the GT\n"
         "          correction error (baseline +0.785; see attribution (b6))"
     )
+    # The label is short so the table stays readable; the directory behind it
+    # has to stay recoverable from the log, so print both.
     for payload in payloads:
+        label = payload.get("label") or Path(payload["run_dir"]).name
         if payload.get("available"):
             print(
-                f"  {Path(payload['run_dir']).name}: reject reasons "
-                f"{payload.get('reject_reason_counts')}"
+                f"  {label}: {payload['run_dir']}  "
+                f"reject reasons {payload.get('reject_reason_counts')}"
             )
+        else:
+            print(f"  {label}: {payload['run_dir']}  no summary.json")
     if args.json_out is not None:
         args.json_out.expanduser().resolve().write_text(
             json.dumps(

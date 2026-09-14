@@ -48,9 +48,29 @@ Stage 3  evaluate_exported_semantic_map --map-source tracks
 Stage 4  print_object_pose_loss_object_only_metrics + 反馈 summary
 ```
 
-默认场景 `00a231a370`、帧窗 `90–189`、prompts `bed wardrobe chair rug dustbin`。
+默认场景 `00a231a370`、帧窗 `90–189`。
 两遍式设计：proposals 全部基于 raw 几何计算；SAM 和 refiner 只跑一次，之后所有
 consensus/gating/阈值迭代只重跑 Stage 2b。
+
+### 2.1 代数（generation）与 prompt 集
+
+run 目录名尾部的 `_v1` / `_v2` 是**代数**：同一套分支在不同配置下各占一代，
+互不覆盖。当前
+
+| 代数 | prompt 集 | 状态 |
+|---|---|---|
+| `_v1` | `bed wardrobe chair rug dustbin`（5） | 通过全部 7 条判据的结果，**保留只读** |
+| `_v2` | v1 + `table mat nightstand cabinet picture window door`（12） | 当前实验 |
+
+prompt 是硬上限：没有 prompt 命中的物体不可能被提案、修正或评分。场景清单
+（`commands_list_scene_objects.txt`）显示 v1 的 5 个 prompt 只够到 71 个可见
+GT 物体中的 5 个。v2 补的 7 个是清单里 kept 帧数最多的刚性物体。
+`floor` / `wall` / `ceiling` 刻意不加：它们是结构面，运动等于房间的运动，
+放进共识会主导中位数而不是提供锚点。
+
+代数之间只差 prompt 集，Stage 1（几何）与 prompt 无关，所以 v2 的几何缓存是
+从 v1 **复制**来的（copy，不是 move/link），即使 Stage 1 决定重建也不会碰到 v1。
+sweep 结束时会打印 v1/v2 逐分支对照表，那才是这一轮的读数。
 
 ## 3. 位姿约定（与已验证的 GT feedback POC 完全一致）
 
@@ -381,9 +401,12 @@ Stage 1 的几何 cache 与分支无关，四个分支共用同一份（`--reuse
 python -m streaming_couping.scripts.run_object_pose_loss_oracle \
   --geometry-cache <run>/horizonstream_geometry.pt \
   --manifest <manifest> --scene-id 00a231a370 \
-  --prompts bed wardrobe chair rug dustbin \
+  --prompts bed wardrobe chair rug dustbin table mat nightstand cabinet picture window door \
   --output-dir <base>.oracle_mask
 ```
+
+（`--prompts` 必须与该代 SAM 分支实际用的一致：它决定 GT 实例覆盖哪些物体，
+不一致就变成了 SAM 与 GT 在比不同的物体集合。）
 
 **它只需要 CPU**：几何来自缓存的 HorizonStream cache，mask 来自 manifest 里的
 `instance_mask` 标注，完全绕过分割模型和 HorizonStream。
