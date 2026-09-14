@@ -1,7 +1,7 @@
 # 物体锚点闭环位姿修正：成立的端到端结果
 
 记录时间：2026-09-14
-代数：**v1**（prompt 集 `bed wardrobe chair rug dustbin`，5 个）
+代数：**v1**（prompt 集 `bed wardrobe chair rug dustbin`，5 个）；§7.3 加了 **v3** 的复核
 场景：ScanNet++ `00a231a370`，帧窗 `90–189`（100 帧）
 
 ## 1. 一句话
@@ -156,6 +156,33 @@ prompt 集 —— 它和位姿结果无关，所以不是调参调到过。v1/v2
 (b) 里起作用的是提案条数和误差，而 (a) 的指标是实例自己的点云。要问"谁撑起共识"，
 要看 `<base>.<branch>/object_pose_feedback/object_proposals.csv` 的逐类别条数。
 
+### 7.3 v3 复核：结果不依赖单一物体
+
+v3 的 prompt 集是 **v1 减掉 dustbin**（`bed wardrobe chair rug`），其余完全不动
+（几何缓存是拷贝，raw 逐位相同，阈值同一套）：
+
+| | proposals | prop_err | cons_err | accepted | d_ATE | d_sim3 | fut_rot | 判据 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| v1/baseline | 229 | 0.0868 | 0.0730 | 33 | **+14.25%** | +5.35% | 0.1004 | GO（`mean,robust,robust_semantic`） |
+| **v3/baseline** | 205 | 0.0911 | 0.0741 | 33 | **+14.25%** | **+5.60%** | 0.1237 | **GO**（多一个 `single`） |
+| **v3/factorized** | 205 | 0.0892 | 0.0701 | 32 | **+19.12%** | **+6.34%** | −0.0695 | 只差 `future_rotation_gain_median_deg` |
+
+**两条可以直接写进结论的：**
+
+1. **v1 的结果不依赖单一物体。** 换掉一个 prompt，d_ATE 不变、仍然 GO，而且
+   `single` 变体在 v3 里也通过了（v1 里它不过）。这回答"v1 是不是靠某个物体撑着"——
+   不是。
+2. **v3/factorized（先旋转后平移）是目前最好的配置**：d_ATE **+19.12%**、d_sim3
+   **+6.34%**，远在噪声底（1.8e-05）之上。v1 的同一分支只有 +2.99%，所以这一支是
+   "去掉 dustbin + 先旋转后平移"两个条件一起才出来的，不能只归给其中一个。
+
+**一个未验证的疑点，写清楚以免被当成结论：** v1 与 v3 的 d_ATE 在四位小数上相同
+（都是 0.1425），接受帧数也相同（33），但提案数差 24 条、共识误差也不同。最可能的
+解释是 **dustbin 那 24 条提案从未进入任何一个被接受的共识**，即它在 v1 里是惰性的——
+若成立，"v1 不依赖 dustbin"会加强为"dustbin 完全没起作用"。**这还没有验证**，
+几十秒可查：`commands_compare_prompt_sets.txt` 第 (2) 段给出每个类别的进入共识帧数
+与投票占比，看 v1 里 dustbin 是多少。
+
 ## 8. 复现入口
 
 ```bash
@@ -174,7 +201,9 @@ zsh streaming_couping/commands_verify_object_pose_feedback.txt
 
 产出：
 - `<base>.branches.json` —— 分支对照表（含噪声底）
-- `<base>.prompt_comparison.json` —— v1/v2 逐代对照
+- `<base>.prompt_comparison.json` —— 逐代对照（v1/v2/v3）
+- `<base>.prompt_categories_<branch>.txt` —— 逐类别明细（§7.1、§7.3）
+- `<base>.sam3_candidate_ledger.txt` —— 每个 prompt 的 track 去向（§7.3）
 - `<base>.prompt_categories_<branch>.json` —— §7.1 的逐类别对照
 - `<base>.<branch>/object_pose_feedback/summary.json` —— 各变体判定与指标
 - `<base>.<branch>/object_pose_feedback/attribution.json` —— 归因分析
