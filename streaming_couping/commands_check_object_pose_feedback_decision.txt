@@ -150,3 +150,16 @@ PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   --prompts "${PROMPTS[@]}" \
   --json-out "$RUN_DIR/object_pose_feedback/object_map_metrics.json" \
   || print -u2 "object-map evaluation failed (the verdict above still stands)"
+
+# ---- The same result as a picture ----------------------------------------
+# A percentage does not show what changed.  This draws the path and the
+# per-frame error, raw against corrected, both against ground truth.
+print ""
+print "===== POSE COMPARISON FIGURE ====="
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m streaming_couping.scripts.plot_pose_comparison \
+  --run-dir "$RUN_DIR" \
+  --variant robust_semantic \
+  --out "$RUN_DIR/object_pose_feedback/pose_comparison.png" \
+  --json-out "$RUN_DIR/object_pose_feedback/pose_comparison.json" \
+  || print -u2 "plot failed (the verdict and metrics above still stand)"
