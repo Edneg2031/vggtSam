@@ -118,9 +118,13 @@ v2 的类别是 `bed / cabinet / chair / dustbin / rug / window`，v1 是
 0.0730 涨到 0.0923；v1 的共识比单提案好 15.9%，v2 比单提案还差 3.9%。
 
 **这不是对 §3 结论的否定，是它的适用范围**：修正机制有效，但"选到哪几个物体"
-是方法的一部分，而现在的机制把它交给了出生帧顺序。可修的地方也因此明确：
-候选账本（谁被谁判重、有没有撞上限）现在完全不记录，记下来就能按**输入侧**测量
-挑 prompt 集，而不是靠猜。
+是方法的一部分，而现在的机制把它交给了出生帧顺序。
+
+可修的地方已经修了一半：候选账本现在会记录每条 track 的去向和判重对手
+（`commands_show_sam3_candidate_ledger.txt`），所以"这个词没产出 mask"和"产出了
+但被另一个 prompt 的 track 挤掉"可以分开。剩下的一半是按这个**输入侧**测量去挑
+prompt 集 —— 它和位姿结果无关，所以不是调参调到过。v1/v2 跑在账本之前，答不了
+这个问题；v3 起可以。
 
 ### 7.2 改善是按物体分布的
 
@@ -163,6 +167,9 @@ zsh streaming_couping/commands_check_object_pose_feedback_decision.txt
 
 # §7.1：prompt 集换了哪些物体、有没有进共识、共识是否还不如单提案（CPU）
 zsh streaming_couping/commands_compare_prompt_sets.txt
+
+# 上面两条 + 单元测试，一次跑完（纯 CPU、只读，不写任何 run 目录）
+zsh streaming_couping/commands_verify_object_pose_feedback.txt
 ```
 
 产出：

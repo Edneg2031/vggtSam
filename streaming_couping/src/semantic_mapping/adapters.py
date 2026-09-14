@@ -232,6 +232,10 @@ class SAM31SegmentationAdapter:
         self.max_total_objects = int(max_total_objects)
         self.min_birth_pixels = int(min_birth_pixels)
         self.duplicate_iou = float(duplicate_iou)
+        #: What every prompt's tracks became, filled in by ``infer``.  Empty
+        #: until a run happens, so readers can always getattr it.
+        self.candidate_ledger: list[dict[str, Any]] = []
+        self.candidate_ledger_summary: dict[str, Any] = ledger_summary([])
         if self.max_objects_per_prompt < 1 or self.max_total_objects < 1:
             raise ValueError("SAM object limits must be positive.")
         if self.min_birth_pixels < 1:
@@ -252,6 +256,13 @@ class SAM31SegmentationAdapter:
             raise ValueError("At least one text prompt is required for SAM3.1.")
 
         candidates: list[dict[str, Any]] = []
+        # Every track a prompt produced, and what became of it.  A prompt can
+        # return masks on every frame and still contribute nothing -- dropped
+        # as too small at birth, or as a duplicate of an earlier-born track, or
+        # beyond the object cap.  All three are silent, and the surviving
+        # observations cannot tell them apart from "the prompt returned
+        # nothing", which are opposite diagnoses with opposite fixes.
+        ledger: list[dict[str, Any]] = []
         for prompt_index, prompt in enumerate(normalized_prompts):
             tracked = self.wrapper.track_all_forward(
                 paths,
@@ -265,12 +276,22 @@ class SAM31SegmentationAdapter:
                 raise ValueError("SAM3.1 returned masks with an invalid shape.")
             for source_slot, source_obj_id in enumerate(tracked.obj_ids):
                 birth = int(tracked.birth_indices[source_slot])
+                entry: dict[str, Any] = {
+                    "prompt": prompt,
+                    "prompt_index": int(prompt_index),
+                    "source_obj_id": int(source_obj_id),
+                    "birth": birth,
+                }
                 if birth < 0 or birth >= len(paths):
+                    ledger.append({**entry, "outcome": "birth_out_of_range"})
                     continue
                 candidate_masks = masks[:, source_slot]
                 birth_pixels = int(candidate_masks[birth].sum())
                 birth_ratio = float(candidate_masks[birth].float().mean())
+                entry["birth_pixels"] = birth_pixels
+                entry["birth_area_ratio"] = birth_ratio
                 if birth_pixels < self.min_birth_pixels or birth_ratio > 0.90:
+                    ledger.append({**entry, "outcome": "birth_mask_rejected"})
                     continue
                 candidates.append(
                     {
@@ -280,8 +301,10 @@ class SAM31SegmentationAdapter:
                         "birth": birth,
                         "masks": candidate_masks,
                         "scores": scores[:, source_slot],
+                        "ledger_index": len(ledger),
                     }
                 )
+                ledger.append({**entry, "outcome": "candidate"})
 
         candidates.sort(
             key=lambda item: (
@@ -292,14 +315,43 @@ class SAM31SegmentationAdapter:
         )
         accepted: list[dict[str, Any]] = []
         for candidate in candidates:
-            if any(
-                _tracks_duplicate(candidate, previous, self.duplicate_iou)
-                for previous in accepted
-            ):
+            duplicate_of = next(
+                (
+                    previous
+                    for previous in accepted
+                    if _tracks_duplicate(candidate, previous, self.duplicate_iou)
+                ),
+                None,
+            )
+            if duplicate_of is not None:
+                # Naming the track it lost to is the whole point: which of two
+                # overlapping tracks survives is decided by birth frame, so a
+                # category can disappear because another prompt's track for the
+                # same pixels was born earlier.
+                ledger[candidate["ledger_index"]].update(
+                    {
+                        "outcome": "duplicate",
+                        "duplicate_of_prompt": duplicate_of["prompt"],
+                        "duplicate_of_source_obj_id": int(duplicate_of["source_obj_id"]),
+                        "duplicate_of_birth": int(duplicate_of["birth"]),
+                    }
+                )
                 continue
             accepted.append(candidate)
+            ledger[candidate["ledger_index"]]["outcome"] = "accepted"
             if len(accepted) >= self.max_total_objects:
                 break
+        # The cap breaks out of the loop, so the candidates behind the cut were
+        # never examined and would otherwise keep the provisional outcome.
+        for entry in ledger:
+            if entry["outcome"] == "candidate":
+                entry["outcome"] = "over_object_cap"
+
+        # Run-level, so it hangs off the adapter rather than being repeated on
+        # every frame -- the pipeline already collects adapter summaries this
+        # way for the geometry guidance layer.
+        self.candidate_ledger = ledger
+        self.candidate_ledger_summary = ledger_summary(ledger, normalized_prompts)
 
         observations_by_frame: list[list[ObjectObservation]] = [
             [] for _ in paths
@@ -834,6 +886,49 @@ def _load_rgb(path: Path, output_size: tuple[int, int]) -> torch.Tensor:
         )
         array = np.asarray(resized, dtype=np.float32).copy() / 255.0
     return torch.from_numpy(array)
+
+
+#: Outcomes that mean the prompt DID return a track, whatever became of it.
+TRACK_PRODUCING_OUTCOMES = ("accepted", "duplicate", "over_object_cap")
+
+
+def ledger_summary(
+    ledger: Sequence[Mapping[str, Any]],
+    prompts: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Per prompt, how many tracks it produced and what became of each.
+
+    This is the readable half of the ledger.  "Produced nothing" and "produced
+    something that was dropped" look the same from the observations that
+    survive, and they call for opposite fixes: a prompt that returns no masks
+    needs different words, while a prompt whose tracks are dropped as
+    duplicates needs the competition between prompts addressed instead.
+
+    ``prompts`` is the full request list.  It has to be given, because a prompt
+    that returned no tracks contributes no ledger entries and would otherwise
+    be indistinguishable from a prompt that was never asked for.
+    """
+
+    per_prompt: dict[str, dict[str, int]] = {
+        str(prompt): {} for prompt in prompts
+    }
+    for entry in ledger:
+        prompt = str(entry.get("prompt", ""))
+        outcome = str(entry.get("outcome", "unknown"))
+        counts = per_prompt.setdefault(prompt, {})
+        counts[outcome] = counts.get(outcome, 0) + 1
+    return {
+        "total": len(ledger),
+        "prompt_count": len(per_prompt),
+        "per_prompt": {
+            name: dict(counts) for name, counts in sorted(per_prompt.items())
+        },
+        "prompts_with_no_track": sorted(
+            name
+            for name, counts in per_prompt.items()
+            if not any(counts.get(outcome) for outcome in TRACK_PRODUCING_OUTCOMES)
+        ),
+    }
 
 
 def _tracks_duplicate(

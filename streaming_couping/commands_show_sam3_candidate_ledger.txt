@@ -1,0 +1,65 @@
+#!/usr/bin/env zsh
+
+# Why did a prompt contribute nothing?  (CPU only)
+#
+#   zsh streaming_couping/commands_show_sam3_candidate_ledger.txt
+#
+# Seconds, read-only.  Prints, per prompt: how many tracks it returned, and what
+# became of each -- accepted, dropped as a duplicate (naming the track it lost
+# to), dropped at birth for size, or left behind the object cap.
+#
+# This is the question that could not be answered before: the observations that
+# reach the refiner are the ones that survived every filter, so from them alone
+# "this word returned no masks" and "this word's masks were dropped" are the
+# same observation, and they call for opposite changes to the prompt set.
+#
+# NOTE: runs made before the ledger existed cannot answer it and this says so
+# rather than printing an empty table.  Re-run stage 2a to record one.
+set -uo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
+
+RUNS_ROOT="$STORAGE_ROOT/outputs"
+PREFIX="semantic_map_100frames_horizonstream_object_pose_feedback_90_189"
+# Newest first: the ledger describes the current prompt set.
+GENERATIONS=(v3 v2 v1)
+# Only the branches that run the segmenter have a ledger; the rest are replays
+# of the baseline's observations and inherit its prompts.
+BRANCHES=(baseline fresh factorized fresh_factor translation_only)
+
+cd "$ROOT"
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+export PYTHONUNBUFFERED=1
+
+# Every generation that ran the segmenter, not just the newest: comparing what
+# one prompt set contributed against another is the reason to look at all.  A
+# generation whose runs predate the ledger prints that it cannot answer, which
+# is the point -- it stops an empty table from reading as "nothing was dropped".
+run_dirs=()
+for generation in "${GENERATIONS[@]}"; do
+  for branch in "${BRANCHES[@]}"; do
+    candidate="$RUNS_ROOT/${PREFIX}_$generation.$branch"
+    [[ -f "$candidate/raw_pose/semantic_map.pt" ]] && run_dirs+=("$candidate")
+  done
+done
+
+if (( ${#run_dirs} == 0 )); then
+  print -u2 "no run with a semantic map is present under $RUNS_ROOT"
+  print -u2 "run commands_run_scannet_object_pose_feedback_branches.txt first"
+  exit 1
+fi
+
+print "===== SAM3 CANDIDATE LEDGER ====="
+print "read_only=1  gpu=0"
+print ""
+
+args=()
+for run_dir in "${run_dirs[@]}"; do
+  args+=(--run-dir "$run_dir")
+done
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m streaming_couping.scripts.show_sam3_candidate_ledger \
+  "${args[@]}" \
+  --json-out "$RUNS_ROOT/${PREFIX}.sam3_candidate_ledger.json"

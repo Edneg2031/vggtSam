@@ -1,0 +1,72 @@
+#!/usr/bin/env zsh
+
+# Check the object-pose-feedback tooling end to end.  (CPU only)
+#
+#   zsh streaming_couping/commands_verify_object_pose_feedback.txt
+#
+# No GPU, no model runs, minutes at most, and read-only with respect to every
+# run directory: nothing here writes into a run.
+#
+# Three parts:
+#   1. the unit tests for the analysis tooling;
+#   2. the v1 explanation -- which categories were in v1's consensus, how much
+#      each voted, and whether the consensus beat a single proposal;
+#   3. the candidate ledger -- what each prompt's tracks became, if the run was
+#      made after the ledger existed.
+#
+# A failure in part 1 is a code failure.  Parts 2 and 3 read whatever runs
+# exist and say so when one is missing, so this is runnable against a tree that
+# only has v1, only has v1+v2, or all three.
+set -uo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
+
+cd "$ROOT"
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+export PYTHONUNBUFFERED=1
+
+failures=0
+
+print "===== 1. TESTS ====="
+if "$PYTHON" -c 'import pytest' >/dev/null 2>&1; then
+  PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" -m pytest \
+    streaming_couping/tests/test_compare_feedback_categories.py \
+    streaming_couping/tests/test_sam3_candidate_ledger.py \
+    streaming_couping/tests/test_show_sam3_candidate_ledger.py \
+    streaming_couping/tests/test_summarize_feedback_branches.py \
+    streaming_couping/tests/test_list_scene_objects.py \
+    -q || failures=1
+  print ""
+  print "  the full suite also exists; the four files above are the ones this"
+  print "  round's tooling lives in.  Run it with:"
+  print "    python -m pytest streaming_couping/tests/ -q"
+  print "  (test_instance_point_consistency.py::test_instance_consistency_is_"
+  print "   causal_and_rejects_far_points fails at HEAD, unrelated to any of this)"
+else
+  print "  pytest is not available to $PYTHON; skipping"
+  print "  set STREAMING_COUPING_PYTHON to an interpreter that has it"
+fi
+
+print ""
+print "===== 2. WHY v1 WORKED ====="
+zsh "$ROOT/streaming_couping/commands_compare_prompt_sets.txt" || {
+    print -u2 "  category comparison failed"
+    failures=1
+  }
+
+print ""
+print "===== 3. WHAT EACH PROMPT CONTRIBUTED ====="
+zsh "$ROOT/streaming_couping/commands_show_sam3_candidate_ledger.txt" || {
+    print -u2 "  candidate ledger failed"
+    failures=1
+  }
+
+print ""
+if (( failures == 0 )); then
+  print "all parts completed"
+else
+  print -u2 "at least one part failed; see above"
+fi
+exit $failures

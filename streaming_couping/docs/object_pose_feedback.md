@@ -77,6 +77,28 @@ v2 说明的是 **prompt 集是方法的一部分，不是自由参数**。v2 �
 `table/mat/nightstand/picture/door` 一个都没产出 proposal。所以 v1→v2 是**换了一套
 物体**，不是"多了 7 个物体"。
 
+### 2.2 prompt 账本（candidate ledger）
+
+候选在四个地方静默死亡，一个都不落盘，所以"这个词没产出 mask"和"产出了但被丢了"
+在**存活下来的观测里长得一模一样** —— 而两者的修法相反。现在 `infer()` 记录每个
+prompt 返回的每条 track 及其去向（`adapters.py` 的 `candidate_ledger`），随
+`semantic_map.pt` 的 metadata 导出：
+
+| outcome | 含义 |
+|---|---|
+| `accepted` | 被跟踪，观测进了 refiner |
+| `duplicate` | 判重丢弃，**并记录输给了哪条 track** |
+| `over_object_cap` | 排在 `--max-objects`（默认 16）之外 |
+| `birth_mask_rejected` | 出生 mask 小于像素下限或过大 |
+| `birth_out_of_range` | 出生帧越界 |
+
+`duplicate` 记录"输给谁"是关键：两条重叠 track 谁活下来由**出生帧**决定，所以一个
+类别可能因为另一个 prompt 的 track 出生更早而消失。看：
+`zsh streaming_couping/commands_show_sam3_candidate_ledger.txt`。
+
+**在账本之前跑的 run 答不了这个问题**，读取工具会直说，而不是打一张空表 ——
+空表会被读成"什么都没被丢"。
+
 机制在代码里（`adapters.py:255`）：每个 prompt 单独跑一次 `track_all_forward`，
 所以加词不会在检测阶段压掉别的词；但检测之后 `accepted` 是**跨 prompt 共享**的 ——
 候选按**出生帧**排序，与已接受 track 的 IoU ≥ `duplicate_iou` 的后来者当重复丢掉，

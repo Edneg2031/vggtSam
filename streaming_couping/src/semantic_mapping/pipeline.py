@@ -629,6 +629,22 @@ class SemanticMapPipeline:
                 "segmentation_guidance_diagnostics",
                 list(guidance_diagnostics),
             )
+        # What each prompt's tracks became.  Without this the only record is the
+        # observations that survived, and "this word returned no masks" is
+        # indistinguishable from "its masks were dropped as duplicates" -- two
+        # findings that call for opposite changes to the prompt set.
+        ledger_summary = getattr(self.segmentation, "candidate_ledger_summary", None)
+        if ledger_summary is not None:
+            result_metadata.setdefault(
+                "sam3_candidate_ledger_summary",
+                dict(ledger_summary),
+            )
+        ledger = getattr(self.segmentation, "candidate_ledger", None)
+        if ledger is not None:
+            result_metadata.setdefault(
+                "sam3_candidate_ledger",
+                [dict(entry) for entry in ledger],
+            )
         return result_metadata
 
 
