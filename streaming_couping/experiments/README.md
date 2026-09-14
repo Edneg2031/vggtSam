@@ -26,5 +26,5 @@
 
 | 记录 | 内容 | 窗口 / 代数 |
 |---|---|---|
-| [results_summary.md](results_summary.md) | **当前成果总结**（汇报用，独立成文） | 100 帧 v1、150 帧 v1 |
+| [report.md](report.md) | **实验报告**（汇报用）：问题、方法、实验过程、结果、结论 | 100 帧 v1、150 帧 v1 |
 | [object_pose_feedback_go.md](object_pose_feedback_go.md) | 完整结果记录：方法、逐项结果、适用范围、逐条证据 | 100 帧 v1、150 帧 v1 |
