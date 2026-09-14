@@ -113,6 +113,10 @@ for candidate in ${(Oa)COMPARE_GENERATIONS}; do
 done
 BASE_RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$(opf_run_dir "$GENERATION")}"
 BRANCHES=(baseline translation_only fresh factorized fresh_factor)
+#: The consensus variant the tables headline and the figures draw.  Matches
+#: MAIN_VARIANT_NAME in object_pose_feedback.py; named here too because the
+#: figures are drawn from this script.
+MAIN_VARIANT="${OBJECT_POSE_FEEDBACK_MAIN_VARIANT:-robust_semantic}"
 FRESH_MAX_AGE="${OBJECT_POSE_FEEDBACK_MAX_REFERENCE_AGE_FRAMES:-15}"
 FRESH_REFRESH="${OBJECT_POSE_FEEDBACK_ANCHOR_REFRESH_INTERVAL_FRAMES:-20}"
 
@@ -536,6 +540,32 @@ if (( ${#failed_branches} > 0 )); then
   print -u2 "FAILED branches: ${(j:, :)failed_branches}"
   exit 1
 fi
+# ---- The result as pictures -------------------------------------------------
+# Both are CPU only and read what stage 2b already wrote, so they cost seconds.
+# They live here as well as in the verdict command because a fresh sweep that
+# produced no picture of its own result would look like it had produced
+# nothing to look at.
+print ""
+print "===== RESULT FIGURES (CPU) ====="
+FIGURE_RUN_DIR="$BASE_RUN_DIR.baseline"
+if [[ -f "$FIGURE_RUN_DIR/object_pose_feedback/poses.pt" ]]; then
+  PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "$PYTHON" -m streaming_couping.scripts.plot_pose_comparison \
+    --run-dir "$FIGURE_RUN_DIR" --variant "$MAIN_VARIANT" \
+    --out "$FIGURE_RUN_DIR/object_pose_feedback/pose_comparison.png" \
+    --json-out "$FIGURE_RUN_DIR/object_pose_feedback/pose_comparison.json" \
+    || print -u2 "pose figure failed (the tables above still stand)"
+  PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "$PYTHON" -m streaming_couping.scripts.plot_object_cloud_comparison \
+    --run-dir "$FIGURE_RUN_DIR" --geometry-cache "$GEOMETRY_CACHE" \
+    --manifest "$MANIFEST_PATH" --scene-id "$SCENE_ID" \
+    --prompts "${PROMPTS[@]}" --variant "$MAIN_VARIANT" \
+    --out "$FIGURE_RUN_DIR/object_pose_feedback/object_cloud_comparison.png" \
+    || print -u2 "object figure failed (the tables above still stand)"
+else
+  print "no baseline poses.pt; skipping the figures"
+fi
+
 print ""
 print "all ${#BRANCHES} branches + the oracle control completed"
 print "(1 GPU run, $(( ${#BRANCHES} - 1 )) CPU replays, 1 CPU oracle)"
