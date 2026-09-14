@@ -191,9 +191,10 @@ def test_cli_names_every_side_of_the_mismatch(
     # an object no prompt reaches would be named here; "bed" also matches
     # "pet bed", so this scene has none, and the script says so
     assert "every visible ground-truth object is reached by a prompt" in output
-    # the mask filter that would drop an object is attributed to the object
+    # the mask filter that would drop an object is attributed to the object,
+    # with the reason (its size) rather than only a count
     assert "would drop in every frame" in output
-    assert "px_median=4.0" in output
+    assert "chair#2(4px)" in output
     # a segmenter category with no ground-truth counterpart is called out
     assert "no ground-truth object" in output
     assert "'rug'" in output

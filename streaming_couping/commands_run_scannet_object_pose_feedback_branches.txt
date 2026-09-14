@@ -223,11 +223,17 @@ print ""
 print "########## branch=baseline (full pipeline; the only GPU stage) ##########"
 OBJECT_POSE_FEEDBACK_PROPOSAL_BRANCH=baseline \
 OBJECT_POSE_FEEDBACK_RUN_DIR="$BASELINE_RUN_DIR" \
-  zsh "$RUN_SCRIPT"
+  zsh "$RUN_SCRIPT" >"$BASELINE_RUN_DIR/sweep.log" 2>&1
 if (( $? != 0 )); then
   print -u2 "baseline run FAILED; nothing else can be compared against it"
+  print -u2 "  last lines of $BASELINE_RUN_DIR/sweep.log:"
+  tail -n 20 "$BASELINE_RUN_DIR/sweep.log" >&2
   exit 1
 fi
+# The stage-2a metrics are the same shape for every branch, and the comparison
+# below reads the numbers from the artifacts rather than from this text -- so
+# only the run's own headline is echoed, and the rest stays in its log.
+print "$(grep -m1 '^pose=raw_pose ' "$BASELINE_RUN_DIR/sweep.log" || print 'stage 2a finished')"
 [[ -f "$BASELINE_DIAGNOSTICS" ]] || {
   print -u2 "missing baseline diagnostics: $BASELINE_DIAGNOSTICS"
   exit 1
@@ -252,7 +258,8 @@ PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   --manifest "$MANIFEST_PATH" \
   --scene-id "$SCENE_ID" \
   --prompts "${PROMPTS[@]}" \
-  --output-dir "$ORACLE_RUN_DIR"
+  --output-dir "$ORACLE_RUN_DIR" \
+  >"$ORACLE_RUN_DIR.log" 2>&1
 if (( $? == 0 )); then
   PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
     "$PYTHON" -m streaming_couping.scripts.run_object_pose_feedback \
@@ -262,13 +269,25 @@ if (( $? == 0 )); then
     --scene-id "$SCENE_ID" \
     --output-dir "$ORACLE_RUN_DIR/object_pose_feedback" \
     --horizon-repo "$ROOT/externals/horizonstream" \
+    >>"$ORACLE_RUN_DIR.log" 2>&1 \
     || print -u2 "oracle: stage-2b analysis failed"
   PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
     "$PYTHON" -m streaming_couping.scripts.analyze_object_pose_feedback_attribution \
     --feedback-dir "$ORACLE_RUN_DIR/object_pose_feedback" \
+    >>"$ORACLE_RUN_DIR.log" 2>&1 \
     || print -u2 "oracle: attribution failed (prop_err is still reported)"
+  # One line, because the point of the control is one comparison: its prop_err
+  # against the baseline's.  Everything else it prints is per-category detail
+  # that is only worth reading once something in that one number looks wrong.
+  print "oracle prop_err=$(PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" -c "
+import json,sys
+with open('$ORACLE_RUN_DIR/object_pose_feedback/summary.json') as handle:
+    s = json.load(handle)
+print(s.get('answers',{}).get('q2_single_proposal_error',{}).get('translation_median_m'))
+" 2>/dev/null) full_output=$ORACLE_RUN_DIR.log"
 else
   print -u2 "oracle control FAILED; the SAM-vs-GT comparison will be missing"
+  print -u2 "  see $ORACLE_RUN_DIR.log"
 fi
 
 
@@ -330,11 +349,12 @@ if (( SAM_REPEATS > 1 )); then
     print "########## baseline repeat $repeat/$SAM_REPEATS (GPU) ##########"
     OBJECT_POSE_FEEDBACK_PROPOSAL_BRANCH=baseline \
     OBJECT_POSE_FEEDBACK_RUN_DIR="$repeat_dir" \
-      zsh "$RUN_SCRIPT"
+      zsh "$RUN_SCRIPT" >"$repeat_dir/sweep.log" 2>&1
     if (( $? != 0 )); then
       print -u2 "baseline repeat $repeat FAILED; it will not join the noise floor"
       continue
     fi
+    print "finished (log: $repeat_dir/sweep.log)"
     noise_floor_dirs+=(--noise-floor "$repeat_dir")
   done
   # the first baseline is part of the same population
@@ -390,16 +410,21 @@ for branch in "${BRANCHES[@]}"; do
     --manifest "$MANIFEST_PATH" \
     --scene-id "$SCENE_ID" \
     --output-dir "$run_dir/object_pose_feedback" \
-    --horizon-repo "$ROOT/externals/horizonstream"
+    --horizon-repo "$ROOT/externals/horizonstream" \
+    >>"$run_dir/analysis.log" 2>&1
   if (( $? != 0 )); then
     print -u2 "branch $branch FAILED at the stage-2b analysis"
     failed_branches+=("$branch")
     continue
   fi
 
+  # Sections (a)-(d) are per-category detail.  Nothing in the comparison below
+  # reads them, and printing them once per branch buried the table that does
+  # decide the next step -- so they go to a file next to the run they describe.
   PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
     "$PYTHON" -m streaming_couping.scripts.analyze_object_pose_feedback_attribution \
     --feedback-dir "$run_dir/object_pose_feedback" \
+    >"$run_dir/object_pose_feedback/attribution.txt" 2>&1 \
     || print -u2 "branch $branch: attribution failed (comparison table still usable)"
 done
 

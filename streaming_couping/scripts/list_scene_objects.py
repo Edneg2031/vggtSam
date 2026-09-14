@@ -259,16 +259,18 @@ def main() -> None:
         for instance_id in never:
             print(f"  id={instance_id} label={defined[instance_id]!r}")
 
+    # The table above already carries the prompt column and the kept count, so
+    # the rows are not repeated here -- only what the table cannot show: the
+    # labels behind a NONE, and which objects are unreachable *and* well seen,
+    # since a small object nobody can use is not the same finding as a large one.
     unmatched = [row for row in rows if row[5] == "NONE"]
     if unmatched:
-        print(
-            f"\n{len(unmatched)} visible object(s) no prompt reaches "
-            f"-- they cannot be proposed, corrected or scored:"
-        )
-        for row in unmatched:
-            print(f"  id={row[0]} label={row[1]!r} frames={row[2]} px={row[3]}")
         labels = sorted({str(row[1]) for row in unmatched})
-        print(f"  distinct labels: {labels}")
+        print(
+            f"\n{len(unmatched)} visible object(s) no prompt reaches, across "
+            f"{len(labels)} distinct labels:"
+        )
+        print(f"  {labels}")
     else:
         print("\nevery visible ground-truth object is reached by a prompt")
 
@@ -276,13 +278,12 @@ def main() -> None:
     if filtered:
         print(
             f"\n{len(filtered)} visible object(s) the pipeline's own mask filters "
-            "would drop in every frame:"
+            "would drop in every frame (px_median below the 32 px floor):"
         )
-        for row in filtered:
-            print(
-                f"  id={row[0]} label={row[1]!r} px_median={row[3]} "
-                f"frames_visible={row[2]}"
-            )
+        print(
+            "  "
+            + ", ".join(f"{row[1]}#{row[0]}({row[3]:.0f}px)" for row in filtered)
+        )
 
     if args.feedback_diagnostics is not None:
         sam = sam_inventory(args.feedback_diagnostics)
