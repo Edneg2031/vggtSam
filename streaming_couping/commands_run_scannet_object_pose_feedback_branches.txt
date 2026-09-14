@@ -249,6 +249,9 @@ fi
 # ---- Stage 2a once, for the baseline --------------------------------------
 print ""
 print "########## branch=baseline (full pipeline; the only GPU stage) ##########"
+# The log's directory is the run directory, which the inner script creates --
+# and a redirect is opened before the command runs, so it has to exist first.
+mkdir -p "$BASELINE_RUN_DIR"
 OBJECT_POSE_FEEDBACK_PROPOSAL_BRANCH=baseline \
 OBJECT_POSE_FEEDBACK_RUN_DIR="$BASELINE_RUN_DIR" \
   zsh "$RUN_SCRIPT" >"$BASELINE_RUN_DIR/sweep.log" 2>&1
@@ -375,6 +378,7 @@ if (( SAM_REPEATS > 1 )); then
     repeat_dir="$BASE_RUN_DIR.baseline_r$repeat"
     print ""
     print "########## baseline repeat $repeat/$SAM_REPEATS (GPU) ##########"
+    mkdir -p "$repeat_dir"
     OBJECT_POSE_FEEDBACK_PROPOSAL_BRANCH=baseline \
     OBJECT_POSE_FEEDBACK_RUN_DIR="$repeat_dir" \
       zsh "$RUN_SCRIPT" >"$repeat_dir/sweep.log" 2>&1
