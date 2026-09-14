@@ -3,7 +3,10 @@
 #
 #   source "$ROOT/streaming_couping/object_pose_feedback_env.zsh"
 #
-# The caller must have set ROOT, STORAGE_ROOT and PYTHON first.
+# The caller must have set ROOT and STORAGE_ROOT first.  An interpreter is
+# resolved here if the caller has none: the inner pipeline script names its
+# interpreters SAM_PYTHON and HORIZON_PYTHON and has no PYTHON at all, so
+# assuming one aborts the run under ``set -u`` before it reaches the GPU.
 #
 # Every command file used to spell the window out in its own run-directory
 # path, so changing the window meant editing eight files and getting one of
@@ -23,6 +26,12 @@ FRAME_COUNT="${OBJECT_POSE_FEEDBACK_FRAME_COUNT:-150}"
 FRAME_START="${OBJECT_POSE_FEEDBACK_FRAME_START:-90}"
 FRAME_STRIDE="${OBJECT_POSE_FEEDBACK_FRAME_STRIDE:-1}"
 FRAME_END=$(( FRAME_START + (FRAME_COUNT - 1) * FRAME_STRIDE ))
+
+#: Used for the cheap JSON checks below, and only for those.  Left empty when
+#: there is none -- deciding that here would abort the source mid-file and
+#: leave the functions below undefined, which reports "command not found"
+#: instead of "no interpreter".
+PYTHON="${PYTHON:-${STREAMING_COUPING_PYTHON:-$(command -v python || true)}}"
 
 RUNS_ROOT="$STORAGE_ROOT/outputs"
 #: Which generation the readers default to.  The newest that has runs, unless
@@ -67,6 +76,11 @@ opf_require_frame_window() {
   # number after that would be labelled with a window it did not use, so this
   # refuses instead.  CPU only, and it runs before anything touches the GPU.
   local manifest="$1" scene_id="$2" available
+  if [[ -z "$PYTHON" ]]; then
+    print -u2 "cannot check the frame window: no python interpreter found"
+    print -u2 "  set STREAMING_COUPING_PYTHON to one"
+    return 1
+  fi
   available=$(PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" -c "
 import json, sys
 with open(sys.argv[1]) as handle:

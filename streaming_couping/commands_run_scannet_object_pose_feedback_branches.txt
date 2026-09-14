@@ -147,6 +147,10 @@ export OBJECT_POSE_FEEDBACK_GEOMETRY_CACHE="$GEOMETRY_CACHE"
 # of remembering, and getting it wrong makes the oracle score a different set of
 # objects than the SAM branches tracked.  Exporting removes the chance.
 export OBJECT_POSE_FEEDBACK_PROMPTS="${(j:,:)PROMPTS}"
+# The inner script is a separate zsh process and resolves its own interpreter;
+# exporting the one this sweep settled on keeps the two the same, so the window
+# check it runs uses the interpreter that is actually known to work here.
+export STREAMING_COUPING_PYTHON="$PYTHON"
 
 for required in "$RUN_SCRIPT" "$MANIFEST_PATH"; do
   [[ -f "$required" ]] || { print -u2 "missing: $required"; exit 1; }
