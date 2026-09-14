@@ -291,7 +291,6 @@ OBJECT_POSE_FEEDBACK_FRAME_COUNT=100 zsh streaming_couping/commands_check_object
 
 配套文档：
 
-- `experiments/results_summary.md` —— 一页数字
 - `experiments/object_pose_feedback_go.md` —— 完整记录（含逐项证据与 §7 范围讨论）
 - `docs/object_pose_feedback.md` —— 实现与判据定义
 - `docs/object_pose_pipeline_summary.md` —— 失败路径与归因分析
