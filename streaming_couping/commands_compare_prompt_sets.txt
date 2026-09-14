@@ -31,12 +31,7 @@ ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
 
-RUNS_ROOT="$STORAGE_ROOT/outputs"
-PREFIX="semantic_map_100frames_horizonstream_object_pose_feedback_90_189"
-
-# Every generation that has been run, oldest first.  Each is a prompt set; a
-# generation with no readable run is skipped, so listing one is harmless.
-GENERATIONS=(v1 v2 v3)
+source "$ROOT/streaming_couping/object_pose_feedback_env.zsh"
 
 # The pairs to read.  The baselines first: they differ only in the prompt set,
 # so that pair is the headline.  `fresh` follows because it is the only branch
@@ -51,7 +46,7 @@ found=0
 for branch in "${PAIRS[@]}"; do
   run_dirs=()
   for generation in "${GENERATIONS[@]}"; do
-    candidate="$RUNS_ROOT/${PREFIX}_$generation.$branch"
+    candidate="$(opf_run_dir "$generation" "$branch")"
     [[ -f "$candidate/object_pose_feedback/object_proposals.csv" ]] \
       && run_dirs+=("$candidate")
   done
@@ -69,8 +64,8 @@ for branch in "${PAIRS[@]}"; do
   PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
     "$PYTHON" -m streaming_couping.scripts.compare_feedback_categories \
     "${args[@]}" \
-    --report-out "$RUNS_ROOT/${PREFIX}.prompt_categories_$branch.txt" \
-    --json-out "$RUNS_ROOT/${PREFIX}.prompt_categories_$branch.json" \
+    --report-out "$RUNS_ROOT/${RUN_PREFIX}.prompt_categories_$branch.txt" \
+    --json-out "$RUNS_ROOT/${RUN_PREFIX}.prompt_categories_$branch.json" \
     || print -u2 "comparison failed for branch=$branch"
 done
 

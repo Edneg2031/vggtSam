@@ -22,9 +22,10 @@ SAM_DEVICE="${SAM_DEVICE:-cuda:2}"
 
 MANIFEST_PATH="$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json"
 SCENE_ID="00a231a370"
-FRAME_START="${OBJECT_POSE_FEEDBACK_FRAME_START:-90}"
-FRAME_STRIDE="${OBJECT_POSE_FEEDBACK_FRAME_STRIDE:-1}"
-FRAME_COUNT="${OBJECT_POSE_FEEDBACK_FRAME_COUNT:-100}"
+# The frame window and the run-directory name both come from the shared env
+# file, so this script cannot disagree with the readers about which window a
+# run belongs to.
+source "$ROOT/streaming_couping/object_pose_feedback_env.zsh"
 # The prompt list has ONE source of truth: the branch sweep exports it, and a
 # second copy here would be a copy that has to be remembered into agreement.
 # Getting it wrong is silent and costly -- the oracle's ground-truth instances
@@ -42,8 +43,8 @@ fi
 # read for comparison, and a standalone run would overwrite one in place.  The
 # branch sweep passes RUN_DIR explicitly, so this default only decides what an
 # unaccompanied invocation does.
-GENERATION="${OBJECT_POSE_FEEDBACK_GENERATION:-v3}"
-RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$STORAGE_ROOT/outputs/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_$GENERATION}"
+GENERATION="${OBJECT_POSE_FEEDBACK_GENERATION:-v1}"
+RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$(opf_run_dir "$GENERATION")}"
 GEOMETRY_CACHE="${OBJECT_POSE_FEEDBACK_GEOMETRY_CACHE:-$RUN_DIR/horizonstream_geometry.pt}"
 OUTPUT_DIR="$RUN_DIR"
 EVAL_DIR="$RUN_DIR/gt_evaluation"
@@ -141,6 +142,8 @@ if ! "$SAM_PYTHON" -c 'import iopath, ftfy, regex, huggingface_hub, timm, einops
   print -u2 "SAM3 runtime dependencies are missing"
   exit 1
 fi
+
+opf_require_frame_window "$MANIFEST_PATH" "$SCENE_ID" || exit 1
 
 mkdir -p "$OUTPUT_DIR" "$EVAL_DIR" "$FEEDBACK_DIR"
 

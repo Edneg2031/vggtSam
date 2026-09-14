@@ -22,10 +22,7 @@ ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
 
-RUNS_ROOT="$STORAGE_ROOT/outputs"
-PREFIX="semantic_map_100frames_horizonstream_object_pose_feedback_90_189"
-# Newest first: the ledger describes the current prompt set.
-GENERATIONS=(v3 v2 v1)
+source "$ROOT/streaming_couping/object_pose_feedback_env.zsh"
 # Only the branches that run the segmenter have a ledger; the rest are replays
 # of the baseline's observations and inherit its prompts.
 BRANCHES=(baseline fresh factorized fresh_factor translation_only)
@@ -41,7 +38,7 @@ export PYTHONUNBUFFERED=1
 run_dirs=()
 for generation in "${GENERATIONS[@]}"; do
   for branch in "${BRANCHES[@]}"; do
-    candidate="$RUNS_ROOT/${PREFIX}_$generation.$branch"
+    candidate="$(opf_run_dir "$generation" "$branch")"
     [[ -f "$candidate/raw_pose/semantic_map.pt" ]] && run_dirs+=("$candidate")
   done
 done
@@ -63,5 +60,5 @@ done
 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   "$PYTHON" -m streaming_couping.scripts.show_sam3_candidate_ledger \
   "${args[@]}" \
-  --report-out "$RUNS_ROOT/${PREFIX}.sam3_candidate_ledger.txt" \
-  --json-out "$RUNS_ROOT/${PREFIX}.sam3_candidate_ledger.json"
+  --report-out "$RUNS_ROOT/${RUN_PREFIX}.sam3_candidate_ledger.txt" \
+  --json-out "$RUNS_ROOT/${RUN_PREFIX}.sam3_candidate_ledger.json"

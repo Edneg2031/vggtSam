@@ -71,6 +71,30 @@ run 目录名尾部的 `_v1` / `_v2` 是**代数**：同一套分支在不同配
 缓存种子、对照表和 oracle 的 GT 集合全部由这两行推出。prompt 列表是**单一来源**，
 sweep 通过 `OBJECT_POSE_FEEDBACK_PROMPTS` 传给内层脚本，不再需要两边手抄一致。
 
+### 2.1b 帧窗是第二个维度
+
+帧窗和 run 目录名都在 `object_pose_feedback_env.zsh` 里定义一次，所有命令文件
+source 它。改窗口就是改那一个变量：
+
+```zsh
+FRAME_COUNT=150   # → 目录名 semantic_map_150frames_..._90_239_vN
+```
+
+**窗口不同就是前缀不同**，所以两个窗口的 run 永远不会互相污染 —— 尤其是 Stage 1
+的几何缓存（它是窗口相关的），不可能被跨窗口 seed。
+
+读旧窗口不用改文件，加一个变量即可：
+
+```bash
+OBJECT_POSE_FEEDBACK_FRAME_COUNT=100 zsh streaming_couping/commands_check_object_pose_feedback_decision.txt
+```
+
+**一个必须堵的坑**：帧选择是**静默截断**的（`selected_positions` 里的
+`positions[:count]`）。要 150 帧而场景只有 120，就会得到 120，而目录名仍写着
+150 —— 之后每个数字都会被贴上它没用过的窗口。`opf_require_frame_window` 在任何
+东西碰到 GPU 之前就拒绝这种跑法。（100 帧那轮的目录名前缀是 `_90_189`，
+150 帧是 `_90_239`。）
+
 v2 说明的是 **prompt 集是方法的一部分，不是自由参数**。v2 产出的类别是
 `bed/cabinet/chair/dustbin/rug/window`，v1 是 `bed/chair/dustbin/rug/wardrobe` ——
 **`wardrobe` 消失**，多出 `cabinet` 和 `window`；补进去的

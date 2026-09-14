@@ -30,11 +30,7 @@ ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
 
-RUNS_ROOT="$STORAGE_ROOT/outputs"
-PREFIX="semantic_map_100frames_horizonstream_object_pose_feedback_90_189"
-# Newest last, so the search below takes the most recent generation that has
-# each artifact.
-GENERATIONS=(v1 v2 v3)
+source "$ROOT/streaming_couping/object_pose_feedback_env.zsh"
 
 # The ground-truth side of the inventory only needs a run's frames and grid;
 # the segmenter side needs a run's diagnostics, and only the NEWEST generation's
@@ -44,16 +40,16 @@ GENERATIONS=(v1 v2 v3)
 # because a v1 segmenter listing read while thinking about v2 prompts is exactly
 # the confusion this check exists to prevent.
 newest="${GENERATIONS[-1]}"
-BASE_RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$RUNS_ROOT/${PREFIX}_$newest}"
+BASE_RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$(opf_run_dir "$newest")}"
 GEOMETRY_CACHE=""
 DIAGNOSTICS=""
 for generation in ${(Oa)GENERATIONS}; do
   [[ -n "$GEOMETRY_CACHE" ]] || {
-    candidate="$RUNS_ROOT/${PREFIX}_$generation/horizonstream_geometry.pt"
+    candidate="$(opf_run_dir "$generation")/horizonstream_geometry.pt"
     [[ -f "$candidate" ]] && GEOMETRY_CACHE="$candidate"
   }
   [[ -n "$DIAGNOSTICS" ]] || {
-    candidate="$RUNS_ROOT/${PREFIX}_$generation.baseline/object_pose_refinement/feedback_diagnostics.pt"
+    candidate="$(opf_run_dir "$generation" baseline)/object_pose_refinement/feedback_diagnostics.pt"
     [[ -f "$candidate" ]] && DIAGNOSTICS="$candidate"
   }
 done
@@ -67,7 +63,7 @@ done
 for required in "$GEOMETRY_CACHE" "$DIAGNOSTICS"; do
   [[ -n "$required" ]] || continue
   case "$required" in
-    *"${PREFIX}_$newest"*) ;;
+    *"${RUN_PREFIX}_$newest"*) ;;
     *) print "note: reading an older generation for $required:t" ;;
   esac
 done
@@ -91,7 +87,7 @@ ARGS=(
   --scene-id "$SCENE_ID"
   --geometry-cache "$GEOMETRY_CACHE"
   --prompts "${PROMPTS[@]}"
-  --report-out "$STORAGE_ROOT/outputs/${OBJECT_POSE_FEEDBACK_RUN_DIR:-scene}.prompt_reachability.txt"
+  --report-out "$RUNS_ROOT/${RUN_PREFIX}.prompt_reachability.txt"
 )
 if [[ -f "$DIAGNOSTICS" ]]; then
   ARGS+=(--feedback-diagnostics "$DIAGNOSTICS")

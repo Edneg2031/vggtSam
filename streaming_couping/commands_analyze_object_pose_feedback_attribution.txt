@@ -24,14 +24,14 @@ ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
 
-RUNS_ROOT="$STORAGE_ROOT/outputs"
+source "$ROOT/streaming_couping/object_pose_feedback_env.zsh"
 # The baseline branch of the newest generation that has one.  Resolved rather
 # than fixed so this keeps working across generations -- and deterministically,
 # because a sweep leaves several branch directories behind and "which one did
 # it pick" must not depend on the order a glob happens to come back in.
 DEFAULT_RUN_DIR=""
-for generation in v3 v2 v1; do
-  candidate="$RUNS_ROOT/semantic_map_100frames_horizonstream_object_pose_feedback_90_189_$generation.baseline"
+for generation in ${(Oa)GENERATIONS}; do
+  candidate="$(opf_run_dir "$generation" baseline)"
   if [[ -d "$candidate/object_pose_feedback" ]]; then
     DEFAULT_RUN_DIR="$candidate"
     break

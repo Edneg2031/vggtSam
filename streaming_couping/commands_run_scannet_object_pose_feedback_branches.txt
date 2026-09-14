@@ -71,9 +71,13 @@ PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
 # To try another prompt set, change GENERATION and PROMPTS below.  Nothing else
 # needs editing: the run directories, the cache seed, the comparison table and
 # the oracle's ground-truth set all derive from these two lines.
-RUNS_ROOT="$STORAGE_ROOT/outputs"
-RUN_PREFIX="semantic_map_100frames_horizonstream_object_pose_feedback_90_189"
-GENERATION="${OBJECT_POSE_FEEDBACK_GENERATION:-v3}"
+# The frame window and the run-directory name come from the shared env file.
+# A different window is a different prefix, so runs of two windows never
+# collide -- and the stage-1 cache, which is window-specific, can never be
+# seeded across them.
+source "$ROOT/streaming_couping/object_pose_feedback_env.zsh"
+
+GENERATION="${OBJECT_POSE_FEEDBACK_GENERATION:-v1}"
 
 # Prompts for THIS generation.  v1 minus dustbin: v1 produced bed/chair/dustbin/
 # rug/wardrobe and dustbin was the best-scoring category against ground truth,
@@ -82,26 +86,32 @@ GENERATION="${OBJECT_POSE_FEEDBACK_GENERATION:-v3}"
 # object slots (see adapters.py), so the object set that comes out is not
 # predictable from the words that went in.  v2 taught that the hard way: seven
 # words were ADDED and a category was still lost.
-PROMPTS=(bed wardrobe chair rug)
+PROMPTS=(bed wardrobe chair rug dustbin)
 
 # Generations the closing table compares, oldest first.  A generation with no
 # readable run is skipped, so listing one that was never run is harmless.
-COMPARE_GENERATIONS=(v1 v2 v3)
+# These are generations WITHIN the current window; the 100-frame window's v1 is
+# a different set of directories and is not listed here.
+COMPARE_GENERATIONS=("${GENERATIONS[@]}")
 GENERATION_PROMPTS=(
   "v1:bed wardrobe chair rug dustbin"
   "v2:bed wardrobe chair rug dustbin table mat nightstand cabinet picture window door"
   "v3:bed wardrobe chair rug"
 )
+#: The window the earlier generations were run at, kept so the reader can say
+#: which window a listed generation belongs to rather than implying it is this
+#: one.  See opf_run_dir in the shared env file.
+
 
 PRIOR_RUN_DIR=""
 for candidate in ${(Oa)COMPARE_GENERATIONS}; do
   [[ "$candidate" == "$GENERATION" ]] && continue
-  if [[ -f "$RUNS_ROOT/${RUN_PREFIX}_$candidate/horizonstream_geometry.pt" ]]; then
-    PRIOR_RUN_DIR="$RUNS_ROOT/${RUN_PREFIX}_$candidate"
+  if [[ -f "$(opf_run_dir "$candidate")/horizonstream_geometry.pt" ]]; then
+    PRIOR_RUN_DIR="$(opf_run_dir "$candidate")"
     break
   fi
 done
-BASE_RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$RUNS_ROOT/${RUN_PREFIX}_$GENERATION}"
+BASE_RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$(opf_run_dir "$GENERATION")}"
 BRANCHES=(baseline translation_only fresh factorized fresh_factor)
 FRESH_MAX_AGE="${OBJECT_POSE_FEEDBACK_MAX_REFERENCE_AGE_FRAMES:-15}"
 FRESH_REFRESH="${OBJECT_POSE_FEEDBACK_ANCHOR_REFRESH_INTERVAL_FRAMES:-20}"

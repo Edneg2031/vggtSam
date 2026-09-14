@@ -21,12 +21,11 @@ ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
 STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
 PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
 
-RUNS_ROOT="$STORAGE_ROOT/outputs"
-PREFIX="semantic_map_100frames_horizonstream_object_pose_feedback_90_189"
+source "$ROOT/streaming_couping/object_pose_feedback_env.zsh"
 
 # Newest first: the verdict is re-read for the current generation, and the
 # comparison table carries the older ones beside it.
-GENERATIONS=(v3 v2 v1)
+GENERATIONS=(${(Oa)GENERATIONS})
 
 # The prompt list has to match the generation being read: it decides which
 # ground-truth categories the object-map reference is built from, and scoring a
@@ -43,7 +42,7 @@ if [[ -n "${OBJECT_POSE_FEEDBACK_RUN_DIR:-}" ]]; then
 else
   BASE_RUN_DIR=""
   for generation in "${GENERATIONS[@]}"; do
-    candidate="$RUNS_ROOT/${PREFIX}_$generation"
+    candidate="$(opf_run_dir "$generation")"
     [[ -d "$candidate.baseline" ]] && { BASE_RUN_DIR="$candidate"; break }
   done
   [[ -n "$BASE_RUN_DIR" ]] || {
@@ -118,7 +117,7 @@ for entry in "${GENERATION_PROMPTS[@]}"; do
 done
 verdict_args=()
 verdict_seen=()
-for candidate in "$RUNS_ROOT/${PREFIX}_v1.baseline" "$RUN_DIR"; do
+for candidate in "$(opf_run_dir "${GENERATIONS[-1]}" baseline)" "$RUN_DIR"; do
   [[ -f "$candidate/object_pose_feedback/summary.json" ]] || continue
   # Reading v1 means RUN_DIR *is* the v1 baseline; the same row must not be
   # printed twice, which reads as two runs that happen to agree.
