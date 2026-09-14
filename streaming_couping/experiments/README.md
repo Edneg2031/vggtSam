@@ -26,4 +26,4 @@
 
 | 记录 | 内容 | 代数 |
 |---|---|---|
-| [object_pose_feedback_go.md](object_pose_feedback_go.md) | 物体锚点闭环位姿修正：轨迹与点云双向成立的端到端结果 | v1（5 prompt） |
+| [object_pose_feedback_go.md](object_pose_feedback_go.md) | 物体锚点闭环位姿修正：轨迹与点云双向成立的端到端结果。§0 是当前成果一览 | 100 帧 v1、150 帧 v1 |
