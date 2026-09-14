@@ -162,4 +162,21 @@ PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   --variant robust_semantic \
   --out "$RUN_DIR/object_pose_feedback/pose_comparison.png" \
   --json-out "$RUN_DIR/object_pose_feedback/pose_comparison.json" \
-  || print -u2 "plot failed (the verdict and metrics above still stand)"
+  || print -u2 "pose figure failed (the verdict and metrics above still stand)"
+
+# ---- And the objects themselves -------------------------------------------
+# The same object points placed by each trajectory: ground truth, raw, and
+# corrected.  Only the pose changes between the last two, so identity errors,
+# mask quality and sampling cancel and what is left is the thing claimed.
+print ""
+print "===== OBJECT CLOUD FIGURE ====="
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m streaming_couping.scripts.plot_object_cloud_comparison \
+  --run-dir "$RUN_DIR" \
+  --geometry-cache "$GEOMETRY_CACHE" \
+  --manifest "$MANIFEST_PATH" \
+  --scene-id "$SCENE_ID" \
+  --prompts "${PROMPTS[@]}" \
+  --variant robust_semantic \
+  --out "$RUN_DIR/object_pose_feedback/object_cloud_comparison.png" \
+  || print -u2 "object figure failed (the verdict and metrics above still stand)"
