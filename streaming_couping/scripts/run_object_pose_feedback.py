@@ -240,8 +240,18 @@ def check_replay_equivalence(
     *,
     translation_tolerance_m: float,
     rotation_tolerance_deg: float,
+    supplied_base_c2w: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    """Replay-without-injections must reproduce the cached raw trajectory."""
+    """Replay-without-injections must reproduce the cached raw trajectory.
+
+    The second half of the check -- replay against the trajectory recorded in
+    the diagnostics -- is the wrong pair once a base has been supplied: those
+    diagnostics were solved against the supplied base, so they record it, and
+    comparing them to the raw replay reports the base difference as a
+    corruption.  ``supplied_base_c2w`` swaps in the base for that comparison, so
+    the check still runs and now asks the question that matters: is the base
+    being scored against the one the diagnostics were solved from.
+    """
 
     cache_c2w = np.stack(
         [
@@ -253,6 +263,19 @@ def check_replay_equivalence(
     diagnostics_c2w = (
         torch.as_tensor(diagnostics_raw_poses).detach().float().cpu().numpy()
     )
+    # Round one compares the replay against the poses the diagnostics recorded,
+    # because both are the raw trajectory and that is the point.  Once a base is
+    # supplied the replay is still raw and the diagnostics still record the
+    # base, so the pair to compare is the supply against the record -- asking
+    # whether the base being scored against is the one the diagnostics were
+    # solved from.  Comparing the replay to either of them would just report the
+    # base difference as corruption.
+    if supplied_base_c2w is None:
+        recorded_left_c2w = replay_c2w
+        recorded_reference_c2w = diagnostics_c2w
+    else:
+        recorded_left_c2w = np.asarray(supplied_base_c2w, dtype=np.float64)
+        recorded_reference_c2w = diagnostics_c2w
     if replay_c2w.shape != cache_c2w.shape or diagnostics_c2w.shape != cache_c2w.shape:
         raise ValueError("Trajectory shapes disagree between replay/cache/diagnostics.")
 
@@ -277,13 +300,16 @@ def check_replay_equivalence(
             max_diagnostics_translation,
             float(
                 np.linalg.norm(
-                    replay_c2w[index, :3, 3] - diagnostics_c2w[index, :3, 3]
+                    recorded_left_c2w[index, :3, 3]
+                    - recorded_reference_c2w[index, :3, 3]
                 )
             ),
         )
         max_diagnostics_rotation = max(
             max_diagnostics_rotation,
-            _rotation_error_deg(replay_c2w[index], diagnostics_c2w[index]),
+            _rotation_error_deg(
+                recorded_left_c2w[index], recorded_reference_c2w[index]
+            ),
         )
     passed = (
         max_cache_translation <= float(translation_tolerance_m)
@@ -297,6 +323,9 @@ def check_replay_equivalence(
         "rotation_tolerance_deg": float(rotation_tolerance_deg),
         "max_replay_vs_cache_translation_m": max_cache_translation,
         "max_replay_vs_cache_rotation_deg": max_cache_rotation,
+        "recorded_reference": (
+            "supplied_base" if supplied_base_c2w is not None else "diagnostics"
+        ),
         "max_replay_vs_diagnostics_translation_m": max_diagnostics_translation,
         "max_replay_vs_diagnostics_rotation_deg": max_diagnostics_rotation,
     }
@@ -513,6 +542,18 @@ def main() -> None:
         for chunk in aux["chunk_cam_maps"]
     ]
 
+    # A base is loaded before the equivalence check because the check needs to
+    # compare against it rather than against the diagnostics' own poses.
+    supplied_base = None
+    if args.base_trajectory is not None:
+        base_path = args.base_trajectory.expanduser().resolve()
+        base_payload = torch.load(base_path, map_location="cpu", weights_only=False)
+        if "raw_c2w" not in base_payload:
+            raise KeyError(f"{base_path} has no 'raw_c2w' to use as a base")
+        supplied_base = (
+            torch.as_tensor(base_payload["raw_c2w"]).detach().float().cpu().numpy()
+        )
+
     # ---- Branch A: raw replay + equivalence assertions ------------------
     raw_c2w, raw_payload = replay_trajectory_with_injections(
         chunk_cam_maps,
@@ -527,6 +568,7 @@ def main() -> None:
         diagnostics["raw_camera_to_world"],
         translation_tolerance_m=float(args.equivalence_translation_tolerance_m),
         rotation_tolerance_deg=float(args.equivalence_rotation_tolerance_deg),
+        supplied_base_c2w=supplied_base,
     )
     if not equivalence["passed"]:
         raise RuntimeError(
@@ -551,14 +593,8 @@ def main() -> None:
     # The equivalence check above still runs on the REPLAYED trajectory: it
     # validates that the chunk camera maps reproduce the cache, which is an
     # integrity check on stage 1 and unrelated to which base is analysed.
-    if args.base_trajectory is not None:
-        base_path = args.base_trajectory.expanduser().resolve()
-        base_payload = torch.load(base_path, map_location="cpu", weights_only=False)
-        if "raw_c2w" not in base_payload:
-            raise KeyError(f"{base_path} has no 'raw_c2w' to use as a base")
-        base = (
-            torch.as_tensor(base_payload["raw_c2w"]).detach().float().cpu().numpy()
-        )
+    if supplied_base is not None:
+        base = supplied_base
         if base.shape != raw_c2w.shape:
             raise ValueError(
                 f"base trajectory {base_path} has shape {base.shape}, expected "
