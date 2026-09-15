@@ -87,7 +87,7 @@ source "$ROOT/streaming_couping/object_pose_feedback_env.zsh"
 #: Which generation this round runs, and -- through the table below -- which
 #: prompt set that generation means.  One line to switch; the tag and the word
 #: list cannot disagree because the list is looked up from the tag.
-GENERATION="${OBJECT_POSE_FEEDBACK_GENERATION:-v4}"
+GENERATION="${OBJECT_POSE_FEEDBACK_GENERATION:-v5}"
 
 # What each generation's prompt set is.  A generation IS a prompt set, so the
 # two are recorded together rather than in two places that have to be kept in
@@ -101,12 +101,17 @@ GENERATION="${OBJECT_POSE_FEEDBACK_GENERATION:-v4}"
 #       the object set that comes out is not predictable from the words in.
 #   v4  v1 plus ONE word, chosen as the most-kept rigid object the inventory
 #       lists as unreached.  ONE, because adding is not free: v2 added seven and
-#       lost a category it already had.
+#       lost a category it already had.  The word produced ZERO tracks -- the
+#       text grounding found nothing -- so v4's object set was v1's.
+#   v5  v1 plus cabinet, which is the best-motivated single word available: of
+#       the seven v2 added, only two produced any track at all, and cabinet was
+#       one of them (132 proposals, the most of any category in that run).
 GENERATION_PROMPTS=(
   "v1:bed wardrobe chair rug dustbin"
   "v2:bed wardrobe chair rug dustbin table mat nightstand cabinet picture window door"
   "v3:bed wardrobe chair rug"
   "v4:bed wardrobe chair rug dustbin table"
+  "v5:bed wardrobe chair rug dustbin cabinet"
 )
 
 PROMPTS=()

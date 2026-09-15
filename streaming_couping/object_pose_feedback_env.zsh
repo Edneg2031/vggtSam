@@ -36,7 +36,7 @@ PYTHON="${PYTHON:-${STREAMING_COUPING_PYTHON:-$(command -v python || true)}}"
 RUNS_ROOT="$STORAGE_ROOT/outputs"
 #: Which generation the readers default to.  The newest that has runs, unless
 #: a caller names one; see opf_generations below.
-GENERATIONS=(v1 v2 v3 v4)
+GENERATIONS=(v1 v2 v3 v4 v5)
 
 #: The name every run of this window shares.  A different window is a different
 #: prefix, so runs of two windows never collide and a reader can never pick up
