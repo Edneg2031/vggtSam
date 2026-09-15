@@ -301,7 +301,15 @@ def main() -> None:
         )
     first, second = before.get("translation_median_m"), after.get("translation_median_m")
     if first is not None and second is not None:
-        if second < first:
+        if first <= 0.0:
+            # A zero first round means the proposals were already exact, which
+            # is a property of the inputs rather than of the loop; there is no
+            # ratio to take and reporting one would be dividing by nothing.
+            print(
+                "  -> round one was already exact, so there is no residual to "
+                "shrink; the ratio is undefined and is not reported"
+            )
+        elif second < first:
             print(
                 f"  -> the residual shrank by {(1 - second / first):.1%}; the loop "
                 "carries information the first round did not use"
