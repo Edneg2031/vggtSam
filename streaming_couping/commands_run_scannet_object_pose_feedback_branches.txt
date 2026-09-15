@@ -133,7 +133,26 @@ fi
 # readable run is skipped, so listing one that was never run is harmless.
 # These are generations WITHIN the current window; the 100-frame window's v1 is
 # a different set of directories and is not listed here.
+#
+# The list lives in the shared env file because the readers use it too, and
+# they have no access to GENERATION_PROMPTS.  So a generation added to one and
+# not the other is silently missing from the comparison table -- which is
+# exactly what happened to v4 on its first round.  This checks instead.
 COMPARE_GENERATIONS=("${GENERATIONS[@]}")
+for known in "${GENERATION_PROMPTS[@]}"; do
+  tag="${known%%:*}"
+  if (( ${GENERATIONS[(Ie)$tag]} == 0 )); then
+    print -u2 "generation $tag has a prompt set but is not in the shared"
+    print -u2 "  GENERATIONS list in object_pose_feedback_env.zsh, so the"
+    print -u2 "  comparison table would omit it.  Add it there."
+    exit 1
+  fi
+done
+if (( ${GENERATIONS[(Ie)$GENERATION]} == 0 )); then
+  print -u2 "generation $GENERATION is not in the shared GENERATIONS list"
+  print -u2 "  in object_pose_feedback_env.zsh; the readers would not find its runs."
+  exit 1
+fi
 #: The window the earlier generations were run at, kept so the reader can say
 #: which window a listed generation belongs to rather than implying it is this
 #: one.  See opf_run_dir in the shared env file.
