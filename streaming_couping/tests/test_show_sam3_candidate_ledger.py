@@ -39,6 +39,8 @@ LEDGER_SUMMARY = {
         "rug": {},
     },
     "prompts_with_no_track": ["rug", "table"],
+    "prompts_returning_nothing": ["rug"],
+    "prompts_found_but_unusable": ["table"],
 }
 
 
@@ -117,13 +119,18 @@ def test_cli_prints_the_outcome_table(
                     "rug": {"over_object_cap": 2},
                 },
                 "prompts_with_no_track": ["table"],
+                "prompts_returning_nothing": [],
+                "prompts_found_but_unusable": ["table"],
             },
         },
     )
     monkeypatch.setattr("sys.argv", ["show", "--run-dir", str(run)])
     main()
     printed = capsys.readouterr().out
-    assert "returned no track at all: table" in printed
+    # table has a birth_mask_rejected row, so it WAS found -- the distinction
+    # from "returned nothing" is the point of the message
+    assert "found but unusable" in printed
+    assert "table" in printed
     # each outcome that actually occurred is explained, because the codes alone
     # do not say what to do about them
     assert "overlaps a track that was born earlier" in printed
@@ -175,6 +182,8 @@ def test_report_out_sends_the_tables_to_a_file(
                 "prompt_count": 2,
                 "per_prompt": {"bed": {"accepted": 1}, "table": {"birth_mask_rejected": 1}},
                 "prompts_with_no_track": ["table"],
+                "prompts_returning_nothing": [],
+                "prompts_found_but_unusable": ["table"],
             },
         },
     )
@@ -191,3 +200,23 @@ def test_report_out_sends_the_tables_to_a_file(
     assert "dropped: birth mask below the pixel floor" in body
     # stdout stays a headline: one line per run plus the paths
     assert len([line for line in printed.splitlines() if line.strip()]) <= 4
+
+
+def test_a_prompt_that_returned_nothing_is_not_called_unusable() -> None:
+    """The two failures have opposite fixes and must not share a label.
+
+    Absent from the ledger means the text grounding found no object -- replace
+    the word.  Present with outcomes but none usable means the object WAS found
+    and every track died on the way in -- look at the thresholds instead.
+    """
+
+    from streaming_couping.src.semantic_mapping.adapters import ledger_summary
+
+    summary = ledger_summary(
+        [{"prompt": "chair", "outcome": "birth_mask_rejected"}],
+        ["chair", "table"],
+    )
+    assert summary["prompts_returning_nothing"] == ["table"]
+    assert summary["prompts_found_but_unusable"] == ["chair"]
+    # the merged list still exists for callers that only want "not usable"
+    assert summary["prompts_with_no_track"] == ["chair", "table"]

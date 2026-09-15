@@ -917,17 +917,30 @@ def ledger_summary(
         outcome = str(entry.get("outcome", "unknown"))
         counts = per_prompt.setdefault(prompt, {})
         counts[outcome] = counts.get(outcome, 0) + 1
+    # Two different failures that a single "no track" count would merge, and
+    # they call for opposite work.  A prompt absent from the ledger returned
+    # nothing at all -- the text grounding found no object -- which is a word to
+    # replace.  A prompt present with outcomes but none of them producing means
+    # the object WAS found and every track died on the way in, which is a
+    # threshold or a competition to look at instead.
+    returned_nothing = sorted(
+        name for name, counts in per_prompt.items() if not counts
+    )
+    found_but_unusable = sorted(
+        name
+        for name, counts in per_prompt.items()
+        if counts
+        and not any(counts.get(outcome) for outcome in TRACK_PRODUCING_OUTCOMES)
+    )
     return {
         "total": len(ledger),
         "prompt_count": len(per_prompt),
         "per_prompt": {
             name: dict(counts) for name, counts in sorted(per_prompt.items())
         },
-        "prompts_with_no_track": sorted(
-            name
-            for name, counts in per_prompt.items()
-            if not any(counts.get(outcome) for outcome in TRACK_PRODUCING_OUTCOMES)
-        ),
+        "prompts_returning_nothing": returned_nothing,
+        "prompts_found_but_unusable": found_but_unusable,
+        "prompts_with_no_track": sorted(returned_nothing + found_but_unusable),
     }
 
 

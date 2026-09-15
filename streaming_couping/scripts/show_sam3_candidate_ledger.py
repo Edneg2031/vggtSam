@@ -149,7 +149,13 @@ def digest_line(run_name: str, summary: Mapping[str, Any] | None, note: str | No
         }
     )
     detail = f"{summary.get('total', 0)} tracks / {len(prompts)} prompts"
-    if no_track:
+    nothing = summary.get("prompts_returning_nothing") or []
+    unusable = summary.get("prompts_found_but_unusable") or []
+    if nothing:
+        detail += f"; returned nothing: {', '.join(map(str, nothing))}"
+    if unusable:
+        detail += f"; found but unusable: {', '.join(map(str, unusable))}"
+    if not nothing and not unusable and no_track:
         detail += f"; no track: {', '.join(map(str, no_track))}"
     if dropped:
         detail += f"; dropped as: {', '.join(dropped)}"
@@ -183,16 +189,30 @@ def main() -> None:
         summary = {**loaded["summary"], "prompts": loaded["prompts"]}
         prompts, outcomes, rows = outcome_matrix(summary)
         outcomes_seen.update(outcomes)
+        nothing_count = len(summary.get("prompts_returning_nothing") or [])
+        unusable_count = len(summary.get("prompts_found_but_unusable") or [])
         sections.append(
             f"  {summary.get('total')} track(s) from {len(prompts)} prompt(s); "
-            f"{len(summary.get('prompts_with_no_track') or [])} returned no track"
+            f"{nothing_count} returned nothing, {unusable_count} found but unusable"
+            if (nothing_count or unusable_count or "prompts_returning_nothing" in summary)
+            else f"  {summary.get('total')} track(s) from {len(prompts)} prompt(s)"
         )
         sections.append("")
         sections.append(_table(["prompt", *outcomes], rows))
-        no_track = summary.get("prompts_with_no_track") or []
-        if no_track:
+        nothing = summary.get("prompts_returning_nothing") or []
+        unusable = summary.get("prompts_found_but_unusable") or []
+        if nothing or unusable:
             sections.append("")
-            sections.append(f"  returned no track at all: {', '.join(map(str, no_track))}")
+        if nothing:
+            sections.append(
+                f"  returned NOTHING -- the text grounding found no object, so "
+                f"nothing was offered to any filter: {', '.join(map(str, nothing))}"
+            )
+        if unusable:
+            sections.append(
+                f"  found but unusable -- every track died on the way in: "
+                f"{', '.join(map(str, unusable))}"
+            )
         sections.append("")
         for outcome in outcomes:
             if outcome in OUTCOME_MEANING:
