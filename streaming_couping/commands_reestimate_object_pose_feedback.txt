@@ -60,3 +60,18 @@ PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   --poses "$RUN_DIR/object_pose_feedback/poses.pt" \
   --trajectory "$VARIANT" \
   --output-dir "$OUT_DIR"
+
+# ---- The null control -------------------------------------------------------
+# Re-solving from the UNCHANGED base must reproduce the source proposals.  The
+# re-solve path rebuilds the observations and the config from the diagnostics
+# rather than reusing stage 2a's, so it has a difference of its own -- and that
+# difference has to be measured before the loop run's change is attributed to
+# the loop.  Skip this and an 18% shrink could be the rebuild.
+print ""
+print "===== NULL CONTROL (same base, no correction fed back) ====="
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m streaming_couping.scripts.run_object_pose_loss_reestimate \
+  --diagnostics "$RUN_DIR/object_pose_refinement/feedback_diagnostics.pt" \
+  --poses "$RUN_DIR/object_pose_feedback/poses.pt" \
+  --control \
+  --output-dir "$OUT_DIR.control"

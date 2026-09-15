@@ -172,6 +172,17 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--tolerance", type=float, default=GAUGE_TOLERANCE)
+    parser.add_argument(
+        "--control",
+        action="store_true",
+        help=(
+            "Re-solve against the UNCHANGED base.  This is the null control: "
+            "the result must reproduce the source proposals, and the gap "
+            "between it and the loop run is what the re-solve path itself "
+            "contributes.  Without it a residual change cannot be attributed "
+            "to the loop."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -189,12 +200,18 @@ def main() -> None:
 
     poses = torch.load(poses_path, map_location="cpu", weights_only=False)
     variants = poses.get("variant_c2w") or {}
-    if args.trajectory not in variants:
-        raise KeyError(
-            f"{poses_path} has no trajectory {args.trajectory!r}; "
-            f"available: {sorted(variants)}"
-        )
-    corrected = torch.as_tensor(variants[args.trajectory]).detach().float().cpu()
+    if args.control:
+        # The null control re-solves from the base the source already used, so
+        # any difference it shows is the re-solve path and not the loop.
+        corrected = torch.as_tensor(poses["raw_c2w"]).detach().float().cpu()
+        args.trajectory = "raw (control)"
+    else:
+        if args.trajectory not in variants:
+            raise KeyError(
+                f"{poses_path} has no trajectory {args.trajectory!r}; "
+                f"available: {sorted(variants)}"
+            )
+        corrected = torch.as_tensor(variants[args.trajectory]).detach().float().cpu()
     raw_from_poses = torch.as_tensor(poses["raw_c2w"]).detach().float().cpu()
     gt_c2w = torch.as_tensor(poses["gt_c2w"]).detach().float().cpu()
 
@@ -223,7 +240,7 @@ def main() -> None:
         f"base_shift_m: median={float(shift.median()):.6f} "
         f"max={float(shift.max()):.6f}"
     )
-    if float(shift.max()) <= 0.0:
+    if float(shift.max()) <= 0.0 and not args.control:
         raise RuntimeError(
             "the base trajectory is identical to the one the source was solved "
             "from; there is nothing to feed back"
@@ -291,6 +308,13 @@ def main() -> None:
             f"  {name}: n={stats.get('proposal_count')} "
             f"translation_median={stats.get('translation_median_m', float('nan')):.6f} m "
             f"rotation_median={stats.get('rotation_median_deg', float('nan')):.6f} deg"
+        )
+    if args.control:
+        print(
+            "  CONTROL: this re-solved from the UNCHANGED base, so it must "
+            "reproduce round 1.  Any gap here is the re-solve path's own "
+            "contribution and has to be subtracted from the loop run's change "
+            "before that change is attributed to the loop."
         )
     if not after.get("proposal_count"):
         print(
