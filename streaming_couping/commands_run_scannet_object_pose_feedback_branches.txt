@@ -8,6 +8,12 @@
 # No arguments and no environment variables are needed; edit the block below to
 # change the branch list or the freshness thresholds.
 #
+# DEFAULT IS ONE BRANCH AND ONE REPEAT.  That is the run that produces the
+# reported result: a stage-1 cache hit, one segmentation pass, the oracle
+# control, the replay gate and the two comparison tables.  The four ablation
+# branches and the two extra repeats are opt-in -- see BRANCHES and SAM_REPEATS
+# below for what each costs and what it buys.
+#
 # GENERATIONS
 #
 # This sweep writes a new generation of run directories (_v2) rather than
@@ -138,7 +144,25 @@ for candidate in ${(Oa)COMPARE_GENERATIONS}; do
   fi
 done
 BASE_RUN_DIR="${OBJECT_POSE_FEEDBACK_RUN_DIR:-$(opf_run_dir "$GENERATION")}"
-BRANCHES=(baseline translation_only fresh factorized fresh_factor)
+# Which proposal-side branches to run.  One is the default: the other four are
+# ablations, they cost one segmentation pass each only when they need a replay
+# (they do not -- see below), and they are read from the tables rather than
+# re-derived every round.
+#
+#   baseline          the method; what every result is reported from
+#   translation_only  falsified (worse everywhere it was tried)
+#   fresh             bounded reference age; worse than baseline at both windows
+#   factorized        rotation-then-translation; passes or fails depending on the
+#                     prompt set, so it is not a configuration to report
+#   fresh_factor      both of the above knobs
+#
+# The full sweep is one edit away:
+#   OBJECT_POSE_FEEDBACK_BRANCHES=baseline,translation_only,fresh,factorized,fresh_factor
+if [[ -n "${OBJECT_POSE_FEEDBACK_BRANCHES:-}" ]]; then
+  BRANCHES=("${(@s:,:)OBJECT_POSE_FEEDBACK_BRANCHES}")
+else
+  BRANCHES=(baseline)
+fi
 #: The consensus variant the tables headline and the figures draw.  Matches
 #: MAIN_VARIANT_NAME in object_pose_feedback.py; named here too because the
 #: figures are drawn from this script.
@@ -154,7 +178,12 @@ FRESH_REFRESH="${OBJECT_POSE_FEEDBACK_ANCHOR_REFRESH_INTERVAL_FRAMES:-20}"
 # 3 means two extra stage-2a passes; stage 1 is reused from the cache by
 # --reuse-if-valid, so the geometry model runs once.  Set it to 1 to skip the
 # measurement and read the table without a noise floor.
-SAM_REPEATS="${OBJECT_POSE_FEEDBACK_SAM_REPEATS:-3}"
+# Every repeat is a full segmentation pass, which is the expensive half of a
+# round.  One is the default because the numbers are already known to be stable
+# within a shared geometry cache (spread ~1e-05); three is what measures that
+# spread, and is worth paying for when a noise floor is being quoted rather
+# than read.
+SAM_REPEATS="${OBJECT_POSE_FEEDBACK_SAM_REPEATS:-1}"
 
 MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
 SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
