@@ -213,10 +213,10 @@ def main() -> None:
                 f"  found but unusable -- every track died on the way in: "
                 f"{', '.join(map(str, unusable))}"
             )
+        # The legend is printed once for the whole report, after every run, so
+        # a run does not repeat the same three lines; it used to appear both
+        # inside each run's block and again at the end.
         sections.append("")
-        for outcome in outcomes:
-            if outcome in OUTCOME_MEANING:
-                sections.append(f"  {outcome:22s} {OUTCOME_MEANING[outcome]}")
         stdout_lines.append(digest_line(run_dir.name, summary, None))
         reports[run_dir.name] = summary
 
