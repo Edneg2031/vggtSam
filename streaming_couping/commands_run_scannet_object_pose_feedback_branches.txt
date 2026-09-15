@@ -87,7 +87,7 @@ source "$ROOT/streaming_couping/object_pose_feedback_env.zsh"
 #: Which generation this round runs, and -- through the table below -- which
 #: prompt set that generation means.  One line to switch; the tag and the word
 #: list cannot disagree because the list is looked up from the tag.
-GENERATION="${OBJECT_POSE_FEEDBACK_GENERATION:-v3}"
+GENERATION="${OBJECT_POSE_FEEDBACK_GENERATION:-v4}"
 
 # What each generation's prompt set is.  A generation IS a prompt set, so the
 # two are recorded together rather than in two places that have to be kept in
@@ -99,10 +99,14 @@ GENERATION="${OBJECT_POSE_FEEDBACK_GENERATION:-v3}"
 #       still works without it.  Not "v1's objects minus dustbin": the prompt
 #       list competes for a fixed number of object slots (see adapters.py), so
 #       the object set that comes out is not predictable from the words in.
+#   v4  v1 plus ONE word, chosen as the most-kept rigid object the inventory
+#       lists as unreached.  ONE, because adding is not free: v2 added seven and
+#       lost a category it already had.
 GENERATION_PROMPTS=(
   "v1:bed wardrobe chair rug dustbin"
   "v2:bed wardrobe chair rug dustbin table mat nightstand cabinet picture window door"
   "v3:bed wardrobe chair rug"
+  "v4:bed wardrobe chair rug dustbin table"
 )
 
 PROMPTS=()
@@ -620,6 +624,19 @@ if [[ -f "$FIGURE_RUN_DIR/object_pose_feedback/poses.pt" ]]; then
 else
   print "no baseline poses.pt; skipping the figures"
 fi
+
+# ---- What the prompt set actually produced ---------------------------------
+# The primary reading for a prompt-set change is not the pose number: it is
+# whether the added word entered at all, and whether anything that was already
+# there got pushed out.  A word that produced no track cannot have helped, and a
+# category that disappeared means the pose number is not a clean reading of
+# "adding this word helped".
+print ""
+print "===== WHAT THE PROMPT SET PRODUCED ====="
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m streaming_couping.scripts.show_sam3_candidate_ledger \
+  --run-dir "$FIGURE_RUN_DIR" \
+  || print -u2 "ledger unavailable for this run (it predates the ledger?)"
 
 print ""
 print "all ${#BRANCHES} branches + the oracle control completed"
