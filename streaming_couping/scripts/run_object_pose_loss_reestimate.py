@@ -292,6 +292,13 @@ def main() -> None:
             f"translation_median={stats.get('translation_median_m', float('nan')):.6f} m "
             f"rotation_median={stats.get('rotation_median_deg', float('nan')):.6f} deg"
         )
+    if not after.get("proposal_count"):
+        print(
+            "  -> round two solved no proposals, so there is nothing to compare. "
+            "That means the rebased references produced no usable pairing, which "
+            "is itself a result: the corrected base moved the references too far "
+            "for the matching thresholds."
+        )
     first, second = before.get("translation_median_m"), after.get("translation_median_m")
     if first is not None and second is not None:
         if second < first:

@@ -1,0 +1,62 @@
+#!/usr/bin/env zsh
+
+# Close the estimation loop one step.  (CPU only)
+#
+#   zsh streaming_couping/commands_reestimate_object_pose_feedback.txt
+#
+# No GPU: the observations are camera-space points that no pose change touches,
+# so the same masks and the same points are re-solved against reference clouds
+# rebuilt under the corrected trajectory.
+#
+# WHAT IT ANSWERS
+#
+# The pipeline is two-pass -- proposals from un-corrected geometry, corrections
+# replayed afterwards -- so a correction at frame t never reaches the proposal
+# at frame t+1.  This feeds round one's corrected trajectory back in as the
+# base and measures whether the residual proposal error shrinks.
+#
+# NOT YET WIRED: the trajectory comparison
+#
+# Stage 2b derives the base it scores against from its own replay of the
+# geometry cache, so it cannot yet be told to use the corrected base.  Round
+# two's own trajectory is therefore not computed here; what is printed is the
+# proposal-level answer, which is the one that decides whether the loop carries
+# information.  round_base.pt is written alongside for when stage 2b takes it.
+set -uo pipefail
+
+ROOT="${VGGT_SAM_ROOT:-/home/wlh50060092/vggtSam}"
+STORAGE_ROOT="${VGGT_SAM_STORAGE_ROOT:-/data184/open_source/vggtSam}"
+PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
+
+source "$ROOT/streaming_couping/object_pose_feedback_env.zsh"
+
+GENERATION="${OBJECT_POSE_FEEDBACK_GENERATION:-v1}"
+VARIANT="${OBJECT_POSE_FEEDBACK_MAIN_VARIANT:-robust_semantic}"
+RUN_DIR="$(opf_run_dir "$GENERATION" baseline)"
+OUT_DIR="$(opf_run_dir "$GENERATION" reestimate)"
+
+cd "$ROOT"
+export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
+export PYTHONUNBUFFERED=1
+
+for required in "$RUN_DIR/object_pose_refinement/feedback_diagnostics.pt" \
+                "$RUN_DIR/object_pose_feedback/poses.pt"; do
+  [[ -f "$required" ]] || {
+    print -u2 "missing: $required"
+    print -u2 "run commands_run_scannet_object_pose_feedback_branches.txt first"
+    exit 1
+  }
+done
+
+print "===== RE-ESTIMATE AGAINST THE CORRECTED TRAJECTORY ====="
+print "run_dir=$RUN_DIR"
+print "generation=$GENERATION  base_trajectory=$VARIANT"
+print "cpu_only=1  gpu=0"
+print ""
+
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m streaming_couping.scripts.run_object_pose_loss_reestimate \
+  --diagnostics "$RUN_DIR/object_pose_refinement/feedback_diagnostics.pt" \
+  --poses "$RUN_DIR/object_pose_feedback/poses.pt" \
+  --trajectory "$VARIANT" \
+  --output-dir "$OUT_DIR"
