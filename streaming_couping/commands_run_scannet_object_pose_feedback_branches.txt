@@ -68,36 +68,62 @@ PYTHON="${STREAMING_COUPING_PYTHON:-$(command -v python)}"
 # or linked, so the earlier generation cannot be damaged even if stage 1
 # decides the cache needs rebuilding.
 #
-# To try another prompt set, change GENERATION and PROMPTS below.  Nothing else
-# needs editing: the run directories, the cache seed, the comparison table and
-# the oracle's ground-truth set all derive from these two lines.
+# To try another prompt set, change GENERATION below.  The prompt list is looked
+# up from the generation, so the tag and the words cannot disagree; nothing else
+# needs editing, because the run directories, the cache seed, the comparison
+# table and the oracle's ground-truth set all derive from it.
 # The frame window and the run-directory name come from the shared env file.
 # A different window is a different prefix, so runs of two windows never
 # collide -- and the stage-1 cache, which is window-specific, can never be
 # seeded across them.
 source "$ROOT/streaming_couping/object_pose_feedback_env.zsh"
 
-GENERATION="${OBJECT_POSE_FEEDBACK_GENERATION:-v1}"
+#: Which generation this round runs, and -- through the table below -- which
+#: prompt set that generation means.  One line to switch; the tag and the word
+#: list cannot disagree because the list is looked up from the tag.
+GENERATION="${OBJECT_POSE_FEEDBACK_GENERATION:-v3}"
 
-# Prompts for THIS generation.  v1 minus dustbin: v1 produced bed/chair/dustbin/
-# rug/wardrobe and dustbin was the best-scoring category against ground truth,
-# so this asks whether the set still works without it.  Note this is not
-# "v1's objects minus dustbin" -- the prompt list competes for a fixed number of
-# object slots (see adapters.py), so the object set that comes out is not
-# predictable from the words that went in.  v2 taught that the hard way: seven
-# words were ADDED and a category was still lost.
-PROMPTS=(bed wardrobe chair rug dustbin)
+# What each generation's prompt set is.  A generation IS a prompt set, so the
+# two are recorded together rather than in two places that have to be kept in
+# step by hand.
+#
+#   v1  the five words the reported result was produced with
+#   v2  v1 plus seven rigid objects -- adding words lost a category that v1 had
+#   v3  v1 minus dustbin, the best-scoring category, asking whether the set
+#       still works without it.  Not "v1's objects minus dustbin": the prompt
+#       list competes for a fixed number of object slots (see adapters.py), so
+#       the object set that comes out is not predictable from the words in.
+GENERATION_PROMPTS=(
+  "v1:bed wardrobe chair rug dustbin"
+  "v2:bed wardrobe chair rug dustbin table mat nightstand cabinet picture window door"
+  "v3:bed wardrobe chair rug"
+)
+
+PROMPTS=()
+if [[ -n "${OBJECT_POSE_FEEDBACK_PROMPTS:-}" ]]; then
+  # An explicit list wins, so an ad-hoc set can be tried without inventing a
+  # generation tag for it.
+  PROMPTS=("${(@s:,:)OBJECT_POSE_FEEDBACK_PROMPTS}")
+else
+  for entry in "${GENERATION_PROMPTS[@]}"; do
+    [[ "${entry%%:*}" == "$GENERATION" ]] || continue
+    words="${entry#*:}"
+    PROMPTS=("${(@s: :)words}")
+  done
+  if (( ${#PROMPTS} == 0 )); then
+    print -u2 "no prompt set recorded for generation $GENERATION"
+    known=("${GENERATION_PROMPTS[@]%%:*}")
+    print -u2 "known generations: ${(j:, :)known}"
+    print -u2 "add it to GENERATION_PROMPTS, or set OBJECT_POSE_FEEDBACK_PROMPTS"
+    exit 1
+  fi
+fi
 
 # Generations the closing table compares, oldest first.  A generation with no
 # readable run is skipped, so listing one that was never run is harmless.
 # These are generations WITHIN the current window; the 100-frame window's v1 is
 # a different set of directories and is not listed here.
 COMPARE_GENERATIONS=("${GENERATIONS[@]}")
-GENERATION_PROMPTS=(
-  "v1:bed wardrobe chair rug dustbin"
-  "v2:bed wardrobe chair rug dustbin table mat nightstand cabinet picture window door"
-  "v3:bed wardrobe chair rug"
-)
 #: The window the earlier generations were run at, kept so the reader can say
 #: which window a listed generation belongs to rather than implying it is this
 #: one.  See opf_run_dir in the shared env file.
