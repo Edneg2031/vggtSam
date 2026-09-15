@@ -384,6 +384,16 @@ def _parse_args() -> argparse.Namespace:
         default=1e-3,
     )
     parser.add_argument(
+        "--base-trajectory",
+        type=Path,
+        default=None,
+        help=(
+            "Score against this trajectory instead of the replayed raw one.  "
+            "Used to run a second round of the loop, whose proposals were "
+            "solved against the first round's corrected trajectory."
+        ),
+    )
+    parser.add_argument(
         "--equivalence-rotation-tolerance-deg",
         type=float,
         default=0.01,
@@ -528,6 +538,39 @@ def main() -> None:
         f"(max_t={_fmt(equivalence['max_replay_vs_cache_translation_m'])} m, "
         f"max_r={_fmt(equivalence['max_replay_vs_cache_rotation_deg'])} deg)"
     )
+
+    # ---- Base trajectory, if one is supplied ---------------------------
+    # A second round of the loop solves its proposals against the trajectory
+    # the first round produced, so the ground-truth deltas and the injected
+    # targets are all relative to THAT base, not to the raw one.  Swapping it
+    # here is the whole change: everything downstream -- GT deltas, the gating
+    # metric, the injection targets, the reported ATE -- reads this variable,
+    # so one assignment moves all of them together and none of them can end up
+    # scored against a different base than the others.
+    #
+    # The equivalence check above still runs on the REPLAYED trajectory: it
+    # validates that the chunk camera maps reproduce the cache, which is an
+    # integrity check on stage 1 and unrelated to which base is analysed.
+    if args.base_trajectory is not None:
+        base_path = args.base_trajectory.expanduser().resolve()
+        base_payload = torch.load(base_path, map_location="cpu", weights_only=False)
+        if "raw_c2w" not in base_payload:
+            raise KeyError(f"{base_path} has no 'raw_c2w' to use as a base")
+        base = (
+            torch.as_tensor(base_payload["raw_c2w"]).detach().float().cpu().numpy()
+        )
+        if base.shape != raw_c2w.shape:
+            raise ValueError(
+                f"base trajectory {base_path} has shape {base.shape}, expected "
+                f"{raw_c2w.shape}"
+            )
+        shift = np.linalg.norm(base[:, :3, 3] - raw_c2w[:, :3, 3], axis=-1)
+        print(
+            f"base trajectory overridden from {base_path}: "
+            f"median shift {float(np.median(shift)):.6f} m, "
+            f"max {float(shift.max()):.6f} m"
+        )
+        raw_c2w = base
 
     # ---- Proposals, reliability, consensus, gating (no GT) --------------
     proposals = build_proposals(diagnostics, config=config)

@@ -34,6 +34,9 @@ GENERATION="${OBJECT_POSE_FEEDBACK_GENERATION:-v1}"
 VARIANT="${OBJECT_POSE_FEEDBACK_MAIN_VARIANT:-robust_semantic}"
 RUN_DIR="$(opf_run_dir "$GENERATION" baseline)"
 OUT_DIR="$(opf_run_dir "$GENERATION" reestimate)"
+GEOMETRY_CACHE="${OBJECT_POSE_FEEDBACK_GEOMETRY_CACHE:-$(opf_run_dir "$GENERATION")/horizonstream_geometry.pt}"
+MANIFEST_PATH="${SEMANTIC_MAP_MANIFEST:-$STORAGE_ROOT/data/processed/scannetpp_pinhole_2d/manifest.json}"
+SCENE_ID="${SEMANTIC_MAP_SCENE_ID:-00a231a370}"
 
 cd "$ROOT"
 export VGGT_SAM_STORAGE_ROOT="$STORAGE_ROOT"
@@ -60,6 +63,36 @@ PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
   --poses "$RUN_DIR/object_pose_feedback/poses.pt" \
   --trajectory "$VARIANT" \
   --output-dir "$OUT_DIR"
+
+# ---- Round two's trajectory -------------------------------------------------
+# Same stage-2b path as round one, differing in the two things that make it a
+# second round: the proposals are round two's, and the base it scores against is
+# round one's corrected trajectory rather than the replayed raw one.  That is
+# why this needs no separate replay semantics -- the injection map is built from
+# whatever diagnostics it is given, against whatever base it is given.
+#
+# The number to compare is d_ATE here against round one's d_ATE in the baseline
+# run, and the null control below says how much of any difference is the
+# re-solve path rather than the loop.
+print ""
+print "===== ROUND TWO TRAJECTORY (stage 2b on the corrected base) ====="
+for required in "$OUT_DIR/object_pose_refinement/feedback_diagnostics.pt" \
+                "$OUT_DIR/object_pose_feedback/round_base.pt"; do
+  [[ -f "$required" ]] || {
+    print -u2 "missing: $required (did the re-estimate step succeed?)"
+    exit 1
+  }
+done
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -m streaming_couping.scripts.run_object_pose_feedback \
+  --run-dir "$OUT_DIR" \
+  --geometry-cache "$GEOMETRY_CACHE" \
+  --manifest "$MANIFEST_PATH" \
+  --scene-id "$SCENE_ID" \
+  --output-dir "$OUT_DIR/object_pose_feedback" \
+  --base-trajectory "$OUT_DIR/object_pose_feedback/round_base.pt" \
+  --horizon-repo "$ROOT/externals/horizonstream" \
+  || print -u2 "round-two stage 2b failed (the proposal-level result above stands)"
 
 # ---- The null control -------------------------------------------------------
 # Re-solving from the UNCHANGED base must reproduce the source proposals.  The
