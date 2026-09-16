@@ -57,7 +57,7 @@ EVAL_LOG="$EVAL_DIR/evaluator.log"
 ALIGNED_BRANCH="object_pose_object_only_per_instance"
 
 # Frequently tuned feedback thresholds (defaults live in
-# ObjectPoseFeedbackConfig; see docs/object_pose_feedback.md).
+# ObjectPoseFeedbackConfig; see docs/method.md).
 MIN_CONSENSUS_OBJECTS="${OBJECT_POSE_FEEDBACK_MIN_CONSENSUS_OBJECTS:-2}"
 MAX_CONSENSUS_TRANSLATION_M="${OBJECT_POSE_FEEDBACK_MAX_CONSENSUS_TRANSLATION_M:-0.20}"
 MAX_CONSENSUS_ROTATION_DEG="${OBJECT_POSE_FEEDBACK_MAX_CONSENSUS_ROTATION_DEG:-8.0}"

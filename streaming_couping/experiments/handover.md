@@ -25,9 +25,9 @@
 | 项 | 状态 |
 |---|---|
 | 主结果 | `robust_semantic`，**v1 prompt 集**，100 帧与 150 帧两轮都 GO |
-| 最好的单次配置 | `factorized`，但它**不稳定**，不能当主线（§5.3） |
+| 最好的单次配置 | `factorized`，但它**不稳定**，不能当主线（`experiments.md` §6） |
 | 代码 | 已精简到这条线；旧线（dinov3 / multiclip / v0 / v11 / v21–23 / sam31-auto / temporal）已全部移除 |
-| 规模 | commands 9 · scripts 29 · src 70 · tests 28 · docs 12 · experiments 3 |
+| 规模 | commands 9 · scripts 29 · src 70 · tests 28 · **docs 1 · experiments 2** |
 | 测试 | **231 通过**，1 个失败（`test_instance_point_consistency`，**在精简之前就存在**，与本线无关） |
 
 ---
@@ -73,8 +73,8 @@ streaming_couping/
   src/semantic_mapping/       这条线的主体：几何适配、SAM 适配、提案、共识、门控、重放
   scripts/                    29 个，其中 18 个在 baseline 链上
   tests/                      28 个
-  docs/                       12 份技术文档
-  experiments/                3 份：本文件 + report.md + object_pose_feedback_go.md
+  docs/method.md              方法：pipeline、判据、六层筛选
+  experiments/                2 份：experiments.md（实验）+ handover.md（本文件）
 ```
 
 **baseline 链**：`..._branches.txt` → `..._100f.txt` → `evaluate_..._object_only.txt`。
@@ -84,7 +84,7 @@ streaming_couping/
 
 ## 5. 已经试过并且失败的方向（**最省时间的部分**）
 
-这些都有实测证据，**别重复做**。每条在 §8 的文档里都有原始数据。
+这些都有实测证据，**别重复做**。每条在 `experiments.md` §6 里都有原始数据。
 
 | 方向 | 结论 |
 |---|---|
@@ -129,7 +129,7 @@ streaming_couping/
 
 4. **噪声底有两种，别用一个数当全部。** 1.8e-05 是"共享同一次几何缓存"的；跨独立 stage-1 是 **2.4e-03**。
 
-5. **不要用 ICP loss 判断好坏。** 判据只有位姿指标（七条，见 `report.md` §3.3）。loss 下降不代表
+5. **不要用 ICP loss 判断好坏。** 判据只有位姿指标（七条，见 `../docs/method.md` §7）。loss 下降不代表
    位姿变好 —— V3 那次 loss 降 58% 而 GT 指标平坦。
 
 6. **报告里 150 帧的数来自两次不同的 stage-1 跑**（+15.60% 与 +15.36%），章节里都标注了是哪一次。
@@ -142,15 +142,31 @@ streaming_couping/
 
 ## 8. 文档地图
 
+**全仓库只有三份文档**（外加 `readme.md`）：
+
 | 想知道什么 | 看哪份 |
 |---|---|
-| **汇报用**：问题、方法、实验过程、结果、结论 | [`report.md`](report.md) |
-| **完整记录**：逐项结果、逐条证据、适用范围讨论 | [`object_pose_feedback_go.md`](object_pose_feedback_go.md) |
-| 实现与判据定义（四阶段、判据阈值、输出格式） | `docs/object_pose_feedback.md` |
-| **六层筛选判据**，以及哪一层实测有效 | `docs/object_selection_criteria.md` |
-| 失败路径与归因分析（首次给出两个分数反预测） | `docs/object_pose_pipeline_summary.md` |
-| 环路机制验证（GT 修正写回累积器） | `docs/horizonstream_gt_feedback_poc.md` |
-| 这条线早期版本沿革 | `docs/current_pipeline.md`、`docs/current_status.md`、`docs/experiment_route.md` |
+| **方法**：pipeline 怎么搭、每步做什么、判据是什么、六层筛选 | [`../docs/method.md`](../docs/method.md) |
+| **实验**：做过什么、结果是什么、什么失败了、早期弯路 | [`experiments.md`](experiments.md) |
+| **交接**：现在什么状态、怎么跑、坑在哪、下一步 | 本文件 |
+
+`experiments.md` 内部的定位：
+
+| 章节 | 内容 |
+|---|---|
+| §0–§4 | 结论、位姿主结果、点云传导、环路验证、不依赖单一物体 |
+| §5 | 消融：共识侧 5 变体 + 提案侧 5 分支（每个分支检验什么假设） |
+| §6 | **已否证的方向**（含闭环、加 prompt 的机制细节） |
+| §7 | 适用范围 |
+| §8 | 早期实验（这条线的前身，别重复） |
+| §9 | 未解释的观察（`anchor_rho`） |
+| §10 | 复现命令 |
+
+**这三份文档合并自原来 16 份**，被合并的原文在 git 历史里可查。
+
+---
+
+## 8b. 图
 
 **每轮跑完产出两张图**（CPU，几秒），在 `<run>.baseline/object_pose_feedback/` 下：
 

@@ -102,5 +102,5 @@ SAM，避免 depth 与 mask 像素错位。
 - adapters: HorizonStream cache、StreamVGGT、SAM3.1 和旧 V0 cache。
 
 HorizonStream 源码固定为子模块 `externals/horizonstream`，当前 revision 为 `9602f53`；权重
-保留在 NAS，不提交到 Git。详细设计见 [系统 pipeline](docs/system_pipeline.md)，已有实验证据
-见 [当前状态](docs/current_status.md)。
+保留在 NAS，不提交到 Git。详细设计见 [方法文档](docs/method.md)，已有实验证据
+见 [实验文档](experiments/experiments.md)。
