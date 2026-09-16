@@ -429,8 +429,8 @@ object edge 必须保留 provenance，并允许因 mask、匹配、深度或 pos
 历史实验的详细设置和完整 artifact 路径见：
 
 - [`current_status.md`](current_status.md)
-- [`multiclip_affine_geometry.md`](multiclip_affine_geometry.md)
-- [`dinov3_object_geometry_current_status.md`](dinov3_object_geometry_current_status.md)
+- `multiclip_affine_geometry.md`（已随旧线移除）
+- `dinov3_object_geometry_current_status.md`（已随旧线移除）
 - [`object_pose_refinement.md`](object_pose_refinement.md)
 - [`current_pipeline.md`](current_pipeline.md)
 
