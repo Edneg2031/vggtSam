@@ -1,5 +1,15 @@
 # SAM3 instance-guided HorizonStream pose refinement
 
+
+> **入口已移除（2026-09-16）。** 本文档描述的若干运行入口 `commands_*.txt` 在精简中删除：
+> `commands_run_semantic_map.txt`、`commands_run_object_pose_refinement.txt`、
+> `commands_run_two_dataset_baseline.txt`、`commands_run_scannet_instance_point_consistency.txt`、
+> `commands_run_scannet_object_pose_loss_object_only_100f.txt`、
+> `commands_run_scannet_object_pose_loss_object_per_instance_300f.txt`。
+> 它们背后调用的脚本（`streaming_couping/scripts/*.py`）**都还在**，命令文件只是薄封装，
+> 内容可从 git 历史取回。当前主线的入口是
+> `commands_run_scannet_object_pose_feedback_branches.txt`。
+
 更新时间：2026-09-02
 
 这是一个默认关闭的、免训练的 pose-graph ablation。它不修改 HorizonStream 网络、权重或
@@ -39,7 +49,7 @@ instance ID 只用于确认两次观察属于同一个候选物体，不会把 o
 推荐直接运行独立的 B0 命令：
 
 ```zsh
-zsh streaming_couping/commands_run_object_pose_refinement.txt
+# 入口 commands_run_object_pose_refinement.txt 已移除（2026-09-16）；等价脚本：streaming_couping/scripts/run_object_pose_refinement.py
 ```
 
 它复用 baseline 已生成的 `horizonstream_geometry.pt`，并把完整日志保存到
@@ -50,12 +60,12 @@ edge 太少。如果需要复现之前的无额外模型 smoke test，可以切�
 
 ```zsh
 OBJECT_POSE_FEATURE_BACKEND=rgb_patch \
-zsh streaming_couping/commands_run_object_pose_refinement.txt
+# 入口 commands_run_object_pose_refinement.txt 已移除（2026-09-16）；等价脚本：streaming_couping/scripts/run_object_pose_refinement.py
 ```
 
 这会把 DINOv3 放在 `OBJECT_POSE_DINOV3_DEVICE`（默认 `cuda:0`），SAM 仍按原配置运行。
 
-如果需要手动配置，也可以编辑 `streaming_couping/commands_run_semantic_map.txt`：
+如果需要手动配置，运行 `streaming_couping/scripts/run_semantic_map.py` 时带上对应参数：
 
 ```zsh
 OBJECT_POSE_REFINEMENT=1
@@ -65,7 +75,7 @@ FUSION_POLICY="raw"
 然后执行：
 
 ```zsh
-zsh streaming_couping/commands_run_semantic_map.txt
+# 入口 commands_run_semantic_map.txt 已移除（2026-09-16）；等价脚本：streaming_couping/scripts/run_semantic_map.py
 ```
 
 命令文件默认让 HorizonStream 和 SAM3.1 使用同一个 `horizonstream` Python 环境；如果

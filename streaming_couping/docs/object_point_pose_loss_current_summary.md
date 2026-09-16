@@ -1,5 +1,15 @@
 # HorizonStream + SAM3.1 物体点云对齐实验总结
 
+
+> **入口已移除（2026-09-16）。** 本文档描述的若干运行入口 `commands_*.txt` 在精简中删除：
+> `commands_run_semantic_map.txt`、`commands_run_object_pose_refinement.txt`、
+> `commands_run_two_dataset_baseline.txt`、`commands_run_scannet_instance_point_consistency.txt`、
+> `commands_run_scannet_object_pose_loss_object_only_100f.txt`、
+> `commands_run_scannet_object_pose_loss_object_per_instance_300f.txt`。
+> 它们背后调用的脚本（`streaming_couping/scripts/*.py`）**都还在**，命令文件只是薄封装，
+> 内容可从 git 历史取回。当前主线的入口是
+> `commands_run_scannet_object_pose_feedback_branches.txt`。
+
 更新时间：2026-09-10
 代码分支：`main`  参考提交：`f3509e7`
 
@@ -495,7 +505,7 @@ frame_count=300
 运行命令：
 
 ```zsh
-zsh streaming_couping/commands_run_scannet_object_pose_loss_object_per_instance_300f.txt
+# 入口 commands_run_scannet_object_pose_loss_object_per_instance_300f.txt 已移除（2026-09-16）；等价脚本：streaming_couping/scripts/run_scannet_object_pose_loss_object_per_instance_300f.py
 ```
 
 对应输出目录：

@@ -1,5 +1,15 @@
 # 当前做法与实验状态
 
+
+> **入口已移除（2026-09-16）。** 本文档描述的若干运行入口 `commands_*.txt` 在精简中删除：
+> `commands_run_semantic_map.txt`、`commands_run_object_pose_refinement.txt`、
+> `commands_run_two_dataset_baseline.txt`、`commands_run_scannet_instance_point_consistency.txt`、
+> `commands_run_scannet_object_pose_loss_object_only_100f.txt`、
+> `commands_run_scannet_object_pose_loss_object_per_instance_300f.txt`。
+> 它们背后调用的脚本（`streaming_couping/scripts/*.py`）**都还在**，命令文件只是薄封装，
+> 内容可从 git 历史取回。当前主线的入口是
+> `commands_run_scannet_object_pose_feedback_branches.txt`。
+
 更新时间：2026-09-02
 
 ## 当前方案
@@ -45,7 +55,7 @@ mapping 层也不执行 BA、ICP 或 affine correction。两个模型在独立�
 运行入口：
 
 ```bash
-zsh streaming_couping/commands_run_semantic_map.txt
+# 入口 commands_run_semantic_map.txt 已移除（2026-09-16）；等价脚本：streaming_couping/scripts/run_semantic_map.py
 ```
 
 CPU contract/smoke 已通过；真实 HorizonStream 权重与 50 帧 GPU 推理只能在服务器环境验证。

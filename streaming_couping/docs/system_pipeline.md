@@ -1,5 +1,15 @@
 # HorizonStream + SAM3.1 语义地图系统
 
+
+> **入口已移除（2026-09-16）。** 本文档描述的若干运行入口 `commands_*.txt` 在精简中删除：
+> `commands_run_semantic_map.txt`、`commands_run_object_pose_refinement.txt`、
+> `commands_run_two_dataset_baseline.txt`、`commands_run_scannet_instance_point_consistency.txt`、
+> `commands_run_scannet_object_pose_loss_object_only_100f.txt`、
+> `commands_run_scannet_object_pose_loss_object_per_instance_300f.txt`。
+> 它们背后调用的脚本（`streaming_couping/scripts/*.py`）**都还在**，命令文件只是薄封装，
+> 内容可从 git 历史取回。当前主线的入口是
+> `commands_run_scannet_object_pose_feedback_branches.txt`。
+
 更新时间：2026-08-31
 
 ## 1. 系统目标
@@ -138,5 +148,5 @@ depth 和共享坐标系位姿；系统必须把各帧反投影后融合，才�
 - 当前静态判断主要沿用 track/static gate，不等价于完整动态场景建模；
 - 历史 affine、depth veto 和 temporal point prompt 均为 NO-GO，不自动启用。
 
-主运行入口是 `streaming_couping/commands_run_semantic_map.txt`。默认场景、帧数、权重、两个
+主运行入口是 `streaming_couping/scripts/run_semantic_map.py`。默认场景、帧数、权重、两个
 Python 路径、GPU 与 cache 都集中写在该文件顶部。

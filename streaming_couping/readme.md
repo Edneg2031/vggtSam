@@ -1,5 +1,15 @@
 # HorizonStream + SAM3.1 语义地图
 
+
+> **入口已移除（2026-09-16）。** 本文档描述的若干运行入口 `commands_*.txt` 在精简中删除：
+> `commands_run_semantic_map.txt`、`commands_run_object_pose_refinement.txt`、
+> `commands_run_two_dataset_baseline.txt`、`commands_run_scannet_instance_point_consistency.txt`、
+> `commands_run_scannet_object_pose_loss_object_only_100f.txt`、
+> `commands_run_scannet_object_pose_loss_object_per_instance_300f.txt`。
+> 它们背后调用的脚本（`streaming_couping/scripts/*.py`）**都还在**，命令文件只是薄封装，
+> 内容可从 git 历史取回。当前主线的入口是
+> `commands_run_scannet_object_pose_feedback_branches.txt`。
+
 当前主线是免训练的 RGB + 文本 prompt 语义实例地图：
 
 - HorizonStream 输出 metric depth、相机内参、在线因果位姿和置信度；
@@ -18,10 +28,10 @@ StreamVGGT 仍可作为兼容后端，但不再是默认几何来源。历史优
 git checkout main
 git pull --ff-only origin main
 git submodule update --init externals/horizonstream externals/sam3
-zsh streaming_couping/commands_run_semantic_map.txt
+# 入口 commands_run_semantic_map.txt 已移除（2026-09-16）；等价脚本：streaming_couping/scripts/run_semantic_map.py
 ```
 
-唯一需要日常修改的文件是 `commands_run_semantic_map.txt` 顶部配置。默认值为：
+唯一需要日常修改的是 `run_semantic_map` 的配置。默认值为：
 
 ```text
 scene                 00a231a370

@@ -138,7 +138,7 @@ prompt 返回的每条 track 及其去向（`adapters.py` 的 `candidate_ledger`
 `experiments/object_pose_feedback_go.md` §7.1。
 
 prompt 是硬上限：没有 prompt 命中的物体不可能被提案、修正或评分。场景清单
-（`commands_list_scene_objects.txt`）显示 v1 的 5 个 prompt 只够到 71 个可见
+（`list_scene_objects`）显示 v1 的 5 个 prompt 只够到 71 个可见
 GT 物体中的 5 个。v2 补的 7 个是清单里 kept 帧数最多的刚性物体。
 `floor` / `wall` / `ceiling` 刻意不加：它们是结构面，运动等于房间的运动，
 放进共识会主导中位数而不是提供锚点。

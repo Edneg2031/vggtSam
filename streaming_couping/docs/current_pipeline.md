@@ -1,5 +1,15 @@
 # 当前语义地图实现
 
+
+> **入口已移除（2026-09-16）。** 本文档描述的若干运行入口 `commands_*.txt` 在精简中删除：
+> `commands_run_semantic_map.txt`、`commands_run_object_pose_refinement.txt`、
+> `commands_run_two_dataset_baseline.txt`、`commands_run_scannet_instance_point_consistency.txt`、
+> `commands_run_scannet_object_pose_loss_object_only_100f.txt`、
+> `commands_run_scannet_object_pose_loss_object_per_instance_300f.txt`。
+> 它们背后调用的脚本（`streaming_couping/scripts/*.py`）**都还在**，命令文件只是薄封装，
+> 内容可从 git 历史取回。当前主线的入口是
+> `commands_run_scannet_object_pose_feedback_branches.txt`。
+
 更新时间：2026-09-02
 
 本文描述当前 `main` 分支实际使用的语义地图 pipeline。当前主线不是旧的
@@ -41,7 +51,7 @@ RGB 图像 + text prompts
 运行入口是：
 
 ```bash
-zsh streaming_couping/commands_run_semantic_map.txt
+# 入口 commands_run_semantic_map.txt 已移除（2026-09-16）；等价脚本：streaming_couping/scripts/run_semantic_map.py
 ```
 
 当前命令文件顶部的默认配置为：
@@ -80,7 +90,7 @@ SAM3.1 的 mask 与 persistent instance ID 只参与语义实例写入。新增�
 ScanNet++ `00a231a370` 的可复制命令是：
 
 ```bash
-zsh streaming_couping/commands_run_scannet_instance_point_consistency.txt
+# 入口 commands_run_scannet_instance_point_consistency.txt 已移除（2026-09-16）；等价脚本：streaming_couping/scripts/run_scannet_instance_point_consistency.py
 ```
 
 它会自动生成或复用此前 50 帧的 `horizonstream_geometry.pt`，输出到

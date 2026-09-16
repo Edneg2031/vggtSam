@@ -6,7 +6,7 @@ separate process/stage: it opens ``semantic_map.pt`` artifacts, reads the
 ScanNet++ pointmaps and instance masks, fits one reference-frame Sim(3), and
 reports the same metrics for every branch under one shared alignment.
 
-Typical use after ``commands_run_semantic_map.txt``::
+Typical use after a semantic-map run (``run_semantic_map``)::
 
     python -m streaming_couping.scripts.evaluate_exported_semantic_map \
       --input-dir /data184/open_source/vggtSam/outputs/semantic_map_50frames_horizonstream \
