@@ -399,7 +399,20 @@ zsh streaming_couping/commands_verify_object_pose_feedback.txt
 
 # 读回上一个帧窗（默认是当前窗口）
 OBJECT_POSE_FEEDBACK_FRAME_COUNT=100 zsh streaming_couping/commands_check_object_pose_feedback_decision.txt
+
+# 闭环一步：把修正轨迹喂回去重解提案 + 空对照（纯 CPU，几秒）
+zsh streaming_couping/commands_reestimate_object_pose_feedback.txt
+
+# 每个 prompt 返回了几条 track、被谁判重、有没有撞上限（纯 CPU）
+zsh streaming_couping/commands_show_sam3_candidate_ledger.txt
 ```
+
+每轮会产出两张图（CPU，几秒），在 `<run>.baseline/object_pose_feedback/` 下：
+
+| 图 | 画的是 |
+|---|---|
+| `pose_comparison.png` | 轨迹俯视 + 逐帧平移/旋转误差，GT / raw / 修正后三条线，RMSE 写在标题里 |
+| `object_cloud_comparison.png` | 每个物体的点云，同一批点用三条轨迹摆三次 —— **只有位姿变** |
 
 配套文档：
 
