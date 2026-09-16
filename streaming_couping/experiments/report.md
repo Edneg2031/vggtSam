@@ -128,9 +128,18 @@ correction_too_large（共识幅度）→ no_alignment_improvement`。
 zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
 ```
 
-它会依次：跑 Stage 1（150 帧）→ Stage 2a 一次 → GT-mask oracle 对照（CPU）→
-重放确定性门（replay 必须复现 baseline 的提案，否则整轮中止）→ 2 次 baseline 重复
-（算噪声底）→ 4 个分支的 CPU 重放 + 各分支 Stage 2b → 两张对照表。
+**默认只跑 baseline、只跑一次** —— 这就是产出报告主结果的那一轮：Stage 1（150 帧）→
+Stage 2a 一次 → GT-mask oracle 对照（CPU）→ **重放确定性门**（replay 必须复现 baseline
+的提案，否则整轮中止）→ 各变体的 CPU 重放 → 两张对照表 → 两张图 → 候选账本。
+
+两个东西是**显式打开**的，因为它们各自要花一次 segmentation pass：
+
+| 打开 | 加什么 | 换来什么 |
+|---|---|---|
+| `OBJECT_POSE_FEEDBACK_BRANCHES=baseline,fresh,...` | 4 个消融分支的 CPU 重放 | §4.3 那张表 |
+| `OBJECT_POSE_FEEDBACK_SAM_REPEATS=3` | 2 次额外 Stage 2a | 噪声底（§3.4 的 1.8e-05） |
+
+四个消融分支的答案已经写在 §4.3，重复跑是在重新推导表里已有的数。
 
 ### 3.2 实验矩阵
 
@@ -139,7 +148,7 @@ zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
 | 维度 | 取值 |
 |---|---|
 | **帧窗** | `90–189`（100 帧）、`90–239`（150 帧） |
-| **prompt 集** | v1 `bed wardrobe chair rug dustbin`（5）、v2 加 7 个刚性物体（12）、v3 = v1 减 `dustbin`（4） |
+| **prompt 集** | **v1**（5 个，主结果）、v3 = v1 减 `dustbin`、v4 = v1 加 `table`、v5 = v1 加 `cabinet`、v2 = v1 加 7 个刚性物体（12 个，100 帧窗口） |
 | **提案侧分支** | `baseline`（joint 6DoF + 永久 anchor）、`fresh`（有界参考年龄）、`factorized`（先旋转后平移）、`fresh_factor`、`translation_only` |
 | **共识变体** | `single` / `mean` / `robust` / `robust_semantic`（主）/ `robust_semantic_geometric` |
 
