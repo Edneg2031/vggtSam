@@ -2,7 +2,7 @@
 
 2026-09-17 · 实习工作交接
 
-本文是**交接文档**，说明项目当前状态、运行方式、已知限制与后续建议。方法细节见 [`streaming_couping/docs/method.md`](streaming_couping/docs/method.md)；实验过程与证据见 [`streaming_couping/experiments/experiments.md`](streaming_couping/experiments/experiments.md)。三份文档合并自原 16 份，原文见 git 历史。
+本文是**交接文档**，说明项目当前状态、运行方式、已知限制与后续建议。方法细节与实验结果同见 [`streaming_couping/docs/report.md`](streaming_couping/docs/report.md)。本文档与技术报告合并自原 16 份文档，原文见 git 历史。
 
 ---
 
@@ -20,14 +20,13 @@ HorizonStream 是流式几何基础模型，逐帧输出 metric depth、depth co
 
 对每个 (帧, 实例)，以 mask ∩ 有效深度取最多 256 个相机系点，与同一实例的参考云做最近点对齐，解一个 6DoF 增量；各物体的 `log(ΔT)` 经加权 Huber IRLS 取加权中位数得到每帧修正；修正通过门控后，作为**绝对目标**写入累积器。整体为**两遍式**：提案基于 raw 几何一次算完，修正之后仅重放累积器。
 
-完整的坐标约定、可靠性分数、门控规则与判据定义见 `streaming_couping/docs/method.md`。
+完整的坐标约定、可靠性分数、门控规则与判据定义见 `streaming_couping/docs/report.md` §1–§9。
 
 ### 1.3 交付物清单
 
 | 交付物 | 位置 |
 |---|---|
-| 方法文档 | `docs/method.md` |
-| 实验文档（结果、消融、已排除方向、早期实验） | `experiments/experiments.md` |
+| 技术报告（方法 §1–§9、实验 §10–§20） | `docs/report.md` |
 | 本文档（仓库根） | `HANDOVER.md` |
 | 主执行链路与读取工具 | `streaming_couping/commands_*.txt` |
 | 实现 | `streaming_couping/src/`、`streaming_couping/scripts/` |
@@ -49,7 +48,7 @@ HorizonStream 是流式几何基础模型，逐帧输出 metric depth、depth co
 
 150 帧的区间来自**两次独立的 stage-1 运行**（+15.60% 与 +15.36%），其差值即跨运行误差，见 §6.2。点云指标同步改善（accuracy −29%、ghost −44%、F5cm +12%），且与轨迹判据独立地给出同一排序。
 
-**证据、消融与逐项数据见 `streaming_couping/experiments/experiments.md` §1–§5。**
+**证据、消融与逐项数据见 `streaming_couping/docs/report.md` §10–§14。**
 
 ### 2.2 代码与测试状态
 
@@ -208,8 +207,7 @@ streaming_couping/
   scripts/                     29 个可执行模块
   tests/                       28 个测试文件
   configs/                     运行配置
-  docs/method.md               方法文档
-  experiments/experiments.md   实验文档
+  docs/report.md               技术报告（方法 + 实验）
 (仓库根) HANDOVER.md            交接文档（本文件）
 ```
 
@@ -237,7 +235,7 @@ streaming_couping/
 
 ## 5 已排除的技术方向
 
-以下方向均已实测，**不建议重复尝试**。各方向的检验方式与完整数据见 `streaming_couping/experiments/experiments.md` §6。
+以下方向均已实测，**不建议重复尝试**。各方向的检验方式与完整数据见 `streaming_couping/docs/report.md` §15。
 
 | 方向 | 结论 |
 |---|---|
@@ -269,7 +267,7 @@ streaming_couping/
 
 **2. 噪声底存在两种，不可混用。** 共享同一次几何缓存时为 **1.8e-05**；跨独立 stage-1 运行时为 **2.4e-03**，后者约为前者的 130 倍。判断"差异是否显著"时须使用与比较方式相对应的那一个。
 
-**3. 150 帧的数值来自两次不同运行。** 引用时须注明是哪一次（`streaming_couping/experiments/experiments.md` 各处已标注）。
+**3. 150 帧的数值来自两次不同运行。** 引用时须注明是哪一次（`streaming_couping/docs/report.md` 各处已标注）。
 
 ### 6.3 工程注意事项
 
@@ -284,7 +282,7 @@ streaming_couping/
 
 (b) 中不存在逐点修正：同一批相机系点由不同轨迹置入世界。以 (a) 的逐实例结果推断其在 (b) 共识中的权重是错误的。
 
-**3. 判定不得依据 ICP loss。** 判据仅取位姿指标（七条，见 `streaming_couping/docs/method.md` §7）。loss 下降不代表位姿改善 —— 已有实例显示 loss 降 58% 而 GT 指标持平。
+**3. 判定不得依据 ICP loss。** 判据仅取位姿指标（七条，见 `streaming_couping/docs/report.md` §7）。loss 下降不代表位姿改善 —— 已有实例显示 loss 降 58% 而 GT 指标持平。
 
 **4. 静态导入分析在本仓库不可靠。** 精简过程中该手段出现三次误判（漏解析相对导入、正则捕获错误标识符、将仍在使用的模块判为不可达）。判断某一文件属于旧线还是当前线，应依据其 **docstring**。
 
@@ -312,7 +310,7 @@ streaming_couping/
 
 3. **分离单次增词实验的归因。** 需构造"新词进入而原词不丢"的条件（提高 `--max-objects` 或调整判重排序），以确定结果劣化源于丢失原词还是引入新词。
 
-4. **建立物体预筛选判据。** 现有判据分三类且生效时机不同（详见 `streaming_couping/docs/method.md` §5）；若要继续提升，可改进的是跟踪层规则，而非物体质量打分。
+4. **建立物体预筛选判据。** 现有判据分三类且生效时机不同（详见 `streaming_couping/docs/report.md` §5）；若要继续提升，可改进的是跟踪层规则，而非物体质量打分。
 
 ---
 
@@ -320,8 +318,7 @@ streaming_couping/
 
 | 文档 | 内容 |
 |---|---|
-| [`streaming_couping/docs/method.md`](streaming_couping/docs/method.md) | 方法：系统结构、逐步流程、坐标约定、六层筛选、七条判据、两种噪声底 |
-| [`streaming_couping/experiments/experiments.md`](streaming_couping/experiments/experiments.md) | 实验：主结果、点云传导、环路验证、消融、已排除方向、早期实验、复现命令 |
+| [`streaming_couping/docs/report.md`](streaming_couping/docs/report.md) | 技术报告。方法（§1–§9）：系统结构、逐步流程、坐标约定、六层筛选、七条判据、两种噪声底；实验（§10–§20）：主结果、点云传导、环路验证、消融、已排除方向、早期实验、复现命令 |
 | 本文档 | 交接：状态、环境、运行、代码结构、限制与风险、后续建议 |
 
 每轮运行产出的两张图位于 `<run>.baseline/object_pose_feedback/`，说明见 §3.4。
