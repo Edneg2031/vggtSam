@@ -37,7 +37,7 @@ HorizonStream 的累计位姿漂移，并把修正反馈进后续帧。**
 |---|---|
 | 方法文档 | `docs/method.md` |
 | 实验文档（结果、消融、已排除方向、早期实验） | `experiments/experiments.md` |
-| 本文档 | `HANDOVER.md` |
+| 本文档（仓库根） | `HANDOVER.md` |
 | 主执行链路与读取工具 | `streaming_couping/commands_*.txt` |
 | 实现 | `streaming_couping/src/`、`streaming_couping/scripts/` |
 | 单元测试 | `streaming_couping/tests/` |
@@ -222,7 +222,8 @@ streaming_couping/
   tests/                       28 个测试文件
   configs/                     运行配置
   docs/method.md               方法文档
-  experiments/                 experiments.md、handover.md
+  experiments/experiments.md   实验文档
+(仓库根) HANDOVER.md            交接文档（本文件）
 ```
 
 ### 4.2 主执行链路
