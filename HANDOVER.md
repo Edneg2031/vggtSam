@@ -111,7 +111,26 @@ HorizonStream 是流式几何基础模型，逐帧输出 metric depth、depth co
 | `HORIZONSTREAM_PYTHON` | `/home/huawei/miniconda3/envs/horizonstream/bin/python` | 3.11.14 | 2.8.0+cu128 | 12.8 | Stage 1（几何） |
 | `STREAMING_COUPING_PYTHON` | `/home/huawei/miniconda3/envs/3am/bin/python` | 3.11.15 | 2.5.1+cu118 | 11.8 | Stage 2a/2b/3（SAM、分析、评测） |
 
-两套环境的 PyTorch 与 CUDA 版本不同，因此**不可交叉调用**：Stage 1 必须在前者下运行，其余阶段必须在后者下运行。命令文件已按此分工，无需手工切换。
+两套环境的 PyTorch 与 CUDA 版本不同，因此**不可交叉调用**：Stage 1 必须在前者下运行，其余阶段必须在后者下运行。命令文件已按此分工。
+
+**conda 环境**：两套解释器对应两个 conda 环境（均在 `/home/huawei/miniconda3/envs/`）。**运行前必须先激活 `3am`** —— 入口脚本以 `$(command -v python)` 解析 Stage 2/3 的解释器，激活哪个环境就用哪个：
+
+```bash
+conda activate 3am
+zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
+```
+
+无法激活时（例如非交互脚本），改为显式指定：
+
+```bash
+export STREAMING_COUPING_PYTHON=/home/huawei/miniconda3/envs/3am/bin/python
+```
+
+Stage 1 所用的 `horizonstream` 环境由脚本内部按固定路径调用，**不需要激活**。
+
+**警告**：两者都没有提供时，入口回落到 PATH 上的 `python`；而单独运行 `commands_run_scannet_object_pose_feedback_100f.txt` 或 `commands_evaluate_scannet_object_pose_loss_object_only.txt` 时，会回落到 **`horizonstream` 环境** —— 该环境与 Stage 2 的 PyTorch/CUDA 不匹配，会静默用错解释器。
+
+**依赖声明**：仓库根 `requirements.txt` 仅列通用包（`numpy`、`pillow`、`pyyaml`、`matplotlib`、`scipy`），并注明 torch 需按服务器 CUDA 版本另行安装；SAM3 与 StreamVGGT 的依赖由 `externals/` 各自提供。它**不是**可直接重建上述两套环境的完整 spec。
 
 **依赖包（实测）**：两套解释器均无缺失。所需包按用途分为三组：几何与分析（`torch`、`numpy`、`PIL`）、SAM3 运行时（`iopath`、`ftfy`、`regex`、`huggingface_hub`、`timm`、`einops`、`pycocotools`）、绘图（`matplotlib`）。
 
@@ -130,6 +149,7 @@ python -m streaming_couping.scripts.report_environment
 **全仓库只有一个运行入口**：
 
 ```bash
+conda activate 3am    # Stage 2/3 的解释器由当前激活的环境决定，见 §3.1
 zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
 ```
 
