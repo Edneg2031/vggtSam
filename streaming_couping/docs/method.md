@@ -2,7 +2,7 @@
 
 2026-09-16 · 本文是**方法文档**：pipeline 怎么搭、每一步做什么、判据是什么。
 实验结果与失败分析见 [`../experiments/experiments.md`](../experiments/experiments.md)；
-交接须知见 [`../experiments/handover.md`](../experiments/handover.md)。
+交接须知见 [`../HANDOVER.md`](../HANDOVER.md)。
 
 > 本文合并自原 `current_pipeline.md`、`system_pipeline.md`、`object_pose_feedback.md`、
 > `object_pose_refinement.md`、`object_selection_criteria.md`、

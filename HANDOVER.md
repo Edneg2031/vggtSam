@@ -3,8 +3,8 @@
 2026-09-17 · 实习工作交接
 
 本文是**交接文档**，说明项目当前状态、运行方式、已知限制与后续建议。
-方法细节见 [`../docs/method.md`](../docs/method.md)；实验过程与证据见
-[`experiments.md`](experiments.md)。三份文档合并自原 16 份，原文见 git 历史。
+方法细节见 [`streaming_couping/docs/method.md`](streaming_couping/docs/method.md)；实验过程与证据见
+[`streaming_couping/experiments/experiments.md`](streaming_couping/experiments/experiments.md)。三份文档合并自原 16 份，原文见 git 历史。
 
 ---
 
@@ -29,7 +29,7 @@ HorizonStream 的累计位姿漂移，并把修正反馈进后续帧。**
 修正通过门控后，作为**绝对目标**写入累积器。整体为**两遍式**：提案基于 raw 几何一次算完，
 修正之后仅重放累积器。
 
-完整的坐标约定、可靠性分数、门控规则与判据定义见 `../docs/method.md`。
+完整的坐标约定、可靠性分数、门控规则与判据定义见 `streaming_couping/docs/method.md`。
 
 ### 1.3 交付物清单
 
@@ -37,7 +37,7 @@ HorizonStream 的累计位姿漂移，并把修正反馈进后续帧。**
 |---|---|
 | 方法文档 | `docs/method.md` |
 | 实验文档（结果、消融、已排除方向、早期实验） | `experiments/experiments.md` |
-| 本文档 | `experiments/handover.md` |
+| 本文档 | `HANDOVER.md` |
 | 主执行链路与读取工具 | `streaming_couping/commands_*.txt` |
 | 实现 | `streaming_couping/src/`、`streaming_couping/scripts/` |
 | 单元测试 | `streaming_couping/tests/` |
@@ -60,7 +60,7 @@ HorizonStream 的累计位姿漂移，并把修正反馈进后续帧。**
 见 §6.2。点云指标同步改善（accuracy −29%、ghost −44%、F5cm +12%），且与轨迹判据独立地
 给出同一排序。
 
-**证据、消融与逐项数据见 `experiments.md` §1–§5。**
+**证据、消融与逐项数据见 `streaming_couping/experiments/experiments.md` §1–§5。**
 
 ### 2.2 代码与测试状态
 
@@ -252,7 +252,7 @@ streaming_couping/
 
 ## 5 已排除的技术方向
 
-以下方向均已实测，**不建议重复尝试**。各方向的检验方式与完整数据见 `experiments.md` §6。
+以下方向均已实测，**不建议重复尝试**。各方向的检验方式与完整数据见 `streaming_couping/experiments/experiments.md` §6。
 
 | 方向 | 结论 |
 |---|---|
@@ -289,7 +289,7 @@ streaming_couping/
 运行时为 **2.4e-03**，后者约为前者的 130 倍。判断"差异是否显著"时须使用与比较方式
 相对应的那一个。
 
-**3. 150 帧的数值来自两次不同运行。** 引用时须注明是哪一次（`experiments.md` 各处已标注）。
+**3. 150 帧的数值来自两次不同运行。** 引用时须注明是哪一次（`streaming_couping/experiments/experiments.md` 各处已标注）。
 
 ### 6.3 工程注意事项
 
@@ -306,7 +306,7 @@ streaming_couping/
 (b) 中不存在逐点修正：同一批相机系点由不同轨迹置入世界。以 (a) 的逐实例结果推断其在
 (b) 共识中的权重是错误的。
 
-**3. 判定不得依据 ICP loss。** 判据仅取位姿指标（七条，见 `../docs/method.md` §7）。
+**3. 判定不得依据 ICP loss。** 判据仅取位姿指标（七条，见 `streaming_couping/docs/method.md` §7）。
 loss 下降不代表位姿改善 —— 已有实例显示 loss 降 58% 而 GT 指标持平。
 
 **4. 静态导入分析在本仓库不可靠。** 精简过程中该手段出现三次误判（漏解析相对导入、
@@ -340,7 +340,7 @@ loss 下降不代表位姿改善 —— 已有实例显示 loss 降 58% 而 GT �
 3. **分离单次增词实验的归因。** 需构造"新词进入而原词不丢"的条件（提高 `--max-objects`
    或调整判重排序），以确定结果劣化源于丢失原词还是引入新词。
 
-4. **建立物体预筛选判据。** 现有判据分三类且生效时机不同（详见 `../docs/method.md` §5）；
+4. **建立物体预筛选判据。** 现有判据分三类且生效时机不同（详见 `streaming_couping/docs/method.md` §5）；
    若要继续提升，可改进的是跟踪层规则，而非物体质量打分。
 
 ---
@@ -349,8 +349,8 @@ loss 下降不代表位姿改善 —— 已有实例显示 loss 降 58% 而 GT �
 
 | 文档 | 内容 |
 |---|---|
-| [`../docs/method.md`](../docs/method.md) | 方法：系统结构、逐步流程、坐标约定、六层筛选、七条判据、两种噪声底 |
-| [`experiments.md`](experiments.md) | 实验：主结果、点云传导、环路验证、消融、已排除方向、早期实验、复现命令 |
+| [`streaming_couping/docs/method.md`](streaming_couping/docs/method.md) | 方法：系统结构、逐步流程、坐标约定、六层筛选、七条判据、两种噪声底 |
+| [`streaming_couping/experiments/experiments.md`](streaming_couping/experiments/experiments.md) | 实验：主结果、点云传导、环路验证、消融、已排除方向、早期实验、复现命令 |
 | 本文档 | 交接：状态、环境、运行、代码结构、限制与风险、后续建议 |
 
 每轮运行产出的两张图位于 `<run>.baseline/object_pose_feedback/`，说明见 §3.4。
