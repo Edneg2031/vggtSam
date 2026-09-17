@@ -245,23 +245,11 @@ cabinet   6         0          9
 ## 11 复现
 
 ```bash
-# 主链路：一条命令完成一轮（含 GPU）
+# 运行（GPU，唯一入口）：判定、对照表、两张图、候选账本摘要一次产出
 zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
 
-# 判定 + 两张图 + 点云评测（CPU，数秒）
-zsh streaming_couping/commands_check_object_pose_feedback_decision.txt
-
-# 测试 + 逐类别解释 + 候选账本（CPU，只读）
-zsh streaming_couping/commands_verify_object_pose_feedback.txt
-
-# 每个 prompt 返回的 track 数、判重与名额截断情况（CPU）
-zsh streaming_couping/commands_show_sam3_candidate_ledger.txt
-
-# 闭环一步：以修正轨迹为基座重解提案，含空对照（CPU）
-zsh streaming_couping/commands_reestimate_object_pose_feedback.txt
-
 # 读取历史帧窗（默认使用当前窗口）
-OBJECT_POSE_FEEDBACK_FRAME_COUNT=100 zsh streaming_couping/commands_check_object_pose_feedback_decision.txt
+OBJECT_POSE_FEEDBACK_FRAME_COUNT=100 zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
 ```
 
 **每轮运行产出两张图**（CPU，数秒），位于 `<run>.baseline/object_pose_feedback/`：
@@ -270,3 +258,6 @@ OBJECT_POSE_FEEDBACK_FRAME_COUNT=100 zsh streaming_couping/commands_check_object
 |---|---|
 | `pose_comparison.png` | 轨迹俯视与逐帧平移/旋转误差，三条曲线为 GT / raw / 修正后，RMSE 标注于标题 |
 | `object_cloud_comparison.png` | 逐物体点云，**同一批点以三条轨迹分别置入世界**，仅位姿不同 |
+
+本文涉及但主链路不直接产出的分析（逐类别对照、闭环实验、归因分析），其调用方式见
+[`../../HANDOVER.md`](../../HANDOVER.md) §3.2。

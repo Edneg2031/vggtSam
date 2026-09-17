@@ -142,30 +142,38 @@ recovery config 中的 `sam3.device`（当前为 `cuda:2`）。机器上无 SLUR
 **环境探查**：
 
 ```bash
-zsh streaming_couping/commands_report_environment.txt
+python -m streaming_couping.scripts.report_environment
 ```
 
 ### 3.2 运行入口
 
+**全仓库只有一个运行入口**：
+
 ```bash
-# 主链路：一条命令完成一轮（含 GPU）
 zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
-
-# 只重读判定 + 两张图 + 点云评测（CPU，数秒）
-zsh streaming_couping/commands_check_object_pose_feedback_decision.txt
-
-# 单元测试 + 逐类别解释 + 候选账本（CPU，只读）
-zsh streaming_couping/commands_verify_object_pose_feedback.txt
-
-# 每个 prompt 返回的 track 数、判重与被名额截断情况（CPU）
-zsh streaming_couping/commands_show_sam3_candidate_ledger.txt
-
-# 闭环一步：以修正轨迹为基座重解提案，并含空对照（CPU）
-zsh streaming_couping/commands_reestimate_object_pose_feedback.txt
-
-# 环境探查（CPU，只读）
-zsh streaming_couping/commands_report_environment.txt
 ```
+
+该入口内部依次调用 `commands_run_scannet_object_pose_feedback_100f.txt` 与
+`commands_evaluate_scannet_object_pose_loss_object_only.txt`，三者构成完整链路，
+**缺一不可**（精简过程中已逐项确认）。
+
+一轮运行即产出全部结论性内容：判定与判据表、逐代对照表、两张对比图、候选账本摘要，
+以及完整日志（`sweep.log` / `analysis.log`）。
+
+**不再保留独立的读取入口**。各类分析脚本仍然存在，可直接调用：
+
+| 需要什么 | 调用方式 |
+|---|---|
+| 重读判定与逐变体指标 | `python -m streaming_couping.scripts.summarize_feedback_branches --run-dir <run>` |
+| 生成两张对比图 | `python -m streaming_couping.scripts.plot_pose_comparison --run-dir <run> --out <png>`<br>`python -m streaming_couping.scripts.plot_object_cloud_comparison ...` |
+| 物体点云指标 | `python -m streaming_couping.scripts.evaluate_pose_feedback_object_map ...` |
+| 候选账本 | `python -m streaming_couping.scripts.show_sam3_candidate_ledger --run-dir <run>` |
+| 逐代逐类别对照 | `python -m streaming_couping.scripts.compare_feedback_categories ...` |
+| 闭环实验 | `python -m streaming_couping.scripts.run_object_pose_loss_reestimate ...` |
+| 环境探查 | `python -m streaming_couping.scripts.report_environment` |
+| 单元测试 | `python -m pytest streaming_couping/tests/ -q` |
+
+各脚本的参数见其 `--help`，或将已删除的同名 `.txt` 从 git 历史取出作为完整调用示例。
 
 **默认配置为单分支、单次重复**，即产出 §2.1 主结果的那一轮。以下两项为显式开启，
 各自需要额外的 GPU 开销：
@@ -184,11 +192,14 @@ zsh streaming_couping/commands_report_environment.txt
 | prompt 集 | 同上 `GENERATION_PROMPTS` | 临时词表可用 `OBJECT_POSE_FEEDBACK_PROMPTS` 覆盖 |
 | 反馈阈值 | `ObjectPoseFeedbackConfig` 与主链路命令行参数 | 约 40 项，均可在命令行覆盖 |
 
-读取历史帧窗时无需修改文件：
+帧窗由环境变量覆盖，无需修改文件（该覆盖对运行与读取均有效）：
 
 ```bash
-OBJECT_POSE_FEEDBACK_FRAME_COUNT=100 zsh streaming_couping/commands_check_object_pose_feedback_decision.txt
+OBJECT_POSE_FEEDBACK_FRAME_COUNT=100 zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
 ```
+
+若只需查看某个**已存在**的历史 run 而不重跑，直接对该 run 目录调用 §3.2 的分析脚本，
+例如 `summarize_feedback_branches --run-dir <run>`。
 
 ### 3.4 产出物
 
@@ -361,27 +372,14 @@ loss 下降不代表位姿改善 —— 已有实例显示 loss 降 58% 而 GT �
 ## 附录 B 命令速查
 
 ```bash
-# 主链路（GPU）
+# 运行（GPU，唯一入口）
 zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
 
-# 判定 + 两张图 + 点云评测（CPU）
-zsh streaming_couping/commands_check_object_pose_feedback_decision.txt
-
-# 测试 + 逐类别 + 候选账本（CPU）
-zsh streaming_couping/commands_verify_object_pose_feedback.txt
-
-# 候选账本（CPU）
-zsh streaming_couping/commands_show_sam3_candidate_ledger.txt
-
-# 闭环实验（CPU）
-zsh streaming_couping/commands_reestimate_object_pose_feedback.txt
-
-# 环境探查（CPU）
-zsh streaming_couping/commands_report_environment.txt
-
 # 读取历史帧窗
-OBJECT_POSE_FEEDBACK_FRAME_COUNT=100 zsh streaming_couping/commands_check_object_pose_feedback_decision.txt
+OBJECT_POSE_FEEDBACK_FRAME_COUNT=100 zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
 
 # 完整测试套件
 python -m pytest streaming_couping/tests/ -q
 ```
+
+分析脚本的调用方式见 §3.2。
