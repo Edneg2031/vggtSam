@@ -2,11 +2,7 @@
 
 2026-09-17 · 实习工作交接
 
-本文是**交接文档**，说明项目当前状态、运行方式、已知限制与后续建议。方法细节见
-[`streaming_couping/docs/method.md`](streaming_couping/docs/method.md)；实验过程
-与证据见
-[`streaming_couping/experiments/experiments.md`](streaming_couping/experiments/e
-xperiments.md)。三份文档合并自原 16 份，原文见 git 历史。
+本文是**交接文档**，说明项目当前状态、运行方式、已知限制与后续建议。方法细节见 [`streaming_couping/docs/method.md`](streaming_couping/docs/method.md)；实验过程与证据见 [`streaming_couping/experiments/experiments.md`](streaming_couping/experiments/experiments.md)。三份文档合并自原 16 份，原文见 git 历史。
 
 ---
 
@@ -14,27 +10,17 @@ xperiments.md)。三份文档合并自原 16 份，原文见 git 历史。
 
 ### 1.1 问题定义
 
-HorizonStream 是流式几何基础模型，逐帧输出 metric depth、depth
-confidence、intrinsics
-与相机位姿。其位姿由运行时累积器（`online_motion_averaging`）在线因果产生，**误
-差会累积 且不自纠正** —— 模型本身没有任何跨帧的景物级约束。
+HorizonStream 是流式几何基础模型，逐帧输出 metric depth、depth confidence、intrinsics 与相机位姿。其位姿由运行时累积器（`online_motion_averaging`）在线因果产生，**误差会累积且不自纠正** —— 模型本身没有任何跨帧的景物级约束。
 
-本课题验证：**SAM3.1 的 persistent object tracks 能否作为跨帧稳定的物体锚点，检
-测并修正 HorizonStream 的累计位姿漂移，并把修正反馈进后续帧。**
+本课题验证：**SAM3.1 的 persistent object tracks 能否作为跨帧稳定的物体锚点，检测并修正 HorizonStream 的累计位姿漂移，并把修正反馈进后续帧。**
 
-约束：不训练任何模型；不修改 HorizonStream 的 backbone / KV / GLA cache；不引入
-DINO 或 任何 learned score；GT 仅在所有反馈决策冻结之后加载，仅用于评测。
+约束：不训练任何模型；不修改 HorizonStream 的 backbone / KV / GLA cache；不引入 DINO 或任何 learned score；GT 仅在所有反馈决策冻结之后加载，仅用于评测。
 
 ### 1.2 方法概要
 
-对每个 (帧, 实例)，以 mask ∩ 有效深度取最多 256
-个相机系点，与同一实例的参考云做最近点 对齐，解一个 6DoF 增量；各物体的
-`log(ΔT)` 经加权 Huber IRLS
-取加权中位数得到每帧修正；修正通过门控后，作为**绝对目标**写入累积器。整体为**两
-遍式**：提案基于 raw 几何一次算完，修正之后仅重放累积器。
+对每个 (帧, 实例)，以 mask ∩ 有效深度取最多 256 个相机系点，与同一实例的参考云做最近点对齐，解一个 6DoF 增量；各物体的 `log(ΔT)` 经加权 Huber IRLS 取加权中位数得到每帧修正；修正通过门控后，作为**绝对目标**写入累积器。整体为**两遍式**：提案基于 raw 几何一次算完，修正之后仅重放累积器。
 
-完整的坐标约定、可靠性分数、门控规则与判据定义见
-`streaming_couping/docs/method.md`。
+完整的坐标约定、可靠性分数、门控规则与判据定义见 `streaming_couping/docs/method.md`。
 
 ### 1.3 交付物清单
 
@@ -61,12 +47,9 @@ DINO 或 任何 learned score；GT 仅在所有反馈决策冻结之后加载，
 | 100 帧 | 0.1166 m | **+14.25%** | **+5.35%** | GO |
 | 150 帧 | 0.1095 m | **+15.4 ~ 15.6%** | 正 | GO |
 
-150 帧的区间来自**两次独立的 stage-1 运行**（+15.60% 与
-+15.36%），其差值即跨运行误差，见 §6.2。点云指标同步改善（accuracy −29%、ghost
-−44%、F5cm +12%），且与轨迹判据独立地 给出同一排序。
+150 帧的区间来自**两次独立的 stage-1 运行**（+15.60% 与 +15.36%），其差值即跨运行误差，见 §6.2。点云指标同步改善（accuracy −29%、ghost −44%、F5cm +12%），且与轨迹判据独立地给出同一排序。
 
-**证据、消融与逐项数据见 `streaming_couping/experiments/experiments.md` §1–§5。*
-*
+**证据、消融与逐项数据见 `streaming_couping/experiments/experiments.md` §1–§5。**
 
 ### 2.2 代码与测试状态
 
@@ -80,10 +63,7 @@ DINO 或 任何 learned score；GT 仅在所有反馈决策冻结之后加载，
 
 测试结果：**231 通过，1 失败，3 跳过**。
 
-失败项为
-`test_instance_point_consistency.py::test_instance_consistency_is_causal_and_rej
-ects_far_points`（`assert 4 == 3`）。该失败**在本次代码精简之前即存在**，与本课
-题的主链路无关，未修复。
+失败项为 `test_instance_point_consistency.py::test_instance_consistency_is_causal_and_rejects_far_points`（`assert 4 == 3`）。该失败**在本次代码精简之前即存在**，与本课题的主链路无关，未修复。
 
 ### 2.3 外部依赖
 
@@ -104,9 +84,7 @@ ects_far_points`（`assert 4 == 3`）。该失败**在本次代码精简之前�
 | ScanNet++ manifest | `data/processed/scannetpp_pinhole_2d/manifest.json` | 4.9 MiB | OK |
 | 存储根 | `/data184/open_source/vggtSam` | — | OK |
 
-**已知配置遗留**：`configs/recovery_dynamic_instance.yaml` 中仍保留 StreamVGGT
-条目（`device: cuda:0`）。该条目由旧线使用，当前主链路不读取；后续清理时可一并移
-除。
+**已知配置遗留**：`configs/recovery_dynamic_instance.yaml` 中仍保留 StreamVGGT 条目（`device: cuda:0`）。该条目由旧线使用，当前主链路不读取；后续清理时可一并移除。
 
 ---
 
@@ -125,8 +103,7 @@ ects_far_points`（`assert 4 == 3`）。该失败**在本次代码精简之前�
 | 存储根可用空间 | 144.7 GiB / 1130.2 GiB |
 | 仓库所在盘可用空间 | 19.6 GiB / 2382.3 GiB |
 
-仓库盘剩余空间偏紧（19.6 GiB），而单次运行的产物（几何缓存、诊断、点云）量级为
-GiB 级，长期迭代时需留意。
+仓库盘剩余空间偏紧（19.6 GiB），而单次运行的产物（几何缓存、诊断、点云）量级为 GiB 级，长期迭代时需留意。
 
 **解释器（两套，版本不同，不可互换）**
 
@@ -135,21 +112,13 @@ GiB 级，长期迭代时需留意。
 | `HORIZONSTREAM_PYTHON` | `/home/huawei/miniconda3/envs/horizonstream/bin/python` | 3.11.14 | 2.8.0+cu128 | 12.8 | Stage 1（几何） |
 | `STREAMING_COUPING_PYTHON` | `/home/huawei/miniconda3/envs/3am/bin/python` | 3.11.15 | 2.5.1+cu118 | 11.8 | Stage 2a/2b/3（SAM、分析、评测） |
 
-两套环境的 PyTorch 与 CUDA 版本不同，因此**不可交叉调用**：Stage 1
-必须在前者下运行，其余阶段必须在后者下运行。命令文件已按此分工，无需手工切换。
+两套环境的 PyTorch 与 CUDA 版本不同，因此**不可交叉调用**：Stage 1 必须在前者下运行，其余阶段必须在后者下运行。命令文件已按此分工，无需手工切换。
 
-**依赖包（实测）**：两套解释器均无缺失。所需包按用途分为三组：几何与分析（`torch
-`、`numpy`、`PIL`）、SAM3
-运行时（`iopath`、`ftfy`、`regex`、`huggingface_hub`、`timm`、`einops`、`pycocot
-ools`）、绘图（`matplotlib`）。
+**依赖包（实测）**：两套解释器均无缺失。所需包按用途分为三组：几何与分析（`torch`、`numpy`、`PIL`）、SAM3 运行时（`iopath`、`ftfy`、`regex`、`huggingface_hub`、`timm`、`einops`、`pycocotools`）、绘图（`matplotlib`）。
 
-> `matplotlib`
-> 为近期新增（用于生成对比图）。缺失时判定与指标表仍会产出，仅图片生成失败。
+> `matplotlib` 为近期新增（用于生成对比图）。缺失时判定与指标表仍会产出，仅图片生成失败。
 
-**设备分配**：Stage 1 使用 `HORIZONSTREAM_DEVICE`（默认 `cuda:0`）；Stage 2a
-使用 recovery config 中的 `sam3.device`（当前为 `cuda:2`）。机器上无
-SLURM，进程直接占用物理卡，因此并行运行多组实验时需自行通过
-`CUDA_VISIBLE_DEVICES` 隔离。
+**设备分配**：Stage 1 使用 `HORIZONSTREAM_DEVICE`（默认 `cuda:0`）；Stage 2a 使用 recovery config 中的 `sam3.device`（当前为 `cuda:2`）。机器上无 SLURM，进程直接占用物理卡，因此并行运行多组实验时需自行通过 `CUDA_VISIBLE_DEVICES` 隔离。
 
 **环境探查**：
 
@@ -165,12 +134,9 @@ python -m streaming_couping.scripts.report_environment
 zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
 ```
 
-该入口内部依次调用 `commands_run_scannet_object_pose_feedback_100f.txt` 与
-`commands_evaluate_scannet_object_pose_loss_object_only.txt`，三者构成完整链路，
-**缺一不可**（精简过程中已逐项确认）。
+该入口内部依次调用 `commands_run_scannet_object_pose_feedback_100f.txt` 与 `commands_evaluate_scannet_object_pose_loss_object_only.txt`，三者构成完整链路，**缺一不可**（精简过程中已逐项确认）。
 
-一轮运行即产出全部结论性内容：判定与判据表、逐代对照表、两张对比图、候选账本摘要
-，以及完整日志（`sweep.log` / `analysis.log`）。
+一轮运行即产出全部结论性内容：判定与判据表、逐代对照表、两张对比图、候选账本摘要，以及完整日志（`sweep.log` / `analysis.log`）。
 
 **不再保留独立的读取入口**。各类分析脚本仍然存在，可直接调用：
 
@@ -185,11 +151,9 @@ zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
 | 环境探查 | `python -m streaming_couping.scripts.report_environment` |
 | 单元测试 | `python -m pytest streaming_couping/tests/ -q` |
 
-各脚本的参数见其 `--help`，或将已删除的同名 `.txt` 从 git
-历史取出作为完整调用示例。
+各脚本的参数见其 `--help`，或将已删除的同名 `.txt` 从 git 历史取出作为完整调用示例。
 
-**默认配置为单分支、单次重复**，即产出 §2.1
-主结果的那一轮。以下两项为显式开启，各自需要额外的 GPU 开销：
+**默认配置为单分支、单次重复**，即产出 §2.1 主结果的那一轮。以下两项为显式开启，各自需要额外的 GPU 开销：
 
 | 环境变量 | 作用 |
 |---|---|
@@ -208,12 +172,10 @@ zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
 帧窗由环境变量覆盖，无需修改文件（该覆盖对运行与读取均有效）：
 
 ```bash
-OBJECT_POSE_FEEDBACK_FRAME_COUNT=100 zsh
-streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
+OBJECT_POSE_FEEDBACK_FRAME_COUNT=100 zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
 ```
 
-若只需查看某个**已存在**的历史 run 而不重跑，直接对该 run 目录调用 §3.2
-的分析脚本，例如 `summarize_feedback_branches --run-dir <run>`。
+若只需查看某个**已存在**的历史 run 而不重跑，直接对该 run 目录调用 §3.2 的分析脚本，例如 `summarize_feedback_branches --run-dir <run>`。
 
 ### 3.4 产出物
 
@@ -238,27 +200,26 @@ streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
 ### 4.1 目录组织
 
 ```
-streaming_couping/ commands_*.txt               9 个入口
-object_pose_feedback_env.zsh 帧窗与 run 目录名的唯一定义处
-src/semantic_mapping/        主链路：几何适配、SAM 适配、提案、共识、门控、重放
-src/{aggregation,backbones,bridge,learned_pose,solvers}/ scripts/
-      29 个可执行模块 tests/                       28 个测试文件 configs/
-              运行配置 docs/method.md               方法文档
-experiments/experiments.md   实验文档 (仓库根) HANDOVER.md
-交接文档（本文件）
+streaming_couping/
+  commands_*.txt               9 个入口
+  object_pose_feedback_env.zsh 帧窗与 run 目录名的唯一定义处
+  src/semantic_mapping/        主链路：几何适配、SAM 适配、提案、共识、门控、重放
+  src/{aggregation,backbones,bridge,learned_pose,solvers}/
+  scripts/                     29 个可执行模块
+  tests/                       28 个测试文件
+  configs/                     运行配置
+  docs/method.md               方法文档
+  experiments/experiments.md   实验文档
+(仓库根) HANDOVER.md            交接文档（本文件）
 ```
 
 ### 4.2 主执行链路
 
-`commands_run_scannet_object_pose_feedback_branches.txt` →
-`commands_run_scannet_object_pose_feedback_100f.txt` →
-`commands_evaluate_scannet_object_pose_loss_object_only.txt`
+`commands_run_scannet_object_pose_feedback_branches.txt` → `commands_run_scannet_object_pose_feedback_100f.txt` → `commands_evaluate_scannet_object_pose_loss_object_only.txt`
 
 **三者缺一不可**：删除其中任何一个，主入口立即失效。精简过程中已就此逐项确认。
 
-主链路依次执行：Stage 1 几何 → Stage 2a 语义与提案 → GT-mask oracle
-对照（CPU）→ 重放确定性门 → 各变体的 CPU 重放 → Stage 2b 分析 → 对照表 → 两张图
-→ 候选账本。
+主链路依次执行：Stage 1 几何 → Stage 2a 语义与提案 → GT-mask oracle 对照（CPU）→ 重放确定性门 → 各变体的 CPU 重放 → Stage 2b 分析 → 对照表 → 两张图 → 候选账本。
 
 ### 4.3 关键模块职责
 
@@ -276,8 +237,7 @@ experiments/experiments.md   实验文档 (仓库根) HANDOVER.md
 
 ## 5 已排除的技术方向
 
-以下方向均已实测，**不建议重复尝试**。各方向的检验方式与完整数据见
-`streaming_couping/experiments/experiments.md` §6。
+以下方向均已实测，**不建议重复尝试**。各方向的检验方式与完整数据见 `streaming_couping/experiments/experiments.md` §6。
 
 | 方向 | 结论 |
 |---|---|
@@ -305,25 +265,15 @@ experiments/experiments.md   实验文档 (仓库根) HANDOVER.md
 
 ### 6.2 复现风险
 
-**1. 不得删除 `outputs/` 目录。** 两次独立 stage-1 运行的 d_ATE 相差约
-**0.24 个百分点**（实测 +15.60% →
-+15.36%），大于多个分支之间的差异。主链路会将新一代的几何缓存**自上一代 复制**，
-使两代共享同一次 stage-1、从而可比；删除该目录即失去这一条件，且对照一旦丢失便
-无法事后恢复。
+**1. 不得删除 `outputs/` 目录。** 两次独立 stage-1 运行的 d_ATE 相差约 **0.24 个百分点**（实测 +15.60% → +15.36%），大于多个分支之间的差异。主链路会将新一代的几何缓存**自上一代复制**，使两代共享同一次 stage-1、从而可比；删除该目录即失去这一条件，且对照一旦丢失便无法事后恢复。
 
-**2. 噪声底存在两种，不可混用。** 共享同一次几何缓存时为 **1.8e-05**；跨独立
-stage-1 运行时为 **2.4e-03**，后者约为前者的 130
-倍。判断"差异是否显著"时须使用与比较方式 相对应的那一个。
+**2. 噪声底存在两种，不可混用。** 共享同一次几何缓存时为 **1.8e-05**；跨独立 stage-1 运行时为 **2.4e-03**，后者约为前者的 130 倍。判断"差异是否显著"时须使用与比较方式相对应的那一个。
 
-**3. 150 帧的数值来自两次不同运行。**
-引用时须注明是哪一次（`streaming_couping/experiments/experiments.md`
-各处已标注）。
+**3. 150 帧的数值来自两次不同运行。** 引用时须注明是哪一次（`streaming_couping/experiments/experiments.md` 各处已标注）。
 
 ### 6.3 工程注意事项
 
-**1. prompt 列表不可加。** 增词可能挤掉已有词，机制有两条：跨 prompt
-判重（按**出生帧** 排序，重叠者丢弃后到者）与全局
-**16 条**名额（所有词共享）。增词是摊薄名额，而非增加检测器。
+**1. prompt 列表不可加。** 增词可能挤掉已有词，机制有两条：跨 prompt 判重（按**出生帧** 排序，重叠者丢弃后到者）与全局 **16 条**名额（所有词共享）。增词是摊薄名额，而非增加检测器。
 
 **2. "修正点云"存在两种不同机制，不可混淆。**
 
@@ -332,16 +282,11 @@ stage-1 运行时为 **2.4e-03**，后者约为前者的 130
 | 相机位姿 | 保持 raw | 被修正 |
 | 修正对象 | 每个实例自身的点云 | **置点所用的位姿** |
 
-(b) 中不存在逐点修正：同一批相机系点由不同轨迹置入世界。以 (a)
-的逐实例结果推断其在 (b) 共识中的权重是错误的。
+(b) 中不存在逐点修正：同一批相机系点由不同轨迹置入世界。以 (a) 的逐实例结果推断其在 (b) 共识中的权重是错误的。
 
-**3. 判定不得依据 ICP loss。** 判据仅取位姿指标（七条，见
-`streaming_couping/docs/method.md` §7）。loss 下降不代表位姿改善 ——
-已有实例显示 loss 降 58% 而 GT 指标持平。
+**3. 判定不得依据 ICP loss。** 判据仅取位姿指标（七条，见 `streaming_couping/docs/method.md` §7）。loss 下降不代表位姿改善 —— 已有实例显示 loss 降 58% 而 GT 指标持平。
 
-**4. 静态导入分析在本仓库不可靠。**
-精简过程中该手段出现三次误判（漏解析相对导入、正则捕获错误标识符、将仍在使用的模
-块判为不可达）。判断某一文件属于旧线还是当前线，应依据其 **docstring**。
+**4. 静态导入分析在本仓库不可靠。** 精简过程中该手段出现三次误判（漏解析相对导入、正则捕获错误标识符、将仍在使用的模块判为不可达）。判断某一文件属于旧线还是当前线，应依据其 **docstring**。
 
 ---
 
@@ -361,20 +306,13 @@ stage-1 运行时为 **2.4e-03**，后者约为前者的 130
 
 按优先级排列：
 
-1. **补充第二个场景。** 当前结论的场景数为
-   1，且位于开发窗口。这是将结论由"在该窗口上
-   成立"提升为"该方法成立"的唯一途径；其余工作均为次要。
+1. **补充第二个场景。** 当前结论的场景数为 1，且位于开发窗口。这是将结论由"在该窗口上成立"提升为"该方法成立"的唯一途径；其余工作均为次要。
 
-2. **查清 `anchor_rho` 的消失。** 该量在 100 帧上是最强预测因子（`fresh`
-   分支即为此设计），在 150
-   帧上却归零。可能是测量问题，也可能指向尚未发现的机制。
+2. **查清 `anchor_rho` 的消失。** 该量在 100 帧上是最强预测因子（`fresh` 分支即为此设计），在 150 帧上却归零。可能是测量问题，也可能指向尚未发现的机制。
 
-3. **分离单次增词实验的归因。** 需构造"新词进入而原词不丢"的条件（提高
-   `--max-objects` 或调整判重排序），以确定结果劣化源于丢失原词还是引入新词。
+3. **分离单次增词实验的归因。** 需构造"新词进入而原词不丢"的条件（提高 `--max-objects` 或调整判重排序），以确定结果劣化源于丢失原词还是引入新词。
 
-4. **建立物体预筛选判据。** 现有判据分三类且生效时机不同（详见
-   `streaming_couping/docs/method.md`
-   §5）；若要继续提升，可改进的是跟踪层规则，而非物体质量打分。
+4. **建立物体预筛选判据。** 现有判据分三类且生效时机不同（详见 `streaming_couping/docs/method.md` §5）；若要继续提升，可改进的是跟踪层规则，而非物体质量打分。
 
 ---
 
@@ -397,8 +335,7 @@ stage-1 运行时为 **2.4e-03**，后者约为前者的 130
 zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
 
 # 读取历史帧窗
-OBJECT_POSE_FEEDBACK_FRAME_COUNT=100 zsh
-streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
+OBJECT_POSE_FEEDBACK_FRAME_COUNT=100 zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
 
 # 完整测试套件
 python -m pytest streaming_couping/tests/ -q
