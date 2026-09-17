@@ -1,185 +1,386 @@
 # 交接文档：SAM 物体锚点修正 HorizonStream 位姿漂移
 
-2026-09-16 · 实习交接
+2026-09-17 · 实习工作交接
 
-> **先读这份。** 它告诉你现在有什么、怎么跑、什么已经试过并且失败了、以及哪些坑会浪费时间。
-> 想深入某一块时，按 §8 的文档地图去查。
-
----
-
-## 1. 一句话
-
-在**冻结的 HorizonStream** 上，用 **SAM3.1 的 persistent object tracks** 做跨物体共识、
-把修正反馈进因果位姿累积器，**位姿与点云产物同时改善，两个帧窗上都通过全部七条预先声明的判据**。
-
-主结果：direct ATE **+14.25%**（100 帧）、**+15.4 ~ 15.6%**（150 帧），sim3 同为正。
-全程不训练，不改 HorizonStream backbone / KV / GLA cache，GT 只在所有决策冻结后加载。
-
-**但它的边界很窄**：单场景、单条开发窗口、阈值就在这条窗口上选的、无 held-out 证据。
-详见 §6。
+本文是**交接文档**，说明项目当前状态、运行方式、已知限制与后续建议。
+方法细节见 [`../docs/method.md`](../docs/method.md)；实验过程与证据见
+[`experiments.md`](experiments.md)。三份文档合并自原 16 份，原文见 git 历史。
 
 ---
 
-## 2. 现在的状态
+## 1 项目概述
 
-| 项 | 状态 |
+### 1.1 问题定义
+
+HorizonStream 是流式几何基础模型，逐帧输出 metric depth、depth confidence、intrinsics
+与相机位姿。其位姿由运行时累积器（`online_motion_averaging`）在线因果产生，**误差会累积
+且不自纠正** —— 模型本身没有任何跨帧的景物级约束。
+
+本课题验证：**SAM3.1 的 persistent object tracks 能否作为跨帧稳定的物体锚点，检测并修正
+HorizonStream 的累计位姿漂移，并把修正反馈进后续帧。**
+
+约束：不训练任何模型；不修改 HorizonStream 的 backbone / KV / GLA cache；不引入 DINO 或
+任何 learned score；GT 仅在所有反馈决策冻结之后加载，仅用于评测。
+
+### 1.2 方法概要
+
+对每个 (帧, 实例)，以 mask ∩ 有效深度取最多 256 个相机系点，与同一实例的参考云做最近点
+对齐，解一个 6DoF 增量；各物体的 `log(ΔT)` 经加权 Huber IRLS 取加权中位数得到每帧修正；
+修正通过门控后，作为**绝对目标**写入累积器。整体为**两遍式**：提案基于 raw 几何一次算完，
+修正之后仅重放累积器。
+
+完整的坐标约定、可靠性分数、门控规则与判据定义见 `../docs/method.md`。
+
+### 1.3 交付物清单
+
+| 交付物 | 位置 |
 |---|---|
-| 主结果 | `robust_semantic`，**v1 prompt 集**，100 帧与 150 帧两轮都 GO |
-| 最好的单次配置 | `factorized`，但它**不稳定**，不能当主线（`experiments.md` §6） |
-| 代码 | 已精简到这条线；旧线（dinov3 / multiclip / v0 / v11 / v21–23 / sam31-auto / temporal）已全部移除 |
-| 规模 | commands 9 · scripts 29 · src 70 · tests 28 · **docs 1 · experiments 2** |
-| 测试 | **231 通过**，1 个失败（`test_instance_point_consistency`，**在精简之前就存在**，与本线无关） |
+| 方法文档 | `docs/method.md` |
+| 实验文档（结果、消融、已排除方向、早期实验） | `experiments/experiments.md` |
+| 本文档 | `experiments/handover.md` |
+| 主执行链路与读取工具 | `streaming_couping/commands_*.txt` |
+| 实现 | `streaming_couping/src/`、`streaming_couping/scripts/` |
+| 单元测试 | `streaming_couping/tests/` |
+| 环境探查脚本 | `streaming_couping/scripts/report_environment.py` |
 
 ---
 
-## 3. 怎么跑
+## 2 当前状态
+
+### 2.1 已验证结论
+
+主结果：`robust_semantic` + v1 prompt 集，**两个帧窗均通过全部七条事前判据**。
+
+| 帧窗 | raw direct ATE | d_ATE | d_sim3 | 判定 |
+|---|---:|---:|---:|---|
+| 100 帧 | 0.1166 m | **+14.25%** | **+5.35%** | GO |
+| 150 帧 | 0.1095 m | **+15.4 ~ 15.6%** | 正 | GO |
+
+150 帧的区间来自**两次独立的 stage-1 运行**（+15.60% 与 +15.36%），其差值即跨运行误差，
+见 §6.2。点云指标同步改善（accuracy −29%、ghost −44%、F5cm +12%），且与轨迹判据独立地
+给出同一排序。
+
+**证据、消融与逐项数据见 `experiments.md` §1–§5。**
+
+### 2.2 代码与测试状态
+
+| 项 | 数量 |
+|---|---:|
+| 命令入口 | 9 |
+| `scripts/*.py` | 29 |
+| `src/**/*.py` | 70 |
+| 测试文件 | 28 |
+| 文档 | 3 |
+
+测试结果：**231 通过，1 失败，3 跳过**。
+
+失败项为 `test_instance_point_consistency.py::test_instance_consistency_is_causal_and_rejects_far_points`
+（`assert 4 == 3`）。该失败**在本次代码精简之前即存在**，与本课题的主链路无关，未修复。
+
+### 2.3 外部依赖
+
+以下为实测结果（`scripts/report_environment.py`，2026-09-17）。
+
+**模型权重**
+
+| 用途 | 路径 | 大小 | 状态 |
+|---|---|---:|---|
+| HorizonStream（Stage 1） | `/home/bod/86Nas/95_data_bak/FoundationModels/HorizonStream.pt` | 4.5 GiB | OK |
+| SAM3.1（Stage 2a） | `/home/bod/86Nas/95_data_bak/FoundationModels/sam3.1/sam3.1_multiplex.pt` | 3.3 GiB | OK |
+| StreamVGGT | `/home/bod/86Nas/95_data_bak/FoundationModels/StreamVGGT/checkpoints.pth` | 4.7 GiB | 存在，但**属旧线，主链路不使用** |
+
+**数据集**
+
+| 用途 | 路径 | 大小 | 状态 |
+|---|---|---:|---|
+| ScanNet++ manifest | `data/processed/scannetpp_pinhole_2d/manifest.json` | 4.9 MiB | OK |
+| 存储根 | `/data184/open_source/vggtSam` | — | OK |
+
+**已知配置遗留**：`configs/recovery_dynamic_instance.yaml` 中仍保留 StreamVGGT 条目
+（`device: cuda:0`）。该条目由旧线使用，当前主链路不读取；后续清理时可一并移除。
+
+---
+
+## 3 运行说明
+
+### 3.1 环境要求
+
+**硬件（实测）**
+
+| 项 | 值 |
+|---|---|
+| GPU | 8 × NVIDIA GeForce RTX 3090（23.7 GiB 各） |
+| CUDA（驱动侧） | 12.8 |
+| CPU | 48 核 |
+| 内存 | 377.6 GiB |
+| 存储根可用空间 | 144.7 GiB / 1130.2 GiB |
+| 仓库所在盘可用空间 | 19.6 GiB / 2382.3 GiB |
+
+仓库盘剩余空间偏紧（19.6 GiB），而单次运行的产物（几何缓存、诊断、点云）量级为 GiB 级，
+长期迭代时需留意。
+
+**解释器（两套，版本不同，不可互换）**
+
+| 环境变量 | 路径 | Python | PyTorch | CUDA | 用途 |
+|---|---|---|---|---|---|
+| `HORIZONSTREAM_PYTHON` | `/home/huawei/miniconda3/envs/horizonstream/bin/python` | 3.11.14 | 2.8.0+cu128 | 12.8 | Stage 1（几何） |
+| `STREAMING_COUPING_PYTHON` | `/home/huawei/miniconda3/envs/3am/bin/python` | 3.11.15 | 2.5.1+cu118 | 11.8 | Stage 2a/2b/3（SAM、分析、评测） |
+
+两套环境的 PyTorch 与 CUDA 版本不同，因此**不可交叉调用**：Stage 1 必须在前者下运行，
+其余阶段必须在后者下运行。命令文件已按此分工，无需手工切换。
+
+**依赖包（实测）**：两套解释器均无缺失。所需包按用途分为三组：
+几何与分析（`torch`、`numpy`、`PIL`）、SAM3 运行时（`iopath`、`ftfy`、`regex`、
+`huggingface_hub`、`timm`、`einops`、`pycocotools`）、绘图（`matplotlib`）。
+
+> `matplotlib` 为近期新增（用于生成对比图）。缺失时判定与指标表仍会产出，仅图片生成失败。
+
+**设备分配**：Stage 1 使用 `HORIZONSTREAM_DEVICE`（默认 `cuda:0`）；Stage 2a 使用
+recovery config 中的 `sam3.device`（当前为 `cuda:2`）。机器上无 SLURM，进程直接占用物理卡，
+因此并行运行多组实验时需自行通过 `CUDA_VISIBLE_DEVICES` 隔离。
+
+**环境探查**：
 
 ```bash
-# 主入口：一条命令跑完一轮（含 GPU）
-zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
-
-# 只重读判定 + 两张图 + 点云评测（纯 CPU，几秒）
-zsh streaming_couping/commands_check_object_pose_feedback_decision.txt
-
-# 单元测试 + 逐类别解释 + prompt 账本（纯 CPU，只读）
-zsh streaming_couping/commands_verify_object_pose_feedback.txt
-
-# 每个 prompt 返回了几条 track、被谁判重、有没有撞名额（纯 CPU）
-zsh streaming_couping/commands_show_sam3_candidate_ledger.txt
+zsh streaming_couping/commands_report_environment.txt
 ```
 
-**默认只跑 baseline、只跑一次**（就是产出主结果的那一轮，约占一次 segmentation pass）。
-两个东西是显式打开的，各自换来一张表：
+### 3.2 运行入口
 
-| 打开 | 换来 |
+```bash
+# 主链路：一条命令完成一轮（含 GPU）
+zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
+
+# 只重读判定 + 两张图 + 点云评测（CPU，数秒）
+zsh streaming_couping/commands_check_object_pose_feedback_decision.txt
+
+# 单元测试 + 逐类别解释 + 候选账本（CPU，只读）
+zsh streaming_couping/commands_verify_object_pose_feedback.txt
+
+# 每个 prompt 返回的 track 数、判重与被名额截断情况（CPU）
+zsh streaming_couping/commands_show_sam3_candidate_ledger.txt
+
+# 闭环一步：以修正轨迹为基座重解提案，并含空对照（CPU）
+zsh streaming_couping/commands_reestimate_object_pose_feedback.txt
+
+# 环境探查（CPU，只读）
+zsh streaming_couping/commands_report_environment.txt
+```
+
+**默认配置为单分支、单次重复**，即产出 §2.1 主结果的那一轮。以下两项为显式开启，
+各自需要额外的 GPU 开销：
+
+| 环境变量 | 作用 |
 |---|---|
-| `OBJECT_POSE_FEEDBACK_BRANCHES=baseline,fresh,factorized,...` | 提案侧消融表 |
-| `OBJECT_POSE_FEEDBACK_SAM_REPEATS=3` | 噪声底 |
+| `OBJECT_POSE_FEEDBACK_BRANCHES=baseline,fresh,...` | 运行提案侧消融分支 |
+| `OBJECT_POSE_FEEDBACK_SAM_REPEATS=3` | 重复运行以测量噪声底 |
 
-**换帧窗**：改 `object_pose_feedback_env.zsh` 的 `FRAME_COUNT`；读旧窗口用
-`OBJECT_POSE_FEEDBACK_FRAME_COUNT=100 zsh ...`。
+### 3.3 配置项
 
-**换 prompt 集**：改 sweep 顶部的 `GENERATION` 一行 —— 词表从 `GENERATION_PROMPTS` 按标签
-查出，所以标签和词表不可能不一致。
+| 配置 | 位置 | 说明 |
+|---|---|---|
+| 帧窗 | `object_pose_feedback_env.zsh` 的 `FRAME_COUNT` / `FRAME_START` / `FRAME_STRIDE` | 帧窗同时决定 run 目录名前缀，不同帧窗的产物互不干扰 |
+| 代数（generation） | 主链路的 `GENERATION` | 一代即一个 prompt 集；词表由 `GENERATION_PROMPTS` 按标签查出，标签与词表不会不一致 |
+| prompt 集 | 同上 `GENERATION_PROMPTS` | 临时词表可用 `OBJECT_POSE_FEEDBACK_PROMPTS` 覆盖 |
+| 反馈阈值 | `ObjectPoseFeedbackConfig` 与主链路命令行参数 | 约 40 项，均可在命令行覆盖 |
+
+读取历史帧窗时无需修改文件：
+
+```bash
+OBJECT_POSE_FEEDBACK_FRAME_COUNT=100 zsh streaming_couping/commands_check_object_pose_feedback_decision.txt
+```
+
+### 3.4 产出物
+
+每轮在 `<run>.baseline/` 下产出：
+
+| 产物 | 内容 |
+|---|---|
+| `object_pose_feedback/summary.json` | 各共识变体的判定、判据与指标 |
+| `object_pose_feedback/object_proposals.csv` | 每条提案的特征、拒绝原因与 GT 误差 |
+| `object_pose_feedback/attribution.json` | 归因分析结果 |
+| `object_pose_feedback/poses.pt` | raw / GT / 各变体轨迹 |
+| `object_pose_feedback/pose_comparison.png` | 轨迹俯视与逐帧平移/旋转误差（GT / raw / 修正后） |
+| `object_pose_feedback/object_cloud_comparison.png` | 逐物体点云，同一批点以三条轨迹分别置入世界 |
+| `object_pose_refinement/feedback_diagnostics.pt` | 观测点云、参考云与提案（供 CPU 重放） |
+| `gt_evaluation/` | 逐实例点云指标 |
+| `sweep.log` / `analysis.log` | 完整运行日志（标准输出仅保留结论性内容） |
 
 ---
 
-## 4. 代码在哪
+## 4 代码结构
+
+### 4.1 目录组织
 
 ```
 streaming_couping/
-  commands_*.txt              9 个入口（3 个在 baseline 链上，6 个是读结果的工具）
-  object_pose_feedback_env.zsh 帧窗与 run 目录名的单一来源
-  src/semantic_mapping/       这条线的主体：几何适配、SAM 适配、提案、共识、门控、重放
-  scripts/                    29 个，其中 18 个在 baseline 链上
-  tests/                      28 个
-  docs/method.md              方法：pipeline、判据、六层筛选
-  experiments/                2 份：experiments.md（实验）+ handover.md（本文件）
+  commands_*.txt               9 个入口
+  object_pose_feedback_env.zsh 帧窗与 run 目录名的唯一定义处
+  src/semantic_mapping/        主链路：几何适配、SAM 适配、提案、共识、门控、重放
+  src/{aggregation,backbones,bridge,learned_pose,solvers}/
+  scripts/                     29 个可执行模块
+  tests/                       28 个测试文件
+  configs/                     运行配置
+  docs/method.md               方法文档
+  experiments/                 experiments.md、handover.md
 ```
 
-**baseline 链**：`..._branches.txt` → `..._100f.txt` → `evaluate_..._object_only.txt`。
-删这三个里的任何一个，主入口直接跑不起来 —— 精简时确认过。
+### 4.2 主执行链路
+
+`commands_run_scannet_object_pose_feedback_branches.txt`
+→ `commands_run_scannet_object_pose_feedback_100f.txt`
+→ `commands_evaluate_scannet_object_pose_loss_object_only.txt`
+
+**三者缺一不可**：删除其中任何一个，主入口立即失效。精简过程中已就此逐项确认。
+
+主链路依次执行：Stage 1 几何 → Stage 2a 语义与提案 → GT-mask oracle 对照（CPU）→
+重放确定性门 → 各变体的 CPU 重放 → Stage 2b 分析 → 对照表 → 两张图 → 候选账本。
+
+### 4.3 关键模块职责
+
+| 模块 | 职责 |
+|---|---|
+| `src/semantic_mapping/adapters.py` | 几何与分割适配；**含物体筛选的跟踪层规则**（名额、判重） |
+| `src/semantic_mapping/object_pose_loss_refinement.py` | 逐实例 6DoF 提案求解（ICP 式交替 + Adam） |
+| `src/semantic_mapping/object_pose_feedback.py` | 可靠性分数、跨物体共识、门控、判据 |
+| `src/semantic_mapping/pipeline.py` | 四阶段编排 |
+| `scripts/run_object_pose_feedback.py` | Stage 2b：共识、门控、累积器注入重放 |
+| `scripts/run_object_pose_loss_replay.py` | 由诊断重跑 refiner（CPU，用于分支消融） |
+| `scripts/run_object_pose_loss_reestimate.py` | 闭环实验：以外部轨迹为基座重解提案 |
 
 ---
 
-## 5. 已经试过并且失败的方向（**最省时间的部分**）
+## 5 已排除的技术方向
 
-这些都有实测证据，**别重复做**。每条在 `experiments.md` §6 里都有原始数据。
+以下方向均已实测，**不建议重复尝试**。各方向的检验方式与完整数据见 `experiments.md` §6。
 
 | 方向 | 结论 |
 |---|---|
-| **换更好的分割** | `oracle_mask`（**用 GT mask 替换 SAM**）的 `prop_err` **反而更差**（0.1010 vs 0.0892）。瓶颈不在 mask 质量 |
-| **参考集太旧** | `fresh` 分支把 anchor 年龄从 37.5 降到 8、相关性从 0.79 降到 0.17，**提案误差纹丝不动**（0.0893→0.0891）。那个相关不是因果 —— anchor 旧 ⟺ 处于序列后半段 |
-| **旋转平移解耦** | `factorized` 能全过，但**跨配置从 +3% 摆到 +19%**（100 帧 v1 +2.99% 不过 → 150 帧 v1 +18.64% GO → 100 帧 v3 +19.12% 差一条 → 150 帧 v3 NO_GO）。**不是更好的配置，是不稳定的配置** |
-| **只修平移** | `translation_only` **更差**：强制 ω=0 后 sim3 变负。旋转与平移在联合解里耦合 |
-| **加 prompt** | `table` 在 SAM 侧**一条 track 都没回**（而 GT oracle 给它出了约 99 条提案）；`cabinet` 回来了 15 条，把全局名额占满，还把 `wardrobe` 判重挤掉，结果 **−11.87%** |
-| **闭环 / 流式** | 把修正轨迹喂回去重解提案：**残差降 18.0%**（空对照 +0.1%），但**轨迹差 3.6%**，五变体全 NO_GO。加上原理限制 → **真流式不值得做** |
-| **换优化目标** | 目标函数对**共模误差免疫**：`P` 和 `Q` 出自同一条 depth+pose 流水线，共同误差相减时抵消 —— loss 看不见它，而它恰恰贡献绝对位姿误差 |
-
-**`S_geo`（几何置信度）是反预测的**（类内 ρ **+0.342**），`S_sem` 也是（**+0.634**）。
-主方法只用 `S_sem` 加权、不用 `S_geo`，**差别全在这里**：多乘 `S_geo` 让增益从 +14.25% 减半到 +7.83%。
+| 改进分割质量 | GT mask 替换 SAM 后提案误差**反而更差**（0.1010 对 0.0892），瓶颈不在 mask |
+| 更新参考集 | 将 anchor 年龄由 37.5 降至 8、相关系数由 0.79 降至 0.17，提案误差**无变化**（0.0893→0.0891）；该相关系混淆所致 |
+| 旋转与平移解耦 | 可全部通过判据，但跨配置摆动于 +3% 与 +19% 之间，属**不稳定配置**，不宜作为主线 |
+| 仅修正平移 | 显著更差，sim3 转负；旋转与平移在联合求解中耦合 |
+| 扩充 prompt | 单次增词即可挤占全局名额并触发判重，导致结果由 +15.36% 跌至 −11.87% |
+| 闭环 / 流式 | 提案残差降 18.0%，轨迹反而差 3.6%，全部变体 NO_GO |
+| 更换优化目标 | 目标函数对共模误差免疫（`P`、`Q` 同源），无法感知其贡献的绝对位姿误差 |
 
 ---
 
-## 6. 还没回答的问题
+## 6 已知限制与风险
+
+### 6.1 结论的适用范围
+
+| 项 | 状态 |
+|---|---|
+| 场景数 | **1**（`00a231a370`） |
+| 帧窗 | 2 个，为**同一场景的复核**，非第二个场景 |
+| 协议角色 | 开发窗口；判据与阈值即在窗口上确定，**无 held-out 证据** |
+| prompt 集 | 方法的一部分，非自由参数 |
+| 点云绝对数值 | 不可引用（预测云稀疏约 100 倍），仅 raw 与修正的对比有效 |
+
+### 6.2 复现风险
+
+**1. 不得删除 `outputs/` 目录。** 两次独立 stage-1 运行的 d_ATE 相差约 **0.24 个百分点**
+（实测 +15.60% → +15.36%），大于多个分支之间的差异。主链路会将新一代的几何缓存**自上一代
+复制**，使两代共享同一次 stage-1、从而可比；删除该目录即失去这一条件，且对照一旦丢失便
+无法事后恢复。
+
+**2. 噪声底存在两种，不可混用。** 共享同一次几何缓存时为 **1.8e-05**；跨独立 stage-1
+运行时为 **2.4e-03**，后者约为前者的 130 倍。判断"差异是否显著"时须使用与比较方式
+相对应的那一个。
+
+**3. 150 帧的数值来自两次不同运行。** 引用时须注明是哪一次（`experiments.md` 各处已标注）。
+
+### 6.3 工程注意事项
+
+**1. prompt 列表不可加。** 增词可能挤掉已有词，机制有两条：跨 prompt 判重（按**出生帧**
+排序，重叠者丢弃后到者）与全局 **16 条**名额（所有词共享）。增词是摊薄名额，而非增加检测器。
+
+**2. "修正点云"存在两种不同机制，不可混淆。**
+
+| | (a) 逐实例修正点云 | (b) 位姿反馈（主线） |
+|---|---|---|
+| 相机位姿 | 保持 raw | 被修正 |
+| 修正对象 | 每个实例自身的点云 | **置点所用的位姿** |
+
+(b) 中不存在逐点修正：同一批相机系点由不同轨迹置入世界。以 (a) 的逐实例结果推断其在
+(b) 共识中的权重是错误的。
+
+**3. 判定不得依据 ICP loss。** 判据仅取位姿指标（七条，见 `../docs/method.md` §7）。
+loss 下降不代表位姿改善 —— 已有实例显示 loss 降 58% 而 GT 指标持平。
+
+**4. 静态导入分析在本仓库不可靠。** 精简过程中该手段出现三次误判（漏解析相对导入、
+正则捕获错误标识符、将仍在使用的模块判为不可达）。判断某一文件属于旧线还是当前线，
+应依据其 **docstring**。
+
+---
+
+## 7 未决问题
 
 | 问题 | 状态 |
 |---|---|
-| **第二个场景** | **没有**。所有结果来自 `00a231a370` 一条场景。这是最该补的一件事 |
-| `anchor_rho` 从 0.79 掉到 0.09 | **未解释**。它在 100 帧上是最强预测因子，窗口变长后理应保持，却消失了 |
-| **哪个物体会赢，事前判不出** | 两个为"物体质量"设计的分数都是反预测的，`reliable` 硬拒零区分度。有效的两个（`consensus_inlier`、帧级 gate）都要求**先有一群物体在投票** |
-| 16 个名额 + 判重按出生帧 | **已知是机制**（v5 账本实测到了），**没有改**。这是控制"哪些物体参与"唯一能改的地方 |
-| v5 的归因 | **分不清**是丢 `wardrobe` 还是加 `cabinet` 造成的 —— 两者同时发生。要分开需让 cabinet 进来而 wardrobe 不丢 |
+| 缺少第二个场景 | 现有结论全部来自单一场景 |
+| `anchor_rho` 由 0.79 降至 0.09 | 未解释。该量在 100 帧上为最强预测因子，窗口变长后理应保持 |
+| 缺少可用的物体预筛选判据 | 两个为"物体质量"设计的分数均反预测，硬拒筛选零区分度；有效的两个判据均需先形成共识 |
+| 跟踪层规则未变更 | 16 条名额与按出生帧判重为已知机制，但未修改；这是控制"哪些物体参与"的可改之处 |
+| 单次增词实验的归因未分离 | 丢失 `wardrobe` 与新增 `cabinet` 同时发生，无法区分二者对结果的影响 |
 
 ---
 
-## 7. 交接时必须知道的坑
+## 8 后续工作建议
 
-1. **不要删 `outputs/`。** 删了会失去可比性：**两次独立 stage-1 跑的 d_ATE 差约 0.24 个百分点**
-   （清空后重建实测：+15.60% → +15.36%），比很多分支差异还大。而且对照没了就永远分不出来。
-   sweep 会把新代的几何缓存**从上一代复制**，所以两代天然共享同一次 stage-1 —— 删了就失去这个。
+按优先级排列：
 
-2. **prompt 列表不是可加的。** 加一个词可能**挤掉**已有的词 —— 两个机制：跨 prompt 判重（按
-   **出生帧**排序，重叠就丢后到的）、全局 **16 条**名额（所有词共享）。加词是摊薄名额，不是多几个检测器。
+1. **补充第二个场景。** 当前结论的场景数为 1，且位于开发窗口。这是将结论由"在该窗口上
+   成立"提升为"该方法成立"的唯一途径；其余工作均为次要。
 
-3. **"修点云"有两个，别混。**
-   - **(a) 逐实例修点云**：相机位姿保持 raw，每个实例各修自己的点云（`object_pose_object_only_per_instance`）。
-   - **(b) 位姿反馈**：修的是**相机轨迹**，点云一个点都没改 —— 改的是**把它放进世界的那个位姿**。
-   主线是 (b)。拿 (a) 的逐实例好坏去推断它在 (b) 的共识里话语权多大是错的。
+2. **查清 `anchor_rho` 的消失。** 该量在 100 帧上是最强预测因子（`fresh` 分支即为此设计），
+   在 150 帧上却归零。可能是测量问题，也可能指向尚未发现的机制。
 
-4. **噪声底有两种，别用一个数当全部。** 1.8e-05 是"共享同一次几何缓存"的；跨独立 stage-1 是 **2.4e-03**。
+3. **分离单次增词实验的归因。** 需构造"新词进入而原词不丢"的条件（提高 `--max-objects`
+   或调整判重排序），以确定结果劣化源于丢失原词还是引入新词。
 
-5. **不要用 ICP loss 判断好坏。** 判据只有位姿指标（七条，见 `../docs/method.md` §7）。loss 下降不代表
-   位姿变好 —— V3 那次 loss 降 58% 而 GT 指标平坦。
-
-6. **报告里 150 帧的数来自两次不同的 stage-1 跑**（+15.60% 与 +15.36%），章节里都标注了是哪一次。
-   引用时注意。
-
-7. **静态导入分析在这条仓库里不可靠。** 精简时它错了三次（漏相对导入、惰性正则抓错标识符、
-   把 `recovery`/`semantic_map`/`object_memory` 判成不可达）。判断"旧线还是当前"要看 **docstring**。
+4. **建立物体预筛选判据。** 现有判据分三类且生效时机不同（详见 `../docs/method.md` §5）；
+   若要继续提升，可改进的是跟踪层规则，而非物体质量打分。
 
 ---
 
-## 8. 文档地图
+## 附录 A 文档索引
 
-**全仓库只有三份文档**（外加 `readme.md`）：
-
-| 想知道什么 | 看哪份 |
+| 文档 | 内容 |
 |---|---|
-| **方法**：pipeline 怎么搭、每步做什么、判据是什么、六层筛选 | [`../docs/method.md`](../docs/method.md) |
-| **实验**：做过什么、结果是什么、什么失败了、早期弯路 | [`experiments.md`](experiments.md) |
-| **交接**：现在什么状态、怎么跑、坑在哪、下一步 | 本文件 |
+| [`../docs/method.md`](../docs/method.md) | 方法：系统结构、逐步流程、坐标约定、六层筛选、七条判据、两种噪声底 |
+| [`experiments.md`](experiments.md) | 实验：主结果、点云传导、环路验证、消融、已排除方向、早期实验、复现命令 |
+| 本文档 | 交接：状态、环境、运行、代码结构、限制与风险、后续建议 |
 
-`experiments.md` 内部的定位：
-
-| 章节 | 内容 |
-|---|---|
-| §0–§4 | 结论、位姿主结果、点云传导、环路验证、不依赖单一物体 |
-| §5 | 消融：共识侧 5 变体 + 提案侧 5 分支（每个分支检验什么假设） |
-| §6 | **已否证的方向**（含闭环、加 prompt 的机制细节） |
-| §7 | 适用范围 |
-| §8 | 早期实验（这条线的前身，别重复） |
-| §9 | 未解释的观察（`anchor_rho`） |
-| §10 | 复现命令 |
-
-**这三份文档合并自原来 16 份**，被合并的原文在 git 历史里可查。
+每轮运行产出的两张图位于 `<run>.baseline/object_pose_feedback/`，说明见 §3.4。
 
 ---
 
-## 8b. 图
+## 附录 B 命令速查
 
-**每轮跑完产出两张图**（CPU，几秒），在 `<run>.baseline/object_pose_feedback/` 下：
+```bash
+# 主链路（GPU）
+zsh streaming_couping/commands_run_scannet_object_pose_feedback_branches.txt
 
-| 图 | 画的是 |
-|---|---|
-| `pose_comparison.png` | 轨迹俯视 + 逐帧平移/旋转误差，GT / raw / 修正后三条线，RMSE 写在标题里 |
-| `object_cloud_comparison.png` | 每个物体的点云，**同一批点用三条轨迹摆三次** —— 只有位姿变 |
+# 判定 + 两张图 + 点云评测（CPU）
+zsh streaming_couping/commands_check_object_pose_feedback_decision.txt
 
----
+# 测试 + 逐类别 + 候选账本（CPU）
+zsh streaming_couping/commands_verify_object_pose_feedback.txt
 
-## 9. 如果要继续，我会先做这两件
+# 候选账本（CPU）
+zsh streaming_couping/commands_show_sam3_candidate_ledger.txt
 
-1. **第二个场景。** 现在 n=1，而且是开发窗口。这是把结论从"这条窗口上成立"变成"这个方法成立"
-   的唯一途径，其他都是枝节。
-2. **`anchor_rho` 那个消失。** 它在 100 帧上是最强的预测因子（`fresh` 分支就是为它做的），
-   到 150 帧却归零。要么是测量问题，要么背后有个没看见的东西 —— 两者都值得知道。
+# 闭环实验（CPU）
+zsh streaming_couping/commands_reestimate_object_pose_feedback.txt
+
+# 环境探查（CPU）
+zsh streaming_couping/commands_report_environment.txt
+
+# 读取历史帧窗
+OBJECT_POSE_FEEDBACK_FRAME_COUNT=100 zsh streaming_couping/commands_check_object_pose_feedback_decision.txt
+
+# 完整测试套件
+python -m pytest streaming_couping/tests/ -q
+```
