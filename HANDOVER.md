@@ -54,11 +54,11 @@ HorizonStream 是流式几何基础模型，逐帧输出 metric depth、depth co
 
 | 项 | 数量 |
 |---|---:|
-| 命令入口 | 9 |
+| 命令入口 | 3（构成唯一一条链路） |
 | `scripts/*.py` | 29 |
 | `src/**/*.py` | 70 |
 | 测试文件 | 28 |
-| 文档 | 3 |
+| 文档 | 2 |
 
 测试结果：**231 通过，1 失败，3 跳过**。
 
@@ -220,7 +220,7 @@ OBJECT_POSE_FEEDBACK_FRAME_COUNT=100 zsh streaming_couping/commands_run_scannet_
 
 ```
 streaming_couping/
-  commands_*.txt               9 个入口
+  commands_*.txt               3 个入口（唯一一条链路）
   object_pose_feedback_env.zsh 帧窗与 run 目录名的唯一定义处
   src/semantic_mapping/        主链路：几何适配、SAM 适配、提案、共识、门控、重放
   src/{aggregation,backbones,bridge,learned_pose,solvers}/
